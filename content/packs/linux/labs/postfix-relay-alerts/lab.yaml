@@ -12,12 +12,13 @@ metadata:
 spec:
   description: |
     The depot host `depot-5` sends its alerts (cron, monitoring) by mail to `root`. Postfix is
-    installed (local-only configuration) and running, but nothing leaves the host. Central
-    mail goes through **`tr-mail-1`** (`tr-mail-1`, SMTP on port 25 of this lab network), a
-    strict relay: it only accepts mail **from** senders at `tallowmere.example` and **for**
-    recipients at `tallowmere.example`, and rejects everything else with a 550.
+    installed with the distribution's "local only" configuration and running, but nothing
+    leaves the host. Central mail goes through **`tr-mail-1`** (SMTP on port 25 of this lab
+    network), a strict relay: it only accepts mail **from** senders at `tallowmere.example`
+    and **for** recipients at `tallowmere.example`, and rejects everything else with a 550.
     A shell is open on this host and you have `sudo`; there is no systemd, so use
-    `sudo postfix reload` and `sudo postqueue -p`.
+    `sudo postfix reload` and `sudo postqueue -p`, and read Postfix's log in
+    `/var/log/postfix.log`.
 
     Configure Postfix so that:
 
@@ -32,12 +33,12 @@ spec:
        `{{opsbox}}`'s mailbox on `tr-mail-1` and the Postfix queue is empty.
 
     The grader sends its own alert, so do not rely on one test message from your side.
-    `tr-mail-1` keeps what it receives under `/var/lib/cloudtrain/mail/` (not readable by
-    you); its log of rejections is `/var/log/tr-mail-1.log`.
+    `tr-mail-1` keeps what it receives out of your reach; its log of rejections is
+    `/var/log/tr-mail-1.log`.
   objectives:
     - Send all mail through a relay host with relayhost
     - Rewrite a local recipient with an alias and rebuild the alias database
-    - Set the mail origin so that the sender domain is acceptable to the relay
+    - Rewrite the sender address on the way out so that the relay accepts it
     - Read the mail queue and Postfix's log files to see why mail is deferred
   params:
     opsbox:
@@ -136,7 +137,8 @@ spec:
         if ! dpkg -s postfix >/dev/null 2>&1; then apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q postfix >/dev/null; fi
         service postfix stop >/dev/null 2>&1 || postfix stop >/dev/null 2>&1 || true
         if [ -f /etc/postfix/main.cf.dist ]; then cp /etc/postfix/main.cf.dist /etc/postfix/main.cf; else cp /etc/postfix/main.cf /etc/postfix/main.cf.dist; fi
-        postconf -e 'inet_interfaces = loopback-only' 'relayhost =' 'myorigin = /etc/mailname' 'smtp_host_lookup = dns, native'
+        postconf -e 'inet_interfaces = loopback-only' 'relayhost =' 'myorigin = /etc/mailname' 'maillog_file = /var/log/postfix.log' 'default_transport = error: outside mail is not deliverable' 'relay_transport = error: outside mail is not deliverable'
+        : > /var/log/postfix.log; chmod 0644 /var/log/postfix.log
         echo 'depot-5.localdomain' > /etc/mailname
         printf 'postmaster: root\n' > /etc/aliases; newaliases
         rm -f /var/mail/root; postsuper -d ALL >/dev/null 2>&1 || true
@@ -182,8 +184,11 @@ spec:
     - title: Relay host
       body: "`sudo postconf -e 'relayhost = [tr-mail-1]:25'` (the brackets skip MX lookups). `postconf -n` shows what differs from the defaults. Reload with `sudo postfix reload`."
       cost: 1
+    - title: Local-only means no outside transport
+      body: "The distribution's local-only setup sets `default_transport` and `relay_transport` to an `error:` transport, so every outside address bounces whatever the relayhost says. Look for `status=bounced` in /var/log/postfix.log and reset both to `smtp`."
+      cost: 2
     - title: Sender domain
-      body: "The envelope sender of local mail is `user@$myorigin` (default: /etc/mailname). Set `myorigin = tallowmere.example`, or rewrite with `smtp_generic_maps`. `sudo tail /var/log/mail.log` is not available here: use `sudo postqueue -p` for the deferral reason, and /var/log/tr-mail-1.log for what the relay refused."
+      body: "Local mail leaves as `root@depot-5.localdomain` and the relay refuses that. Do not change myorigin: an unqualified `root` would become `root@tallowmere.example`, which is no longer a local address and the alias for root would stop applying. Rewrite the sender on the way out instead: `smtp_generic_maps` (or `sender_canonical_maps`) with a regexp or hash map."
       cost: 2
     - title: Rewriting root
       body: "An entry `root: opsbox@tallowmere.example` in /etc/aliases makes local mail for root go elsewhere, but only after `sudo newaliases` rebuilds the database. `recipient_canonical_maps` is the other way."
@@ -200,44 +205,61 @@ spec:
         on: depot-5
         as: learner
         run: |
-          sudo postconf -e 'relayhost = [tr-mail-1]:25' 'myorigin = tallowmere.example'
+          sudo postconf -e 'relayhost = [tr-mail-1]:25' 'default_transport = smtp' 'relay_transport = smtp' 'smtp_generic_maps = regexp:/etc/postfix/generic'
+          echo '/^(.+)@depot-5\.localdomain$/ ${1}@tallowmere.example' | sudo tee /etc/postfix/generic >/dev/null
           echo 'root: {{opsbox}}@tallowmere.example' | sudo tee -a /etc/aliases >/dev/null
           sudo postfix reload >/dev/null 2>&1
     - id: sender-domain-left
       description: Relays and rewrites root but leaves the sender at the local host name.
-      feedback: "tr-mail-1 rejects senders outside tallowmere.example (see its log). Set myorigin (or a generic map) so the envelope sender and From header use that domain."
+      feedback: "tr-mail-1 rejects senders outside tallowmere.example (see its log). Rewrite the sender on the way out with smtp_generic_maps or sender_canonical_maps."
       expectFail: [alert-delivered]
       mutation:
         on: depot-5
         as: learner
         run: |
-          sudo postconf -e 'relayhost = [tr-mail-1]:25'
+          sudo postconf -e 'relayhost = [tr-mail-1]:25' 'default_transport = smtp' 'relay_transport = smtp'
+          echo 'root: {{opsbox}}@tallowmere.example' | sudo tee -a /etc/aliases >/dev/null
+          sudo newaliases
+          sudo postfix reload >/dev/null 2>&1
+    - id: local-only-transport-left
+      description: Sets the relay host but leaves the distribution's error transport as the default transport.
+      feedback: "With default_transport and relay_transport still pointing at the error transport, Postfix bounces every outside address before it ever looks at relayhost. Set both to smtp."
+      expectFail: [alert-delivered]
+      mutation:
+        on: depot-5
+        as: learner
+        run: |
+          sudo postconf -e 'relayhost = [tr-mail-1]:25' 'smtp_generic_maps = regexp:/etc/postfix/generic'
+          echo '/^(.+)@depot-5\.localdomain$/ ${1}@tallowmere.example' | sudo tee /etc/postfix/generic >/dev/null
           echo 'root: {{opsbox}}@tallowmere.example' | sudo tee -a /etc/aliases >/dev/null
           sudo newaliases
           sudo postfix reload >/dev/null 2>&1
     - id: no-relayhost
-      description: Sets the alias and origin but leaves out the relay, so Postfix tries to deliver directly.
+      description: Resets the transport and fixes alias and sender but leaves out the relay, so Postfix tries to deliver directly.
       feedback: "Without relayhost Postfix looks up the MX of tallowmere.example itself, which this host cannot reach, and the message sits in the queue. Relay through tr-mail-1."
       expectFail: [postfix-configured, alert-delivered]
       mutation:
         on: depot-5
         as: learner
         run: |
-          sudo postconf -e 'myorigin = tallowmere.example'
+          sudo postconf -e 'default_transport = smtp' 'relay_transport = smtp' 'smtp_generic_maps = regexp:/etc/postfix/generic'
+          echo '/^(.+)@depot-5\.localdomain$/ ${1}@tallowmere.example' | sudo tee /etc/postfix/generic >/dev/null
           echo 'root: {{opsbox}}@tallowmere.example' | sudo tee -a /etc/aliases >/dev/null
           sudo newaliases
           sudo postfix reload >/dev/null 2>&1
   solution:
     explanation: |
-      relayhost = [tr-mail-1]:25 sends everything through the central relay; myorigin =
-      tallowmere.example gives local mail a sender the relay accepts; an alias for root plus
-      newaliases rewrites the recipient; postfix reload applies the settings.
+      relayhost = [tr-mail-1]:25 plus default_transport and relay_transport reset to smtp
+      sends everything through the central relay; an alias for root (and newaliases) rewrites
+      the recipient; smtp_generic_maps turns the sender root@depot-5.localdomain into one at
+      tallowmere.example on the way out; postfix reload applies the settings.
     steps:
       - on: depot-5
         as: learner
         timeoutSec: 90
         run: |
-          sudo postconf -e 'relayhost = [tr-mail-1]:25' 'myorigin = tallowmere.example'
+          sudo postconf -e 'relayhost = [tr-mail-1]:25' 'default_transport = smtp' 'relay_transport = smtp' 'smtp_generic_maps = regexp:/etc/postfix/generic'
+          echo '/^(.+)@depot-5\.localdomain$/ ${1}@tallowmere.example' | sudo tee /etc/postfix/generic >/dev/null
           echo 'root: {{opsbox}}@tallowmere.example' | sudo tee -a /etc/aliases >/dev/null
           sudo newaliases
           sudo postfix check
@@ -247,16 +269,16 @@ spec:
           sudo postqueue -p
           cat /var/log/tr-mail-1.log
     alternatives:
-      - id: canonical-and-generic-maps
-        description: Rewrite the recipient with recipient_canonical_maps and the sender with smtp_generic_maps instead of an alias and myorigin.
+      - id: canonical-maps
+        description: Rewrite the recipient with recipient_canonical_maps and the sender with sender_canonical_maps instead of an alias and a generic map.
         steps:
           - on: depot-5
             as: learner
             timeoutSec: 90
             run: |
               echo 'root@depot-5.localdomain {{opsbox}}@tallowmere.example' | sudo tee /etc/postfix/recipient_canonical >/dev/null
-              printf '@depot-5.localdomain @tallowmere.example\n' | sudo tee /etc/postfix/generic >/dev/null
-              sudo postmap /etc/postfix/recipient_canonical /etc/postfix/generic
-              sudo postconf -e 'relayhost = [tr-mail-1]:25' 'recipient_canonical_maps = hash:/etc/postfix/recipient_canonical' 'smtp_generic_maps = hash:/etc/postfix/generic'
+              printf '@depot-5.localdomain @tallowmere.example\n' | sudo tee /etc/postfix/sender_canonical >/dev/null
+              sudo postmap /etc/postfix/recipient_canonical /etc/postfix/sender_canonical
+              sudo postconf -e 'relayhost = [tr-mail-1]:25' 'default_transport = smtp' 'relay_transport = smtp' 'recipient_canonical_maps = hash:/etc/postfix/recipient_canonical' 'sender_canonical_maps = hash:/etc/postfix/sender_canonical'
               sudo postfix check
               sudo postfix reload
