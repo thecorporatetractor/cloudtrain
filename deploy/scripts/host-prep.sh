@@ -37,3 +37,23 @@ for d in /dev/kvm /dev/vhost-net /dev/net/tun; do
   [[ -c $d ]] || die "$d missing after module load"
 done
 log "host ready: kvm, vhost-net, tun, openvswitch, geneve"
+
+# Modules lab content needs (tunnels, IPsec, VLANs, bonds, tc, NAT; lab-kernel-modules.txt).
+# Not fatal: the platform runs without them, only the labs that use them fail (e.g.
+# `add tunnel "gre0" failed: No such device`). Load what is missing, warn about the rest
+# (on WSL2 a module missing from the kernel build cannot be loaded at all).
+builtin=/lib/modules/$(uname -r)/modules.builtin
+have_mod() { grep -qE "^$1 " /proc/modules || [[ -d /sys/module/$1 ]] || grep -qE "/$1\.ko" "$builtin" 2>/dev/null; }
+lab_missing=()
+while read -r m; do
+  [[ -z $m || $m == \#* ]] && continue
+  have_mod "$m" || lab_missing+=("$m")
+done < "$(dirname "$0")/lab-kernel-modules.txt"
+if ((${#lab_missing[@]})); then
+  log "loading lab kernel modules: ${lab_missing[*]}"
+  docker run --rm --privileged --entrypoint sh -v /lib/modules:/lib/modules:ro "$KIND_NODE_IMAGE" \
+    -c "for m in ${lab_missing[*]}; do modprobe \$m 2>/dev/null; done; true" >/dev/null 2>&1 || true
+  still=()
+  for m in "${lab_missing[@]}"; do have_mod "$m" || still+=("$m"); done
+  ((${#still[@]})) && warn "kernel modules missing (labs that use them will fail): ${still[*]}$(grep -qi microsoft /proc/sys/kernel/osrelease && echo '; WSL2: the kernel build lacks them (custom kernel or wsl --update)')"
+fi

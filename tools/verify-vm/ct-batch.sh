@@ -3,7 +3,8 @@
 #
 #   ct-batch.sh loop                 pull origin/main, verify every `status: built` lab and exam task,
 #                                    then the exam runs; repeat every CYCLE_SLEEP seconds (systemd unit)
-#   ct-batch.sh once [id,...]        one cycle (optionally only these lab ids; they are re-run even if passed)
+#   ct-batch.sh once [id,...]        one cycle (optionally only these lab ids; they are re-run even if passed);
+#                                    while the loop runs, the ids are queued for it instead (state/requeue)
 #   ct-batch.sh summary              print the summary table
 #   ct-batch.sh list                 built labs: slot, run/skip, image readiness (no side effects)
 #
@@ -22,11 +23,13 @@ RES=${RES:-/srv/ct-work/results}
 VMCFG=${VMCFG:-/srv/ct-work/vm-config}
 CTX=kind-cloudtrain-dev
 export CT_SLOTS_HEAVY=${CT_SLOTS_HEAVY:-1} CT_SLOTS_POD=${CT_SLOTS_POD:-4}
+export CT_SLOTS_ENV=${CT_SLOTS_ENV:-$CFG}   # tools/slots/run.sh re-reads the limits from it while waiting
 SESSION_LABEL=${SESSION_LABEL:-labs.cloudtrain.dev/verify=batch}
 ORCH_NS=${ORCH_NS:-ct-batch-system}
 RECONCILES=${RECONCILES:-64}
 PAR_VM=${PAR_VM:-2} PAR_POD=${PAR_POD:-3}
 READY_TIMEOUT=${READY_TIMEOUT:-45m}
+GRADE_TIMEOUT=${GRADE_TIMEOUT:-15m}   # labctl verify --grade-timeout: max time for one grading round (default 5m)
 CYCLE_SLEEP=${CYCLE_SLEEP:-900}
 EXAM_SEEDS=${EXAM_SEEDS:-"1 2"}   # auto-solve with the first, no-solve with the second
 mkdir -p "$RES"/{labs,logs,reports,exams,state}
@@ -132,7 +135,7 @@ run_lab() { # run_lab <id> <dir> <slot>
   rm -f "$rep"
   { echo "# $id ($slot) rev $(git -C "$REPO" rev-parse --short HEAD) started $(date -u +%FT%TZ)"
     cd "$REPO/services/lab-orchestrator" && "$REPO/tools/slots/run.sh" "$slot" -- timeout -k 2m 4h bin/labctl verify --context "$CTX" \
-      --repo-root "$REPO" --session-label "$SESSION_LABEL" --parallel "$par" --ready-timeout "$READY_TIMEOUT" "$dir"; } >"$log" 2>&1
+      --repo-root "$REPO" --session-label "$SESSION_LABEL" --parallel "$par" --ready-timeout "$READY_TIMEOUT" --grade-timeout "$GRADE_TIMEOUT" "$dir"; } >"$log" 2>&1
   rc=$?
   [[ -f $rep ]] && cp "$rep" "$RES/reports/$id.json"
   local status=fail step=""
@@ -210,6 +213,26 @@ reap() { local p; for p in "${!RUNNING[@]}"; do kill -0 "$p" 2>/dev/null || { wa
 reload_limits() { [[ -f $CFG ]] && eval "$(grep -E '^(export )?CT_SLOTS_(HEAVY|POD)=[0-9]+$' "$CFG")"; export CT_SLOTS_HEAVY CT_SLOTS_POD; }
 limit_for() { reload_limits; [[ $1 == vm ]] && echo "$CT_SLOTS_HEAVY" || echo "$CT_SLOTS_POD"; }
 
+# Requeue: `once <ids>` while the loop holds the runner lock appends the ids to state/requeue;
+# the loop picks them up while it dispatches (and wakes from its sleep for them), forced.
+REQUEUE=$RES/state/requeue
+requeue_add() { (flock 8; tr ',' '\n' <<<"$1" | grep -v '^$' >> "$REQUEUE") 8>"$REQUEUE.lock"; }
+requeue_take() { # prints queued ids (comma-separated) and empties the queue
+  (flock 8; [[ -s $REQUEUE ]] && sort -u "$REQUEUE" | paste -sd, -; : > "$REQUEUE") 8>"$REQUEUE.lock" 2>/dev/null
+}
+# requeue_into <ids>: append those labs to vmq/podq of the calling cycle (forced), unless running
+requeue_into() {
+  local id dir slot refs n=0
+  while IFS=$'\t' read -r id dir slot refs; do
+    [[ ,$1, == *",$id,"* && $slot != missing ]] || continue
+    alive "$dir" && { log "requeue: $id is running; skipped"; continue; }
+    [[ " ${vmq[*]} ${podq[*]} " == *" $id|"* ]] && continue   # already waiting in this cycle
+    if [[ $slot == vm ]]; then vmq+=("$id|$dir|$refs"); else podq+=("$id|$dir|$refs"); fi
+    n=$((n + 1))
+  done < <(lab_list)
+  log "requeue: queued $n of $1"
+}
+
 cycle() { # cycle [ids]
   local only=${1:-} force=0 id dir slot vmq=() podq=()
   [[ -n $only ]] && force=1
@@ -240,6 +263,7 @@ cycle() { # cycle [ids]
   local q i e refs miss started_at=$SECONDS left
   while :; do
     reap
+    local rq; rq=$(requeue_take); [[ -n $rq ]] && requeue_into "$rq"
     left=0
     for q in vm pod; do
       local -n Q=${q}q
@@ -307,11 +331,16 @@ case ${1:-loop} in
         exec 9>"$RES/state/runner.flock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
         log "runner cycle start (pid $$)"
         cycle || log "cycle failed; retrying after sleep"; summary >/dev/null
-        log "cycle done; sleeping ${CYCLE_SLEEP}s"; sleep "$CYCLE_SLEEP"
+        log "cycle done; sleeping ${CYCLE_SLEEP}s (a requeue wakes it)"
+        for ((t = 0; t < CYCLE_SLEEP; t += 15)); do [[ -s $REQUEUE ]] && break; sleep 15; done
         exec 9>&-
         cp "$SELF" "$RES/state/ct-batch.run.sh.new" && mv "$RES/state/ct-batch.run.sh.new" "$RES/state/ct-batch.run.sh"
         CT_BATCH_SELF=$SELF exec bash "$RES/state/ct-batch.run.sh" loop ;;
-  once) exec 9>"$RES/state/runner.flock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
+  once) exec 9>"$RES/state/runner.flock"
+        if ! flock -n 9; then
+          [[ -n ${2:-} ]] || { log "another runner holds the lock"; exit 1; }
+          requeue_add "$2"; log "the loop holds the runner lock; queued for it: $2"; exit 0
+        fi
         cycle "${2:-}"; summary >/dev/null ;;
   summary) summary ;;
   list) load_catalog; while IFS=$'\t' read -r id dir slot refs; do
