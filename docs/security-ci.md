@@ -40,6 +40,7 @@ Images built by `images.yml`:
 | lab-orchestrator | `services/lab-orchestrator/Dockerfile` |
 | jumphost | `tools/images/jumphost/` |
 | frr, nettools, netsvc | `tools/images/netdev/` |
+| oci-registry | `tools/images/oci-registry/` |
 
 They are pushed as `ghcr.io/thecorporatetractor/cloudtrain/<name>`. Not built in CI:
 - the KubeVirt golden VM images (`tools/images/build.sh`), which need KVM and about 30 minutes;

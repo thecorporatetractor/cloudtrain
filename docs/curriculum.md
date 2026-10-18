@@ -2162,9 +2162,7 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `deb-sys:24.04` | container | B | proposed | Kata pod image with systemd as PID 1, networking and storage tools, Ubuntu 24.04 based |
 | `el-vm:9` | containerDisk | C | proposed | EL 9 cloud image (AlmaLinux 9 GenericCloud) for the RHEL 9 variant |
 | `dockerd:29` | container | B | spike | Kata pod running rootful Docker Engine 29 with a block-backed /var/lib/docker (overlay2 spike pending) |
-| `oci-registry:3` | container | A/B | proposed | CNCF Distribution registry pod per learner (TLS and htpasswd configurable) |
 | `gitea:1` | container | A | proposed | In-lab Git server for Git workflow, module sources and Ansible content |
-| `s3-store:1` | container | A/V | spike | SeaweedFS S3 endpoint for remote state with use_lockfile (two-writer contention test pending) |
 | `ansible-node:1` | container | A | proposed | sshd managed-node pod with a sudo-enabled student user (no systemd) |
 | `awx:24` | service | C | spike | AWX controller pool (Apache-2.0; releases paused upstream), per-learner org or per-learner instance |
 | `galaxy-ng:4` | service | A | proposed | Private Galaxy (Pulp galaxy_ng) for collection publish labs |
