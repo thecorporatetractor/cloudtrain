@@ -72,8 +72,9 @@ func dockerHubName(ref string) string {
 
 // ResolveImage turns a catalog image into the ref the cluster pulls:
 // registry prefixes an unqualified image (as --image-registry always did),
-// then the longest matching mirror rewrites its registry part. Tags and
-// digests are kept.
+// then the longest matching mirror rewrites its registry part. A mirror's
+// From matches at a path boundary (a registry, a path, or a whole repository
+// before its tag or digest); tags and digests are kept.
 func ResolveImage(registry string, mirrors []RegistryMirror, image string) string {
 	out := image
 	if registry != "" && !qualified(out) {
@@ -90,7 +91,7 @@ func ResolveImage(registry string, mirrors []RegistryMirror, image string) strin
 	sort.SliceStable(ms, func(i, j int) bool { return len(ms[i].From) > len(ms[j].From) })
 	for _, m := range ms {
 		from := strings.TrimSuffix(m.From, "/")
-		if rest, ok := strings.CutPrefix(candidate, from); ok && (rest == "" || strings.HasPrefix(rest, "/")) {
+		if rest, ok := strings.CutPrefix(candidate, from); ok && (rest == "" || strings.ContainsAny(rest[:1], "/:@")) {
 			return strings.TrimSuffix(m.To, "/") + rest
 		}
 	}
