@@ -184,12 +184,30 @@ between the xpe-iac-* tasks and others; not ours).
 | xpe-net-depot-route, xpe-net-edge-nat | harbour cluster nodes are VMs; netsvc stand-ins are used for the nodes and the Ingress | none, by design |
 | shipment-operator-crd (k8s-admin) | operator simulated by an admin-container loop (no operator image in `workloadImages`) | optional controller image |
 
-### Verify queue (path order)
+### Verify queue (round 5 close, 47 built labs)
 
-1. The wave-1 drafts first (the 22 labs from `net-subnet-east-campus` to `net-qos-voice-priority`) and the
-   wave-2 security/VPN labs, then `net-jinja-render-frr`.
-2. Pool tasks, so retakes draw fresh tasks: the 16 wave-2 `xnt-*` tasks plus `xnt-json-neighbour-export`, then
-   `xpe-net-depot-route` and `xpe-net-edge-nat`.
-3. A full `labctl exam run --allow-missing --auto-solve` and `--no-solve` of `sim-net-associate`.
-First-verify risks for `net-jinja-render-frr`: OSPF DR election on the broadcast links takes ~40 s (checks
-retry up to 100 s), and `ip ospf passive` is read from `show running-config`.
+All networking labs are envTier N, so none needs the heavy (vm/kubeadm) slot; nothing here is
+Kata-blocked and no built lab is image-blocked (every image is in `deploy/images/catalog.yaml`;
+`lab-verify --strict` is clean). The remote batch runner re-verifies built labs from `origin/main`;
+verify in this order (wave-1 drafts and wave-2 labs first, then pool tasks, then the exam run).
+
+| Slot kind | Count | Labs |
+|---|---|---|
+| pod, container nodes only (netsvc/nettools/jumphost) | 19 | net-acl-grades-server, net-dhcp-pools-reservations, net-fix-mtu-blackhole, net-hack-open-management, net-ipsec-partner-tunnel, net-mgmt-plane-hardening, net-ntp-hierarchy, net-qos-voice-priority, net-wireguard-annex-tunnel, net-zone-firewall-edge, xnt-capture-dns-transport, xnt-dhcp-pool-reservation, xnt-dhcp-relay-annex, xnt-inter-vlan-annex, xnt-lacp-server-bond, xnt-rstp-root-choice, xnt-snmpv3-only, xnt-wireguard-annex, xpe-net-edge-nat |
+| pod with netdev (FRR) nodes | 28 | net-default-route-edge, net-dhcp-relay-campus, net-dns-district-zone, net-fix-library-mask, net-fix-nat-inside-outside, net-fix-ospf-adjacency, net-fix-unreachable-campus, net-floating-static-backup, net-ipv6-dual-stack-office, net-ipv6-static-routes, net-jinja-render-frr, net-ospf-cost-dr-passive, net-ospf-single-area, net-pat-internet-edge, net-read-routing-table, net-snmpv3-polling, net-static-nat-timetable, net-static-routes-campuses, net-subnet-east-campus, net-syslog-central, xnt-floating-backup-route, xnt-ipv6-office-slaac, xnt-json-neighbour-export, xnt-neighbour-link-local, xnt-ospf-dr-election, xnt-route-preference-report, xnt-vrrp-lab-gateway, xpe-net-depot-route |
+| vm / kubeadm | 0 | none |
+| Kata-blocked | 0 | none |
+| image-blocked (still `proposed`, not queued) | 6 | the SR Linux set of five and net-ansible-frr-backup, see Blockers |
+
+Unmerged PRs: none for networking (waves 1-3 are #56, #61, #75, all merged; wave 3 merged as a2134f8).
+Wave 3 needed a README/docs rebase re-render and a local lab-schema rebuild (stale `secretParams` export);
+nothing was committed from that.
+
+Then: a full `labctl exam run --allow-missing --auto-solve` and `--no-solve` of `sim-net-associate`
+(the pool now holds the 2x draw except automation).
+
+First-verify risks: WireGuard/IPsec kernel modules in the user-namespaced netns (net-wireguard-annex-tunnel,
+net-ipsec-partner-tunnel, xnt-wireguard-annex); `ip_gre` and 1400-byte frames (net-fix-mtu-blackhole); FRR JSON
+field names (`state` DR/Backup/DROther, `ifaceName`) and `show ip route <dest> json` layout; for
+`net-jinja-render-frr`, OSPF DR election on the broadcast links takes ~40 s (checks retry up to 100 s) and
+`ip ospf passive` is read from `show running-config`.
