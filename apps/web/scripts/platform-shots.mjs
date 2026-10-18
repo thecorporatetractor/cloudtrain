@@ -198,8 +198,13 @@ try {
       for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
         if (only?.length && !only.includes(name)) continue;
         const { ctx, page } = await session(theme, persona);
-        await open(page, url, waitFor);
-        await shot(page, `${name}-${theme}`);
+        try {
+          await open(page, url, waitFor);
+          await shot(page, `${name}-${theme}`);
+        } catch (e) {
+          console.log('FAILED', `${name}-${theme}`, e.message.split('\n')[0]);
+          failed = true;
+        }
         await ctx.close();
       }
     }
