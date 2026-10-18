@@ -317,9 +317,11 @@ State at the end of round 5. Everything below is `built` (static checks only: la
 
 Pools: sim-containers-docker and sim-containers-podman are at 2x their draw. The sim-platform-engineer containers-delivery pool is 4/2 once #114 merges.
 
-### Unmerged PRs: none (final state, round 5 closed)
+### Unmerged PRs: none open; one unmerged fix commit (final state, round 5 closed)
 
-Waves 1 to 5 (#58, #63, #87, #114, #124) are all merged; no containers PR is open. Total written in round 5: 111 labs/tasks (23 + 21 + 23 + 25 + 19), all `built`, none run live; verified live is still the original 24. All 79 proposed learning labs are now written. The review findings on wave 4 (#114) below were not confirmed fixed before merge: treat them as content bugs to fix first in the testing round (the verify will catch most of them):
+Waves 1 to 5 (#58, #63, #87, #114, #124) are all merged; no containers PR is open. One review-fix commit is NOT in main: `e1645d5` "wave 5 review fixes (flapping oneLine, drain-probe detach, rights-db identity)", pushed to `origin/content/containers-r5-w5-fixes` and `origin/content/containers-r5-w5-minor` (same commit, no PR). It touches `ctr-link-env-removed`, `ctr-swarm-init-quorum`, `content/curriculum.yaml` and `docs/curriculum.md`. It needs its own PR (rebase on main, `node tools/curriculum/render.mjs`, `lab-verify --strict`, CI, squash); the local worktree `.worktrees/containers-r5-w5` (branch `content/containers-r5-w5-fixes`) holds it and must not be removed before then. Land it before the verify batch reaches those two labs.
+
+lab-verify now also errors when a built or verified lab's curriculum images differ from its `lab.yaml` node images or are not in `deploy/images/catalog.yaml`; the verify batch runner picks built labs up from origin/main. The first CI run after the next containers change will show any image drift (all containers labs use `jumphost:1`, `docker-vm:29`, and `el-vm:10` for wave 2). Total written in round 5: 111 labs/tasks (23 + 21 + 23 + 25 + 19), all `built`, none run live; verified live is still the original 24. All 79 proposed learning labs are now written. The review findings on wave 4 (#114) below were not confirmed fixed before merge: treat them as content bugs to fix first in the testing round (the verify will catch most of them):
 
 - Blocker: `xpe-image-slim-fix` exec-form check uses `test("sh$")`, which matches the solution's own `ENTRYPOINT ["/printer.sh"]`; solution and alternative both fail.
 - Major: `xpe-image-build-push` reads the digest with `buildx imagetools` against a registry whose CA is trusted only in `/etc/docker/certs.d`; imagetools likely ignores that, so `digest.txt` is empty.
