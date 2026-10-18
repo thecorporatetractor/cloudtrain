@@ -54,6 +54,9 @@ type RuntimeOptions struct {
 	UserNamespaces bool
 	// DenyLearnerSudo refuses labs whose entry node sets learnerSudo.
 	DenyLearnerSudo bool
+	// NamespaceAccess, when set, binds the manager's session permissions in
+	// the namespaces drivers create (vcluster host namespaces).
+	NamespaceAccess NamespaceAccess
 	// Network: network mode (Kube-OVN primary or non-primary behind
 	// Multus) and the MTU of session segments, for the VM lab network.
 	// The pod link network (LinkNetwork) takes the same options.
@@ -121,7 +124,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	cluster := &ClusterDriver{
 		Virtual: &VClusterDriver{Client: o.Client, Reader: o.Reader, Container: container, Helm: o.Helm,
 			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
-			PodSecurity: o.VClusterPodSecurity},
+			PodSecurity: o.VClusterPodSecurity, NamespaceAccess: o.NamespaceAccess},
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
 			Session: session, ImageRegistry: registry, Disks: disks},
 	}

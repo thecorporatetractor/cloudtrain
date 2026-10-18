@@ -498,3 +498,65 @@ func TestValidPodSecurity(t *testing.T) {
 		}
 	}
 }
+
+type recordAccess struct{ namespaces []string }
+
+func (a *recordAccess) Ensure(_ context.Context, ns string) error {
+	a.namespaces = append(a.namespaces, ns)
+	return nil
+}
+
+// The manager holds no namespaced permissions of its own: every vcluster host
+// namespace is a lab namespace, bound before Helm installs into it.
+func TestVClusterHostNamespaceIsBound(t *testing.T) {
+	ctx := context.Background()
+	tpl := kubeadmTopology()
+	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[3]}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	acc := &recordAccess{}
+	d := &VClusterDriver{Client: c, NamespaceAccess: acc}
+	if ready, err := d.ensureHostNamespace(ctx, ref); err != nil || !ready {
+		t.Fatalf("ensure = %v %v", ready, err)
+	}
+	host := VClusterNamespace(ref.Session, ref.Node.Name)
+	ns := &corev1.Namespace{}
+	if err := c.Get(ctx, client.ObjectKey{Name: host}, ns); err != nil {
+		t.Fatal(err)
+	}
+	if ns.Labels[LabelLabNamespace] != "true" || ns.Labels[LabelManagedBy] != ManagedBy || !strings.HasPrefix(host, "ct-vc-") {
+		t.Errorf("host namespace %s labels = %v (the admission policy wants ct-vc-*, managed-by, lab label)", host, ns.Labels)
+	}
+	if len(acc.namespaces) != 1 || acc.namespaces[0] != host {
+		t.Errorf("Ensure calls = %v", acc.namespaces)
+	}
+
+	// A host namespace from before the lab label gets it (and its binding).
+	delete(ns.Labels, LabelLabNamespace)
+	if err := c.Update(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := d.ensureHostNamespace(ctx, ref); err != nil || !ready {
+		t.Fatalf("ensure (existing) = %v %v", ready, err)
+	}
+	_ = c.Get(ctx, client.ObjectKeyFromObject(ns), ns)
+	if ns.Labels[LabelLabNamespace] != "true" {
+		t.Errorf("lab label not added: %v", ns.Labels)
+	}
+
+	// Terminating: Destroy waits for it without touching what is inside
+	// (the namespace's RoleBinding may already be gone).
+	ns.Finalizers = []string{"test/hold"}
+	if err := c.Update(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	acc.namespaces = nil
+	if err := d.Destroy(ctx, ref); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("destroy with a terminating host namespace: %v", err)
+	}
+	if len(acc.namespaces) != 0 {
+		t.Errorf("bound a terminating namespace: %v", acc.namespaces)
+	}
+}

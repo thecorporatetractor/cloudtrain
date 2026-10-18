@@ -25,6 +25,7 @@ import (
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/compile"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/rbac"
 )
 
 const (
@@ -100,36 +101,49 @@ type LabSessionReconciler struct {
 	Reader client.Reader
 	// Metrics, when set, counts warm pool claims.
 	Metrics *PoolMetrics
+	// Access, when set, grants the manager its session permissions in the
+	// session's namespace before any driver runs (internal/rbac).
+	Access SessionNamespaceAccess
 }
 
+// SessionNamespaceAccess grants the manager its session permissions in a
+// namespace holding LabSessions (*rbac.SessionAccess).
+type SessionNamespaceAccess interface {
+	// EnsureHeld binds the session permissions; the binding outlives the
+	// namespace's deletion until Release.
+	EnsureHeld(ctx context.Context, namespace string) error
+	// Release drops the binding's finalizer (no LabSessions left).
+	Release(ctx context.Context, namespace string) error
+	// Forget makes the next EnsureHeld check the binding again.
+	Forget(namespace string)
+}
+
+// The manager's cluster-wide ClusterRole (config/rbac/role.yaml). Everything
+// it does inside a lab namespace (Secrets, pods/exec, writes to pods,
+// services, VMs, ...) is in the session ClusterRole (internal/rbac), bound
+// per lab namespace; docs/deploy.md (RBAC) has the inventory.
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labtemplates,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;update;patch;delete;deletecollection
-// Drivers: session Secrets, vcluster Helm releases (the chart's own objects
-// and everything vcluster syncs into the session namespace), KubeVirt VMs and
-// the Kube-OVN lab network. escalate/bind let the vcluster chart create its
-// Roles without the manager holding every permission they grant.
-// +kubebuilder:rbac:groups="",resources=secrets;configmaps;serviceaccounts;endpoints;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete;deletecollection
-// +kubebuilder:rbac:groups=apps,resources=statefulsets;deployments;replicasets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;escalate;bind
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;subnets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete;patch
-// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
+// Read-only, cluster-wide: the informers behind Owns(Pod), Owns(Service)
+// (filtered to the orchestrator's own objects by label in the cache; RBAC
+// cannot filter by label). --watch-namespace narrows the informers, not RBAC.
+// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch
+// vcluster host namespaces (ct-vc-*): created, relabelled and deleted by the
+// manager; the admission policy limits it to namespaces it labelled itself.
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;create;patch;delete
+// Lab namespaces: bind the session ClusterRole to itself. bind is limited to
+// that role by name; RoleBinding writes are cluster-wide because the lab
+// namespaces are not known in advance (the admission policy limits them to
+// labelled namespaces and the manager as the only subject).
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=lab-orchestrator-session
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // Storage preflight at startup: the configured or default StorageClass must exist.
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+// Metrics endpoint authn/authz (--metrics-secure).
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 
@@ -159,15 +173,27 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Access first: every driver call below acts in the session namespace.
+	// Teardown tries even without it (a terminating namespace takes no new
+	// RoleBinding, but the one from provisioning is still there).
+	accessErr := ensureAccess(ctx, r.Access, s.Namespace)
+	if accessErr != nil && s.DeletionTimestamp.IsZero() && !errors.Is(accessErr, rbac.ErrNamespaceNotLab) {
+		return ctrl.Result{}, accessErr
+	}
+
 	// Deletion: destroy node resources, then release the finalizer. Teardown
 	// uses the topology recorded in status, never only the live template.
 	if !s.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(s, Finalizer) {
 			if err := r.teardown(ctx, s); err != nil {
+				forgetAccessOnForbidden(r.Access, s.Namespace, err)
 				if errors.Is(err, drivers.ErrInProgress) {
 					log.V(1).Info("teardown in progress", "reason", err.Error())
 					return ctrl.Result{RequeueAfter: requeueTeardown}, nil
 				}
+				return ctrl.Result{}, err
+			}
+			if err := r.releaseAccess(ctx, s); err != nil {
 				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(s, Finalizer)
@@ -197,6 +223,16 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return nil
 	}
 
+	if accessErr != nil {
+		msg := fmt.Sprintf("the orchestrator works only in lab namespaces: label namespace %s with %s=true (%v)", s.Namespace, drivers.LabelLabNamespace, accessErr)
+		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonNamespaceNotLab, msg)
+		r.event(s, corev1.EventTypeWarning, ReasonNamespaceNotLab, msg)
+		if err := save(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueNamespaceNotLab}, nil
+	}
+
 	tpl, tplErr := r.template(ctx, s)
 	var res ctrl.Result
 	var err error
@@ -211,9 +247,56 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, errors.Join(err, uerr)
 	}
 	if err != nil {
+		forgetAccessOnForbidden(r.Access, s.Namespace, err)
 		log.Error(err, "reconcile failed", "phase", s.Status.Phase)
 	}
 	return res, err
+}
+
+// ReasonNamespaceNotLab: the session's namespace lacks the lab label.
+const ReasonNamespaceNotLab = "NamespaceNotLab"
+
+// requeueNamespaceNotLab: how often a session in an unlabelled namespace
+// checks the label again.
+const requeueNamespaceNotLab = 30 * time.Second
+
+// ensureAccess grants the manager its session permissions in namespace.
+func ensureAccess(ctx context.Context, a SessionNamespaceAccess, namespace string) error {
+	if a == nil {
+		return nil
+	}
+	return a.EnsureHeld(ctx, namespace)
+}
+
+// forgetAccessOnForbidden makes the next ensureAccess check the binding
+// again after a Forbidden error (e.g. it was deleted).
+func forgetAccessOnForbidden(a SessionNamespaceAccess, namespace string, err error) {
+	if a != nil && apierrors.IsForbidden(err) {
+		a.Forget(namespace)
+	}
+}
+
+// releaseAccess drops the session binding's finalizer once s, torn down,
+// is the last LabSession in its namespace that carries the cleanup
+// finalizer (read uncached: a session created a moment ago counts).
+func (r *LabSessionReconciler) releaseAccess(ctx context.Context, s *labsv1.LabSession) error {
+	if r.Access == nil {
+		return nil
+	}
+	var reader client.Reader = r.Client
+	if r.Reader != nil {
+		reader = r.Reader
+	}
+	list := &labsv1.LabSessionList{}
+	if err := reader.List(ctx, list, client.InNamespace(s.Namespace)); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		if o := &list.Items[i]; o.Name != s.Name && controllerutil.ContainsFinalizer(o, Finalizer) {
+			return nil
+		}
+	}
+	return r.Access.Release(ctx, s.Namespace)
 }
 
 // template fetches the session's LabTemplate and resolves its params.

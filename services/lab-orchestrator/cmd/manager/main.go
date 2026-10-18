@@ -4,11 +4,17 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	nodev1 "k8s.io/api/node/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -24,6 +30,7 @@ import (
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/controller"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/rbac"
 )
 
 func main() {
@@ -34,6 +41,7 @@ func main() {
 		storageClass, homeStorageClass, vmDiskStorageClass, vmDiskVolumeMode, vmDiskAccessModes, storagePreflight string
 		vmDisks, userNamespaces, vclusterPodSecurity                                                              string
 		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag                                               string
+		sessionClusterRole, serviceAccount                                                                        string
 		labMTU                                                                                                    int
 		linkSysctls                                                                                               bool
 		linkRateMbps                                                                                              int
@@ -78,6 +86,8 @@ func main() {
 	flag.StringVar(&vmDiskVolumeMode, "vm-disk-volume-mode", "", "volumeMode of VM disks: Block, Filesystem, or empty = the class's CDI StorageProfile decides")
 	flag.StringVar(&vmDiskAccessModes, "vm-disk-access-modes", "ReadWriteOnce", "comma separated accessModes of VM disks (ReadWriteOnce suits every class)")
 	flag.StringVar(&storagePreflight, "storage-preflight", "warn", "startup check that the configured (or a default) StorageClass exists: warn (log), strict (exit on a missing configured class) or off")
+	flag.StringVar(&sessionClusterRole, "session-cluster-role", rbac.DefaultSessionClusterRole, "ClusterRole with the manager's permissions inside lab namespaces (config/rbac/session_role.yaml); the manager binds it to itself in every namespace labelled "+drivers.LabelLabNamespace+"=true it works in. Empty = never bind (the operator grants those permissions)")
+	flag.StringVar(&serviceAccount, "service-account", "", "the manager's own ServiceAccount, <namespace>/<name>, the subject of those RoleBindings; empty = $POD_NAMESPACE/$SERVICE_ACCOUNT_NAME (downward API)")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -121,8 +131,13 @@ func main() {
 
 	cfg := ctrl.GetConfigOrDie()
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
-		Cache:                  cacheOpts,
+		Scheme: scheme,
+		Cache:  cacheOpts,
+		// Reads of anything but the cached kinds above (and the labs CRDs) go
+		// to the API server: an informer would list and watch the kind in
+		// every namespace, which the scoped RBAC does not allow (Secrets,
+		// PVCs, ... are readable only in lab namespaces).
+		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: uncached()}},
 		Metrics:                metricsOpts,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
@@ -223,6 +238,25 @@ func main() {
 	}
 	netOpts := network.Options{Mode: netMode, MTU: labMTU}
 	log.Info("lab network", "mode", netMode, "segmentMTU", labMTU)
+	var access *rbac.SessionAccess
+	if sessionClusterRole != "" {
+		saNS, saName, err := ownServiceAccount(serviceAccount)
+		if err != nil {
+			log.Error(err, "--session-cluster-role needs the manager's ServiceAccount")
+			os.Exit(1)
+		}
+		access = &rbac.SessionAccess{Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), ClusterRole: sessionClusterRole,
+			ServiceAccount: saName, ServiceAccountNamespace: saNS}
+		log.Info("session permissions", "clusterRole", sessionClusterRole, "serviceAccount", saNS+"/"+saName, "labNamespaceLabel", drivers.LabelLabNamespace+"=true")
+	} else {
+		log.Info("session permissions: not bound by the manager (--session-cluster-role empty)")
+	}
+	// Typed nil pointers must not reach the interfaces.
+	var nsAccess drivers.NamespaceAccess
+	var sessionAccess controller.SessionNamespaceAccess
+	if access != nil {
+		nsAccess, sessionAccess = access, access
+	}
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, ImageMirrors: mirrors, ImagePullSecrets: pullSecrets,
@@ -233,7 +267,7 @@ func main() {
 		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent", StorageClass: vmDiskStorageClass,
 			VolumeMode: vmDiskVolumeMode, AccessModes: drivers.SplitList(vmDiskAccessModes)},
 		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
-		Network: netOpts,
+		Network: netOpts, NamespaceAccess: nsAccess,
 	})
 	if err != nil {
 		log.Error(err, "unable to build drivers")
@@ -274,7 +308,7 @@ func main() {
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
 		Recorder:         mgr.GetEventRecorder("lab-orchestrator"),
 		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
-		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics,
+		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics, Access: sessionAccess,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
 		os.Exit(1)
@@ -288,7 +322,7 @@ func main() {
 	}
 	if err := (&controller.ExamSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
-		Recorder: mgr.GetEventRecorder("lab-orchestrator"),
+		Recorder: mgr.GetEventRecorder("lab-orchestrator"), Access: sessionAccess,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up ExamSession controller")
 		os.Exit(1)
@@ -304,6 +338,33 @@ func main() {
 		log.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+// uncached: kinds the manager reads straight from the API server.
+func uncached() []client.Object {
+	return []client.Object{
+		&corev1.Secret{}, &corev1.ConfigMap{}, &corev1.PersistentVolumeClaim{}, &corev1.ServiceAccount{},
+		&corev1.Endpoints{}, &corev1.Namespace{}, &corev1.Node{}, &appsv1.StatefulSet{}, &appsv1.Deployment{},
+		&networkingv1.NetworkPolicy{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}, &rbacv1.ClusterRole{},
+		&rbacv1.ClusterRoleBinding{}, &storagev1.StorageClass{}, &nodev1.RuntimeClass{},
+	}
+}
+
+// ownServiceAccount parses --service-account (<namespace>/<name>), else
+// $POD_NAMESPACE and $SERVICE_ACCOUNT_NAME.
+func ownServiceAccount(flagValue string) (string, string, error) {
+	if flagValue != "" {
+		ns, name, ok := strings.Cut(flagValue, "/")
+		if !ok || ns == "" || name == "" {
+			return "", "", fmt.Errorf("--service-account %q: want <namespace>/<name>", flagValue)
+		}
+		return ns, name, nil
+	}
+	ns, name := os.Getenv("POD_NAMESPACE"), os.Getenv("SERVICE_ACCOUNT_NAME")
+	if ns == "" || name == "" {
+		return "", "", fmt.Errorf("set --service-account or POD_NAMESPACE and SERVICE_ACCOUNT_NAME")
+	}
+	return ns, name, nil
 }
 
 func firstNonEmpty(a, b string) string {

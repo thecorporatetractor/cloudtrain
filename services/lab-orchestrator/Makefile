@@ -12,7 +12,7 @@ CURRICULUM_SRC := ../../packages/lab-schema/schema/curriculum.schema.json
 CURRICULUM_DST := internal/labschema/curriculum.schema.json
 BIN            := bin
 
-.PHONY: all generate schema deepcopy manifests fmt vet test build labctl manager samples clean controller-gen
+.PHONY: all generate schema deepcopy manifests fmt vet test test-rbac build labctl manager samples clean controller-gen
 
 all: generate build test
 
@@ -29,6 +29,7 @@ deepcopy: controller-gen
 manifests: controller-gen
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd
 	$(CONTROLLER_GEN) rbac:roleName=lab-orchestrator paths=./internal/controller/... output:rbac:artifacts:config=config/rbac
+	$(CONTROLLER_GEN) rbac:roleName=lab-orchestrator-session paths=./internal/rbac/... output:rbac:stdout > config/rbac/session_role.yaml
 
 controller-gen:
 	@test -x "$(CONTROLLER_GEN)" || { \
@@ -45,6 +46,14 @@ vet:
 ## test: unit tests (fake client; no cluster or network needed)
 test: vet
 	go test ./...
+
+## test-rbac: the RBAC envtest (real API server: RBAC authorizer and the admission
+## policy; downloads the envtest binaries into $(LOCALBIN)/envtest)
+ENVTEST_K8S_VERSION    ?= 1.36.0
+SETUP_ENVTEST_VERSION  ?= release-0.25
+test-rbac:
+	KUBEBUILDER_ASSETS="$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/envtest -p path)" \
+		go test ./internal/rbac/ -run 'Envtest' -count=1 -v
 
 ## build: binaries into bin/
 build: labctl manager

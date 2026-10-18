@@ -45,6 +45,7 @@ import (
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/compile"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/controller"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/rbac"
 )
 
 // Run kinds.
@@ -618,11 +619,14 @@ func allPassed(g *GradeReport) bool {
 }
 
 // sessionNamespaceLabels adds the Pod Security labels of a session
-// namespace (drivers.SessionNamespacePodSecurity) to labels.
+// namespace (drivers.SessionNamespacePodSecurity) and the lab label (the
+// orchestrator binds its session permissions only in lab namespaces) to
+// labels.
 func sessionNamespaceLabels(labels map[string]string) map[string]string {
 	for k, v := range drivers.SessionNamespacePodSecurity() {
 		labels[k] = v
 	}
+	labels[drivers.LabelLabNamespace] = "true"
 	return labels
 }
 
@@ -818,7 +822,7 @@ func (v *verifier) leftovers(ctx context.Context, ns, uid string) ([]string, err
 				continue
 			}
 			for _, it := range ul.Items {
-				if ignorable(res.Kind, it.GetName()) {
+				if ignorable(res.Kind, it.GetName(), it.GetLabels()) {
 					continue
 				}
 				out = append(out, fmt.Sprintf("%s/%s", strings.ToLower(res.Kind), it.GetName()))
@@ -866,10 +870,14 @@ func (v *verifier) leftovers(ctx context.Context, ns, uid string) ([]string, err
 	return out, nil
 }
 
-func ignorable(kind, name string) bool {
+func ignorable(kind, name string, labels map[string]string) bool {
 	switch {
 	case kind == "ConfigMap" && name == "kube-root-ca.crt",
 		kind == "ServiceAccount" && name == "default":
+		return true
+	// The orchestrator's grant in the lab namespace (internal/rbac): it
+	// outlives the sessions and goes with the namespace.
+	case kind == "RoleBinding" && strings.HasPrefix(name, rbac.DefaultSessionClusterRole) && labels[drivers.LabelManagedBy] == drivers.ManagedBy:
 		return true
 	}
 	return false
