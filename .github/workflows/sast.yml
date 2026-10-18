@@ -1,6 +1,9 @@
 # Static analysis. Blocking: actionlint, zizmor (medium+), shellcheck (warning+),
 # hadolint (error). Report-only (SARIF to code scanning, triaged there): semgrep,
 # gosec, hadolint warnings, zizmor (all). See docs/security-ci.md.
+# Path-aware on pull requests (`changes` job): semgrep when code outside
+# content/ and docs/ changed, gosec for Go, the lint job for workflows, shell
+# scripts and Dockerfiles. Push to main and the weekly run do everything.
 name: sast
 
 on:
@@ -18,8 +21,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # list the PR's files
+    outputs:
+      code: ${{ steps.c.outputs.code }}
+      go: ${{ steps.c.outputs.go }}
+      lint: ${{ steps.c.outputs.lint }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/changes.sh --pr "$PR" >> "$GITHUB_OUTPUT"
+
+  # Gated jobs run when `changes` was skipped (not a PR) or failed (fail-safe), or
+  # when their group is on; they are skipped (= success) otherwise.
   semgrep:
     name: semgrep (report)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -53,6 +86,8 @@ jobs:
 
   gosec:
     name: gosec (report)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.go == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -81,6 +116,8 @@ jobs:
 
   lint:
     name: hadolint, shellcheck, actionlint, zizmor
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.lint == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
