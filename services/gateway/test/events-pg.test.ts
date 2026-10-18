@@ -67,7 +67,7 @@ describe.skipIf(!available)('CTF events (teams, shared progress, scoreboard, exp
       const r = await start(u);
       expect(r.statusCode).toBe(201);
       sessions[u] = r.json().id;
-      ready(sessions[u]);
+      ready(sessions[u]!);
     }
     const ls = (u: string) => h.cluster.sessions.get(sessions[u]!)!;
     expect(ls(Q.lucas).spec.seed).toBe(ls(Q.mei).spec.seed);
