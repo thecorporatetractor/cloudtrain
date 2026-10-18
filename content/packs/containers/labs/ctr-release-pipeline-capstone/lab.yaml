@@ -64,17 +64,22 @@ spec:
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         command -v cosign >/dev/null || { echo "this lab needs cosign on the host image (not built yet)" >&2; exit 1; }
-        docker image inspect moby/buildkit:latest >/dev/null 2>&1 || { echo "this lab needs moby/buildkit and the buildkit-syft-scanner image on the host image (not built yet)" >&2; exit 1; }
+        docker image inspect moby/buildkit:v0.23.2 >/dev/null 2>&1 || { echo "this lab needs moby/buildkit and the buildkit-syft-scanner image on the host image (not built yet)" >&2; exit 1; }
         docker rm -f release-registry >/dev/null 2>&1 || true
         docker compose -p catalogue down >/dev/null 2>&1 || true
         rm -rf /srv/release /srv/release-registry; install -d /srv/release-registry
         install -d -o learner -g learner /srv/release /srv/release/src
         docker run -d --name release-registry --restart always -p 127.0.0.1:{{port}}:5000 -v /srv/release-registry:/var/lib/registry registry:3 >/dev/null
         for i in $(seq 30); do curl -fs http://127.0.0.1:{{port}}/v2/ >/dev/null && break; sleep 1; done
+        # the docker-container builder does not use the engine image store and the host is offline:
+        # serve the base image from the lab registry
+        docker tag busybox:1.37 127.0.0.1:{{port}}/busybox:1.37
+        docker push -q 127.0.0.1:{{port}}/busybox:1.37 >/dev/null
+        printf '[registry."127.0.0.1:{{port}}"]\n  http = true\n  insecure = true\n' > /srv/release/buildkitd.toml
         cd /srv/release/src
         echo "catalogue-api 5.0.0 revision {{rev}}" > index.html
         cat > Dockerfile <<'DF'
-        FROM --platform=$BUILDPLATFORM busybox:1.37 AS base
+        FROM --platform=$BUILDPLATFORM 127.0.0.1:{{port}}/busybox:1.37 AS base
         FROM scratch
         COPY --from=base / /
         COPY index.html /www/index.html
@@ -117,7 +122,7 @@ spec:
       type: shell
       timeoutSec: 60
       on: cl-release-01
-      skills: [containers.buildkit.cache-export]
+      skills: [containers.buildkit.multi-platform]
       weight: 1
       command: curl -fs http://127.0.0.1:{{port}}/v2/catalogue-api/tags/list | jq -r '.tags | index("buildcache") != null | tostring'
       expect: {match: exact, value: "true"}
@@ -161,7 +166,7 @@ spec:
       expect: {match: exact, value: gated}
   hints:
     - title: A builder that can export cache and attestations
-      body: "The default builder cannot export a registry cache. Create a docker-container builder (`docker buildx create --use --driver-opt network=host`) and build with `--platform`, `--cache-to type=registry,ref=...,mode=max`, `--sbom=true --provenance=mode=max` and `--push`."
+      body: "The default builder cannot export a registry cache. Create a docker-container builder (`docker buildx create --use --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.23.2 --config /srv/release/buildkitd.toml`) and build with `--platform`, `--cache-to type=registry,ref=...,mode=max`, `--sbom=true --provenance=mode=max` and `--push`."
       cost: 1
     - title: Sign and pin the same digest
       body: "Resolve the digest of the pushed index once (`docker buildx imagetools inspect <ref> --format '{{json .Manifest}}' | jq -r .digest`) and use it for cosign and for the image line in compose.yaml."
@@ -198,9 +203,10 @@ spec:
     steps:
       - on: cl-release-01
         as: learner
+        timeoutSec: 480
         run: |
           cd /srv/release/src
-          docker buildx create --name relbuilder --driver docker-container --driver-opt network=host --use
+          docker buildx create --name relbuilder --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.23.2 --config /srv/release/buildkitd.toml --use
           docker buildx build --platform linux/amd64,linux/arm64 --sbom=true --provenance=mode=max \
             --cache-to type=registry,ref=127.0.0.1:{{port}}/catalogue-api:buildcache,mode=max,registry.insecure=true \
             -t 127.0.0.1:{{port}}/catalogue-api:5.0.0 --push .
@@ -218,3 +224,32 @@ spec:
           SH
           chmod 755 /srv/release/deploy.sh
           /srv/release/deploy.sh 5.0.0
+    alternatives:
+      - id: attest-flags-and-curl-digest
+        description: Use --attest flags for the SBOM and provenance and resolve digests with a manifest HEAD request.
+        steps:
+          - on: cl-release-01
+            as: learner
+            timeoutSec: 480
+            run: |
+              cd /srv/release/src
+              docker buildx create --name relbuilder2 --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.23.2 --config /srv/release/buildkitd.toml --use
+              docker buildx build --platform linux/amd64,linux/arm64 --attest type=sbom --attest type=provenance,mode=max \
+                --cache-to type=registry,ref=127.0.0.1:{{port}}/catalogue-api:buildcache,mode=max,registry.insecure=true \
+                -t 127.0.0.1:{{port}}/catalogue-api:5.0.0 --push .
+              cat > /srv/release/deploy.sh <<'SH'
+              #!/bin/sh
+              set -eu
+              v=$1
+              A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+              d=$(curl -fsI -H "$A" http://127.0.0.1:{{port}}/v2/catalogue-api/manifests/$v | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              cosign verify --key /home/learner/release/release.pub --insecure-ignore-tlog=true --allow-insecure-registry "127.0.0.1:{{port}}/catalogue-api@$d" >/dev/null 2>&1 || { echo "refusing unsigned $v" >&2; exit 1; }
+              printf 'services:\n  api:\n    image: 127.0.0.1:{{port}}/catalogue-api@%s\n    ports: ["127.0.0.1:8088:8080"]\n' "$d" > /srv/release/compose.yaml
+              cd /srv/release && docker compose -p catalogue up -d
+              SH
+              chmod 755 /srv/release/deploy.sh
+              A='Accept: application/vnd.oci.image.index.v1+json'
+              d=$(curl -fsI -H "$A" http://127.0.0.1:{{port}}/v2/catalogue-api/manifests/5.0.0 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              cd ~/release
+              COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "127.0.0.1:{{port}}/catalogue-api@$d"
+              /srv/release/deploy.sh 5.0.0

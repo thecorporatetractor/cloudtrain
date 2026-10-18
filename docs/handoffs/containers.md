@@ -406,7 +406,7 @@ Wave 4 after waves 1-3 (and wave 2 once `el-vm:10` Podman is confirmed): the wri
 
 ## Round 5, wave 5 (branch `content/containers-r5-w5`): troubleshooting, delivery, internals, swarm, 19 labs
 
-All 19 are `built` (static checks only; lab-verify --strict, render --check, schema/content tests on CI). This completes the 79 proposed learning labs of the containers domain. No exam pools were touched (no exam tasks in this wave); the pool state is unchanged.
+All 19 are `built` (static checks only; lab-verify --strict, render --check, schema/content tests on CI). This completes the writing of the 79 proposed learning labs once wave 4 (#114) merges. No exam pools were touched (no exam tasks in this wave); the pool state is unchanged.
 
 | Module (course id) | Labs | Host(s) |
 |---|---|---|
@@ -432,8 +432,8 @@ All 19 are `built` (static checks only; lab-verify --strict, render --check, sch
 | Lab | Blocker |
 |---|---|
 | `ctr-engine-upgrade` | needs a docker-vm variant that boots on Engine 28 with the Engine 29 packages staged as a local apt repo in `/srv/apt/engine-29`; setup refuses otherwise |
-| `ctr-ci-rootless-buildkit` | needs `moby/buildkit:rootless`, `cosign`, `trivy` and an offline trivy database; Gitea is not used (`GITEA_IMAGE` is not on docker-vm), the CI job is a plain script |
-| `ctr-release-pipeline-capstone` | needs `cosign`, `moby/buildkit` (docker-container builder for the registry cache) and the `buildkit-syft-scanner` image; the arm64 side is `FROM scratch` content (no binfmt) |
+| `ctr-ci-rootless-buildkit` | needs `moby/buildkit:rootless`, `cosign`, `trivy` and an offline trivy database; the BuildKit builder cannot use the engine image store and the host is offline, so setup pushes busybox:1.37 to the lab registry and the Dockerfile builds FROM it (written that way); Gitea is not used (`GITEA_IMAGE` is not on docker-vm), the CI job is a plain script |
+| `ctr-release-pipeline-capstone` | needs `cosign`, `moby/buildkit:v0.23.2` exactly (builder pinned with `--driver-opt image=`; base image served from the lab registry, as in `ctr-buildx-cache-export`) (docker-container builder for the registry cache) and the `buildkit-syft-scanner` image; the arm64 side is `FROM scratch` content (no binfmt) |
 | swarm labs | unconfirmed: the Kube-OVN VPC passes 2377/tcp, 7946/tcp+udp and 4789/udp between lab VMs, and ESP plus kernel `xfrm`/`esp4`/`xt_u32` for the encrypted overlay in `ctr-swarm-stack` (the grader only needs the routing mesh, so the check still passes if encryption is not enforced); 3 VMs x 2 GiB per lab |
 
 Image wishlist for the next docker-vm rebuild (all containers waves): `cosign` v2, `notation`, `trivy` plus an offline vulnerability DB (or grype/scout), `moby/buildkit:v0.23.2` and `moby/buildkit:rootless`, the `buildkit-syft-scanner` image, `golang:1.25-alpine`, distroless bases, binfmt/arm64 bases, a variant with Engine 28 and Engine 29 staged in a local apt repo, and the gitea image.
