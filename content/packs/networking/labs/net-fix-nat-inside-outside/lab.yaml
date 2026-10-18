@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-fix-nat-inside-outside
+  title: Repair address translation applied on the wrong side
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [nat, troubleshooting, tcpdump, nftables]
+  version: 1
+spec:
+  description: |
+    After last night's firewall migration nobody on the north campus reaches the
+    outside. The edge router `mv-edge-1` (Linux, shell, nftables) has the north
+    campus LAN 10.{{octet}}.10.0/24 on `eth1` (`north-pc`) and the outside
+    network on `eth4` (203.0.113.{{pub}}/24, regional router `regional-gw` at .1).
+    The regional network has no route to private addresses; the regional portal
+    is `http://198.51.100.80/`.
+
+    1. Find out why translation does not work and fix it in table `ip nat`, so
+       north campus traffic leaves `eth4` with the edge's outside address.
+    2. Prove it: on `mv-edge-1`, capture on `eth4` while `north-pc` fetches the
+       portal and save the capture as `/root/outside.pcap`.
+  objectives:
+    - Read an nftables NAT ruleset and spot the wrong interface
+    - Fix source NAT so it applies on the outside interface
+    - Prove the translated source with a capture on the outside
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    pub:
+      type: int
+      min: 20
+      max: 250
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: regional-gw, driver: netdev, image: frr:10 }
+      - { name: regional-portal, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 } }
+      - { name: north-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "north-pc:eth1" }
+      - { a: "mv-edge-1:eth4", b: "regional-gw:eth1" }
+      - { a: "regional-gw:eth2", b: "regional-portal:eth1" }
+  setup:
+    - on: mv-edge-1
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.10.1/24 dev eth1
+        ip addr replace 203.0.113.{{pub}}/24 dev eth4
+        ip route replace default via 203.0.113.1
+        nft add table ip nat
+        nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat; }'
+        nft add rule ip nat postrouting oifname eth1 ip saddr 10.{{octet}}.10.0/24 masquerade comment '"north campus PAT"'
+    - on: regional-gw
+      config: |
+        interface eth1
+         ip address 203.0.113.1/24
+        interface eth2
+         ip address 198.51.100.1/24
+    - on: regional-portal
+      run: |
+        ip addr replace 198.51.100.80/24 dev eth1; ip route replace default via 198.51.100.1
+        mkdir -p /srv/www; echo 'regional portal' > /srv/www/index.html
+        setsid httpd -p 80 -h /srv/www </dev/null >/dev/null 2>&1 &
+    - { on: north-pc, run: "ip addr replace 10.{{octet}}.10.10/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
+  checks:
+    - id: north-out
+      description: north-pc loads the regional portal
+      type: shell
+      on: north-pc
+      command: wget -q -T 3 -O- http://198.51.100.80/
+      expect: { match: exact, value: "regional portal" }
+      skills: [net.services.nat]
+      weight: 2
+    - id: rule-on-outside
+      description: The NAT rule for the north LAN matches the outside interface
+      type: shell
+      on: mv-edge-1
+      command: nft list table ip nat | grep -iE 'masquerade|snat' | grep -c 'oifname "eth4"'
+      expect: { match: regex, value: "^[1-9]$" }
+      skills: [net.services.nat]
+    - id: capture-proves
+      description: /root/outside.pcap on mv-edge-1 shows the portal request leaving with the outside address
+      type: shell
+      on: mv-edge-1
+      command: tcpdump -nn -r /root/outside.pcap 'tcp dst port 80' 2>/dev/null | grep -c "IP 203\.0\.113\.{{pub}}\.[0-9]* > 198\.51\.100\.80\.80:"
+      expect: { match: regex, value: "^[1-9][0-9]*$" }
+      skills: [net.troubleshooting.packet-capture]
+  hints:
+    - title: Look at the rule
+      body: "`nft list ruleset` shows where the masquerade applies. Postrouting rules match the interface a packet leaves through."
+      cost: 1
+    - title: Capture to prove it
+      body: Run tcpdump on eth4 with `-w /root/outside.pcap` in the background, fetch the portal from north-pc, then stop the capture.
+      command: "tcpdump -ni eth4 -w /root/outside.pcap tcp port 80"
+      cost: 1
+    - title: Replacing a rule
+      body: "`nft -a list chain ip nat postrouting` shows rule handles; delete the wrong rule by handle and add one with `oifname eth4`."
+      cost: 2
+  misconceptions:
+    - id: capture-too-early
+      description: Adds a correct rule but captures before testing, so the capture proves nothing
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft add rule ip nat postrouting oifname eth4 ip saddr 10.{{octet}}.10.0/24 masquerade
+          timeout 3 tcpdump -ni eth4 -w /root/outside.pcap tcp port 80 >/dev/null 2>&1; true
+      expectFail: [capture-proves]
+      feedback: The capture must contain the translated request; capture while north-pc fetches the portal.
+    - id: masquerade-inbound
+      description: Moves the rule to the prerouting hook
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft flush chain ip nat postrouting
+          nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }'
+          nft add rule ip nat prerouting iifname eth4 ip daddr 203.0.113.{{pub}} counter
+      expectFail: [north-out, rule-on-outside]
+      feedback: Source translation belongs in postrouting on the outside interface.
+  solution:
+    explanation: |
+      The masquerade rule matched `oifname eth1`, the inside interface, so packets
+      to the outside left untranslated and the regional network could not answer.
+      Replace it with the same rule on eth4, then capture on eth4 while fetching.
+    steps:
+      - on: mv-edge-1
+        run: |
+          nft flush chain ip nat postrouting
+          nft add rule ip nat postrouting oifname eth4 ip saddr 10.{{octet}}.10.0/24 masquerade
+          setsid tcpdump -ni eth4 -U -w /root/outside.pcap tcp port 80 </dev/null >/dev/null 2>&1 &
+          sleep 2
+      - on: north-pc
+        run: wget -q -T 3 -O /dev/null http://198.51.100.80/
+      - on: mv-edge-1
+        run: sleep 1; pkill -x tcpdump; sleep 1
+    alternatives:
+      - id: iptables-rule
+        description: Add the masquerade on eth4 with iptables instead of nft
+        steps:
+          - on: mv-edge-1
+            run: |
+              nft flush chain ip nat postrouting
+              iptables -t nat -A POSTROUTING -o eth4 -s 10.{{octet}}.10.0/24 -j MASQUERADE
+              setsid tcpdump -ni eth4 -U -w /root/outside.pcap tcp port 80 </dev/null >/dev/null 2>&1 &
+              sleep 2
+          - on: north-pc
+            run: wget -q -T 3 -O /dev/null http://198.51.100.80/
+          - on: mv-edge-1
+            run: sleep 1; pkill -x tcpdump; sleep 1

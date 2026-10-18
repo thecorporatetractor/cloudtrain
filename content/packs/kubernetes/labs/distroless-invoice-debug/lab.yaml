@@ -1,0 +1,303 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: distroless-invoice-debug
+  title: Debug a shell-less container with an ephemeral container
+  domain: kubernetes
+  frameworks: [cka:troubleshooting, ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [troubleshooting, ephemeral-containers, configmap, distroless]
+  version: 1
+spec:
+  description: |
+    The invoice renderer of Quillmoor Logistics runs as Deployment
+    **`invoice-renderer`** in namespace `invoice-render`. Its image carries no
+    shell and no tools, so `kubectl exec` is no help, and every request to the
+    Service `invoice-renderer` (port 8080) fails with `404 Not Found`.
+    The renderer reads its settings from a configuration file at start-up. The
+    file comes from ConfigMap **`invoice-config`**, mounted at `/etc/invoice`.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Attach an **ephemeral debug container** to the running renderer Pod and
+       find out which file name the renderer expects inside `/etc/invoice`.
+       Write that path to **`/home/learner/answers/invoice-config-path.txt`**.
+       The cluster enforces the Pod Security baseline level, so a debug
+       container must not add capabilities: use `kubectl debug` with
+       `--profile=baseline`.
+    2. Fix the ConfigMap by renaming its key to the file name the renderer
+       expects (the Deployment's volume stays as it is), and make the
+       Deployment pick the change up. A request to
+       `http://invoice-renderer.invoice-render:8080/` from inside the cluster
+       must return `200` with the rendered page.
+
+    Do not replace the image or the container command of the Deployment.
+  objectives:
+    - Attach an ephemeral container that shares the target's process namespace
+    - Read a shell-less container's filesystem through /proc/<pid>/root
+    - Fix a misnamed ConfigMap key and roll the Deployment
+  params:
+    terms:
+      type: choice
+      values: [net-30, net-45, prepaid]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/answers
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: invoice-render}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: invoice-config, namespace: invoice-render}
+        data:
+          render.conf: |
+            terms={{terms}}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: invoice-renderer, namespace: invoice-render, labels: {app: invoice-renderer}}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: invoice-renderer}}
+          template:
+            metadata: {labels: {app: invoice-renderer}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: renderer
+                  image: busybox:1.37
+                  resources:
+                    requests: {cpu: 10m, memory: 16Mi}
+                    limits: {cpu: 100m, memory: 64Mi}
+                  # Reads its configuration once at start-up, then deletes every
+                  # shell and tool so the container behaves like a distroless image.
+                  command:
+                    - /bin/sh
+                    - -c
+                    - |
+                      mkdir -p /.app /srv/www
+                      cp /bin/busybox /.app/busybox
+                      conf=/etc/invoice/renderer.conf
+                      if [ -f "$conf" ]; then
+                        t=$(sed -n 's/^terms=//p' "$conf")
+                        echo "Invoice renderer ready: terms=$t" > /srv/www/index.html
+                        echo "config_path=$conf config_found=yes" > /.app/state
+                        echo "invoice-renderer: started"
+                      else
+                        echo "config_path=$conf config_found=no" > /.app/state
+                        echo "invoice-renderer: started without its configuration, requests will fail"
+                      fi
+                      /.app/busybox rm -rf /bin /sbin /usr/bin /usr/sbin
+                      exec /.app/busybox httpd -f -p 8080 -h /srv/www
+                  ports: [{containerPort: 8080}]
+                  readinessProbe:
+                    tcpSocket: {port: 8080}
+                    periodSeconds: 2
+                  volumeMounts:
+                    - {name: config, mountPath: /etc/invoice}
+              volumes:
+                - name: config
+                  configMap: {name: invoice-config}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: invoice-renderer, namespace: invoice-render}
+        spec:
+          selector: {app: invoice-renderer}
+          ports: [{port: 8080, targetPort: 8080}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: invoice-probe, namespace: invoice-render}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - name: probe
+              image: busybox:1.37
+              command: [sleep, "3600"]
+              resources:
+                requests: {cpu: 5m, memory: 8Mi}
+    - on: qm-depot
+      timeoutSec: 120
+      run: |
+        kubectl -n invoice-render rollout status deploy/invoice-renderer --timeout=90s
+        kubectl -n invoice-render wait pod/invoice-probe --for=condition=Ready --timeout=60s
+        # Grader-owned evidence: a pod only keeps its ephemeral containers until
+        # it is replaced, so a small loop in the platform's admin container
+        # records the name of every pod seen with one.
+        cat > /tmp/invoice-debug-audit.sh <<'SH'
+        while true; do
+          kubectl -n invoice-render get pods -o json 2>/dev/null \
+            | jq -r '.items[] | select((.spec.ephemeralContainers // []) | length > 0) | .metadata.name' \
+            | while read -r p; do
+                kubectl -n invoice-render create configmap debug-audit --from-literal=seen="$p" --dry-run=client -o yaml \
+                  | kubectl apply -f - >/dev/null 2>&1
+              done
+          sleep 2
+        done
+        SH
+        pgrep -f "^sh /tmp/invoice-debug-[a]udit.sh" >/dev/null || setsid nohup sh /tmp/invoice-debug-audit.sh >/dev/null 2>&1 < /dev/null &
+        sleep 1
+        if kubectl -n invoice-render exec deploy/invoice-renderer -c renderer -- sh -c true 2>/dev/null; then echo "shell still present" >&2; exit 1; fi
+  teardown:
+    - on: qm-depot
+      run: |
+        pkill -f "^sh /tmp/invoice-debug-[a]udit.sh" || true
+        kubectl delete namespace invoice-render --ignore-not-found --wait=false
+  checks:
+    - id: answer-path
+      description: invoice-config-path.txt names the file the renderer expects
+      type: file
+      on: workstation
+      target: /home/learner/answers/invoice-config-path.txt
+      skills: [k8s.troubleshooting.debug-containers]
+      weight: 2
+      expect: {match: regex, value: '^\s*(/etc/invoice/)?renderer\.conf\s*$'}
+    - id: debug-used
+      description: An ephemeral container was attached to an invoice-renderer Pod
+      type: k8s-query
+      timeoutSec: 20
+      skills: [k8s.troubleshooting.debug-containers]
+      weight: 2
+      query: {cluster: qm-depot, resource: configmap, name: debug-audit, namespace: invoice-render, jsonpath: "{.data.seen}"}
+      expect: {match: regex, value: '^invoice-renderer-'}
+    - id: configmap-key
+      description: ConfigMap invoice-config holds the key renderer.conf with the invoice terms
+      type: k8s-query
+      timeoutSec: 20
+      skills: [k8s.troubleshooting.debug-containers]
+      query: {cluster: qm-depot, resource: configmap, name: invoice-config, namespace: invoice-render, jsonpath: '{.data.renderer\.conf}'}
+      expect: {match: regex, value: '(?m)^terms={{terms}}$'}
+    - id: renders
+      description: An in-cluster request to the invoice-renderer Service returns 200 with the rendered page
+      type: shell
+      on: qm-depot
+      timeoutSec: 60
+      skills: [k8s.troubleshooting.debug-containers]
+      weight: 3
+      command: |
+        for i in $(seq 1 25); do
+          out=$(kubectl -n invoice-render exec invoice-probe -- wget -q -T 3 -O- http://invoice-renderer.invoice-render:8080/ 2>/dev/null) && [ -n "$out" ] && break
+          sleep 2
+        done
+        echo "$out"
+      expect: {match: exact, value: "Invoice renderer ready: terms={{terms}}"}
+  hints:
+    - title: Attach to the running Pod
+      body: "`kubectl debug` adds an ephemeral container to the Pod itself. `--target=renderer` shares the renderer's process namespace, and `--profile=baseline` keeps the cluster's Pod Security baseline happy (the default profile adds a capability and is refused)."
+      command: kubectl -n invoice-render debug -it deploy/invoice-renderer --image=busybox:1.37 --target=renderer --profile=baseline
+      cost: 1
+    - title: Read the other container's filesystem
+      body: "In a shared process namespace, process 1 is the renderer. Its root filesystem is `/proc/1/root`; look at `/proc/1/root/.app/state` and compare the path it names with what `ls /proc/1/root/etc/invoice` shows. Fix the ConfigMap key, then restart the Deployment: the file is read only at start-up."
+      command: "ls /proc/1/root/etc/invoice; cat /proc/1/root/.app/state"
+      cost: 2
+  misconceptions:
+    - id: default-profile
+      description: Runs kubectl debug with its default profile, which adds SYS_PTRACE; the platform refuses debug containers that add capabilities.
+      feedback: Under the Pod Security baseline level a container may not add capabilities. `--profile=baseline` attaches a debug container without them, and with --target it can still read /proc/1/root of the renderer.
+      expectFail: [answer-path, debug-used, renders]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n invoice-render debug deploy/invoice-renderer --image=busybox:1.37 --target=renderer --container=inspect -- sleep 600 || true
+    - id: no-rollout
+      description: Renames the ConfigMap key but never restarts the Deployment.
+      feedback: The renderer reads its configuration once, at start-up, and a running container does not re-read it. After fixing the ConfigMap run `kubectl rollout restart deployment/invoice-renderer`.
+      expectFail: [renders]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n invoice-render get configmap invoice-config -o json \
+            | jq '.data["renderer.conf"] = .data["render.conf"] | del(.data["render.conf"])' \
+            | kubectl replace -f -
+    - id: guessed-key
+      description: Guesses another file name for the ConfigMap key and restarts the Deployment.
+      feedback: The ConfigMap key becomes the file name, so it must match the name the renderer opens, character for character. Read it from the running container instead of guessing.
+      expectFail: [configmap-key, renders, answer-path]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n invoice-render get configmap invoice-config -o json \
+            | jq '.data["render.config"] = .data["render.conf"] | del(.data["render.conf"])' \
+            | kubectl replace -f -
+          kubectl -n invoice-render rollout restart deployment/invoice-renderer
+          kubectl -n invoice-render rollout status deployment/invoice-renderer --timeout=60s
+  solution:
+    explanation: |
+      An ephemeral container with `--target=renderer --profile=baseline` shares the
+      renderer's process namespace; `/proc/1/root/.app/state` shows that the
+      renderer opens `/etc/invoice/renderer.conf`, while the ConfigMap key is
+      `render.conf`. Rename the key and restart the Deployment so the renderer
+      reads the file at start-up.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          pod=$(kubectl -n invoice-render get pod -l app=invoice-renderer -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n invoice-render debug "$pod" --image=busybox:1.37 --target=renderer --profile=baseline --container=inspect -- sleep 600
+          for i in $(seq 1 30); do
+            kubectl -n invoice-render exec "$pod" -c inspect -- true 2>/dev/null && break
+            sleep 2
+          done
+          kubectl -n invoice-render exec "$pod" -c inspect -- sh -c 'sed -n "s/^config_path=\([^ ]*\) .*/\1/p" /proc/1/root/.app/state' > ~/answers/invoice-config-path.txt
+          sleep 4
+          kubectl -n invoice-render get configmap invoice-config -o json \
+            | jq '.data["renderer.conf"] = .data["render.conf"] | del(.data["render.conf"])' \
+            | kubectl replace -f -
+          kubectl -n invoice-render rollout restart deployment/invoice-renderer
+          kubectl -n invoice-render rollout status deployment/invoice-renderer --timeout=90s
+    alternatives:
+      - id: replace-configmap
+        description: Recreate the ConfigMap from a file named renderer.conf and restart the Deployment, using a one-shot debug command for the discovery.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              kubectl config use-context qm-depot
+              pod=$(kubectl -n invoice-render get pod -l app=invoice-renderer -o jsonpath='{.items[0].metadata.name}')
+              kubectl -n invoice-render debug "$pod" --image=busybox:1.37 --target=renderer --profile=baseline --container=reader -- sh -c 'cat /proc/1/root/.app/state; sleep 300'
+              for i in $(seq 1 30); do
+                out=$(kubectl -n invoice-render logs "$pod" -c reader 2>/dev/null)
+                [ -n "$out" ] && break
+                sleep 2
+              done
+              echo "$out" | sed -n 's/^config_path=\([^ ]*\) .*/\1/p' > ~/answers/invoice-config-path.txt
+              sleep 4
+              d=$(mktemp -d)
+              kubectl -n invoice-render get configmap invoice-config -o jsonpath='{.data.render\.conf}' > "$d/renderer.conf"
+              kubectl -n invoice-render create configmap invoice-config --from-file="$d/renderer.conf" --dry-run=client -o yaml | kubectl replace -f -
+              kubectl -n invoice-render rollout restart deployment/invoice-renderer
+              kubectl -n invoice-render rollout status deployment/invoice-renderer --timeout=90s

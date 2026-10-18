@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-pat-internet-edge
+  title: Share one public address across the student VLANs
+  domain: networking
+  frameworks: [ccna:ip-services, lfcs:networking]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [nat, pat, masquerade, nftables]
+  version: 1
+spec:
+  description: |
+    The district edge router `mv-edge-1` is a Linux router (shell, nftables). It
+    has one public address towards the regional network, and the regional
+    router `regional-gw` knows no route to Marlow Valley's private addresses.
+
+    | Interface | Network | Host behind it |
+    |---|---|---|
+    | `eth1` | student LAN 10.{{octet}}.30.0/24 | `student-pc` (.10) |
+    | `eth2` | staff LAN 10.{{octet}}.20.0/24 | `staff-pc` (.10) |
+    | `eth3` | management LAN 10.{{octet}}.99.0/24 | `mgmt-pc` (.10) |
+    | `eth4` | outside 203.0.113.0/24, edge = 203.0.113.{{pub}} | `regional-gw` (.1) |
+
+    Configure port address translation on `mv-edge-1` so that traffic from the
+    student and staff LANs leaving through `eth4` is translated to the edge's
+    outside address, and **nothing else** is translated (management traffic must
+    leave untranslated). Test with the regional portal
+    `http://198.51.100.80/`.
+  objectives:
+    - Configure source NAT with port translation (masquerade) on the outside interface
+    - Limit translation to the intended inside subnets
+    - Verify the translated source address on the far side
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    pub:
+      type: int
+      min: 20
+      max: 250
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: regional-gw, driver: netdev, image: frr:10 }
+      - { name: regional-portal, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 } }
+      - { name: student-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: staff-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: mgmt-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "student-pc:eth1" }
+      - { a: "mv-edge-1:eth2", b: "staff-pc:eth1" }
+      - { a: "mv-edge-1:eth3", b: "mgmt-pc:eth1" }
+      - { a: "mv-edge-1:eth4", b: "regional-gw:eth1" }
+      - { a: "regional-gw:eth2", b: "regional-portal:eth1" }
+  setup:
+    - on: mv-edge-1
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.30.1/24 dev eth1
+        ip addr replace 10.{{octet}}.20.1/24 dev eth2
+        ip addr replace 10.{{octet}}.99.1/24 dev eth3
+        ip addr replace 203.0.113.{{pub}}/24 dev eth4
+        ip route replace default via 203.0.113.1
+    - on: regional-gw
+      config: |
+        interface eth1
+         ip address 203.0.113.1/24
+        interface eth2
+         ip address 198.51.100.1/24
+    - on: regional-portal
+      run: |
+        ip addr replace 198.51.100.80/24 dev eth1; ip route replace default via 198.51.100.1
+        mkdir -p /srv/www /var/lib/cloudtrain; echo 'regional portal' > /srv/www/index.html
+        setsid httpd -p 80 -h /srv/www </dev/null >/dev/null 2>&1 &
+        setsid tcpdump -i eth1 -nn -U -w /var/lib/cloudtrain/portal.pcap 'tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - { on: student-pc, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+    - { on: staff-pc, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+    - { on: mgmt-pc, run: "ip addr replace 10.{{octet}}.99.10/24 dev eth1 && ip route replace default via 10.{{octet}}.99.1" }
+  checks:
+    - id: capture-reset
+      description: (probe) restart the portal capture so only this round's connections are recorded
+      type: shell
+      on: regional-portal
+      command: |
+        pkill -x tcpdump; sleep 0.5
+        rm -f /var/lib/cloudtrain/portal.pcap
+        setsid tcpdump -i eth1 -nn -U -w /var/lib/cloudtrain/portal.pcap 'tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0' </dev/null >/dev/null 2>&1 &
+        sleep 1; echo restarted
+      expect: { match: exact, value: restarted }
+      timeoutSec: 10
+      skills: [net.services.nat]
+      weight: 0
+    - id: students-out
+      description: student-pc loads the regional portal
+      type: shell
+      on: student-pc
+      command: wget -q -T 3 -O- http://198.51.100.80/
+      expect: { match: exact, value: "regional portal" }
+      skills: [net.services.nat]
+      weight: 2
+    - id: staff-out
+      description: staff-pc loads the regional portal
+      type: shell
+      on: staff-pc
+      command: wget -q -T 3 -O- http://198.51.100.80/
+      expect: { match: exact, value: "regional portal" }
+      skills: [net.services.nat]
+      weight: 2
+    - id: mgmt-probe
+      description: (probe) mgmt-pc tries the portal once so the grader can see its source address
+      type: shell
+      on: mgmt-pc
+      command: wget -q -T 2 -O /dev/null http://198.51.100.80/ 2>/dev/null; echo probed
+      expect: { match: exact, value: probed }
+      timeoutSec: 8
+      skills: [net.services.nat]
+      weight: 0
+    - id: only-intended-translated
+      description: The portal saw the inside LANs only as the edge's outside address, and management untranslated
+      type: shell
+      on: regional-portal
+      command: |
+        tcpdump -nn -r /var/lib/cloudtrain/portal.pcap 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort -u | tr '\n' ' '
+      expect: { match: exact, value: "10.{{octet}}.99.10 203.0.113.{{pub}} " }
+      skills: [net.services.nat, linux.net.nat-forwarding]
+      weight: 2
+  hints:
+    - title: Where does NAT happen?
+      body: Source translation happens on the way out, in a postrouting NAT chain, matched on the outside interface.
+      command: "nft add table ip nat; nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat; }'"
+      cost: 1
+    - title: Masquerade with a source match
+      body: "Match only the two inside LANs: `nft add rule ip nat postrouting oifname eth4 ip saddr { 10.{{octet}}.20.0/24, 10.{{octet}}.30.0/24 } masquerade`."
+      cost: 2
+  misconceptions:
+    - id: translate-everything
+      description: Masquerades everything leaving eth4, including management
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft add table ip nat
+          nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat; }'
+          nft add rule ip nat postrouting oifname eth4 masquerade
+      expectFail: [only-intended-translated]
+      feedback: The task says nothing but the student and staff LANs may be translated.
+    - id: inside-interface
+      description: Applies the masquerade rule on an inside interface instead of eth4
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft add table ip nat
+          nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat; }'
+          nft add rule ip nat postrouting oifname eth1 ip saddr '{ 10.{{octet}}.20.0/24, 10.{{octet}}.30.0/24 }' masquerade
+      expectFail: [students-out, staff-out]
+      feedback: Postrouting rules match the interface a packet leaves through; traffic to the regional network leaves through eth4.
+  solution:
+    explanation: |
+      A source-NAT postrouting chain with one masquerade rule for traffic leaving
+      eth4 from the two inside LANs. Many inside hosts share the outside address,
+      kept apart by translated source ports.
+    steps:
+      - on: mv-edge-1
+        run: |
+          nft add table ip nat
+          nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat; }'
+          nft add rule ip nat postrouting oifname eth4 ip saddr '{ 10.{{octet}}.20.0/24, 10.{{octet}}.30.0/24 }' masquerade
+    alternatives:
+      - id: iptables-masquerade
+        description: The same translation with iptables rules
+        steps:
+          - on: mv-edge-1
+            run: |
+              iptables -t nat -A POSTROUTING -o eth4 -s 10.{{octet}}.20.0/24 -j MASQUERADE
+              iptables -t nat -A POSTROUTING -o eth4 -s 10.{{octet}}.30.0/24 -j MASQUERADE
