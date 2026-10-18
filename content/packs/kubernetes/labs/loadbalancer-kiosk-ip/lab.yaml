@@ -105,7 +105,11 @@ spec:
       command: |
         ip=$(tr -d ' \r\n' < /home/learner/reports/kiosk-ip.txt 2>/dev/null)
         exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-yard -n yard-kiosk get svc {{svc}} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-        [ -n "$ip" ] && [ "$ip" = "$exp" ] && curl -s -m 5 "http://$ip/" || echo "address $ip"
+        [ -n "$ip" ] && [ "$ip" = "$exp" ] || { echo "address $ip"; exit 0; }
+        # A fresh address answers a moment after MetalLB announces it (kube-proxy
+        # on the announcing node programs it about a second later): retry briefly.
+        for i in 1 2 3; do out=$(curl -s -m 4 "http://$ip/") && break; sleep 1; done
+        echo "${out:-address $ip}"
       expect: {match: exact, value: kiosk-api-online}
   hints:
     - title: Switch context
@@ -144,7 +148,7 @@ spec:
     steps:
       - on: workstation
         as: learner
-        timeoutSec: 120
+        timeoutSec: 220
         run: |
           kubectl config use-context qm-yard
           kubectl -n yard-kiosk expose deploy/kiosk-api --name={{svc}} --type=LoadBalancer --port=80 --target-port=8080
@@ -152,4 +156,8 @@ spec:
             ip=$(kubectl -n yard-kiosk get svc {{svc}} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'); [ -n "$ip" ] && break; sleep 2
           done
           echo "$ip" > ~/reports/kiosk-ip.txt
-          curl -s -m 5 "http://$ip/"
+          # Right after the announcement kube-proxy may not have programmed the
+          # address yet; a connection started then fails for good (its conntrack
+          # entry has no DNAT), so retry with new connections.
+          for i in $(seq 1 20); do curl -s -m 5 "http://$ip/" && exit 0; sleep 2; done
+          exit 1

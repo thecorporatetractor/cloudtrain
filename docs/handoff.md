@@ -78,8 +78,8 @@ Kata and the kubeadm proof under load:
    exam topologies switched together). Falco labs rewritten for the DaemonSet, ingress-TLS
    labs for Traefik. Only 2 K labs got verified: the heavy slot was won twice in ~7 h
    (no FIFO) and at host load 25-50 three-node clusters still crashloop after init
-   (calico-node, controller-manager). MetalLB reachability from the workstation is still
-   unproven (see `docs/handoffs/foundations.md`). Exam runs for sim-k8s-security and
+   (calico-node, controller-manager). MetalLB reachability from the workstation works
+   (a first-connection race with kube-proxy, see `docs/handoffs/foundations.md`). Exam runs for sim-k8s-security and
    sim-k8s-admin still blocked on pool coverage (`docs/handoffs/k8s-sec.md`, `k8s-admin.md`).
 
 ## Where things are
@@ -138,7 +138,7 @@ el-vm VMs for the exam).
 4. **Foundations: done except Kata** (round 3, 2026-10-17). kubeadm:1.37-full/-sec,
    deb-lab, ubuntu-vm built and verified; mirrors deployed and smoke-tested;
    `gvisor-runtimeclass` and `text-filters-ticket-sales` switched to the new images.
-   Left: Kata spike, MetalLB IP reachability inside a Kube-OVN VPC, switching the other
+   Left: Kata spike, switching the other
    add-on and Linux labs (see `docs/handoffs/foundations.md`).
 5. **Resume content streams** from their handoffs, verify queues one VM job at a
    time (`tools/slots/run.sh`), then exam runs (`labctl exam run --auto-solve`
