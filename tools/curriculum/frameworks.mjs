@@ -6,7 +6,7 @@
 /** Marks a generated file; tools/lab-verify validates the curriculum entry instead of the file. */
 export const GENERATED_FROM = "content/curriculum.yaml";
 
-const DOMAINS = ["kubernetes", "linux", "containers", "iac", "automation", "networking"];
+const DOMAINS = ["kubernetes", "linux", "containers", "iac", "automation", "networking", "secops"];
 
 /** Domain of most labs referencing the framework (more than half), else cross-domain. */
 export function majorityDomain(labs) {

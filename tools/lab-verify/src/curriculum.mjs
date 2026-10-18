@@ -13,6 +13,9 @@ export const TITLE_DENY = [
   /\bEX\d{3}\b/i, /\bXK0-\d{3}\b/i, /Linux\+/, /\bCCNA\b/, /\bCCNP\b/, /\bCisco\b/i, /\bRed Hat\b/i, /\bCompTIA\b/i,
   /\bHashiCorp\b/i, /\bLPIC\b/i, /\bLPI\b/, /\bDCA\b/, /\bDocker Certified\b/i, /\bMirantis\b/i, /\bCNCF\b/,
   /\bLinux Foundation\b/i, /\bcertified\b/i, /\bcertification\b/i, /\bAssociate 00\d\b/i,
+  // Security operations: no exam codes, product, vendor or dataset names (and no query-language name) in titles.
+  /\bSC-\d{3}\b/i, /\bMicrosoft\b/i, /\bSentinel\b/i, /\bDefender\b/i, /\bSplunk\b/i, /\bKQL\b/i, /\bKusto\b/i,
+  /\bBOTS\b/, /\bBoss of the SOC\b/i,
 ];
 
 /** Detects a cycle in a graph given as Map<id, string[]>. Returns the first cycle found, or undefined. */

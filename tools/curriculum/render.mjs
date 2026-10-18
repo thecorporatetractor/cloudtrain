@@ -18,7 +18,7 @@ const out = path.join(root, "docs/curriculum.md");
 const readme = path.join(root, "README.md");
 const doc = YAML.parse(readFileSync(src, "utf8"));
 
-const DOMAIN_ORDER = ["kubernetes", "linux", "containers", "iac", "automation", "networking"];
+const DOMAIN_ORDER = ["kubernetes", "linux", "containers", "iac", "automation", "networking", "secops"];
 const TIERS = ["A", "B", "C", "K", "V", "N"];
 const TYPES = ["learn", "do", "fix", "hack", "ctf"];
 const cell = (v) => String(v ?? "").replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();

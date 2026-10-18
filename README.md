@@ -114,7 +114,8 @@ objectives and never copy exam content.
 | Infrastructure as code with Terraform | 5 | 99 | 2 | — | 99 |
 | Configuration management and automation | 7 | 97 | 1 | 36 | 9 |
 | Network administration | 4 | 78 | 1 | 7 | 65 |
-| **Total** | **43** | **880** (500 learning, 380 exam tasks) | **13** | **314** | **418** |
+| Security operations | 3 | 67 | 1 | — | — |
+| **Total** | **46** | **947** (542 learning, 405 exam tasks) | **14** | **314** | **418** |
 <!-- curriculum-table:end -->
 
 "Built" means written and passing schema, skill and compile validation;
