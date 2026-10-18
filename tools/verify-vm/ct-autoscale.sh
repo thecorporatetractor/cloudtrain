@@ -29,7 +29,8 @@ jobs() {
     args=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
     [[ $args =~ tools/slots/run\.sh\ (vm|build|pod) ]] || continue
     kind=${BASH_REMATCH[1]}
-    run=0; pgrep -P "$pid" >/dev/null 2>&1 && run=1
+    # running = run.sh has started its command; a waiting run.sh only has its `sleep 15` child
+    run=0; pgrep -P "$pid" -l 2>/dev/null | grep -qv ' sleep$' && run=1
     par=1; [[ $args =~ --parallel[=\ ]([0-9]+) ]] && par=${BASH_REMATCH[1]}
     if [[ $kind == pod ]]; then pj=$((pj + 1)); pr=$((pr + run)); ps=$((ps + run * par))
     else hj=$((hj + 1)); hr=$((hr + run)); hs=$((hs + run * par)); fi
