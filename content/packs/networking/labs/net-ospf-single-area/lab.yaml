@@ -17,8 +17,8 @@ spec:
     | Router | Loopback (router ID) | Links |
     |---|---|---|
     | mv-core-1 | 10.255.{{octet}}.1/32 | eth1 north, eth2 south, eth3 edge |
-    | mv-campus-north | 10.255.{{octet}}.2/32 | eth1 core, eth3 south, eth2 north LAN 10.{{octet}}.10.0/24 |
-    | mv-campus-south | 10.255.{{octet}}.3/32 | eth1 core, eth3 north, eth2 south LAN 10.{{octet}}.30.0/24 |
+    | mv-campus-north | 10.255.{{octet}}.2/32 | eth1 core, eth3 south, eth2 north LAN 10.{{octet}}.{{northnet}}.0/24 |
+    | mv-campus-south | 10.255.{{octet}}.3/32 | eth1 core, eth3 north, eth2 south LAN 10.{{octet}}.{{southnet}}.0/24 |
     | mv-edge-1 | 10.255.{{octet}}.4/32 | eth1 core |
 
     Run OSPFv2 in area 0 on all four routers: enable it on every link, LAN and
@@ -35,6 +35,14 @@ spec:
       type: int
       min: 20
       max: 90
+    northnet:
+      type: int
+      min: 10
+      max: 19
+    southnet:
+      type: int
+      min: 30
+      max: 39
   topology:
     entry: workstation
     nodes:
@@ -63,8 +71,8 @@ spec:
          ip address 10.{{octet}}.0.5/30
         interface eth3
          ip address 10.{{octet}}.0.9/30
-        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.2
-        ip route 10.{{octet}}.30.0/24 10.{{octet}}.0.6
+        ip route 10.{{octet}}.{{northnet}}.0/24 10.{{octet}}.0.2
+        ip route 10.{{octet}}.{{southnet}}.0/24 10.{{octet}}.0.6
         ip route 10.255.{{octet}}.2/32 10.{{octet}}.0.2
         ip route 10.255.{{octet}}.3/32 10.{{octet}}.0.6
         ip route 10.255.{{octet}}.4/32 10.{{octet}}.0.10
@@ -75,7 +83,7 @@ spec:
         interface eth1
          ip address 10.{{octet}}.0.2/30
         interface eth2
-         ip address 10.{{octet}}.10.1/24
+         ip address 10.{{octet}}.{{northnet}}.1/24
         interface eth3
          ip address 10.{{octet}}.0.13/30
         ip route 0.0.0.0/0 10.{{octet}}.0.1
@@ -86,7 +94,7 @@ spec:
         interface eth1
          ip address 10.{{octet}}.0.6/30
         interface eth2
-         ip address 10.{{octet}}.30.1/24
+         ip address 10.{{octet}}.{{southnet}}.1/24
         interface eth3
          ip address 10.{{octet}}.0.14/30
         ip route 0.0.0.0/0 10.{{octet}}.0.5
@@ -98,8 +106,8 @@ spec:
          ip address 10.{{octet}}.0.10/30
         ip route 10.{{octet}}.0.0/16 10.{{octet}}.0.9
         ip route 10.255.{{octet}}.0/24 10.{{octet}}.0.9
-    - { on: north-host, run: "ip addr replace 10.{{octet}}.10.10/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
-    - { on: south-host, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+    - { on: north-host, run: "ip addr replace 10.{{octet}}.{{northnet}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{northnet}}.1" }
+    - { on: south-host, run: "ip addr replace 10.{{octet}}.{{southnet}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{southnet}}.1" }
   checks:
     - id: core-neighbours
       description: mv-core-1 has three Full OSPF neighbours with the expected router IDs
@@ -129,7 +137,7 @@ spec:
       command: |
         for t in $(seq 40); do
           r=$(vtysh -c 'show ip route ospf'); miss=
-          for p in 10.{{octet}}.10.0/24 10.{{octet}}.30.0/24 10.255.{{octet}}.1/32 10.255.{{octet}}.2/32 10.255.{{octet}}.3/32; do echo "$r" | grep -q "^O>\* $p" || miss="$miss $p"; done
+          for p in 10.{{octet}}.{{northnet}}.0/24 10.{{octet}}.{{southnet}}.0/24 10.255.{{octet}}.1/32 10.255.{{octet}}.2/32 10.255.{{octet}}.3/32; do echo "$r" | grep -q "^O>\* $p" || miss="$miss $p"; done
           [ -z "$miss" ] && { echo ok; exit 0; }
           sleep 1
         done
@@ -164,16 +172,16 @@ spec:
       type: shell
       on: north-host
       command: |
-        for i in $(seq 30); do ping -c1 -W1 10.{{octet}}.30.10 >/dev/null 2>&1 && ping -c1 -W1 10.255.{{octet}}.4 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+        for i in $(seq 30); do ping -c1 -W1 10.{{octet}}.{{southnet}}.10 >/dev/null 2>&1 && ping -c1 -W1 10.255.{{octet}}.4 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
       expect: { match: exact, value: ok }
       timeoutSec: 60
       skills: [net.routing.ospf]
     - id: router-ids
-      description: mv-campus-south uses its loopback as OSPF router ID
+      description: mv-campus-south has its loopback configured explicitly as OSPF router ID
       type: shell
       on: mv-campus-south
       command: |
-        vtysh -c 'show ip ospf' | grep -c 'OSPF Routing Process, with ID: 10.255.{{octet}}.3$'
+        vtysh -c 'show running-config' | grep -c '^ ospf router-id 10.255.{{octet}}.3$'
       expect: { match: exact, value: "1" }
       skills: [net.routing.ospf]
   hints:
@@ -277,8 +285,8 @@ spec:
         timeoutSec: 120
       - on: mv-core-1
         config: |
-          no ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.2
-          no ip route 10.{{octet}}.30.0/24 10.{{octet}}.0.6
+          no ip route 10.{{octet}}.{{northnet}}.0/24 10.{{octet}}.0.2
+          no ip route 10.{{octet}}.{{southnet}}.0/24 10.{{octet}}.0.6
           no ip route 10.255.{{octet}}.2/32 10.{{octet}}.0.2
           no ip route 10.255.{{octet}}.3/32 10.{{octet}}.0.6
           no ip route 10.255.{{octet}}.4/32 10.{{octet}}.0.10

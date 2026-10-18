@@ -97,10 +97,10 @@ spec:
       type: shell
       on: mv-core-1
       command: &synced |
-        for i in $(seq 25); do chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break; sleep 1; done
+        for i in $(seq 45); do chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break; [ $((i % 10)) = 5 ] && chronyc burst 4/4 >/dev/null 2>&1; sleep 1; done
         chronyc -n sources | awk '/^\^\*/{print $2}'
       expect: { match: exact, value: "10.{{octet}}.250.123" }
-      timeoutSec: 35
+      timeoutSec: 55
       skills: [net.services.ntp]
     - id: core2-synced
       description: mv-core-2 is synchronised to ntp-dc
@@ -108,20 +108,20 @@ spec:
       on: mv-core-2
       command: *synced
       expect: { match: exact, value: "10.{{octet}}.250.123" }
-      timeoutSec: 35
+      timeoutSec: 55
       skills: [net.services.ntp]
     - id: north-both-cores
       description: mv-campus-north uses both core routers, is synchronised at stratum {{stratum}}+2 and within one second
       type: shell
       on: mv-campus-north
       command: &campus |
-        for i in $(seq 30); do chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break; sleep 1; done
+        for i in $(seq 95); do chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break; [ $((i % 10)) = 1 ] && chronyc burst 4/4 >/dev/null 2>&1; sleep 1; done
         s=$(chronyc -n sources | awk '/^\^[*+-]/{print $2}' | sort | tr '\n' ' ')
         st=$(chronyc tracking | awk -F': ' '/^Stratum/{print $2}')
         off=$(chronyc tracking | awk '/^System time/{print ($4 < 1.0) ? "ok" : "off"}')
         echo "$s| $st $off"
       expect: { match: regex, value: "^10\\.{{octet}}\\.0\\.(1|9) 10\\.{{octet}}\\.0\\.(1|9) \\| [0-9]+ ok$" }
-      timeoutSec: 45
+      timeoutSec: 110
       skills: [net.services.ntp]
       weight: 2
     - id: south-both-cores
@@ -130,7 +130,7 @@ spec:
       on: mv-campus-south
       command: *campus
       expect: { match: regex, value: "^10\\.{{octet}}\\.0\\.(13|5) 10\\.{{octet}}\\.0\\.(13|5) \\| [0-9]+ ok$" }
-      timeoutSec: 45
+      timeoutSec: 110
       skills: [net.services.ntp]
       weight: 2
     - id: campus-stratum
@@ -138,17 +138,17 @@ spec:
       type: shell
       on: mv-campus-north
       command: |
-        for i in $(seq 40); do st=$(chronyc tracking 2>/dev/null | awk '/^Stratum/{print $3}'); [ "$st" = "$(( {{stratum}} + 2 ))" ] && break; sleep 1; done
+        for i in $(seq 95); do st=$(chronyc tracking 2>/dev/null | awk '/^Stratum/{print $3}'); [ "$st" = "$(( {{stratum}} + 2 ))" ] && break; [ $((i % 10)) = 1 ] && chronyc burst 4/4 >/dev/null 2>&1; sleep 1; done
         [ "$st" = "$(( {{stratum}} + 2 ))" ] && echo ok || echo "stratum $st"
       expect: { match: exact, value: ok }
-      timeoutSec: 55
+      timeoutSec: 110
       skills: [net.services.ntp]
     - id: core-serves-campus-only
       description: mv-core-1 serves NTP to its campus links and nothing else
       type: shell
       on: mv-core-1
       command: grep -E '^\s*(allow|deny)' /etc/chrony/chrony.conf | sort | tr '\n' ';'
-      expect: { match: regex, value: "^(allow 10\\.{{octet}}\\.0\\.(0/30|4/30|0/29|0/28|0/24|0/16)[ ]*;)+$" }
+      expect: { match: regex, value: "^(allow 10\\.{{octet}}\\.0\\.(0/30|4/30|0/29|0/28)[ ]*;)+$" }
       skills: [net.services.ntp]
       weight: 0.5
     - id: core2-serves-campus-only
@@ -156,7 +156,7 @@ spec:
       type: shell
       on: mv-core-2
       command: grep -E '^\s*(allow|deny)' /etc/chrony/chrony.conf | sort | tr '\n' ';'
-      expect: { match: regex, value: "^(allow 10\\.{{octet}}\\.0\\.(8/30|12/30|8/29|8/28|0/24|0/16)[ ]*;)+$" }
+      expect: { match: regex, value: "^(allow 10\\.{{octet}}\\.0\\.(8/30|12/30|8/29|8/28)[ ]*;)+$" }
       skills: [net.services.ntp]
       weight: 0.5
   hints:
@@ -189,5 +189,11 @@ spec:
     steps:
       - { on: mv-core-1, run: "printf 'server 10.{{octet}}.250.123 iburst\\nallow 10.{{octet}}.0.0/30\\nallow 10.{{octet}}.0.4/30\\n' > /etc/chrony/chrony.conf && chrony-restart" }
       - { on: mv-core-2, run: "printf 'server 10.{{octet}}.250.123 iburst\\nallow 10.{{octet}}.0.8/30\\nallow 10.{{octet}}.0.12/30\\n' > /etc/chrony/chrony.conf && chrony-restart" }
+      - on: mv-core-1
+        run: for i in $(seq 60); do chronyc -n sources | grep -q '^\^\*' && break; sleep 1; done
+        timeoutSec: 75
+      - on: mv-core-2
+        run: for i in $(seq 60); do chronyc -n sources | grep -q '^\^\*' && break; sleep 1; done
+        timeoutSec: 75
       - { on: mv-campus-north, run: "printf 'server 10.{{octet}}.0.1 iburst\\nserver 10.{{octet}}.0.9 iburst\\n' > /etc/chrony/chrony.conf && chrony-restart" }
       - { on: mv-campus-south, run: "printf 'server 10.{{octet}}.0.5 iburst\\nserver 10.{{octet}}.0.13 iburst\\n' > /etc/chrony/chrony.conf && chrony-restart" }

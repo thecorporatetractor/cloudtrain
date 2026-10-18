@@ -104,12 +104,46 @@ spec:
       expect: { match: exact, value: "Marlow Valley timetable" }
       skills: [net.services.nat]
       weight: 2
+    - id: capture-reset-1
+      description: (probe) restart the portal capture so only the next probe is recorded
+      type: shell
+      on: regional-portal
+      command: |
+        pkill -x tcpdump; sleep 0.5
+        rm -f /var/lib/cloudtrain/portal.pcap
+        setsid tcpdump -i eth1 -nn -U -w /var/lib/cloudtrain/portal.pcap 'tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0' </dev/null >/dev/null 2>&1 &
+        sleep 1; echo restarted
+      expect: { match: exact, value: restarted }
+      timeoutSec: 10
+      skills: [net.services.nat]
+      weight: 0
     - id: probe-timetable
       description: (probe) the timetable server opens a connection to the regional portal
       type: shell
       on: timetable-dc
       command: curl -s -m 3 -o /dev/null http://198.51.100.80/; echo probed
       expect: { match: exact, value: probed }
+      skills: [net.services.nat]
+      weight: 0
+    - id: timetable-source
+      description: The portal saw the timetable server as 203.0.113.{{pub2}} only
+      type: shell
+      on: regional-portal
+      command: tcpdump -nn -r /var/lib/cloudtrain/portal.pcap 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort -u | tr '\n' ' '
+      expect: { match: exact, value: "203.0.113.{{pub2}} " }
+      skills: [net.services.nat, linux.net.nat-forwarding]
+      weight: 2
+    - id: capture-reset-2
+      description: (probe) restart the portal capture so only the next probe is recorded
+      type: shell
+      on: regional-portal
+      command: |
+        pkill -x tcpdump; sleep 0.5
+        rm -f /var/lib/cloudtrain/portal.pcap
+        setsid tcpdump -i eth1 -nn -U -w /var/lib/cloudtrain/portal.pcap 'tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0' </dev/null >/dev/null 2>&1 &
+        sleep 1; echo restarted
+      expect: { match: exact, value: restarted }
+      timeoutSec: 10
       skills: [net.services.nat]
       weight: 0
     - id: probe-staff
@@ -120,12 +154,12 @@ spec:
       expect: { match: exact, value: probed }
       skills: [net.services.nat]
       weight: 0
-    - id: one-to-one-and-pat
-      description: The portal saw the timetable server as 203.0.113.{{pub2}} and staff-pc as 203.0.113.{{pub}}, nothing else
+    - id: staff-pat
+      description: The portal saw staff-pc as the PAT address 203.0.113.{{pub}} only
       type: shell
       on: regional-portal
       command: tcpdump -nn -r /var/lib/cloudtrain/portal.pcap 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort -u | tr '\n' ' '
-      expect: { match: exact, value: "203.0.113.{{pub2}} 203.0.113.{{pub}} " }
+      expect: { match: exact, value: "203.0.113.{{pub}} " }
       skills: [net.services.nat, linux.net.nat-forwarding]
       weight: 2
   hints:
@@ -145,7 +179,7 @@ spec:
           ip addr add 203.0.113.{{pub2}}/24 dev eth4
           nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }'
           nft add rule ip nat prerouting iifname eth4 ip daddr 203.0.113.{{pub2}} tcp dport 443 dnat to 10.{{octet}}.200.10
-      expectFail: [one-to-one-and-pat]
+      expectFail: [timetable-source]
       feedback: Inbound works, but connections the server opens still leave as the PAT address; one-to-one NAT needs the source rule too.
     - id: snat-after-masquerade
       description: Appends the SNAT rule after the masquerade rule, so it never matches
@@ -156,7 +190,7 @@ spec:
           nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }'
           nft add rule ip nat prerouting iifname eth4 ip daddr 203.0.113.{{pub2}} tcp dport 443 dnat to 10.{{octet}}.200.10
           nft add rule ip nat postrouting oifname eth4 ip saddr 10.{{octet}}.200.10 snat to 203.0.113.{{pub2}}
-      expectFail: [one-to-one-and-pat]
+      expectFail: [timetable-source]
       feedback: NAT rules are evaluated in order and the first matching NAT verdict wins; the server's rule must come before the masquerade.
   solution:
     explanation: |

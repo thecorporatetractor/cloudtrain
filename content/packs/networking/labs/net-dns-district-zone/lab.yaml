@@ -24,11 +24,11 @@ spec:
        | timetable | AAAA | 2001:db8:{{octet}}:210::10 |
        | grades | A | 10.{{octet}}.220.20 |
        | grades | AAAA | 2001:db8:{{octet}}:220::20 |
-       | tt | CNAME | timetable |
+       | {{alias}} | CNAME | timetable |
 
     2. Point the campus hosts `north-host` and `south-host` (shell) at
        `mv-dns-1` as their only name server, so that
-       `http://tt.mvschools.example/` and `http://grades.mvschools.example/` load
+       `http://{{alias}}.mvschools.example/` and `http://grades.mvschools.example/` load
        from both campuses.
   objectives:
     - Add A, AAAA and CNAME records to an authoritative zone
@@ -39,6 +39,9 @@ spec:
       type: int
       min: 20
       max: 90
+    alias:
+      type: choice
+      values: [tt, sched, lessons, tbl]
   topology:
     entry: workstation
     nodes:
@@ -125,17 +128,17 @@ spec:
       expect: { match: exact, value: "2001:db8:{{octet}}:210::10 2001:db8:{{octet}}:220::20" }
       skills: [net.services.dns]
     - id: cname-record
-      description: tt is a CNAME for timetable
+      description: "{{alias}} is a CNAME for timetable"
       type: shell
       on: mv-dns-1
-      command: dig +short @127.0.0.1 tt.mvschools.example CNAME
+      command: dig +short @127.0.0.1 {{alias}}.mvschools.example CNAME
       expect: { match: exact, value: "timetable.mvschools.example." }
       skills: [net.services.dns]
     - id: north-uses-resolver
       description: north-host resolves through mv-dns-1 and loads the timetable page by its alias
       type: shell
       on: north-host
-      command: grep -E '^nameserver' /etc/resolv.conf | tr '\n' ';'; wget -q -T 3 -O- http://tt.mvschools.example/
+      command: grep -E '^nameserver' /etc/resolv.conf | tr '\n' ';'; wget -q -T 3 -O- http://{{alias}}.mvschools.example/
       expect: { match: exact, value: "nameserver 10.{{octet}}.200.53;Marlow Valley timetable" }
       skills: [net.services.dns]
       weight: 2
@@ -149,7 +152,7 @@ spec:
       weight: 2
   hints:
     - title: Zone file lines
-      body: "One record per line: `timetable IN A 10.{{octet}}.210.10`, `timetable IN AAAA ...`, `tt IN CNAME timetable`. Names without a trailing dot are relative to the zone."
+      body: "One record per line: `timetable IN A 10.{{octet}}.210.10`, `timetable IN AAAA ...`, `{{alias}} IN CNAME timetable`. Names without a trailing dot are relative to the zone."
       cost: 1
     - title: Make BIND notice
       body: Increase the serial, check the file with `named-checkzone mvschools.example <file>` and reload with `rndc reload`.
@@ -201,7 +204,7 @@ spec:
               dnsmasq --no-resolv --no-hosts --bind-interfaces --listen-address=10.$O.200.53,127.0.0.1 \
                 --host-record=timetable.mvschools.example,10.$O.210.10,2001:db8:$O:210::10 \
                 --host-record=grades.mvschools.example,10.$O.220.20,2001:db8:$O:220::20 \
-                --cname=tt.mvschools.example,timetable.mvschools.example
+                --cname={{alias}}.mvschools.example,timetable.mvschools.example
               sleep 1; pgrep -x dnsmasq >/dev/null
           - { on: north-host, run: "printf 'nameserver 10.{{octet}}.200.53\\n' > /etc/resolv.conf" }
           - { on: south-host, run: "printf 'nameserver 10.{{octet}}.200.53\\n' > /etc/resolv.conf" }

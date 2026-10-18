@@ -24,9 +24,9 @@ spec:
     Router IDs are the loopbacks 10.255.{{octet}}.N (core-1 = 1, core-2 = 2,
     north = 3, edge = 4). Change the OSPF configuration so that:
 
-    1. traffic between `mv-campus-north` and `mv-core-2` (including core-2's
+    1. set the cost of both ends of the copper link to **{{copcost}}**, so traffic between `mv-campus-north` and `mv-core-2` (including core-2's
        loopback) takes the fibre and the data-centre segment instead of the
-       copper link, in both directions, using interface costs only;
+       copper link, in both directions (interface costs only);
     2. `mv-core-1` is the DR on the data-centre segment and `mv-core-2` can never
        become DR or BDR there;
     3. no OSPF hellos are sent on the classroom LAN, while the LAN is still
@@ -42,6 +42,10 @@ spec:
       type: int
       min: 20
       max: 90
+    copcost:
+      type: int
+      min: 100
+      max: 400
   topology:
     entry: workstation
     nodes:
@@ -194,7 +198,7 @@ spec:
       command: "show ip ospf interface eth2"
       cost: 1
     - title: DR election is not pre-emptive
-      body: A priority change takes effect at the next election. Priority 0 means never DR/BDR; after changing it, restart the OSPF process on the routers of that segment.
+      body: A higher priority never unseats a sitting DR; only a new election does. Priority 0 means never DR/BDR (the router steps down at once), but if you only raise core-1's priority, restart the OSPF process on the routers of that segment.
       command: "clear ip ospf process"
       cost: 2
     - title: Passive and default
@@ -207,18 +211,18 @@ spec:
         on: mv-campus-north
         config: |
           interface eth2
-           ip ospf cost 100
+           ip ospf cost {{copcost}}
       expectFail: [core2-to-north-fibre]
       feedback: Costs apply to outgoing interfaces; mv-core-2 still prefers its cheap copper interface back towards north.
     - id: no-reelection
-      description: Sets the priorities but never lets the election run again
+      description: Raises mv-core-1's priority and expects it to take over as DR without a new election
       mutation:
-        on: mv-core-2
+        on: mv-core-1
         config: |
           interface eth2
-           ip ospf priority 0
+           ip ospf priority 100
       expectFail: [core1-dr]
-      feedback: Until the adjacency on the segment restarts, the old DR keeps its role.
+      feedback: OSPF DR election is not pre-emptive. mv-core-2 stays DR (and keeps priority 50) until the election is rerun, so core-1 never becomes DR; lowering core-2's priority to 0 takes effect at once, but a higher priority on core-1 does not unseat a sitting DR.
     - id: passive-by-removing
       description: Removes OSPF from the classroom interface to stop hellos
       mutation:
@@ -230,8 +234,8 @@ spec:
       feedback: That stops the hellos but also withdraws the LAN; a passive interface keeps advertising it.
   solution:
     explanation: |
-      Cost 100 on both ends of the copper link makes north - core-1 - core-2
-      (10 + 10) cheaper than the copper (100). Priority 0 on core-2 and a higher
+      Cost {{copcost}} on both ends of the copper link makes north - core-1 - core-2
+      (10 + 10) cheaper than the copper ({{copcost}}). Priority 0 on core-2 and a higher
       priority on core-1, followed by an OSPF restart on both, elects core-1 as DR.
       `ip ospf passive` on north's eth3 stops hellos; `default-information
       originate always` on the edge advertises a default.
@@ -239,13 +243,13 @@ spec:
       - on: mv-campus-north
         config: |
           interface eth2
-           ip ospf cost 100
+           ip ospf cost {{copcost}}
           interface eth3
            ip ospf passive
       - on: mv-core-2
         config: |
           interface eth1
-           ip ospf cost 100
+           ip ospf cost {{copcost}}
           interface eth2
            ip ospf priority 0
       - on: mv-core-1
@@ -271,13 +275,13 @@ spec:
           - on: mv-campus-north
             config: |
               interface eth2
-               ip ospf cost 100
+               ip ospf cost {{copcost}}
               interface eth3
                ip ospf passive
           - on: mv-core-2
             config: |
               interface eth1
-               ip ospf cost 100
+               ip ospf cost {{copcost}}
               interface eth2
                ip ospf priority 0
           - on: mv-core-1

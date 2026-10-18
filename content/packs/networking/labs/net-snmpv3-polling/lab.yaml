@@ -60,7 +60,6 @@ spec:
         ip addr replace 203.0.113.{{octet}}/24 dev eth2
         mkdir -p /var/lib/net-snmp
         cat > /etc/snmp/snmpd.conf <<'EOC'
-        agentAddress udp:161
         sysName mv-edge-1
         sysLocation Marlow Valley data centre
         rocommunity public default
@@ -112,8 +111,8 @@ spec:
       on: mon-dc
       command: |
         a="-v3 -l authPriv -u nms{{octet}} -a SHA -A $(cat /root/snmp-auth.txt) -x AES -X $(cat /root/snmp-priv.txt) -t 2 -r 1 10.{{octet}}.99.1"
-        idx=$(snmpwalk $a -On .1.3.6.1.2.1.2.2.1.2 2>/dev/null | grep -w eth2 | sed 's/^.*\.\([0-9]*\) = .*$/\1/' | head -1)
-        now=$(snmpget $a -Oqv .1.3.6.1.2.1.31.1.1.1.6.$idx 2>/dev/null)
+        idx=$(snmpwalk -On $a .1.3.6.1.2.1.2.2.1.2 2>/dev/null | grep -w eth2 | sed 's/^.*\.\([0-9]*\) = .*$/\1/' | head -1)
+        now=$(snmpget -Oqv $a .1.3.6.1.2.1.31.1.1.1.6.$idx 2>/dev/null)
         got=$(tr -d ' \n' < /root/uplink-in-octets.txt)
         case "$got" in ''|*[!0-9]*) echo bad; exit 0;; esac
         [ "$got" -gt 0 ] && [ "$got" -le "$now" ] && [ $((now - got)) -lt 50000000 ] && echo ok || echo "bad $got $now"
@@ -122,7 +121,7 @@ spec:
       skills: [net.services.snmp]
   hints:
     - title: Creating the user
-      body: "Stop snmpd, then add the user with `net-snmp-create-v3-user -ro -a SHA -A <auth> -x AES -X <priv> <name>`; it writes a createUser line that snmpd turns into a localised key on start, and adds an `rouser` line. The passphrases are in /root/snmp-auth.txt and /root/snmp-priv.txt."
+      body: "Stop snmpd, then add the user with `net-snmp-create-v3-user -ro -a SHA -A <auth> -x AES -X <priv> <name>`; it writes a createUser line that snmpd turns into a localised key on start, and adds an `rouser` line without `priv` (in /usr/share/snmp/snmpd.conf, which snmpd also reads): remove or fix that line, and add `rouser <name> priv` yourself. The passphrases are in /root/snmp-auth.txt and /root/snmp-priv.txt."
       cost: 2
     - title: Enforcing privacy
       body: "`rouser <name> priv` makes the user readable only at authPriv."
@@ -173,8 +172,8 @@ spec:
       - on: mon-dc
         run: |
           a="-v3 -l authPriv -u nms{{octet}} -a SHA -A $(cat /root/snmp-auth.txt) -x AES -X $(cat /root/snmp-priv.txt) 10.{{octet}}.99.1"
-          idx=$(snmpwalk $a -On .1.3.6.1.2.1.2.2.1.2 | grep -w eth2 | sed 's/^.*\.\([0-9]*\) = .*$/\1/' | head -1)
-          snmpget $a -Oqv .1.3.6.1.2.1.31.1.1.1.6.$idx > /root/uplink-in-octets.txt
+          idx=$(snmpwalk -On $a .1.3.6.1.2.1.2.2.1.2 | grep -w eth2 | sed 's/^.*\.\([0-9]*\) = .*$/\1/' | head -1)
+          snmpget -Oqv $a .1.3.6.1.2.1.31.1.1.1.6.$idx > /root/uplink-in-octets.txt
           cat /root/uplink-in-octets.txt
     alternatives:
       - id: create-user-script
@@ -186,11 +185,12 @@ spec:
               sed -i '/^rocommunity/d' /etc/snmp/snmpd.conf
               net-snmp-create-v3-user -ro -a SHA -A "$(cat /root/snmp-auth.txt)" -x AES -X "$(cat /root/snmp-priv.txt)" nms{{octet}} >/dev/null
               sed -i 's/^rouser nms{{octet}}.*/rouser nms{{octet}} priv/' /etc/snmp/snmpd.conf /var/lib/net-snmp/snmpd.conf 2>/dev/null
+              sed -i '/^rouser nms{{octet}}/d' /usr/share/snmp/snmpd.conf 2>/dev/null
               grep -q '^rouser nms{{octet}} priv' /etc/snmp/snmpd.conf || echo 'rouser nms{{octet}} priv' >> /etc/snmp/snmpd.conf
               snmpd-restart; sleep 1
           - on: mon-dc
             run: |
               a="-v3 -l authPriv -u nms{{octet}} -a SHA -A $(cat /root/snmp-auth.txt) -x AES -X $(cat /root/snmp-priv.txt) 10.{{octet}}.99.1"
-              idx=$(snmpwalk $a -On .1.3.6.1.2.1.2.2.1.2 | grep -w eth2 | sed 's/^.*\.\([0-9]*\) = .*$/\1/' | head -1)
-              snmpget $a -Oqv .1.3.6.1.2.1.31.1.1.1.6.$idx > /root/uplink-in-octets.txt
+              idx=$(snmpwalk -On $a .1.3.6.1.2.1.2.2.1.2 | grep -w eth2 | sed 's/^.*\.\([0-9]*\) = .*$/\1/' | head -1)
+              snmpget -Oqv $a .1.3.6.1.2.1.31.1.1.1.6.$idx > /root/uplink-in-octets.txt
               cat /root/uplink-in-octets.txt
