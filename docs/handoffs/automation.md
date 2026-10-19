@@ -306,12 +306,31 @@ used by the VM labs); `community.general.seport`/`sefcontext` need `policycoreut
 `vtysh -f` merge semantics for the template and restore labs; `ansible.eda.webhook` accepts any
 POST path (`/events`).
 
+## Round 5, wave 4 (decision: not written)
+
+The 8 controller and alert-remediation labs (ov-awx-org-rbac, ov-awx-project-template,
+ov-awx-survey-schedule, ov-awx-git-webhook, ov-awx-approval-workflow, ov-awx-config-as-code,
+ov-awx-backup-triage, ov-eda-alert-remediation) are NOT written (option a). `awx:24`, `gitea:1`
+and an Alertmanager image are not in `deploy/images/catalog.yaml`, lab-verify rejects unknown
+node images, and no catalog entries are added for unbuilt images. Each keeps status `proposed`
+with notes starting `blocked: needs awx:24 (AWX operator instance from a warm pool, DB snapshot)
++ gitea:1 + alertmanager workload image`. If an image addition is approved later (option b):
+write them on a vcluster (tier V) with the AWX operator and its images in workloadImages; grade
+the controller REST API with curl from ov-ctl (job status, RBAC launch denied with 403); the
+awx.awx collection is not in the mirror; keep product names out of titles ("controller");
+backup/restore uses AWXBackup/AWXRestore resources.
+
+Full automation blocker list (all rounds-5 waves): linux_system_roles (3 labs), code-server (1),
+ansible-rulebook/JDK (1), frr sshd/collections (6), srlinux (fallback written), EE build infra
+(1), galaxy-ng/gitea adaptations, awx/alertmanager (8, not writable), and the el10 mirror lacks
+php and comps groups (labs adapted).
+
 ## Verify queue (testing round, grouped by slot kind)
 
 - **vm slot** (el-vm:10): the 12 VM labs above. Needing reboots: ov-reboot-persistence-fix, ov-async-patching (boot-id). Also: `sim-el-automation` exam runs and per-task verify of the 19 xan + 2 xpe tasks (four VMs per session, one at a time).
 - **pod slot**: the 22 runnable labs of PR #84 (not merged; fix its 4 majors and conflicts first).
 - **netdev**, **kubeadm**, **Kata**: none.
-- **image-blocked**: ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-system-role-timesync and the xan roles timesync/selinux tasks (`fedora.linux_system_roles`); ov-execution-environment-build (EE/registry images); the 6 `ov-net-*` labs (frr:10 SSH/python3/account, SR Linux image); ov-eda-webhook-rulebook (ansible-rulebook + JDK).
+- **image-blocked**: the 8 wave-4 controller/alert labs (not written, awx:24 + gitea:1 + alertmanager); ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-system-role-timesync and the xan roles timesync/selinux tasks (`fedora.linux_system_roles`); ov-execution-environment-build (EE/registry images); the 6 `ov-net-*` labs (frr:10 SSH/python3/account, SR Linux image); ov-eda-webhook-rulebook (ansible-rulebook + JDK).
 
 Unmerged PRs: #84 (wave 2, 23 pod labs).
 
