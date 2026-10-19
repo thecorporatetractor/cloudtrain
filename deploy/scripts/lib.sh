@@ -12,13 +12,20 @@ export PATH="$HOME/.local/bin:$PATH"
 #   managed-cni: Cilium is the primary CNI (stands in for a managed cloud's CNI),
 #     Kube-OVN runs non-primary behind Multus, the orchestrator uses --network-mode=secondary.
 #     Its own cluster (default name cloudtrain-mcni), so it never touches cloudtrain-dev.
+#   managed-cni-calico: as managed-cni with Calico (VXLAN, deploy/calico/) as the primary CNI.
+#     Cluster cloudtrain-calico.
 # CT_CLUSTER_NAME overrides the cluster name of either profile.
 export KIND_PROFILE=${KIND_PROFILE:-kubeovn-primary}
 case $KIND_PROFILE in
   kubeovn-primary) ;;
   managed-cni) CLUSTER_NAME=cloudtrain-mcni ;;
-  *) printf 'unknown KIND_PROFILE %s (kubeovn-primary or managed-cni)\n' "$KIND_PROFILE" >&2; exit 2 ;;
+  managed-cni-calico) CLUSTER_NAME=cloudtrain-calico ;;
+  *) printf 'unknown KIND_PROFILE %s (kubeovn-primary, managed-cni or managed-cni-calico)\n' "$KIND_PROFILE" >&2; exit 2 ;;
 esac
+# Profiles where another CNI owns eth0 and Kube-OVN is secondary behind Multus.
+SECONDARY_PROFILE=0
+case $KIND_PROFILE in managed-cni | managed-cni-calico) SECONDARY_PROFILE=1 ;; esac
+export SECONDARY_PROFILE
 export CLUSTER_NAME=${CT_CLUSTER_NAME:-$CLUSTER_NAME}
 export KUBECONTEXT="kind-${CLUSTER_NAME}"
 

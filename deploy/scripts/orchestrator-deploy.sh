@@ -17,8 +17,8 @@ if [[ -n ${PROVISION_TIMEOUT:-} && ! $PROVISION_TIMEOUT =~ ^([0-9]+(\.[0-9]+)?(h
 fi
 case ${VCLUSTER_POD_SECURITY:-baseline} in baseline|restricted) ;; *) die "VCLUSTER_POD_SECURITY must be baseline or restricted";; esac
 # NETWORK_MODE (primary|secondary) sets --network-mode: secondary for clusters where
-# Kube-OVN is not the primary CNI (KIND_PROFILE=managed-cni defaults to it).
-if [[ -z ${NETWORK_MODE:-} && $KIND_PROFILE == managed-cni ]]; then NETWORK_MODE=secondary; fi
+# Kube-OVN is not the primary CNI (the managed-cni profiles default to it).
+if [[ -z ${NETWORK_MODE:-} && $SECONDARY_PROFILE == 1 ]]; then NETWORK_MODE=secondary; fi
 case ${NETWORK_MODE:-primary} in primary|secondary) ;; *) die "NETWORK_MODE must be primary or secondary";; esac
 
 SVC="$REPO_ROOT/services/lab-orchestrator"

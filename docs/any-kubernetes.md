@@ -293,6 +293,7 @@ unreachable while this was written (AZ move), so no new node experiments were ru
 | Primary CNI | Kube-OVN (primary or non-primary) | Azure CNI (overlay / powered by Cilium); BYO-CNI possible but CNI unsupported by Microsoft [D] ([BYO CNI](https://learn.microsoft.com/en-us/azure/aks/use-byo-cni)) | VPC CNI only supported CNI; alternates allowed with partner support; **Auto Mode forbids alternates** [D] ([alternate CNIs](https://docs.aws.amazon.com/eks/latest/userguide/alternate-cni-plugins.html)) | Dataplane V2 (Cilium); not replaceable [U] | Kube-OVN |
 | Multus | install | install (no official doc) [U] | install; VPC CNI multi-NIC exists for ENIs [D] ([multi NIC](https://docs.aws.amazon.com/eks/latest/userguide/pod-multiple-network-interfaces.html)) | Google documents Multus + ipvlan [D] ([GKE Multus](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/multus-ipvlan-whereabouts)); GKE multi-network is L3 [D] | install |
 | Kube-OVN non-primary | n/a or yes | yes [U; mechanism V on kind + Cilium, section 8] | yes [U; mechanism V, section 8] | yes, Ubuntu nodes [U; mechanism V, section 8] | n/a or yes |
+| Calico primary (kind `managed-cni-calico`) | n/a | BYO-CNI option | alternate CNI option | n/a | n/a; verified on kind only [V, section 10] |
 | Underlay MTU for 1400-byte lab links | port group MTU >= 1600 recommended [V, dev-environment.md] | 1500 [U] | 9001 [U] | default 1460: **set VPC MTU 1500 or 8896** [U] | >= 1500 |
 | NetworkPolicy engine | Kube-OVN | Cilium / Azure NPM | VPC CNI `enableNetworkPolicy` must be on [U] | Dataplane V2 | Kube-OVN |
 | LoadBalancer | NSX / Avi on VKS, else MetalLB or kube-vip [U] | Azure LB | AWS LB Controller (NLB) [U] | native | MetalLB |
@@ -606,3 +607,31 @@ to the CNI. `tools/verify-vm/tune.sh` handled it for `cloudtrain-dev` only;
   belongs in the Helm chart, which does not exist yet.
 - Clabernetes is not built yet. Its VXLAN launchers would sit on the primary
   network, independent of this mode.
+
+## 10. Calico profile on kind (2026-10-19)
+
+`KIND_PROFILE=managed-cni-calico` (`task dev:up KIND_PROFILE=managed-cni-calico`,
+cluster `cloudtrain-calico`) is the second "bring your own CNI" profile. It uses
+the same kind config and secondary mode as `managed-cni`, with Calico v3.33.0
+(VXLAN, pool 10.32.0.0/16, the pinned manifest the golden image uses, edited by
+`deploy/calico/kind.sed`) as the primary CNI. Lab CIDRs stay fixed and
+`--lab-mtu=1400` applies as in the Cilium profile.
+
+Verified on ct-testvm (throwaway cluster `ct-calico`, `--network-mode=secondary`,
+`labctl verify --parallel 1 --grade-timeout 15m`):
+
+| Check | Result |
+|---|---|
+| `labctl preflight --probe` | all checks pass: Calico detected, conflist priority 90, eth0 and link MTU 1400, 1400-byte DF frames across workers on both, API service unreachable from wired pods |
+| `fix-ssh-key-perms` (pod) | pass, 6/6 runs |
+| `etcd-snapshot-restore` (KubeVirt VM) | pass, 8/8 runs |
+| `net-fix-mtu-blackhole` (multi-node network) | 6/7 runs pass; `alternative:tunnel-mtu-only` fails (`upload-arrived`, got 32768). Known lab issue, unrelated to the CNI: the Kube-OVN primary `cloudtrain-dev` batch failed the same way |
+
+MTU: lab pod and VM-path interfaces come up at 1400 (set by Kube-OVN
+`Subnet.spec.mtu`; Calico's own eth0 is smaller because of VXLAN and lab traffic
+never uses it) and pass 1400-byte packets with DF set across nodes.
+
+Known startup race: right after KubeVirt reports Available, the first VMI create
+in `verify-kvm.sh` can fail with `virt-api` webhook "connection refused" while the
+virt-api pods restart. Re-running `task dev:verify-kvm` succeeded. Not shown to
+be Calico-specific.
