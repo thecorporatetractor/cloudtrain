@@ -1,0 +1,248 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: pam-pwquality-faillock
+  title: Enforce a password policy and account lockout through PAM
+  domain: linux
+  frameworks:
+  - linuxplus:security
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - pam
+  - pwquality
+  - faillock
+  - authselect
+  - hardening
+  version: 1
+spec:
+  description: |
+    The security baseline for **`tr-pam-01`** (`ssh tr-pam-01`; you have `sudo`) says:
+
+    - passwords have at least **{{minlen}} characters** and at least **three character classes**
+      (`/etc/security/pwquality.conf`);
+    - the **last 5 passwords** cannot be reused (`pam_pwhistory`, `remember` in
+      `/etc/security/pwhistory.conf`);
+    - an account is **locked for 15 minutes after 5 failed attempts** (`pam_faillock`: `deny` and
+      `unlock_time` in `/etc/security/faillock.conf`).
+
+    Apply it with the distribution tooling (`authselect`), not by hand-editing the PAM files. The accounts
+    `tr-probe` and `tr-caller` are for the grader: do not lock anything yourself while testing, and never
+    lock `learner`.
+  objectives:
+  - Set pwquality and pwhistory policy
+  - Enable faillock through authselect with the right deny and unlock time
+  params:
+    minlen:
+      type: choice
+      values:
+      - '14'
+      - '16'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-pam-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-pam-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      V=/var/lib/cloudtrain; install -d -m 0700 $V
+      authselect select local --force >/dev/null
+      authselect disable-feature with-faillock >/dev/null 2>&1 || true
+      authselect disable-feature with-pwhistory >/dev/null 2>&1 || true
+      sed -i -E '/^[#[:space:]]*(minlen|minclass)[[:space:]]*=/d' /etc/security/pwquality.conf
+      [ -f /etc/security/pwhistory.conf ] && sed -i -E '/^[#[:space:]]*remember[[:space:]]*=/d' /etc/security/pwhistory.conf
+      sed -i -E '/^[#[:space:]]*(deny|unlock_time|fail_interval)[[:space:]]*=/d' /etc/security/faillock.conf
+      id tr-probe >/dev/null 2>&1 || useradd -m -s /bin/bash tr-probe
+      id tr-caller >/dev/null 2>&1 || useradd -m -s /bin/bash tr-caller
+      [ -f $V/probe.pw ] || head -c 12 /dev/urandom | base64 | tr -d '/+=' > $V/probe.pw
+      echo "tr-probe:$(cat $V/probe.pw)" | chpasswd
+      faillock --user tr-probe --reset
+      cat > $V/tryauth.py <<'EOPY'
+      import os, pty, pwd, select, sys, time
+      user, pw, caller = sys.argv[1:4]
+      pid, fd = pty.fork()
+      if pid == 0:
+          p = pwd.getpwnam(caller)
+          os.setgroups([]); os.setgid(p.pw_gid); os.setuid(p.pw_uid)
+          os.environ["HOME"] = p.pw_dir
+          os.execv("/usr/bin/su", ["su", user, "-c", "true"])
+      buf = b""; sent = False; end = time.time() + 15
+      while time.time() < end:
+          r, _, _ = select.select([fd], [], [], 0.5)
+          if r:
+              try:
+                  d = os.read(fd, 1024)
+              except OSError:
+                  d = b""
+              if d:
+                  buf += d
+                  if not sent and b"assword" in buf:
+                      os.write(fd, (pw + "\n").encode()); sent = True
+          done, st = os.waitpid(pid, os.WNOHANG)
+          if done:
+              sys.exit(0 if os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 else 1)
+      os.kill(pid, 9); os.waitpid(pid, 0); sys.exit(2)
+      EOPY
+      chmod 0600 $V/tryauth.py
+  checks:
+  - id: quality
+    description: Passwords of {{minlen}} characters with several classes pass; shorter or single-class
+      ones are refused
+    type: shell
+    'on': tr-pam-01
+    skills: &id001
+    - linux.security.auth-hardening
+    weight: 2.5
+    command: |
+      mk=Ku7!bQ2#mZ9pLx4@Wr8e
+      a=$(printf %s "$mk" | cut -c1-{{minlen}} | pwscore >/dev/null 2>&1 && echo len-ok || echo len-refused)
+      b=$(printf %s "$mk" | cut -c1-$(( {{minlen}} - 1 )) | pwscore >/dev/null 2>&1 && echo short-accepted || echo short-refused)
+      c=$(printf %s kubqmzplxwreabcdefgh | pwscore >/dev/null 2>&1 && echo class-accepted || echo class-refused)
+      echo "$a $b $c"
+    expect:
+      match: exact
+      value: len-ok short-refused class-refused
+  - id: history
+    description: pam_pwhistory is in the stack and remembers 5 passwords
+    type: shell
+    'on': tr-pam-01
+    skills: *id001
+    weight: 2
+    command: |
+      authselect current --raw 2>/dev/null | grep -qw with-pwhistory && grep -q pam_pwhistory /etc/pam.d/system-auth && r=$(sed 's/#.*//' /etc/security/pwhistory.conf | awk -F= '$1 ~ /^[ \t]*remember[ \t]*$/ {v=$2; gsub(/[ \t]/,"",v); l=v} END{print l}') && echo "remember=$r" || echo missing
+    expect:
+      match: exact
+      value: remember=5
+  - id: faillock-feature
+    description: The faillock feature is enabled in the authselect profile
+    type: shell
+    'on': tr-pam-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      authselect current --raw 2>/dev/null | grep -qw with-faillock && echo enabled || echo disabled
+    expect:
+      match: exact
+      value: enabled
+  - id: faillock-values
+    description: deny is 5 and unlock_time is 900
+    type: shell
+    'on': tr-pam-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      sed 's/#.*//' /etc/security/faillock.conf | awk -F= '{k=$1; v=$2; gsub(/[ \t]/,"",k); gsub(/[ \t]/,"",v); a[k]=v} END{print "deny=" a["deny"] " unlock=" a["unlock_time"]}'
+    expect:
+      match: exact
+      value: deny=5 unlock=900
+  - id: lock-behaviour
+    description: An account is locked after exactly 5 failures
+    type: shell
+    'on': tr-pam-01
+    skills: *id001
+    weight: 3
+    timeoutSec: 240
+    command: |
+      H=/var/lib/cloudtrain; pw=$(cat $H/probe.pw)
+      faillock --user tr-probe --reset
+      for i in 1 2 3 4; do python3 $H/tryauth.py tr-probe "wrong-$i" tr-caller >/dev/null 2>&1; done
+      python3 $H/tryauth.py tr-probe "$pw" tr-caller >/dev/null 2>&1 && a=ok || a=locked
+      faillock --user tr-probe --reset
+      for i in 1 2 3 4 5; do python3 $H/tryauth.py tr-probe "wrong-$i" tr-caller >/dev/null 2>&1; done
+      python3 $H/tryauth.py tr-probe "$pw" tr-caller >/dev/null 2>&1 && b=accepted || b=locked
+      faillock --user tr-probe --reset
+      echo "$a $b"
+    expect:
+      match: exact
+      value: ok locked
+  hints:
+  - title: Where
+    body: 'pwquality.conf: minlen, minclass. faillock.conf: deny, unlock_time (seconds). pwhistory.conf:
+      remember. authselect list-features local shows the switches.'
+    cost: 0
+  misconceptions:
+  - id: conf-only
+    description: Edits faillock.conf but never enables the feature.
+    feedback: faillock.conf is only read by pam_faillock; the PAM stack calls it only after authselect
+      enable-feature with-faillock.
+    expectFail:
+    - faillock-feature
+    - lock-behaviour
+    mutation:
+      'on': tr-pam-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo sed -i -E '/^[#[:space:]]*(minlen|minclass)[[:space:]]*=/d' /etc/security/pwquality.conf; printf 'minlen = {{minlen}}\nminclass = 3\n' | sudo tee -a /etc/security/pwquality.conf >/dev/null
+        sudo authselect enable-feature with-pwhistory >/dev/null; sudo sed -i -E '/^[#[:space:]]*remember[[:space:]]*=/d' /etc/security/pwhistory.conf; echo 'remember = 5' | sudo tee -a /etc/security/pwhistory.conf >/dev/null
+        sudo sed -i -E '/^[#[:space:]]*(deny|unlock_time)[[:space:]]*=/d' /etc/security/faillock.conf; printf 'deny = 5\nunlock_time = 900\n' | sudo tee -a /etc/security/faillock.conf >/dev/null
+  - id: no-minclass
+    description: Sets the length but not the character classes.
+    feedback: 'Both minlen and minclass are needed: a long all-lowercase password still has to be refused.'
+    expectFail:
+    - quality
+    mutation:
+      'on': tr-pam-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo sed -i -E '/^[#[:space:]]*(minlen|minclass)[[:space:]]*=/d' /etc/security/pwquality.conf; echo 'minlen = {{minlen}}' | sudo tee -a /etc/security/pwquality.conf >/dev/null
+        sudo authselect enable-feature with-pwhistory >/dev/null; sudo sed -i -E '/^[#[:space:]]*remember[[:space:]]*=/d' /etc/security/pwhistory.conf; echo 'remember = 5' | sudo tee -a /etc/security/pwhistory.conf >/dev/null
+        sudo sed -i -E '/^[#[:space:]]*(deny|unlock_time)[[:space:]]*=/d' /etc/security/faillock.conf; printf 'deny = 5\nunlock_time = 900\n' | sudo tee -a /etc/security/faillock.conf >/dev/null
+        sudo authselect enable-feature with-faillock >/dev/null
+  - id: no-history
+    description: Forgets password history.
+    feedback: 'Reuse is blocked by pam_pwhistory: enable the with-pwhistory feature and set remember =
+      5.'
+    expectFail:
+    - history
+    mutation:
+      'on': tr-pam-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo sed -i -E '/^[#[:space:]]*(minlen|minclass)[[:space:]]*=/d' /etc/security/pwquality.conf; printf 'minlen = {{minlen}}\nminclass = 3\n' | sudo tee -a /etc/security/pwquality.conf >/dev/null
+        sudo sed -i -E '/^[#[:space:]]*(deny|unlock_time)[[:space:]]*=/d' /etc/security/faillock.conf; printf 'deny = 5\nunlock_time = 900\n' | sudo tee -a /etc/security/faillock.conf >/dev/null
+        sudo authselect enable-feature with-faillock >/dev/null
+  solution:
+    explanation: |
+      pwquality.conf holds minlen and minclass (read by pam_pwquality and pwscore); authselect enable-feature
+      with-pwhistory and with-faillock add pam_pwhistory and pam_faillock to system-auth and password-auth, and their
+      options live in pwhistory.conf and faillock.conf.
+    steps:
+    - 'on': tr-pam-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo sed -i -E '/^[#[:space:]]*(minlen|minclass)[[:space:]]*=/d' /etc/security/pwquality.conf; printf 'minlen = {{minlen}}\nminclass = 3\n' | sudo tee -a /etc/security/pwquality.conf >/dev/null
+        sudo authselect enable-feature with-pwhistory >/dev/null; sudo sed -i -E '/^[#[:space:]]*remember[[:space:]]*=/d' /etc/security/pwhistory.conf; echo 'remember = 5' | sudo tee -a /etc/security/pwhistory.conf >/dev/null
+        sudo sed -i -E '/^[#[:space:]]*(deny|unlock_time)[[:space:]]*=/d' /etc/security/faillock.conf; printf 'deny = 5\nunlock_time = 900\n' | sudo tee -a /etc/security/faillock.conf >/dev/null
+        sudo authselect enable-feature with-faillock >/dev/null
+        authselect current
+    alternatives:
+    - id: select-with-features
+      description: Select the profile with both features in one command.
+      steps:
+      - 'on': tr-pam-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo sed -i -E '/^[#[:space:]]*(minlen|minclass)[[:space:]]*=/d' /etc/security/pwquality.conf; printf 'minlen = {{minlen}}\nminclass = 3\n' | sudo tee -a /etc/security/pwquality.conf >/dev/null
+          sudo sed -i -E '/^[#[:space:]]*(deny|unlock_time)[[:space:]]*=/d' /etc/security/faillock.conf; printf 'deny = 5\nunlock_time = 900\n' | sudo tee -a /etc/security/faillock.conf >/dev/null
+          sudo authselect select local with-faillock with-pwhistory --force
+          sudo sed -i -E '/^[#[:space:]]*remember[[:space:]]*=/d' /etc/security/pwhistory.conf; echo 'remember = 5' | sudo tee -a /etc/security/pwhistory.conf >/dev/null

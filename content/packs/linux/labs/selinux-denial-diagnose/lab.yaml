@@ -1,0 +1,257 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: selinux-denial-diagnose
+  title: Diagnose why the depot agent is denied by SELinux
+  domain: linux
+  frameworks:
+  - rhcsa-aligned:security
+  - linuxplus:troubleshooting
+  difficulty: hard
+  estimatedMinutes: 20
+  tags:
+  - selinux
+  - troubleshooting
+  - avc
+  - booleans
+  - fcontext
+  version: 1
+spec:
+  description: |
+    The depot agent on **`tr-sel-01`** (`ssh tr-sel-01`; you have `sudo`) is an Apache instance that
+    serves the pages in **`/srv/depot-agent/www`** on port **8008** and forwards **`/api/`** to a local
+    backend on `127.0.0.1:{{bport}}`. It answers correctly in permissive mode and fails in
+    **enforcing** mode (`getenforce` must stay `Enforcing`).
+
+    1. Find the SELinux denials (`ausearch -m avc`, the audit log or the journal) and write
+       **`/home/learner/answers/avc.txt`** with two lines: `denied_type=<the file type httpd_t was
+       denied access to under /srv/depot-agent/www>` and `boolean=<the SELinux boolean that
+       allows the proxy connection>`.
+    2. Fix both causes persistently with a file context rule and a boolean: **no custom policy module**,
+       no permissive domains.
+
+    `http://127.0.0.1:8008/` must show the page and `http://127.0.0.1:8008/api/` the backend answer.
+  objectives:
+  - Read AVC denials and map them to a cause
+  - Fix a file context and a boolean persistently without a custom module
+  params:
+    bport:
+      type: choice
+      values:
+      - '8100'
+      - '8110'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-sel-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-sel-01
+    timeoutSec: 420
+    run: |
+      set -eu
+      V=/var/lib/cloudtrain; install -d -m 0700 $V
+      install -d -o learner -g learner /home/learner/answers; rm -f /home/learner/answers/avc.txt
+      rpm -q httpd policycoreutils-python-utils audit curl >/dev/null 2>&1 || dnf -y -q install httpd policycoreutils-python-utils audit curl >/dev/null
+      systemctl enable --now auditd >/dev/null 2>&1 || true
+      setenforce 1
+      systemctl stop httpd tr-depot-backend >/dev/null 2>&1 || true
+      semanage fcontext -d '/srv/depot-agent(/.*)?' >/dev/null 2>&1 || true
+      setsebool -P httpd_can_network_connect off
+      rm -rf /srv/depot-agent; mkdir -p /srv/depot-agent/www
+      echo 'depot-agent-ok' > /srv/depot-agent/www/index.html
+      restorecon -R /srv/depot-agent
+      ls -Zd /srv/depot-agent/www | awk '{print $1}' | awk -F: '{print $3}' > $V/orig.type
+      semodule -l | sort > $V/semod.base
+      cat > /usr/local/bin/tr-depot-backend <<'EOPY'
+      #!/usr/bin/python3
+      import http.server as h
+      class H(h.BaseHTTPRequestHandler):
+          def do_GET(self):
+              self.send_response(200); self.end_headers(); self.wfile.write(b"backend-ok\n")
+          def log_message(self, *a): pass
+      h.HTTPServer(("127.0.0.1", {{bport}}), H).serve_forever()
+      EOPY
+      chmod 0755 /usr/local/bin/tr-depot-backend
+      printf '[Unit]\nDescription=Depot backend\n[Service]\nExecStart=/usr/local/bin/tr-depot-backend\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-depot-backend.service
+      printf 'Listen 8008\n<VirtualHost *:8008>\n  DocumentRoot /srv/depot-agent/www\n  <Directory /srv/depot-agent/www>\n    Require all granted\n  </Directory>\n  ProxyPass /api/ http://127.0.0.1:{{bport}}/\n</VirtualHost>\n' > /etc/httpd/conf.d/depot-agent.conf
+      systemctl daemon-reload
+      systemctl enable --now tr-depot-backend.service httpd.service >/dev/null 2>&1
+      sleep 2
+      [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8008/)" != 200 ]
+  checks:
+  - id: enforcing
+    description: SELinux is still enforcing
+    type: shell
+    'on': tr-sel-01
+    skills: &id001
+    - linux.security.selinux-troubleshooting
+    weight: 1.5
+    command: |
+      getenforce
+    expect:
+      match: exact
+      value: Enforcing
+  - id: page
+    description: The page is served
+    type: shell
+    'on': tr-sel-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      curl -fs --max-time 5 http://127.0.0.1:8008/ 2>/dev/null | head -1 || echo down
+    expect:
+      match: exact
+      value: depot-agent-ok
+  - id: api
+    description: The proxied backend answers
+    type: shell
+    'on': tr-sel-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      curl -fs --max-time 5 http://127.0.0.1:8008/api/ 2>/dev/null | head -1 || echo down
+    expect:
+      match: exact
+      value: backend-ok
+  - id: label-rule
+    description: A persistent file context rule gives the tree a web content type and restorecon is clean
+    type: shell
+    'on': tr-sel-01
+    skills: *id001
+    weight: 2
+    command: |
+      semanage fcontext -l -C 2>/dev/null | grep -q '/srv/depot-agent' && [ -z "$(restorecon -Rn -v /srv/depot-agent 2>&1)" ] && ls -Zd /srv/depot-agent/www | grep -q httpd_ && echo persistent || echo no
+    expect:
+      match: exact
+      value: persistent
+  - id: boolean
+    description: The boolean is on persistently
+    type: shell
+    'on': tr-sel-01
+    skills: *id001
+    weight: 2
+    command: |
+      getsebool httpd_can_network_connect | grep -q ' on$' && semanage boolean -l -C 2>/dev/null | grep -q '^httpd_can_network_connect.*(on *, *on)' && echo persistent || echo no
+    expect:
+      match: exact
+      value: persistent
+  - id: no-module
+    description: No custom policy module was added
+    type: shell
+    'on': tr-sel-01
+    skills: *id001
+    weight: 1
+    command: |
+      [ "$(semodule -l | sort | diff - /var/lib/cloudtrain/semod.base | wc -l)" = 0 ] && echo none || echo added
+    expect:
+      match: exact
+      value: none
+  - id: avc-notes
+    description: avc.txt names the denied type and the boolean
+    type: shell
+    'on': tr-sel-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      t=$(sed -n 's/^denied_type=//p' /home/learner/answers/avc.txt 2>/dev/null | head -1); b=$(sed -n 's/^boolean=//p' /home/learner/answers/avc.txt 2>/dev/null | head -1)
+      [ "$t" = "$(cat /var/lib/cloudtrain/orig.type)" ] && [ "$b" = httpd_can_network_connect ] && echo ok || echo "t=$t b=$b"
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Find the denials
+    body: sudo ausearch -m avc -ts recent shows scontext, tcontext and tclass; the target type tells you
+      which label or boolean is missing.
+    cost: 0
+  - title: Persistent fixes
+    body: semanage fcontext -a -t TYPE PATH_REGEX followed by restorecon -R; setsebool -P BOOLEAN on.
+      getsebool -a | grep httpd lists the booleans.
+    cost: 1
+  misconceptions:
+  - id: permissive
+    description: Sets the system to permissive.
+    feedback: Permissive hides the denials instead of fixing them; keep enforcing mode and fix the label
+      and the boolean.
+    expectFail:
+    - enforcing
+    - label-rule
+    - boolean
+    mutation:
+      'on': tr-sel-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo setenforce 0
+        printf 'denied_type=%s\nboolean=httpd_can_network_connect\n' "$(ls -Zd /srv/depot-agent/www | awk -F: '{print $3}')" > /home/learner/answers/avc.txt
+  - id: chcon-setsebool
+    description: Fixes it with chcon and setsebool without -P.
+    feedback: chcon and a runtime boolean are lost at relabel or reboot; add a semanage fcontext rule
+      and use setsebool -P.
+    expectFail:
+    - label-rule
+    - boolean
+    mutation:
+      'on': tr-sel-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'denied_type=%s\nboolean=httpd_can_network_connect\n' "$(ls -Zd /srv/depot-agent/www | awk -F: '{print $3}')" > /home/learner/answers/avc.txt
+        sudo chcon -R -t httpd_sys_content_t /srv/depot-agent
+        sudo setsebool httpd_can_network_connect on
+  - id: audit2allow
+    description: Builds a custom module with audit2allow.
+    feedback: A custom module widens policy for a mistake that a label and a boolean fix.
+    expectFail:
+    - no-module
+    - label-rule
+    - boolean
+    mutation:
+      'on': tr-sel-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        printf 'denied_type=%s\nboolean=httpd_can_network_connect\n' "$(ls -Zd /srv/depot-agent/www | awk -F: '{print $3}')" > /home/learner/answers/avc.txt
+        curl -s -o /dev/null http://127.0.0.1:8008/; curl -s -o /dev/null http://127.0.0.1:8008/api/
+        cd /tmp && sudo sh -c 'ausearch -m avc -c httpd --raw | audit2allow -M tr-depot-local >/dev/null && semodule -i tr-depot-local.pp'
+  solution:
+    explanation: |
+      ausearch -m avc shows httpd_t denied read on the tree's inherited type and name_connect to the backend port.
+      semanage fcontext -a -t httpd_sys_content_t with restorecon relabels the tree persistently, and
+      setsebool -P httpd_can_network_connect on lets httpd_t connect out. No policy module is needed.
+    steps:
+    - 'on': tr-sel-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        curl -s -o /dev/null http://127.0.0.1:8008/; curl -s -o /dev/null http://127.0.0.1:8008/api/
+        sudo ausearch -m avc -ts recent | tail -20
+        printf 'denied_type=%s\nboolean=httpd_can_network_connect\n' "$(ls -Zd /srv/depot-agent/www | awk -F: '{print $3}')" > /home/learner/answers/avc.txt
+        sudo semanage fcontext -a -t httpd_sys_content_t '/srv/depot-agent(/.*)?'
+        sudo restorecon -Rv /srv/depot-agent
+        sudo setsebool -P httpd_can_network_connect on
+        curl -s http://127.0.0.1:8008/; curl -s http://127.0.0.1:8008/api/
+    alternatives:
+    - id: equiv-rule
+      description: Use the web content equivalence rule instead of an fcontext path rule.
+      steps:
+      - 'on': tr-sel-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          printf 'denied_type=%s\nboolean=httpd_can_network_connect\n' "$(ls -Zd /srv/depot-agent/www | awk -F: '{print $3}')" > /home/learner/answers/avc.txt
+          sudo semanage fcontext -a -e /var/www '/srv/depot-agent/www'
+          sudo restorecon -Rv /srv/depot-agent
+          sudo setsebool -P httpd_can_network_connect on

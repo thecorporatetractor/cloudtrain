@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: am-i-in-a-container
+  title: Work out whether a shell runs in a container or a VM
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - internals
+  - namespaces
+  - virtualisation
+  - forensics
+  version: 1
+spec:
+  description: |
+    The incident team left three shells open and nobody wrote down which is which:
+
+    1. **shell 1**: the prompt you are in now on `workstation`;
+    2. **shell 2**: `ssh tr-who-01`, the incident VM;
+    3. **shell 3**: a sandbox inside `tr-who-01`, entered with
+       `sudo nsenter -t $(cat /run/tr-sandbox.pid) -a`.
+
+    Decide for each shell whether it is a **container**, a **vm** or a **namespace-sandbox**
+    (a process group isolated by namespaces on a real kernel, with no runtime), using evidence from
+    `/proc`, cgroups, namespaces and hardware identification
+    (`systemd-detect-virt`, `/proc/1/cgroup`, `/proc/self/ns`).
+
+    Write **`/home/learner/answers/verdict.txt`** on `tr-who-01` with exactly these lines:
+
+    ```
+    shell1=<container|vm|namespace-sandbox>
+    shell2=<container|vm|namespace-sandbox>
+    shell3=<container|vm|namespace-sandbox>
+    virt=<what systemd-detect-virt prints on tr-who-01>
+    sandbox-pidns=<the PID namespace link of the sandbox as seen from the VM, e.g. pid:[4026...]>
+    ```
+  objectives:
+  - Tell containers, VMs and bare namespaces apart from kernel evidence
+  - Read namespace identities from /proc
+  params:
+    box:
+      type: choice
+      values:
+      - tt-box-7
+      - tt-box-9
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-who-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-who-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      install -d -o learner -g learner /home/learner/answers
+      rm -f /home/learner/answers/verdict.txt
+      pkill -f '^sleep 31337$' >/dev/null 2>&1 || true
+      sleep 1
+      sh -c "setsid unshare --pid --mount --uts --ipc --net --fork --mount-proc sh -c 'hostname {{box}}; exec sleep 31337' </dev/null >/dev/null 2>&1 &"
+      sleep 2
+      pgrep -f '^sleep 31337$' | head -1 > /run/tr-sandbox.pid
+      chmod 0644 /run/tr-sandbox.pid
+      [ -s /run/tr-sandbox.pid ]
+  checks:
+  - id: verdict-container
+    description: shell 1 is judged a container
+    type: shell
+    'on': tr-who-01
+    skills: &id001
+    - linux.internals.namespaces
+    - linux.kernel.hardware-discovery
+    weight: 0.5
+    command: |
+      sed -n "s/^shell1=//p" /home/learner/answers/verdict.txt 2>/dev/null | head -1
+    expect:
+      match: exact
+      value: container
+  - id: verdict-vm
+    description: shell 2 is judged correctly from the VM facts
+    type: shell
+    'on': tr-who-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      got=$(sed -n 's/^shell2=//p' /home/learner/answers/verdict.txt 2>/dev/null | head -1)
+      if systemd-detect-virt -q --vm; then exp=vm; elif systemd-detect-virt -q --container; then exp=container; else exp=namespace-sandbox; fi
+      [ "$got" = "$exp" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: verdict-sandbox
+    description: shell 3 is judged correctly from the namespaces
+    type: shell
+    'on': tr-who-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      got=$(sed -n 's/^shell3=//p' /home/learner/answers/verdict.txt 2>/dev/null | head -1)
+      P=$(cat /run/tr-sandbox.pid)
+      if [ "$(readlink /proc/$P/ns/pid)" != "$(readlink /proc/1/ns/pid)" ]; then exp=namespace-sandbox; else exp=vm; fi
+      [ "$got" = "$exp" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: virt-evidence
+    description: The detected virtualisation type is recorded
+    type: shell
+    'on': tr-who-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      got=$(sed -n 's/^virt=//p' /home/learner/answers/verdict.txt 2>/dev/null | head -1)
+      [ "$got" = "$(systemd-detect-virt 2>/dev/null)" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: ns-evidence
+    description: The sandbox PID namespace identity is recorded
+    type: shell
+    'on': tr-who-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      got=$(sed -n 's/^sandbox-pidns=//p' /home/learner/answers/verdict.txt 2>/dev/null | head -1)
+      [ "$got" = "$(readlink /proc/$(cat /run/tr-sandbox.pid)/ns/pid)" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Virtualisation
+    body: systemd-detect-virt prints the hypervisor on a VM and the runtime (docker, podman, lxc...) in
+      a container; --container and --vm test each.
+    cost: 0
+  - title: Namespaces
+    body: 'ls -l /proc/1/ns and /proc/PID/ns: equal link targets mean the same namespace.'
+    cost: 1
+  misconceptions:
+  - id: swapped
+    description: Mixes up the VM and the sandbox.
+    feedback: A sandbox shares the VM kernel (and its hardware identity) but has its own namespace IDs;
+      a VM has its own kernel and systemd-detect-virt reports the hypervisor.
+    expectFail:
+    - verdict-vm
+    - verdict-sandbox
+    mutation:
+      'on': tr-who-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'shell1=container\nshell2=namespace-sandbox\nshell3=vm\nvirt=%s\nsandbox-pidns=%s\n' "$(systemd-detect-virt)" "$(sudo readlink /proc/$(cat /run/tr-sandbox.pid)/ns/pid)" > /home/learner/answers/verdict.txt
+  - id: no-evidence
+    description: Gives the right labels without any evidence.
+    feedback: 'Record the evidence too: systemd-detect-virt for the VM and the sandbox PID namespace link.'
+    expectFail:
+    - virt-evidence
+    - ns-evidence
+    mutation:
+      'on': tr-who-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'shell1=container\nshell2=vm\nshell3=namespace-sandbox\n' > /home/learner/answers/verdict.txt
+  solution:
+    explanation: |
+      The jumphost shell is in a container (its own cgroup root and namespaces under a container runtime),
+      the VM reports a hypervisor through systemd-detect-virt, and the sandbox runs on the VM's kernel with
+      different PID, mount, UTS, IPC and network namespace IDs from PID 1. There is no bare-metal host in this
+      environment, so the third category is the namespace-only sandbox.
+    steps:
+    - 'on': tr-who-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        P=$(cat /run/tr-sandbox.pid)
+        systemd-detect-virt; systemd-detect-virt --container || true
+        sudo readlink /proc/$P/ns/pid /proc/1/ns/pid
+        printf 'shell1=container\nshell2=vm\nshell3=namespace-sandbox\nvirt=%s\nsandbox-pidns=%s\n' "$(systemd-detect-virt)" "$(sudo readlink /proc/$P/ns/pid)" > /home/learner/answers/verdict.txt

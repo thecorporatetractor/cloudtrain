@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: systemd-run-slices
+  title: Run the analytics jobs in their own resource slice
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 15
+  tags:
+  - systemd
+  - cgroups
+  - slices
+  - systemd-run
+  version: 1
+spec:
+  description: |
+    Two analytics jobs run on **`tr-an-01`** (`ssh tr-an-01`; you have `sudo`) and compete with the
+    timetable services. Start both with `systemd-run` as transient services:
+
+    - **`tr-job-nightly`** running `/usr/local/bin/tr-analytics-job nightly`;
+    - **`tr-job-weekly`** running `/usr/local/bin/tr-analytics-job weekly`;
+
+    and put both in a dedicated slice **`tr-analytics.slice`**. The slice (not the individual
+    services) must have **`CPUWeight=200`** and **`MemoryHigh={{mhigh}}M`**. Confirm the values in the
+    cgroup hierarchy under `/sys/fs/cgroup`.
+  objectives:
+  - Start transient units in a named slice
+  - Set resource properties on a slice and read them back from the cgroup tree
+  params:
+    mhigh:
+      type: choice
+      values:
+      - '512'
+      - '384'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-an-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-an-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      for u in tr-job-nightly tr-job-weekly; do systemctl stop $u.service >/dev/null 2>&1 || true; systemctl reset-failed $u.service >/dev/null 2>&1 || true; done
+      systemctl stop tr-analytics.slice >/dev/null 2>&1 || true
+      rm -rf /etc/systemd/system/tr-analytics.slice /etc/systemd/system/tr-analytics.slice.d /etc/systemd/system.control/tr-analytics.slice.d /run/systemd/system.control/tr-analytics.slice.d
+      systemctl daemon-reload
+
+      cat > /usr/local/bin/tr-analytics-job <<'EOS'
+      #!/bin/sh
+      echo "analytics job $1 started"
+      exec sleep 100000
+      EOS
+      chmod 0755 /usr/local/bin/tr-analytics-job
+  checks:
+  - id: slice-weight
+    description: The slice cgroup has cpu.weight 200
+    type: shell
+    'on': tr-an-01
+    skills: &id001
+    - linux.internals.cgroups
+    - linux.systemd.unit-authoring
+    weight: 1.5
+    command: |
+      echo "cpu.weight=$(cat /sys/fs/cgroup/tr-analytics.slice/cpu.weight 2>/dev/null)"
+    expect:
+      match: exact
+      value: cpu.weight=200
+  - id: slice-high
+    description: The slice cgroup has memory.high of {{mhigh}} MiB
+    type: shell
+    'on': tr-an-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      v=$(cat /sys/fs/cgroup/tr-analytics.slice/memory.high 2>/dev/null); [ "$v" = "$(( {{mhigh}} * 1048576 ))" ] && echo ok || echo "memory.high=$v"
+    expect:
+      match: exact
+      value: ok
+  - id: both-in-slice
+    description: Both jobs are active inside the slice
+    type: shell
+    'on': tr-an-01
+    skills: *id001
+    weight: 2
+    command: |
+      n=0; for u in tr-job-nightly tr-job-weekly; do
+        [ "$(systemctl is-active $u.service)" = active ] && [ "$(systemctl show -P Slice $u.service)" = tr-analytics.slice ] && n=$((n+1))
+      done; echo "jobs=$n"
+    expect:
+      match: exact
+      value: jobs=2
+  - id: hierarchy
+    description: The jobs appear below the slice in the cgroup tree
+    type: shell
+    'on': tr-an-01
+    skills: *id001
+    weight: 1
+    command: |
+      [ -d /sys/fs/cgroup/tr-analytics.slice/tr-job-nightly.service ] && [ -d /sys/fs/cgroup/tr-analytics.slice/tr-job-weekly.service ] && echo nested || echo flat
+    expect:
+      match: exact
+      value: nested
+  hints:
+  - title: Where the properties go
+    body: CPUWeight and MemoryHigh on a slice are set with systemctl set-property tr-analytics.slice ...
+      or in a slice unit file.
+    cost: 0
+  - title: Verify
+    body: systemd-cgls /tr-analytics.slice and cat /sys/fs/cgroup/tr-analytics.slice/cpu.weight.
+    cost: 1
+  misconceptions:
+  - id: props-on-units
+    description: Passes the limits with -p, which sets them on each service instead of on the slice.
+    feedback: systemd-run -p applies to the transient service. Set CPUWeight and MemoryHigh on the slice
+      itself, for example with systemctl set-property tr-analytics.slice.
+    expectFail:
+    - slice-weight
+    - slice-high
+    mutation:
+      'on': tr-an-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo systemd-run -q --unit tr-job-nightly --slice tr-analytics.slice -p CPUWeight=200 -p MemoryHigh={{mhigh}}M /usr/local/bin/tr-analytics-job nightly
+        sudo systemd-run -q --unit tr-job-weekly --slice tr-analytics.slice -p CPUWeight=200 -p MemoryHigh={{mhigh}}M /usr/local/bin/tr-analytics-job weekly
+  - id: one-job-outside
+    description: Starts the weekly job without the slice.
+    feedback: Both jobs must be started with --slice tr-analytics.slice; otherwise the second runs in
+      system.slice.
+    expectFail:
+    - both-in-slice
+    - hierarchy
+    mutation:
+      'on': tr-an-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo systemd-run -q --unit tr-job-nightly --slice tr-analytics.slice /usr/local/bin/tr-analytics-job nightly
+        sudo systemd-run -q --unit tr-job-weekly /usr/local/bin/tr-analytics-job weekly
+        sudo systemctl set-property tr-analytics.slice CPUWeight=200 MemoryHigh={{mhigh}}M
+  solution:
+    explanation: |
+      --slice puts the transient units under tr-analytics.slice; resource properties set on the
+      slice with systemctl set-property apply to the slice cgroup and are shared by its members.
+    steps:
+    - 'on': tr-an-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo systemd-run -q --unit tr-job-nightly --slice tr-analytics.slice /usr/local/bin/tr-analytics-job nightly
+        sudo systemd-run -q --unit tr-job-weekly --slice tr-analytics.slice /usr/local/bin/tr-analytics-job weekly
+        sudo systemctl set-property tr-analytics.slice CPUWeight=200 MemoryHigh={{mhigh}}M
+        systemd-cgls /tr-analytics.slice --no-pager
+    alternatives:
+    - id: slice-unit-file
+      description: Define the slice in a unit file before starting the jobs.
+      steps:
+      - 'on': tr-an-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          printf '[Slice]\nCPUWeight=200\nMemoryHigh={{mhigh}}M\n' | sudo tee /etc/systemd/system/tr-analytics.slice >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemd-run -q --unit tr-job-nightly --slice tr-analytics.slice /usr/local/bin/tr-analytics-job nightly
+          sudo systemd-run -q --unit tr-job-weekly --slice tr-analytics.slice /usr/local/bin/tr-analytics-job weekly

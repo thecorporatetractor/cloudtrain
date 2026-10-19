@@ -1,0 +1,194 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: linux-namespaces-unshare
+  title: Build an isolated process with namespaces by hand
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - internals
+  - namespaces
+  - unshare
+  - nsenter
+  version: 1
+spec:
+  description: |
+    The platform team wants to understand what a container really is. On **`tr-ns-01`**
+    (`ssh tr-ns-01`; you have `sudo`) start a sandbox by hand, without any container runtime.
+
+    The sandbox is a single process, `sleep 4242`, that runs in its **own PID, mount, UTS and
+    network namespaces**:
+
+    - inside it the process is PID 1 and `/proc` shows only the sandbox's own processes;
+    - its hostname is **`{{name}}`** while the host's hostname is unchanged;
+    - it has no network interfaces other than `lo`.
+
+    Leave it running in the background, then write the PID of the `sleep` process **as seen from
+    the host** to **`/home/learner/answers/sandbox.pid`**. Use `nsenter` from the host to
+    look inside and prove the isolation.
+  objectives:
+  - Create PID, mount, UTS and network namespaces with unshare
+  - Enter a running namespace set with nsenter
+  params:
+    name:
+      type: choice
+      values:
+      - tt-sandbox
+      - tt-yard
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-ns-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-ns-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      pkill -f '^sleep 4242$' >/dev/null 2>&1 || true
+      install -d -o learner -g learner /home/learner/answers
+      rm -f /home/learner/answers/sandbox.pid
+      command -v unshare nsenter >/dev/null
+  checks:
+  - id: pid-one
+    description: The recorded PID is the sandbox process and it is PID 1 inside its PID namespace
+    type: shell
+    'on': tr-ns-01
+    skills: &id001
+    - linux.internals.namespaces
+    weight: 1.5
+    command: |
+      P=$(cat /home/learner/answers/sandbox.pid 2>/dev/null); [ -n "$P" ] && [ "$(tr '\0' ' ' < /proc/$P/cmdline 2>/dev/null)" = "sleep 4242 " ] || { echo "no-sandbox"; exit; }
+      echo "innerpid=$(awk '/^NSpid/{print $NF}' /proc/$P/status)"
+    expect:
+      match: exact
+      value: innerpid=1
+  - id: ns-set
+    description: The process has its own PID, mount, UTS and network namespaces
+    type: shell
+    'on': tr-ns-01
+    skills: *id001
+    weight: 2
+    command: |
+      P=$(cat /home/learner/answers/sandbox.pid 2>/dev/null); [ -d /proc/${P:-x} ] || { echo none; exit; }
+      o=""; for n in cgroup ipc mnt net pid uts; do [ "$(readlink /proc/$P/ns/$n)" != "$(readlink /proc/1/ns/$n)" ] && o="$o $n"; done
+      echo $o | tr ' ' '\n' | grep -E '^(mnt|net|pid|uts)$' | paste -sd' '
+    expect:
+      match: exact
+      value: mnt net pid uts
+  - id: uts-name
+    description: Its hostname is {{name}} and the host keeps its own
+    type: shell
+    'on': tr-ns-01
+    skills: *id001
+    weight: 1
+    command: |
+      P=$(cat /home/learner/answers/sandbox.pid 2>/dev/null); [ -d /proc/${P:-x} ] || { echo none; exit; }
+      in=$(nsenter -t $P -u hostname 2>/dev/null); [ "$in" = "{{name}}" ] && [ "$(hostname)" != "{{name}}" ] && echo named || echo "inside=$in"
+    expect:
+      match: exact
+      value: named
+  - id: net-empty
+    description: The sandbox sees only the loopback interface
+    type: shell
+    'on': tr-ns-01
+    skills: *id001
+    weight: 1
+    command: |
+      P=$(cat /home/learner/answers/sandbox.pid 2>/dev/null); [ -d /proc/${P:-x} ] || { echo none; exit; }
+      nsenter -t $P -n ip -o link 2>/dev/null | awk -F': ' '{print $2}' | paste -sd' '
+    expect:
+      match: exact
+      value: lo
+  - id: proc-private
+    description: /proc inside the sandbox lists only the sandbox processes
+    type: shell
+    'on': tr-ns-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      P=$(cat /home/learner/answers/sandbox.pid 2>/dev/null); [ -d /proc/${P:-x} ] || { echo none; exit; }
+      echo "procs=$(nsenter -t $P -p -m ls /proc 2>/dev/null | grep -c '^[0-9][0-9]*$')"
+    expect:
+      match: exact
+      value: procs=1
+  hints:
+  - title: Create the namespaces
+    body: unshare --pid --mount --uts --net --fork --mount-proc CMD. --fork is needed so that CMD becomes
+      PID 1 of the new PID namespace.
+    cost: 0
+  - title: Find the host PID
+    body: 'The process shows up in the host process table: pgrep -f "^sleep 4242$". nsenter -t PID -u
+      hostname shows the name inside.'
+    cost: 1
+  misconceptions:
+  - id: no-pidns
+    description: Forgets the PID namespace.
+    feedback: Without --pid (and --fork --mount-proc) the process still sees the host PIDs and has a host
+      PID number inside.
+    expectFail:
+    - pid-one
+    - ns-set
+    - proc-private
+    mutation:
+      'on': tr-ns-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo sh -c "setsid unshare --mount --uts --net --fork sh -c 'hostname {{name}}; exec sleep 4242' </dev/null >/dev/null 2>&1 &"
+        sleep 2; pgrep -f '^sleep 4242$' | head -1 > /home/learner/answers/sandbox.pid
+  - id: shared-net
+    description: Leaves the network namespace out.
+    feedback: Add --net so the sandbox gets its own empty network stack.
+    expectFail:
+    - ns-set
+    - net-empty
+    mutation:
+      'on': tr-ns-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo sh -c "setsid unshare --pid --mount --uts --fork --mount-proc sh -c 'hostname {{name}}; exec sleep 4242' </dev/null >/dev/null 2>&1 &"
+        sleep 2; pgrep -f '^sleep 4242$' | head -1 > /home/learner/answers/sandbox.pid
+  - id: host-name
+    description: Forgets to set the hostname inside the UTS namespace.
+    feedback: A new UTS namespace starts with a copy of the host name; set it from inside with hostname.
+    expectFail:
+    - uts-name
+    mutation:
+      'on': tr-ns-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo sh -c "setsid unshare --pid --mount --uts --net --fork --mount-proc sleep 4242 </dev/null >/dev/null 2>&1 &"
+        sleep 2; pgrep -f '^sleep 4242$' | head -1 > /home/learner/answers/sandbox.pid
+  solution:
+    explanation: |
+      unshare creates the namespaces and --fork makes the command a child so that it becomes PID 1 of
+      the new PID namespace; --mount-proc remounts /proc for it. The hostname is set from inside the
+      UTS namespace. The host PID comes from pgrep, and nsenter -t PID with -p -m -u -n enters the
+      individual namespaces.
+    steps:
+    - 'on': tr-ns-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo sh -c "setsid unshare --pid --mount --uts --net --fork --mount-proc sh -c 'hostname {{name}}; exec sleep 4242' </dev/null >/dev/null 2>&1 &"
+        sleep 2
+        pgrep -f '^sleep 4242$' | head -1 > /home/learner/answers/sandbox.pid
+        P=$(cat /home/learner/answers/sandbox.pid)
+        sudo nsenter -t $P -u hostname; sudo nsenter -t $P -n ip -o link; sudo nsenter -t $P -p -m ls /proc
