@@ -92,3 +92,32 @@ ufw state after `ufw --force reset`, firewalld zone XML parsing, authselect and 
 on el-vm 10, cgroup OOM on el-vm, chrony `makestep` against the Python NTP responder, `lvm2` and
 `xfsprogs` installed from the local mirror, `logrotate -d` return codes, netplan apply on a veth,
 `findmnt --verify` summary wording.
+
+## Update 2026-10-19 (waves 4 to 7 merged)
+
+| Wave | PR | Merge commit | Scope | Labs (all `built`) |
+|---|---|---|---|---|
+| 4 | #143 | merged earlier | networking on VMs | 23 |
+| 4 follow-ups | #219 | 155f206 | closes the review minors in `linux-r5-w4.md`; changed labs need a re-verify | 0 |
+| 5 | #217 | decd42f | storage, filesystems, NFS, EL running system (`linux-r5-w5.md`) | 23 |
+| 6 | #212 | 598bfde | container internals, performance, hardening, observability (`linux-r5-w6.md`) | 23 |
+| 7 | #218 | 2d40afd | boot, recovery, kernel, virt, blocked exam tasks, capstones (`linux-r5-w7.md`) | 21 |
+
+Waves 5 to 7 add 67 built labs, none run live. Exam pools: every pool of sim-el-sysadmin and sim-linux-sysadmin
+holds at least 2x its draw and both exams compile with and without `--allow-missing` (W7 report: sim-linux-sysadmin
+10/5, 8/4, 8/4, 6/3, 4/2; sim-el-sysadmin 6/3, 4/2, 2/1, 4/2, 6/3, 4/2, 4/2, 4/2, 4/2, 2/1).
+
+Image-blocked (written, setup fails until packages exist), details in the per-wave handoffs:
+iscsi-attach-volume (targetcli, iscsi-initiator-utils), samba-share-office (samba, smbclient), perf-cpu-flamegraph,
+bpftrace-who-opens, node-exporter-alert, openscap-scan-remediate, ssh-hardening-fail2ban (ban part), ldap-login-crew,
+xlf-ldap-user-login, flatpak-remote-install, xel-flatpak-remote, libvirt-test-vm, xlf-libvirt-autostart,
+libvirt-golden-template (clone proof). Console/reboot-blocked (end state graded over ssh): boot-target-default,
+grub-kernel-args, boot-slow-analysis, recover-root-password, recover-broken-fstab, kernel-panic-initramfs,
+xel-root-password-reset, xlf-recover-fstab-boot; journal-persistent-el previous-boot output. Partially blocked:
+cloud-init-new-depot-host (applies user-data in place; no nested virt).
+
+Verify queue for the testing round: all 67 wave 5 to 7 labs plus the 23 wave 4 labs and the labs changed by #219,
+by slot kind: el-vm:10 VMs (w5 13, w6 12, w7 mixed), ubuntu-vm:24.04 VMs (w5 7, w6 10), two-VM labs (nfs-*, rsyslog,
+fix-boot-mount-network), see the per-wave tables. Watch list: libvirt-golden-template removes ssh host keys on the
+lab VM and relies on the running sshd; confirm the el10 default `ipv6.method` for nmcli-bond-el; autofs on el10
+(nfs-autofs-home) now that libsss_autofs is in the image.
