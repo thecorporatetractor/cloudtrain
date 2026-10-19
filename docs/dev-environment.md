@@ -918,6 +918,20 @@ first when a lab passes locally and fails here.
    environment at load ~60 were clean. Check for it with
    `docker exec cloudtrain-dev-worker sh -c 'ps -eo etimes,args | grep "[/]opt/cni/bin/kube-ovn"'`.
 
+10. **Host AppArmor profiles confine binaries inside lab pods** (exam runs, 2026-10-19). kind
+    runs its nodes privileged, so lab pods are unconfined, and an AppArmor profile of the
+    *host* that attaches by executable path then also confines that binary inside a lab
+    container. On the Ubuntu verify VM, `/etc/apparmor.d/usr.sbin.rsyslogd` denied
+    `xnt-ntp-syslog-client`'s `/etc/rsyslog-server.conf` and `/proc/<pid>/fd/` (rsyslogd hung
+    while daemonizing; `dmesg` shows `apparmor="DENIED" profile="rsyslogd"`); chronyd and
+    tcpdump have path-attached profiles too. It never showed on WSL (no AppArmor). Production
+    nodes give containers the runtime's default profile, so only kind hosts are affected.
+    Fix: `tools/verify-vm/tune.sh` unloads exactly `usr.sbin.rsyslogd`, `usr.sbin.chronyd`
+    and `usr.bin.tcpdump` and links them into `/etc/apparmor.d/disable/` (idempotent; undo
+    with `sudo rm /etc/apparmor.d/disable/<file> && sudo apparmor_parser -r
+    /etc/apparmor.d/<file>`); `deploy/scripts/host-prep.sh` unloads the same three on native
+    Linux dev hosts (not persistent across a host reboot; a no-op without AppArmor).
+
 ## What changes for the vCenter target (nested ESXi / vSphere VMs)
 
 | Local (kind on WSL2) | vCenter production |

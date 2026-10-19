@@ -7,6 +7,22 @@ K="kubectl --context kind-cloudtrain-dev"
 mods=$(grep -vE '^\s*(#|$)' "${REPO:-/srv/ct-work/cloudtrain}/deploy/scripts/lab-kernel-modules.txt" 2>/dev/null || grep -vE '^\s*(#|$)' /etc/modules-load.d/cloudtrain-labs.conf 2>/dev/null || true)
 # shellcheck disable=SC2086
 [[ -n $mods ]] && { sudo -n modprobe -a $mods || echo "tune.sh: some lab kernel modules failed to load" >&2; }
+# Host AppArmor profiles attach by executable path. kind runs its nodes privileged, so lab pods
+# are unconfined and the host's profiles confine the same binaries INSIDE lab containers: the
+# rsyslogd profile denied a lab's config file and /proc/<pid>/fd, and rsyslogd hung while
+# daemonizing (docs/dev-environment.md, "Host AppArmor"). Unload exactly these three and keep
+# them disabled across boots; the host's own chrony/rsyslog keep running, unconfined.
+# Undo one: sudo rm /etc/apparmor.d/disable/<file> && sudo apparmor_parser -r /etc/apparmor.d/<file>
+if [[ -d /sys/kernel/security/apparmor ]]; then
+  for f in usr.sbin.rsyslogd usr.sbin.chronyd usr.bin.tcpdump; do
+    [[ -f /etc/apparmor.d/$f ]] || continue
+    [[ -L /etc/apparmor.d/disable/$f ]] || { sudo -n ln -s "/etc/apparmor.d/$f" "/etc/apparmor.d/disable/$f" && echo "tune.sh: AppArmor $f disabled at boot"; }
+    name=$(sed -nE 's/^profile ([^ ]+) .*/\1/p; s/^(\/[^ ]+) .*\{.*/\1/p' "/etc/apparmor.d/$f" | head -1)
+    if sudo -n awk -v n="$name" '$1 == n { f = 1 } END { exit !f }' /sys/kernel/security/apparmor/profiles; then
+      sudo -n apparmor_parser -R "/etc/apparmor.d/$f" && echo "tune.sh: AppArmor profile $name ($f) unloaded"
+    fi
+  done
+fi
 rl='{"restClient":{"rateLimiter":{"tokenBucketRateLimiter":{"qps":200,"burst":400}}}}'
 $K -n kubevirt patch kv kubevirt --type merge -p "{\"spec\":{\"configuration\":{\"controllerConfiguration\":$rl,\"handlerConfiguration\":$rl,\"webhookConfiguration\":$rl}}}"
 $K patch cdi cdi --type merge -p '{"spec":{"config":{"podResourceRequirements":{"limits":{"cpu":"2","memory":"2Gi"},"requests":{"cpu":"100m","memory":"60M"}}}}}'
