@@ -10,7 +10,8 @@ import (
 func TestCloudInitGraderAccess(t *testing.T) {
 	admin, _ := NewSSHKeyPair("admin")
 	learner, _ := NewSSHKeyPair("learner")
-	ud, err := cloudInit{Hostname: "h", LearnerPub: learner.Public, AdminPub: admin.Public, HostKey: admin,
+	host, _ := NewSSHKeyPair("root@h")
+	ud, err := cloudInit{Hostname: "h", LearnerPub: learner.Public, AdminPub: admin.Public, HostKey: host,
 		Hosts: []PlannedHost{{Name: "h", IP: "192.168.100.10"}}}.Render()
 	if err != nil {
 		t.Fatal(err)
@@ -25,8 +26,17 @@ func TestCloudInitGraderAccess(t *testing.T) {
 	for _, f := range doc.WriteFiles {
 		files[f.Path] = f.Content
 	}
-	if !strings.Contains(files[GraderDropIn], "Include "+GraderMatch+"\n") || strings.Contains(files[GraderDropIn], "Match") {
-		t.Errorf("drop-in must only include the Match file: %q", files[GraderDropIn])
+	var global []string
+	for _, l := range strings.Split(files[GraderDropIn], "\n") {
+		if l != "" && !strings.HasPrefix(l, "#") {
+			global = append(global, l)
+		}
+	}
+	if strings.Join(global, "|") != "HostKey /etc/ssh/ssh_host_ed25519_key|HostKey "+GraderHostKey+"|Include "+GraderMatch {
+		t.Errorf("drop-in must only pin the host key and include the Match file: %q", global)
+	}
+	if files[GraderHostKey] != string(host.Private) || files[GraderHostKey+".pub"] != strings.TrimSpace(string(host.Public))+"\n" {
+		t.Error("the platform host key copy must be the pinned host key")
 	}
 	m := files[GraderMatch]
 	for _, want := range []string{"Match User root Address " + EntryIP + "\n", "\tPermitRootLogin prohibit-password\n",

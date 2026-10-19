@@ -271,7 +271,7 @@ func (c cloudInit) Render() ([]byte, error) {
 		{Path: "/etc/hosts", Content: hosts.String()},
 		{Path: "/root/.ssh/authorized_keys", Content: string(c.AdminPub), Permissions: "0600"},
 	}
-	files = append(files, graderAccessFiles(c.AdminPub)...)
+	files = append(files, graderAccessFiles(c.AdminPub, c.HostKey)...)
 	files = append(files, c.Files...)
 	runcmd := []any{[]any{"bash", "-c", "date +%s.%N > /var/log/cloudtrain-boot.ts"}}
 	for _, r := range c.RunCmd {

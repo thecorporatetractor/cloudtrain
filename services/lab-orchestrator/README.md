@@ -60,14 +60,18 @@ the entry node's admin sidecar. So that hardening labs (`PermitRootLogin no`,
 out, cloud-init installs `/etc/ssh/sshd_config.d/00-cloudtrain-grader.conf`, which
 only includes `/etc/ssh/cloudtrain/grader.conf`: a `Match User root Address
 192.168.99.5` block that allows root with the admin key from
-`/etc/ssh/cloudtrain/grader_keys` (not root's `authorized_keys`). sshd ends a Match
-block at the end of its file, so nothing else changes: `sshd -T` (the global
+`/etc/ssh/cloudtrain/grader_keys` (not root's `authorized_keys`). The drop-in also
+sets `HostKey` to the default ed25519 key and a platform copy of it
+(`/etc/ssh/cloudtrain/ssh_host_ed25519_key`), so a lab that removes
+`/etc/ssh/ssh_host_*` (golden-image prep) keeps the host reachable under the same,
+pinned identity; RSA/ECDSA host keys are no longer offered. sshd ends a Match
+block at the end of its file, so apart from `HostKey` nothing changes: `sshd -T` (the global
 configuration checks grade) is unaffected, and a root login from 127.0.0.1, from
 another host or with another key follows the learner's policy. Lab authors:
 
 - grade sshd with `sshd -T`, and probe "root is refused" from the host itself
   (`ssh ... root@127.0.0.1` with a probe key), never from the workstation;
-- setup steps must not delete the two files (`rm sshd_config.d/00-*` does);
+- setup steps must not delete these files (`rm sshd_config.d/00-*` would);
 - tell learners in hardening descriptions to keep the file. If the grader's ssh
   login fails (refused or unreachable), every check on that host fails with
   "the grader could not log in to this host ..." whatever its expect is.

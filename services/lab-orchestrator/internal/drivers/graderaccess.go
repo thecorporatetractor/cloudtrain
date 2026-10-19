@@ -14,7 +14,7 @@ import (
 // that keeps exactly one login working whatever the learner's global
 // policy says: root, from the entry node's address, with the platform's
 // admin key (a key file only the platform writes, not root's
-// authorized_keys). It changes nothing else: `sshd -T` (the global,
+// authorized_keys). Apart from HostKey (below) it changes nothing: `sshd -T` (the global,
 // effective configuration that checks grade) is unaffected, a root login
 // from anywhere else (127.0.0.1 probes, other hosts) or with any other key
 // still follows the learner's policy.
@@ -26,16 +26,28 @@ import (
 // drop-ins, and compliance scanners and their remediation scripts (which
 // read and rewrite sshd_config and sshd_config.d/*.conf) do not see or
 // delete the root exception.
+//
+// The drop-in also pins the host key: the default ed25519 key and a platform
+// copy of it under /etc/ssh/cloudtrain (both the key the session's known_hosts
+// pins). Labs that remove /etc/ssh/ssh_host_* (golden-image prep) otherwise
+// make sshd reset every new connection; the copy keeps the same identity. It
+// is the only global setting: HostKey lists only ed25519, so the RSA/ECDSA keys
+// an EL image generates are no longer offered (nothing pins them).
 const (
 	GraderDropIn  = "/etc/ssh/sshd_config.d/00-cloudtrain-grader.conf"
 	GraderMatch   = "/etc/ssh/cloudtrain/grader.conf"
 	GraderKeyFile = "/etc/ssh/cloudtrain/grader_keys"
+	GraderHostKey = "/etc/ssh/cloudtrain/ssh_host_ed25519_key"
 )
 
 const graderDropIn = `# CloudTrain platform management access. Keep this file and ` + GraderMatch + `:
 # the platform grades this host by logging in as root from the lab workstation
 # (` + EntryIP + `) with its own key, and only that login is exempt from this host's
 # sshd policy. Removing them locks the grader out and every check fails.
+# The second HostKey is a platform copy of this host's ed25519 key, so the host
+# keeps its SSH identity if /etc/ssh/ssh_host_* are removed.
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey ` + GraderHostKey + `
 Include ` + GraderMatch + `
 `
 
@@ -63,8 +75,10 @@ Match User root Address ` + EntryIP + `
 `
 
 // graderAccessFiles are the cloud-init write_files entries for grader access.
-func graderAccessFiles(adminPub []byte) []cloudInitFile {
+func graderAccessFiles(adminPub []byte, hostKey SSHKeyPair) []cloudInitFile {
 	return []cloudInitFile{
+		{Path: GraderHostKey, Content: string(hostKey.Private), Permissions: "0600"},
+		{Path: GraderHostKey + ".pub", Content: strings.TrimSpace(string(hostKey.Public)) + "\n", Permissions: "0644"},
 		{Path: GraderDropIn, Content: graderDropIn, Permissions: "0644"},
 		{Path: GraderMatch, Content: graderMatch, Permissions: "0644"},
 		{Path: GraderKeyFile, Content: strings.TrimSpace(string(adminPub)) + "\n", Permissions: "0644"},
