@@ -15,10 +15,11 @@ spec:
 
     The timetable re-index job **`/usr/local/bin/tr-reindex`** must not slow down
     the booking system. Start it **as user `{{user}}`** with a **niceness of
-    {{nice}}**, in the background, so that it **keeps running after you log out**.
-    Exactly one instance must run.
+    {{nice}}**, in the background, so that it **keeps running after you log out** and
+    **starts again the same way after a reboot**. Exactly one instance must run.
   objectives:
     - Start a process with a chosen niceness as another user
+    - Keep a background job running across logout and reboot
   params:
     user:
       type: choice
@@ -73,18 +74,22 @@ spec:
         as: learner
         run: sudo -u {{user}} sh -c 'nohup nice /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
   solution:
-    explanation: nice -n sets the niceness at start, nohup and & keep it running in the background after logout.
+    explanation: A systemd service with User= and Nice= starts the job at the requested niceness now (enable --now) and at every boot, independent of any login session. nohup nice -n alone survives the logout but not a reboot.
     steps:
       - on: tr-el-01
         as: learner
-        run: sudo -u {{user}} sh -c 'nohup nice -n {{nice}} /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
+        run: |
+          set -e
+          printf '%s\n' '[Unit]' 'Description=Timetable re-index' '[Service]' 'User={{user}}' 'Nice={{nice}}' 'ExecStart=/usr/local/bin/tr-reindex' '[Install]' 'WantedBy=multi-user.target' \
+            | sudo tee /etc/systemd/system/tr-reindex.service >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now tr-reindex.service
     alternatives:
-      - id: renice
-        description: Start it normally, then renice the running process.
+      - id: cron-reboot
+        description: Start it now with nohup nice -n and add an @reboot entry to the user's crontab.
         steps:
           - on: tr-el-01
             as: learner
             run: |
-              sudo -u {{user}} sh -c 'nohup /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
-              sleep 1
-              sudo renice -n {{nice}} -p $(pgrep -x tr-reindex)
+              sudo -u {{user}} sh -c 'nohup nice -n {{nice}} /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
+              echo '@reboot nice -n {{nice}} /usr/local/bin/tr-reindex >/dev/null 2>&1' | sudo crontab -u {{user}} -

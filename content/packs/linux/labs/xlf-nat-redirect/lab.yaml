@@ -115,16 +115,17 @@ spec:
           sudo nft add rule ip trnat prerouting tcp dport {{pport}} redirect to :{{bport}}
           sudo sysctl -q -w net.ipv4.ip_forward=1
   solution:
-    explanation: An nftables nat table with a prerouting redirect, saved in /etc/nftables.conf with nftables.service enabled, plus ip_forward=1 in a sysctl.d file.
+    explanation: An nftables nat table with a prerouting redirect, saved in /etc/nftables.conf with nftables.service enabled, plus ip_forward=1 in a sysctl.d file. Load only the new table now; `nft -f /etc/nftables.conf` starts with `flush ruleset` and would drop every other live rule, such as podman's port forwards.
     steps:
       - on: tr-ops-01
         as: learner
         run: |
           set -e
-          printf '%s\n' '' 'table ip trnat {' '  chain prerouting {' '    type nat hook prerouting priority dstnat; policy accept;' '    tcp dport {{pport}} redirect to :{{bport}}' '  }' '}' | sudo tee -a /etc/nftables.conf >/dev/null
+          t=$(printf '%s\n' 'table ip trnat {' '  chain prerouting {' '    type nat hook prerouting priority dstnat; policy accept;' '    tcp dport {{pport}} redirect to :{{bport}}' '  }' '}')
+          printf '\n%s\n' "$t" | sudo tee -a /etc/nftables.conf >/dev/null
           sudo nft -c -f /etc/nftables.conf
           sudo systemctl enable nftables
           sudo nft list table ip trnat >/dev/null 2>&1 && sudo nft delete table ip trnat || true
-          sudo nft -f /etc/nftables.conf
+          printf '%s\n' "$t" | sudo nft -f -
           echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/60-forwarding.conf >/dev/null
           sudo sysctl -q -p /etc/sysctl.d/60-forwarding.conf
