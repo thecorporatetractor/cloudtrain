@@ -10,6 +10,8 @@
 #     that node), and capacity tracking makes the scheduler put WaitForFirstConsumer Pods on
 #     the node that runs the plugin
 #   - StorageClass "csi-hostpath" (not the default class; allowVolumeExpansion)
+#   - sidecars unprivileged (upstream makes them privileged for SELinux hosts only); the
+#     driver container itself must be privileged (Bidirectional mount propagation, /dev)
 # All images are preloaded (tools/images/lock/addons.lock).
 apiVersion: v1
 kind: ServiceAccount
@@ -153,6 +155,10 @@ roleRef:
   name: csi-hostpath-cfg
   apiGroup: rbac.authorization.k8s.io
 ---
+# Accepted for a CSI node driver (lab clusters only): the driver container is privileged and
+# writes to its root filesystem, mounts /dev and the kubelet directories with Bidirectional
+# propagation, and runs as root.
+# (Trivy: path-scoped entries in .github/iac/trivyignore.yaml)
 kind: StatefulSet
 apiVersion: apps/v1
 metadata:
@@ -211,7 +217,8 @@ spec:
             - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-hostpath/csi.sock
             - --http-endpoint=:9809
           securityContext:
-            privileged: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
           env:
             - name: KUBE_NODE_NAME
               valueFrom:
@@ -231,6 +238,9 @@ spec:
         - name: liveness-probe
           image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
           args: [--csi-address=/csi/csi.sock, --health-port=9898]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
           volumeMounts:
             - {mountPath: /csi, name: socket-dir}
         - name: csi-provisioner
@@ -249,14 +259,16 @@ spec:
               valueFrom:
                 fieldRef: {fieldPath: metadata.name}
           securityContext:
-            privileged: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
           volumeMounts:
             - {mountPath: /csi, name: socket-dir}
         - name: csi-resizer
           image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
           args: [--v=2, --csi-address=/csi/csi.sock]
           securityContext:
-            privileged: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
           volumeMounts:
             - {mountPath: /csi, name: socket-dir}
       volumes:
