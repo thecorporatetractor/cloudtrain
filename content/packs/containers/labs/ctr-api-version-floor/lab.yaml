@@ -70,6 +70,20 @@ spec:
         echo "deploy ok api=$DOCKER_API_VERSION"
         SH
         chmod 755 /srv/ci/deploy.sh
+        sha256sum /srv/ci/deploy.sh > /var/lib/cloudtrain/deploy.sha256
+        # grading helper: prints the pin from deploy.env, but only if the file holds nothing
+        # except comments and a DOCKER_API_VERSION assignment (no functions, aliases, PATH, ...)
+        cat > /var/lib/cloudtrain/envpin.sh <<'SH'
+        #!/bin/sh
+        export LC_ALL=C
+        f=/etc/copperleaf/ci/deploy.env
+        [ -f "$f" ] || exit 1
+        grep -aEv '^[[:space:]]*(#.*)?$|^[[:space:]]*(export[[:space:]]+)?DOCKER_API_VERSION=["'"'"']?[0-9.]*["'"'"']?[[:space:]]*(#.*)?$' "$f" | grep -aq . && exit 1
+        v=$(grep -aE '^[[:space:]]*(export[[:space:]]+)?DOCKER_API_VERSION=' "$f" | tail -1 | sed 's/^[^=]*=//; s/[[:space:]]*#.*$//' | tr -d '"'"'"'[:space:]')
+        [ -n "$v" ] || exit 1
+        printf '%s\n' "$v"
+        SH
+        chmod 700 /var/lib/cloudtrain/envpin.sh
         docker rm -f deploy-canary >/dev/null 2>&1 || true
   checks:
     - id: deploy-passes
@@ -80,8 +94,19 @@ spec:
       skills: [containers.operations.engine-upgrade]
       weight: 3
       command: |
-        out=$(su -s /bin/sh learner -c /srv/ci/deploy.sh 2>&1 | tail -1)
-        echo "${out% api=*}"
+        # Run the CI job ourselves, as root, with a clean environment and the pin taken from a
+        # filtered copy of deploy.env: a docker() stub, alias or PATH override in deploy.env
+        # never runs. Then read the result back from the engine.
+        D=/usr/bin/docker
+        pin=$(/var/lib/cloudtrain/envpin.sh) || { echo "refused: deploy.env may only set DOCKER_API_VERSION"; exit 0; }
+        (cd /srv/ci && sha256sum -c --status /var/lib/cloudtrain/deploy.sha256) || { echo "refused: deploy.sh was modified"; exit 0; }
+        t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+        printf 'DOCKER_API_VERSION=%s\n' "$pin" > "$t/deploy.env"
+        sed "s#/etc/copperleaf/ci/deploy.env#$t/deploy.env#" /srv/ci/deploy.sh > "$t/deploy.sh"
+        out=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root /bin/sh "$t/deploy.sh" 2>&1 | tail -1)
+        [ "${out% api=*}" = "deploy ok" ] || { echo "$out"; exit 0; }
+        st=$(env -i $D inspect -f '{{.State.Running}} {{.Config.Image}}' deploy-canary 2>/dev/null)
+        [ "$st" = "true nginx:1.29-alpine" ] && echo "deploy ok" || echo "no running canary: $st"
       expect: {match: exact, value: deploy ok}
     - id: canary-answers
       description: The canary answers on the published port
@@ -91,7 +116,14 @@ spec:
       skills: [containers.operations.engine-upgrade]
       weight: 1
       command: |
-        r=000; for i in $(seq 15); do r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:{{canary}}/ 2>/dev/null || true); [ "$r" = 200 ] && break; sleep 1; done; echo "$r"
+        # the answer must come from the engine's own canary container, not any listener
+        D=/usr/bin/docker
+        /var/lib/cloudtrain/envpin.sh >/dev/null || { echo refused; exit 0; }
+        [ "$(env -i $D inspect -f '{{.State.Running}} {{.Config.Image}}' deploy-canary 2>/dev/null)" = "true nginx:1.29-alpine" ] || { echo no-canary; exit 0; }
+        env -i $D port deploy-canary 80/tcp 2>/dev/null | grep -qx '127.0.0.1:{{canary}}' || { echo wrong-port; exit 0; }
+        r=000; for i in $(seq 15); do r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:{{canary}}/ 2>/dev/null || true); [ "$r" = 200 ] && break; sleep 1; done
+        curl -sI --max-time 3 http://127.0.0.1:{{canary}}/ 2>/dev/null | grep -aiq '^server: nginx' || r=not-nginx
+        echo "$r"
       expect: {match: exact, value: "200"}
     - id: pin-in-range
       description: The pinned client version is within the engine's original supported range
@@ -101,10 +133,10 @@ spec:
       skills: [containers.operations.engine-upgrade]
       weight: 2
       command: |
-        # read the pin the way deploy.sh gets it: by sourcing deploy.env as the learner
-        v=$(env -u DOCKER_API_VERSION su -s /bin/sh learner -c '. /etc/copperleaf/ci/deploy.env >/dev/null 2>&1; printf %s "${DOCKER_API_VERSION-}"' 2>/dev/null)
+        # the pin, read from deploy.env only if it holds nothing but that assignment
+        v=$(/var/lib/cloudtrain/envpin.sh 2>/dev/null || true)
         min=$(cat /var/lib/cloudtrain/min.version)
-        max=$(docker version --format json | jq -r '.Server.ApiVersion')
+        max=$(env -i /usr/bin/docker version --format json | jq -r '.Server.ApiVersion')
         awk -v v="$v" -v a="$min" -v b="$max" 'BEGIN { split(v, x, "."); split(a, y, "."); split(b, z, ".");
           if (v ~ /^1\.[0-9]+$/ && x[2] + 0 >= y[2] + 0 && x[2] + 0 <= z[2] + 0) print "in-range"; else print "out-of-range" }'
       expect: {match: exact, value: in-range}
@@ -116,7 +148,7 @@ spec:
       skills: [containers.operations.engine-upgrade]
       weight: 2
       command: |
-        [ "$(docker version --format json | jq -r '.Server.MinAPIVersion')" = "$(cat /var/lib/cloudtrain/min.version)" ] && echo unchanged || echo lowered
+        [ "$(env -i /usr/bin/docker version --format json | jq -r '.Server.MinAPIVersion')" = "$(cat /var/lib/cloudtrain/min.version)" ] && echo unchanged || echo lowered
       expect: {match: exact, value: unchanged}
   hints:
     - title: The error names the floor
@@ -153,6 +185,31 @@ spec:
         on: cl-ci-01
         as: learner
         run: echo 'DOCKER_API_VERSION=1.99' > /etc/copperleaf/ci/deploy.env
+    - id: stub-docker
+      description: Defines a docker() shell function in deploy.env so deploy.sh "succeeds" without touching the engine.
+      feedback: "A stub function fakes the deploy. The canary must really run on the engine; fix the pin and leave deploy.env as plain settings."
+      expectFail: [deploy-passes, canary-answers, pin-in-range]
+      mutation:
+        on: cl-ci-01
+        as: learner
+        run: |
+          v=$(docker version --format json | jq -r '.Server.ApiVersion')
+          printf 'DOCKER_API_VERSION=%s\ndocker() { return 0; }\n' "$v" > /etc/copperleaf/ci/deploy.env
+          /srv/ci/deploy.sh
+    - id: fake-docker-path
+      description: Overrides PATH in deploy.env so deploy.sh runs a fake docker binary.
+      feedback: "A fake docker binary on PATH fakes the deploy. The canary must really run on the engine; fix the pin and leave PATH alone."
+      expectFail: [deploy-passes, canary-answers, pin-in-range]
+      mutation:
+        on: cl-ci-01
+        as: learner
+        run: |
+          v=$(docker version --format json | jq -r '.Server.ApiVersion')
+          mkdir -p "$HOME/fakebin"
+          printf '#!/bin/sh\nexit 0\n' > "$HOME/fakebin/docker"
+          chmod +x "$HOME/fakebin/docker"
+          printf 'DOCKER_API_VERSION=%s\nPATH=%s/fakebin:$PATH\n' "$v" "$HOME" > /etc/copperleaf/ci/deploy.env
+          /srv/ci/deploy.sh
   solution:
     explanation: |
       `docker version` shows the engine's supported API range. The pin in deploy.env is
