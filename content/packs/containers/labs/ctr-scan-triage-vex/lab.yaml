@@ -60,9 +60,13 @@ spec:
         set -eu
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
-        install -d /srv/scan-db
+        # the offline Trivy DB baked into docker-vm:29 (/var/lib/trivy), copied to a cache dir the
+        # learner owns (trivy opens the DB read-write and writes its scan cache next to it)
+        test -s /var/lib/trivy/db/trivy.db || { echo "this lab needs the offline trivy database in /var/lib/trivy (docker-vm:29 rebuild of 2026-10-19)" >&2; exit 1; }
+        rm -rf /srv/scan-db; install -d -o learner -g learner /srv/scan-db
+        cp -a /var/lib/trivy/db /srv/scan-db/db
         echo "copperleaf/pybase:1.1" > /srv/scan-db/fixed-base.txt
-        chmod 0644 /srv/scan-db/fixed-base.txt
+        chown -R learner:learner /srv/scan-db; chmod 0644 /srv/scan-db/fixed-base.txt
         d=$(mktemp -d)
         for v in 1.0 1.1; do
           printf '%s\n' 'FROM alpine:3.22' "RUN echo '$v' > /etc/pybase-release" > "$d/Dockerfile"
@@ -154,7 +158,7 @@ spec:
         run: |
           trivy image --skip-db-update --cache-dir /srv/scan-db --format json -o ~/scan-before.json catalogue-api:{{rel}}
           cd ~/catalogue-api
-          sed -i "s/^FROM .*/FROM $(cat /srv/scan-db/fixed-base.txt)/" Dockerfile
+          sed -i "s#^FROM .*#FROM $(cat /srv/scan-db/fixed-base.txt)#" Dockerfile
           docker build -q -t catalogue-api:{{rel}} .
           jq -n --arg c "CVE-2024-{{cve}}" '{"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:catalogue-api", "author": "copperleaf-security", "timestamp": "2026-01-01T00:00:00Z",
             "statements": [{"vulnerability": {"name": $c}, "products": [{"@id": "pkg:oci/catalogue-api@{{rel}}?repository_url=registry.copperleaf.example:5000", "subcomponents": []}], "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}' > ~/catalogue-api.vex.json

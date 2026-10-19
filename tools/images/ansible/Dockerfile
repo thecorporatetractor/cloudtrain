@@ -5,13 +5,18 @@
 #
 # Contents: ansible-core, ansible-navigator (execution environments disabled by the labs:
 # there is no container engine in the pod), ansible-lint, Molecule, ansible-builder (via
-# navigator), yamllint, the mirrored collections in /usr/share/ansible/collections, sshpass
+# navigator), yamllint, ansible-rulebook (Event-Driven Ansible) with OpenJDK 17 (JRE,
+# headless; the Drools rule engine runs in it), the mirrored collections in
+# /usr/share/ansible/collections (incl. ansible.eda and fedora.linux_system_roles), sshpass
 # (password bootstrap labs), git, vim and nano. Grading helper: ct-ansible. Lab network
 # helper (root, setup only): ct-fleet-net.
 #
 # Licences: ansible-core is GPL-3.0-or-later and runs here as a separate program (CloudTrain
 # code does not link it); its licence text ships in the venv's dist-info and under
-# /usr/share/doc/ansible-core. See docs/handoffs/automation.md "Licence gate".
+# /usr/share/doc/ansible-core. ansible-rulebook and drools_jpy are Apache-2.0; OpenJDK is
+# GPL-2.0 with the Classpath Exception, a separate program from the Ubuntu archive (licence
+# in /usr/share/doc/openjdk-17-jre-headless/copyright). See docs/handoffs/automation.md
+# "Licence gate".
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 ARG UBUNTU_APT_SNAPSHOT
 ARG ANSIBLE_CORE_VERSION
@@ -25,7 +30,11 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends --snapshot "$UBUNTU_APT_SNAPSHOT" \
       python3 python3-venv openssh-client sshpass git bash-completion vim nano less curl jq tree \
       make rsync tar gzip bzip2 unzip file iproute2 iputils-ping dnsutils netcat-openbsd tmux \
- && rm -rf /var/lib/apt/lists/*
+      openjdk-17-jre-headless \
+ && rm -rf /var/lib/apt/lists/* \
+ && test -x /usr/lib/jvm/java-17-openjdk-amd64/bin/java
+# ansible-rulebook finds the JVM (libjvm for drools_jpy) through JAVA_HOME.
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
 # Python tools in one venv, wheels only, every file hash-checked (pip --require-hashes).
 COPY requirements.lock /opt/ansible/requirements.lock
@@ -37,11 +46,12 @@ RUN python3 -m venv /opt/ansible \
  && /opt/ansible/bin/pip check \
  && for b in ansible ansible-config ansible-console ansible-doc ansible-galaxy ansible-inventory \
              ansible-playbook ansible-pull ansible-vault ansible-test ansible-navigator \
-             ansible-builder ansible-runner yamllint; do ln -s "/opt/ansible/bin/$b" "/usr/local/bin/$b"; done \
+             ansible-builder ansible-runner ansible-rulebook yamllint; do ln -s "/opt/ansible/bin/$b" "/usr/local/bin/$b"; done \
  && for b in ansible-lint molecule; do rm -f "/usr/local/bin/$b"; \
       printf '#!/bin/sh\n# venv tool: run it with the venv first on PATH (it warns otherwise)\nPATH=/opt/ansible/bin:$PATH exec /opt/ansible/bin/%s "$@"\n' "$b" > "/usr/local/bin/$b"; \
       chmod 0755 "/usr/local/bin/$b"; done \
  && test "$(ansible --version | head -1)" = "ansible [core ${ANSIBLE_CORE_VERSION}]" \
+ && ansible-rulebook --version \
  && install -d /usr/share/doc/ansible-core \
  && cp /opt/ansible/lib/python3*/site-packages/ansible_core-*.dist-info/licenses/COPYING /usr/share/doc/ansible-core/COPYING
 
