@@ -68,6 +68,54 @@ image_fqn() {
   else echo "docker.io/$ref"; fi
 }
 
+# IMAGE_SOURCE=local (default) loads lab images from the local Docker store (`kind load`,
+# built by tools/images/build*.sh). IMAGE_SOURCE=ghcr pulls the publishable ones from the
+# registry CI publishes them to instead (.github/workflows/images.yml and vm-images.yml),
+# inside each node's containerd, and tags them with the catalog name, so the catalog and
+# the orchestrator stay unchanged. Images CI does not publish (Terraform, upstream
+# images) still come from the local store. GHCR_REGISTRY (default
+# ghcr.io/thecorporatetractor/cloudtrain), GHCR_TAG (default main; a sha-<commit>, a
+# catalog tag or a sha256:<digest> to pin) and, for a private registry, GHCR_USER +
+# GHCR_TOKEN (read:packages) tune it. See docs/deploy.md, "Dev clusters: pull from GHCR".
+image_source() {
+  case ${IMAGE_SOURCE:-local} in local|ghcr) echo "${IMAGE_SOURCE:-local}" ;;
+    *) die "IMAGE_SOURCE must be local or ghcr (got '$IMAGE_SOURCE')" ;; esac
+}
+
+# ghcr_publish_name <image>: the GHCR package name of a catalog image (or overlay entry)
+# that CI publishes; fails for images it does not.
+ghcr_publish_name() {
+  local n
+  n=$(IMG=$1 yq ea -r '[.images[] | select(.image == strenv(IMG) and .publishable == true)] | .[0] // {} |
+      (.publishName // (.image // "" | sub(":[^:/]*$"; "") | sub(".*/"; "")))' \
+    "$REPO_ROOT/deploy/images/catalog.yaml" "$REPO_ROOT"/deploy/images/overlays/*.yaml) || return 1
+  [[ -n $n && $n != null ]] || return 1
+  echo "$n"
+}
+
+# use_ghcr <image>: true when IMAGE_SOURCE=ghcr and CI publishes the image.
+use_ghcr() { [[ $(image_source) == ghcr ]] && ghcr_publish_name "$1" >/dev/null 2>&1; }
+
+# ghcr_pull_image <image> <node...>: pull the published image inside each kind node's
+# containerd (this node's platform only, as load_workloads does) and tag it with the
+# catalog name `image`.
+ghcr_pull_image() {
+  local img=$1 name ref src tag node arch fqn; shift
+  name=$(ghcr_publish_name "$img") || die "$img is not published by CI"
+  ref="${GHCR_REGISTRY:-ghcr.io/thecorporatetractor/cloudtrain}/$name"; tag=${GHCR_TAG:-main}
+  if [[ $tag == sha256:* ]]; then src="$ref@$tag"; else src="$ref:$tag"; fi
+  fqn=$(image_fqn "$img")
+  for node in "$@"; do
+    arch=$(node_arch "$node")
+    log "pulling $src into $node (as $img)"
+    docker exec "$node" ctr -n k8s.io images pull --hosts-dir /etc/containerd/certs.d --platform "linux/$arch" \
+        ${GHCR_TOKEN:+--user "${GHCR_USER:?GHCR_USER is required with GHCR_TOKEN}:$GHCR_TOKEN"} "$src" >/dev/null \
+      || die "pull $src on $node failed (is the package public, or GHCR_USER/GHCR_TOKEN set?)"
+    docker exec "$node" ctr -n k8s.io images tag --force "$src" "$fqn" >/dev/null
+    docker exec "$node" ctr -n k8s.io images label "$fqn" io.cri-containerd.image=managed >/dev/null
+  done
+}
+
 # node_has_image <node> <image> [image-id]: by name via crictl, falling back to ctr. With an
 # image id, the node's containerd index digest must match it as well.
 node_has_image() {

@@ -318,7 +318,11 @@ fi
 
 # --- 4. containerDisk -----------------------------------------------------------
 log "packaging containerDisk $TAG"
+# OCI_IMAGE_SOURCE / OCI_IMAGE_REVISION (CI) add the source and revision labels; GHCR links
+# the package to the repository through the source label.
 docker build -q -t "$TAG" -f "$HERE/containerdisk/Dockerfile" \
+  ${OCI_IMAGE_SOURCE:+--label "org.opencontainers.image.source=$OCI_IMAGE_SOURCE"} \
+  ${OCI_IMAGE_REVISION:+--label "org.opencontainers.image.revision=$OCI_IMAGE_REVISION"} \
   --label "org.opencontainers.image.version=${TAG##*:}" \
   --label "dev.cloudtrain.catalog-ref=${REF}" \
   --label "dev.cloudtrain.base=${BASE_LABEL}" "$WORK/out" >/dev/null

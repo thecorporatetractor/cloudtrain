@@ -8,7 +8,8 @@
 # alias refs during development without editing the shared catalog).
 # LOAD_LAB_IMAGES=1 (default) also loads every catalog image and workload image
 # that exists in the local Docker into the kind nodes (containerDisks only where
-# KVM is).
+# KVM is). IMAGE_SOURCE=ghcr pulls the catalog images CI publishes from GHCR into the
+# nodes instead (GHCR_TAG=main|sha-<commit>|sha256:..., docs/deploy.md); default: local.
 source "$(dirname "$0")/lib.sh"
 for t in kubectl docker kind jq yq; do need "$t"; done
 cluster_exists || die "kind cluster $CLUSTER_NAME not found (run: task dev:up)"
@@ -42,6 +43,10 @@ if [[ ${LOAD_LAB_IMAGES:-1} == 1 ]]; then
   mapfile -t VM_NODES < <(k get nodes -o json | jq -r '.items[] | select((.status.allocatable["devices.kubevirt.io/kvm"] // "0") != "0") | .metadata.name')
   merged=$(yq ea '. as $i ireduce ({}; . * $i)' "$CATALOG" ${CATALOG_OVERLAY:+"$CATALOG_OVERLAY"} -o json)
   while IFS=$'\t' read -r kind image; do
+    if use_ghcr "$image"; then # IMAGE_SOURCE=ghcr: the nodes pull what CI published
+      if [[ $kind == containerDisk ]]; then ghcr_pull_image "$image" "${VM_NODES[@]}"; else ghcr_pull_image "$image" "${ALL_NODES[@]}"; fi
+      continue
+    fi
     docker image inspect "$image" >/dev/null 2>&1 || { warn "catalog image $image not in local Docker; skipping"; continue; }
     if [[ $kind == containerDisk ]]; then load_image "$image" "${VM_NODES[@]}"; else load_image "$image" "${ALL_NODES[@]}"; fi
   done < <(jq -r '.images[] | [.kind, .image] | @tsv' <<<"$merged" | sort -u)

@@ -12,8 +12,11 @@
 #                                                the host nodes
 #
 # Idempotent: an image already on a node with the same digest is skipped.
+# IMAGE_SOURCE=ghcr pulls the images CI publishes from GHCR instead of the local Docker
+# store (lib.sh, docs/deploy.md); the default, local, is unchanged.
 source "$(dirname "$0")/../../deploy/scripts/lib.sh"
 need docker; need kind; need jq
+image_source >/dev/null
 cluster_exists || die "kind cluster $CLUSTER_NAME does not exist (run: task dev:up)"
 HERE="$REPO_ROOT/tools/images"
 
@@ -24,6 +27,7 @@ VM_NODES=$(k get nodes -o json | jq -r '.items[] | select((.status.allocatable["
 # load_docker_image <image> <node...>: load_image from lib.sh (skip by digest/name, fallback
 # to a single-platform import when `kind load` fails).
 load_docker_image() {
+  if use_ghcr "$1"; then ghcr_pull_image "$@"; return; fi
   docker image inspect "$1" >/dev/null 2>&1 || die "$1 not built (run: task image:build:all)"
   KIND_LOAD_VERBOSE=1 load_image "$@"
 }
