@@ -22,10 +22,10 @@ spec:
 
     - IPv4 address **10.40.2.15/24** and IPv6 address **fd00:40:2::15/64** on `eth1`;
     - a **route to {{bb}}.0/24 via the gateway 10.40.2.1** on `eth1` (the host has a default
-      route on `eth0`, which must stay as it is);
+      route on its management interface, which must stay as it is);
     - the static host name **`tr-signal-02`** (`hostnamectl`).
 
-    Do not touch `eth0`, its address or the default route.
+    Do not touch the management interface (`eth0` or `enp1s0`), its address or the default route.
   objectives:
     - Configure a dual-stack static address with Netplan
     - Add a static route through a gateway
@@ -53,7 +53,10 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
-        [ "$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" = eth0 ] || { echo "this lab expects the management NIC to be eth0 (default route is on $(ip -4 route show default | head -1))" >&2; exit 1; }
+        # remember which interface carries the default route (eth0 or a predictable name such as enp1s0)
+        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, > /var/lib/tr-mgmt-if
+        grep -q . /var/lib/tr-mgmt-if
+        ! grep -qw eth1 /var/lib/tr-mgmt-if
         # eth1 is a veth end standing in for a second NIC (the VM has one); eth0 is never touched
         for f in /etc/netplan/*.yaml; do
           [ -f "$f" ] || continue
@@ -150,15 +153,16 @@ spec:
       command: echo "$(hostnamectl --static) $(cat /etc/hostname)"
       expect: {match: exact, value: "tr-signal-02 tr-signal-02"}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the management interface
       type: shell
       on: tr-net-01
       skills: [linux.net.persistent-config]
       weight: 0.5
       command: |
         { ip -4 -o addr show dev eth1 scope global | grep -q '10.40.2.15' || grep -rqs '10.40.2.15' /etc/netplan /etc/systemd/network; } || { echo not-configured; exit 0; }
-        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+        now=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        if [ "$now" = "$(cat /var/lib/tr-mgmt-if)" ]; then echo unchanged; else echo "$now"; fi
+      expect: {match: exact, value: unchanged}
   hints:
     - title: One file for eth1
       body: "Netplan reads YAML from /etc/netplan/*.yaml. Add a file with ethernets: eth1: addresses: [...] and routes: - to: <prefix> via: <gateway>. Both address families go in the same addresses list."
