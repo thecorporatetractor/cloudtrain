@@ -21,7 +21,7 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends --snapshot "$UBUNTU_APT_SNAPSHOT" \
-      openssh-client bash-completion vim nano less curl jq tar gzip \
+      openssh-client bash-completion vim nano less curl jq tar gzip rsync \
       iproute2 iputils-ping dnsutils netcat-openbsd tmux \
  && rm -rf /var/lib/apt/lists/*
 

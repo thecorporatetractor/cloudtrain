@@ -21,6 +21,13 @@ URIs: file:/opt/cloudtrain/repo/noble/
 Suites: ./
 Signed-By: /etc/apt/keyrings/cloudtrain-mirror.asc
 R
+# cloud-init must not rewrite the sources at first boot (its apt module restores the online
+# ubuntu.sources); keep the local repo as the only source
+install -d /etc/cloud/cloud.cfg.d
+cat > /etc/cloud/cloud.cfg.d/99-cloudtrain-apt.cfg <<C
+apt:
+  preserve_sources_list: true
+C
 apt-get update
 apt-get install -y --no-install-recommends \
   qemu-guest-agent auditd apparmor-utils chrony nftables ufw \
@@ -44,7 +51,7 @@ cat /etc/cloudtrain-release
 # generalize (keeps the local repo as the only source; no restore of the online sources)
 rm -f "$B/ubuntu.sources.orig"
 apt-get clean
-rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* "$B"
+rm -rf /tmp/* /var/tmp/* "$B"
 cloud-init clean --logs --seed || true
 truncate -s 0 /etc/machine-id
 rm -f /var/lib/dbus/machine-id /etc/ssh/ssh_host_*
