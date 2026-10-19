@@ -142,20 +142,32 @@ spec:
       L tar -cf - group_vars 2>/dev/null | (cd $j && runuser -u nobody -- tar -x --no-same-owner --no-same-permissions -f - 2>/dev/null)
       (cd $j && runuser -u nobody -- find . -type l -delete)
       w=$(cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 timeout 40 /opt/ansible/bin/python3 -I - <<'EOS'
-      import os
-      from ansible.parsing.dataloader import DataLoader
-      from ansible.parsing.vault import VaultSecret
-      loader = DataLoader()
-      loader.set_vault_secrets([('prod', VaultSecret(b'Ov-vault-{{vaultpw}}'))])
+      import os, yaml
+      from ansible.parsing.vault import VaultLib, VaultSecret
+      vl = VaultLib([('prod', VaultSecret(b'Ov-vault-{{vaultpw}}'))])
+      class L(yaml.SafeLoader):
+          pass
+      L.add_constructor('!vault', lambda l, n: ('vault', l.construct_scalar(n)))
       found = False
       for root, _, files in os.walk('group_vars'):
           for f in files:
               path = os.path.join(root, f)
               try:
-                  if os.path.getsize(path) > 262144 or 'ANSIBLE_VAULT;1.2;AES256;prod' not in open(path).read():
+                  if os.path.getsize(path) > 262144:
                       continue
-                  data = loader.load_from_file(path)
-                  if isinstance(data, dict) and str(data.get('vault_db_password')) == 'Ov-db-{{dbpw}}':
+                  raw = open(path).read()
+                  if 'ANSIBLE_VAULT;1.2;AES256;prod' not in raw:
+                      continue
+                  whole = raw.lstrip().startswith('$ANSIBLE_VAULT')
+                  if whole:
+                      raw = vl.decrypt(raw.encode()).decode()
+                  data = yaml.load(raw, L)
+                  v = data.get('vault_db_password') if isinstance(data, dict) else None
+                  if isinstance(v, tuple):
+                      v = vl.decrypt(v[1].encode()).decode()
+                  elif not whole:
+                      v = None
+                  if v is not None and str(v).strip() == 'Ov-db-{{dbpw}}':
                       found = True
               except Exception:
                   pass
