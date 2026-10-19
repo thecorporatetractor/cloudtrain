@@ -356,6 +356,16 @@ var kubeadmTimeouts = map[string]any{
 // 192.168.0.0/16 is never used: the image's cni-install gets this CIDR.
 const PodCIDR = "10.244.0.0/16"
 
+// dropStrayCNI removes CNI configs that the node image's packages ship (the
+// podman package's bridge, 10.88.0.0/16). containerd uses the first config in
+// /etc/cni/net.d, so every pod sandbox created before the cluster CNI writes
+// its own (CoreDNS, the CNI's controllers, early lab pods) got a node-local
+// bridge address that other nodes cannot route to: cross-node DNS and Service
+// traffic then failed depending on scheduling, and broke entirely once Calico
+// WireGuard was enabled. It runs on every member before init or join (and on
+// prepared hosts the learner joins).
+const dropStrayCNI = `rm -f /etc/cni/net.d/87-podman-bridge.conflist /etc/cni/net.d/*podman*.conflist`
+
 // userdata renders a member's cloud-config.
 func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterNode, p clusterPKI, learnerPub, adminPub []byte) ([]byte, error) {
 	taints, err := memberTaints(m)
@@ -369,6 +379,7 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 	nodeReg := map[string]any{"name": m.Name, "criSocket": criSocket, "taints": taints}
 	if m.State == StateUnjoined {
 		// Prepared host only: hosts, keys and accounts; the learner joins it.
+		ci.RunCmd = []string{dropStrayCNI}
 		return ci.Render()
 	}
 	if m.Name == l.cp.Name {
@@ -404,7 +415,7 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 			{Path: "/etc/kubernetes/pki/ca.key", Content: string(p.ca.Key), Permissions: "0600"},
 			{Path: "/root/kubeadm.yaml", Content: cfg, Permissions: "0600"},
 		}
-		ci.RunCmd = []string{strings.NewReplacer("__POD_CIDR__", PodCIDR, "__INIT_ATTEMPTS__", fmt.Sprint(KubeadmInitAttempts), "__CRI__", criSocket).Replace(`set -e
+		ci.RunCmd = []string{dropStrayCNI, strings.NewReplacer("__POD_CIDR__", PodCIDR, "__INIT_ATTEMPTS__", fmt.Sprint(KubeadmInitAttempts), "__CRI__", criSocket).Replace(`set -e
 sed -i "s/__KUBE_VERSION__/$(kubeadm version -o short)/" /root/kubeadm.yaml
 : > /var/log/kubeadm.log
 # kubeadm init fails under host load (wait-control-plane or an API call
@@ -462,7 +473,7 @@ for i in $(seq 1 120); do
 done
 systemctl disable --now kubelet >> /var/log/kubeadm.log 2>&1`, m.Name)
 	}
-	ci.RunCmd = []string{run}
+	ci.RunCmd = []string{dropStrayCNI, run}
 	return ci.Render()
 }
 

@@ -457,6 +457,39 @@ func TestScoreRerunAndReboot(t *testing.T) {
 	}
 }
 
+// A check that a later pass could not grade (its environment broke after the
+// first pass) fails; it does not keep its first-pass credit.
+func TestScoreCheckMissingFromLaterPassFails(t *testing.T) {
+	all := map[string]bool{"t1/x": true, "t1/y": true, "t2/x": true, "t3/x": true, "t3/z": true}
+	rerun := map[string]bool{"t1/x": true, "t1/y": true, "t3/x": true, "t3/z": true} // t2 ungraded
+	reboot := map[string]bool{"t2/x": true, "t3/x": true, "t3/z": true}              // t1 ungraded
+	g := &labsv1.ExamGradingStatus{Passes: []labsv1.ExamGradingPass{
+		pass(labsv1.PassInitial, all), pass(labsv1.PassRerun, rerun), pass(labsv1.PassReboot, reboot)}}
+	rep := Score(scoreSpec(labsv1.PartialCreditPerCheck), scoreTasks(), g, metav1.Now())
+	t1, t2, t3 := rep.Tasks[0], rep.Tasks[1], rep.Tasks[2]
+	for _, c := range t1.Checks {
+		if c.Passed || !c.FailedAfterReboot || c.Message != MsgNotGraded {
+			t.Errorf("task 1 (ungraded after reboot) %+v", c)
+		}
+	}
+	if c := t2.Checks[0]; c.Passed || !c.FailedOnRerun || c.Message != MsgNotGraded {
+		t.Errorf("task 2 (ungraded after re-run) %+v", c)
+	}
+	for _, c := range t3.Checks {
+		if !c.Passed {
+			t.Errorf("task 3 %+v", c)
+		}
+	}
+	if t1.Outcome != labsv1.OutcomeFail || t2.Outcome != labsv1.OutcomeFail || t3.Outcome != labsv1.OutcomePass {
+		t.Errorf("outcomes %s %s %s", t1.Outcome, t2.Outcome, t3.Outcome)
+	}
+	// Without later passes nothing changes (initial only).
+	g = &labsv1.ExamGradingStatus{Passes: []labsv1.ExamGradingPass{pass(labsv1.PassInitial, all)}}
+	if rep := Score(scoreSpec(labsv1.PartialCreditPerCheck), scoreTasks(), g, metav1.Now()); rep.Score != "100" {
+		t.Errorf("initial-only score %s", rep.Score)
+	}
+}
+
 func TestScoreNeverLeaksOutput(t *testing.T) {
 	g := &labsv1.ExamGradingStatus{Passes: []labsv1.ExamGradingPass{pass(labsv1.PassInitial, map[string]bool{"t1/x": false})}}
 	rep := Score(scoreSpec(labsv1.PartialCreditPerCheck), scoreTasks(), g, metav1.Now())

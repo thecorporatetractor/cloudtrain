@@ -13,6 +13,11 @@
 # $RES/logs/<id>.log, $RES/reports/<id>.json (labctl's own report), $RES/exams/<exam>-<mode>.json.
 # A lab is skipped when it passed with the same lab tree (git) and platform hash; a failed
 # lab is re-run when its tree or the platform changed. Killed runs leave no result and run again.
+#
+# EXAM_PAR (default 1): exam runs at once on the host. An exam starts every drawn task's VMs
+# together (10-40 VMIs), so one heavy slot per exam is not a limit; the count is every
+# `labctl exam run` process on the host (other agents' exam runs included), so it doubles as a
+# host-wide one-exam-at-a-time gate.
 set -uo pipefail
 # shellcheck source=/dev/null
 source ~/.profile 2>/dev/null || true
@@ -470,7 +475,8 @@ cycle() { # cycle [ids]
   local j ex mode seed ih
   for j in "${jobs[@]}"; do
     read -r ex mode seed ih <<<"$j"
-    while (( $(running_count vm) >= $(limit_for vm) )); do sleep 15; reap; done
+    # an exam starts every drawn task at once (10-40 VMIs): cap concurrent exam runs (EXAM_PAR, default 1)
+    while (( $(running_count vm) >= $(limit_for vm) || $(pgrep -fc 'bin/labctl exam run' || true) >= ${EXAM_PAR:-1} )); do sleep 15; reap; done
     run_exam "$ex" "$mode" "$seed" "$ih" 9>&- & RUNNING[$!]=vm; sleep 20
   done
   while ((${#RUNNING[@]} > 0)); do sleep 15; reap; done

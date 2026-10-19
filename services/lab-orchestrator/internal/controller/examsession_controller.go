@@ -140,8 +140,12 @@ func (r *ExamSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if !es.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil // owned environments are garbage-collected
 	}
-	// Grading execs into the environments' pods (session permissions).
-	if err := ensureAccess(ctx, r.Access, es.Namespace); err != nil {
+	// Grading execs into the environments' pods (session permissions). The
+	// attempt never holds the binding: its environment LabSessions hold it and
+	// the last one releases it. A held Ensure here would put the finalizer back
+	// after that release (the attempt outlives its environments), and the
+	// namespace could then never be deleted.
+	if err := ensureExamAccess(ctx, r.Access, es.Namespace); err != nil {
 		if errors.Is(err, rbac.ErrNamespaceNotLab) {
 			log.Info("exam session in a namespace without the lab label; waiting", "namespace", es.Namespace, "label", drivers.LabelLabNamespace)
 			return ctrl.Result{RequeueAfter: requeueNamespaceNotLab}, nil
@@ -168,6 +172,13 @@ func (r *ExamSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		log.Error(err, "exam reconcile failed", "phase", es.Status.Phase)
 	}
 	return res, err
+}
+
+func ensureExamAccess(ctx context.Context, a SessionNamespaceAccess, namespace string) error {
+	if a == nil {
+		return nil
+	}
+	return a.Ensure(ctx, namespace)
 }
 
 func (r *ExamSessionReconciler) reconcile(ctx context.Context, run *examRun) (ctrl.Result, error) {
@@ -221,6 +232,13 @@ func (r *ExamSessionReconciler) reconcile(ctx context.Context, run *examRun) (ct
 
 	// 2. Environments exist and are mirrored.
 	if err := r.ensureEnvironments(ctx, run); err != nil {
+		// An environment that cannot even be built (e.g. tasks whose resolved
+		// shared nodes differ) must not keep the attempt preparing forever.
+		if (st.Phase == labsv1.ExamPending || st.Phase == labsv1.ExamProvisioning) &&
+			r.now().Sub(es.CreationTimestamp.Time) > r.provisionBudget() {
+			r.event(es, "Warning", "EnvironmentBuildFailed", err.Error())
+			return r.failAttempt(ctx, run, "EnvironmentFailed", ExamMsgEnvFailed)
+		}
 		return ctrl.Result{}, err
 	}
 	envs, err := r.observeEnvironments(ctx, run)
@@ -596,13 +614,26 @@ func (r *ExamSessionReconciler) grading(ctx context.Context, run *examRun, envs 
 		return ctrl.Result{Requeue: true}, nil
 	case labsv1.GradingRerun:
 		if err := r.rerun(ctx, run, envs); err != nil {
-			return ctrl.Result{}, err
+			if !r.stageExpired(es) {
+				return ctrl.Result{}, err
+			}
+			// An unreachable node must not hold grading until the environment
+			// expires: the tasks not re-run yet fail their re-run.
+			r.event(es, "Warning", "RerunTimeout", "idempotency re-run incomplete; tasks not re-run fail")
+			r.failPendingReruns(run)
 		}
 		r.setStage(es, labsv1.GradingRerunGrade)
 		return ctrl.Result{Requeue: true}, nil
 	case labsv1.GradingReboot:
 		if err := r.reboot(ctx, run, envs); err != nil {
-			return ctrl.Result{}, err
+			if !r.stageExpired(es) {
+				return ctrl.Result{}, err
+			}
+			// Nodes that cannot be rebooted are graded as they are; checks an
+			// unreachable environment cannot answer fail (exam.Score).
+			r.event(es, "Warning", "RebootTimeout", "reboot before grading incomplete: "+err.Error())
+			r.setStage(es, labsv1.GradingRebootGrade)
+			return ctrl.Result{Requeue: true}, nil
 		}
 		r.setStage(es, labsv1.GradingRebootWait)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -790,6 +821,23 @@ func (r *ExamSessionReconciler) rerun(ctx context.Context, run *examRun, envs ma
 		}
 	}
 	return nil
+}
+
+// failPendingReruns records a failed re-run for every task with re-run
+// actions that has no result yet.
+func (r *ExamSessionReconciler) failPendingReruns(run *examRun) {
+	g := run.es.Status.Grading
+	done := map[int32]bool{}
+	for _, rr := range g.Reruns {
+		done[rr.Task] = true
+	}
+	for _, t := range run.es.Status.Tasks {
+		rt := run.tasks[t.Index]
+		if done[t.Index] || rt == nil || rt.Spec.Exam == nil || len(rt.Spec.Exam.Rerun) == 0 {
+			continue
+		}
+		g.Reruns = append(g.Reruns, labsv1.ExamRerunResult{Task: t.Index, OK: false, Message: exam.MsgRerunFailed})
+	}
 }
 
 // rebootTargets are the nodes rebooted before grading: VMs and kubeadm
