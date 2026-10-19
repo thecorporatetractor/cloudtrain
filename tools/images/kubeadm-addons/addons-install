@@ -19,11 +19,12 @@
 #                   tracking; single node: volumes live on the node running the plugin),
 #                   StorageClass "csi-hostpath" (allowVolumeExpansion, not the default)
 # Aliases: ingress, gateway -> traefik; lb -> metallb; storage -> local-path; all = every
-# add-on except falco and csi-hostpath. Idempotent (kubectl apply).
+# add-on except falco and csi-hostpath. Idempotent (kubectl apply). --wait on metrics-server
+# also waits for the metrics API (APIService v1beta1.metrics.k8s.io Available).
 set -euo pipefail
 ROOT=/opt/cloudtrain/addons
 export KUBECONFIG=${KUBECONFIG:-/etc/kubernetes/admin.conf}
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 list=$1; shift
 wait=0; pool=192.168.100.200-192.168.100.220
@@ -41,6 +42,18 @@ for a in ${list//,/ }; do
   want+=("$a")
 done
 (cd "$ROOT" && sha256sum --quiet -c SHA256SUMS) || { echo "addons-install: add-on manifests do not match SHA256SUMS" >&2; exit 1; }
+# metrics_api: the metrics API is served (APIService Available: the API server reaches
+# metrics-server through its Service), not just a Ready pod. A Ready pod can still leave the
+# APIService unavailable (e.g. a pod that started off the pod network), so it is recreated once.
+metrics_api() {
+  local api=apiservice/v1beta1.metrics.k8s.io
+  kubectl wait --for=condition=Available "$api" --timeout=300s >/dev/null && return 0
+  echo "addons-install: $api not Available, recreating the metrics-server pod" >&2
+  kubectl -n kube-system get pods -l k8s-app=metrics-server -o wide >&2 || true
+  kubectl -n kube-system delete pod -l k8s-app=metrics-server --wait=false >/dev/null
+  kubectl -n kube-system rollout status deploy/metrics-server --timeout=180s
+  kubectl wait --for=condition=Available "$api" --timeout=180s >/dev/null
+}
 done_list=" "
 for a in "${want[@]}"; do
   [[ $done_list == *" $a "* ]] && continue; done_list+="$a "
@@ -73,7 +86,8 @@ done
 if ((wait)); then
   for a in "${want[@]}"; do
     case $a in
-      metrics-server) kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s ;;
+      metrics-server) kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s
+                      metrics_api ;;
       traefik)        kubectl -n traefik rollout status deploy/traefik --timeout=300s ;;
       metallb)        kubectl -n metallb-system rollout status ds/speaker --timeout=300s ;;
       local-path)     kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout=300s ;;
