@@ -656,9 +656,9 @@ Status and measurements: `docs/handoffs/foundations.md`.
   schedulable node reports user namespace support for the runtime handler
   (`--user-namespaces=auto|true|false`). Wired pods (topology links) always run in a
   user namespace when it is available (`--link-sysctls`, default true), whatever the
-  image: their `net-init` then needs no privileged mode, and the node container gets
-  an unmasked `/proc` so labs can change network sysctls; without user namespaces
-  `net-init` is privileged and `/proc/sys` stays read-only. Works on this kind cluster (K8s 1.36.4, containerd 2.3.4, runc 1.4.3,
+  image: the node container gets an unmasked `/proc` so labs can change network
+  sysctls; without user namespaces `/proc/sys` stays read-only and routers take
+  their sysctls from the CNI tuning plugin. `net-init` is never privileged. Works on this kind cluster (K8s 1.36.4, containerd 2.3.4, runc 1.4.3,
   kernel 6.18); idmapped PVC mounts keep uid 1000 on the node. Fallback: host users, with
   the reason in the pod annotation `labs.cloudtrain.dev/user-namespace`. PID 1 is tini,
   learner (uid 1000) has no sudo rights, package sources point only at the mirror.

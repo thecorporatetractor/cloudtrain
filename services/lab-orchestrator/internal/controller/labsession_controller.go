@@ -151,6 +151,9 @@ type SessionNamespaceAccess interface {
 // Storage preflight at startup: the configured or default StorageClass must exist.
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get
+// Startup check that the lab pod admission policy and its binding exist
+// (--pod-admission-policy); read-only.
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get
 // Metrics endpoint authn/authz (--metrics-secure).
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create

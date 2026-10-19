@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
 // ExecDeviceCommand runs one CLI line (Command[0]; further elements are
@@ -64,7 +65,11 @@ func (FRR) ReadyCommand() []string    { return []string{"vtysh", "-c", "show ver
 func (FRR) ConsoleCommand() []string  { return []string{"vtysh"} }
 func (FRR) Capabilities() []corev1.Capability {
 	// zebra programs routes and addresses; ospfd/isisd use raw sockets;
-	// watchfrr manages the daemons.
+	// watchfrr manages the daemons. SYS_ADMIN: every FRR daemon raises its
+	// declared capabilities at start (lib/privs.c, zebra declares
+	// SYS_ADMIN for network namespace VRFs) and exits if one is outside
+	// the bounding set. In a user namespace (the default where the cluster
+	// supports it) it is SYS_ADMIN over the pod's namespaces only.
 	return []corev1.Capability{"NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE", "SYS_ADMIN"}
 }
 
@@ -136,12 +141,28 @@ func (d *NetdevDriver) podFamily(n labsv1.Node) (DeviceFamily, error) {
 	return f, nil
 }
 
+// NetdevSecurityContext is the device container's: the family's
+// capabilities under the runtime's default seccomp profile. The lab pod
+// admission policy allows SYS_ADMIN only on the node container of a
+// netdev-profile pod with RuntimeDefault or Localhost seccomp
+// (config/rbac/pod_admission_policy.yaml).
+func NetdevSecurityContext(f DeviceFamily) *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		Capabilities:   &corev1.Capabilities{Add: f.Capabilities()},
+		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+}
+
 // BuildPod renders the device pod (before network wiring).
 func (d *NetdevDriver) BuildPod(ref NodeRef, f DeviceFamily) *corev1.Pod {
 	pod := d.ContainerDriver.BuildPod(ref)
 	c := &pod.Spec.Containers[0]
 	c.Ports = nil
-	c.SecurityContext = &corev1.SecurityContext{Capabilities: &corev1.Capabilities{Add: f.Capabilities()}}
+	c.SecurityContext = NetdevSecurityContext(f)
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	pod.Labels[network.LabelPodProfile] = network.PodProfileNetdev
 	c.StartupProbe = &corev1.Probe{
 		ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: f.ReadyCommand()}},
 		PeriodSeconds:    2,

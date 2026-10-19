@@ -50,7 +50,7 @@ func newNetdev(t *testing.T) (*NetdevDriver, client.Client, *recordingExecutor) 
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 	rec := &recordingExecutor{}
 	base := &ContainerDriver{Client: c, Scheme: s, ImageRegistry: "cloudtrain", Executor: rec}
-	base.Network = &LinkNetwork{Manager: &network.Manager{Client: c}, ToolsImage: base.ImageFor("nettools:1"), DestroyWait: time.Millisecond}
+	base.Network = &LinkNetwork{Manager: &network.Manager{Client: c}, ToolsImage: base.ImageFor("nettools:1"), DestroyWait: time.Millisecond, UserNamespaces: true}
 	return NewNetdev(base), c, rec
 }
 
@@ -72,6 +72,19 @@ func TestNetdevProvisionPod(t *testing.T) {
 	}
 	if caps := main.SecurityContext.Capabilities.Add; len(caps) != 4 {
 		t.Errorf("caps = %v", caps)
+	}
+	// The lab pod admission policy allows SYS_ADMIN only on the node
+	// container of a netdev-profile pod with RuntimeDefault seccomp.
+	if sp := main.SecurityContext.SeccompProfile; sp == nil || sp.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("FRR seccomp = %+v", sp)
+	}
+	if pod.Labels[network.LabelPodProfile] != network.PodProfileNetdev {
+		t.Errorf("pod profile = %q", pod.Labels[network.LabelPodProfile])
+	}
+	for _, c := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
+		if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
+			t.Errorf("%s is privileged", c.Name)
+		}
 	}
 	if pod.Annotations[network.AnnotationNetworks] == "" || pod.Annotations[network.AnnotationLogicalSwitch] == "" {
 		t.Errorf("annotations = %v", pod.Annotations)

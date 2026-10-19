@@ -154,6 +154,52 @@ spec:
   policyName: {{ $cluster }}
   validationActions: [Deny]
 {{- end }}
+{{- /* The chart needs Kubernetes 1.30+ (Chart.yaml kubeVersion), where ValidatingAdmissionPolicy is GA. */}}
+{{- if $o.rbac.podPolicy.enabled }}
+{{- $classes := list }}
+{{- range $t, $v := $o.sandboxes }}{{- $classes = append $classes $v.runtimeClass }}{{- end }}
+{{- range $t, $rc := $o.tierRuntimeClasses }}{{- $classes = append $classes $rc }}{{- end }}
+{{- $quoted := list }}
+{{- range ($classes | uniq | sortAlpha) }}{{- $quoted = append $quoted (printf "'%s'" .) }}{{- end }}
+{{- $pp := index (splitList "\n---\n" (.Files.Get "files/orchestrator-pod-admission-policy.txt")) 0 | fromYaml }}
+{{- $vars := list }}
+{{- range $pp.spec.variables }}
+{{- if eq .name "sandboxes" }}{{- $_ := set . "expression" (printf "[%s]" (join ", " $quoted)) }}{{- end }}
+{{- $vars = append $vars . }}
+{{- end }}
+{{- $_ := set $pp.spec "variables" $vars }}
+{{- if eq $o.rbac.podPolicy.scope "own" }}
+{{- $_ := set $pp.spec "matchConditions" (list (dict "name" "own-requests" "expression" (printf "request.userInfo.username == 'system:serviceaccount:%s:%s'" .Release.Namespace $name))) }}
+{{- end }}
+---
+# The lab pod admission policy (config/rbac/pod_admission_policy.yaml): no privileged
+# container in lab namespaces unless the pod runs in a sandbox RuntimeClass of
+# orchestrator.sandboxes; capabilities only the platform's own sets.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $cluster }}-pods
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  {{- $pp.spec | toYaml | replace "system:serviceaccount:cloudtrain-system:lab-orchestrator" (printf "system:serviceaccount:%s:%s" .Release.Namespace $name) | nindent 2 }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $cluster }}-pods
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  policyName: {{ $cluster }}-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        labs.cloudtrain.dev/lab-namespace: "true"
+{{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -240,6 +286,9 @@ spec:
             - --vcluster-pod-security={{ $o.vclusterPodSecurity }}
             - --session-cluster-role={{ $session }}
             - --service-account={{ .Release.Namespace }}/{{ $name }}
+            {{- if $o.rbac.podPolicy.enabled }}
+            - --pod-admission-policy={{ $cluster }}-pods
+            {{- end }}
             {{- if $o.rbac.ovnCentral.enabled }}
             - --ovn-central={{ $o.rbac.ovnCentral.namespace }}/{{ $o.rbac.ovnCentral.selector }}
             {{- else }}

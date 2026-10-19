@@ -100,9 +100,43 @@ NS=${ORCH_NAMESPACE:-cloudtrain-system}
 # Cluster-scoped RBAC and admission objects (and the Roles in kube-system) of a
 # separate instance carry its namespace as a suffix.
 SUF=""; [[ $NS != cloudtrain-system ]] && SUF="-$NS"
+# The lab pod admission policy (config/rbac/pod_admission_policy.yaml, docs/deploy.md):
+# privileged containers in lab namespaces only in the sandbox RuntimeClasses of
+# SANDBOXES / TIER_RUNTIME_CLASSES. POD_POLICY=0 leaves it out. POD_POLICY_SCOPE: own
+# (only this manager's requests; the default with SESSION_SELECTOR, where several
+# managers share the cluster and each one's policy must not judge the others' pods) or
+# namespaces (every pod in a lab namespace, whoever creates it; the default otherwise).
+# Without the ValidatingAdmissionPolicy API (Kubernetes < 1.30) both admission
+# policies are skipped with a warning, and the manager warns at startup.
+POD_POLICY=${POD_POLICY:-1}
+if [[ -z ${POD_POLICY_SCOPE:-} ]]; then POD_POLICY_SCOPE=namespaces; [[ -n ${SESSION_SELECTOR:-} ]] && POD_POLICY_SCOPE=own; fi
+case $POD_POLICY_SCOPE in own|namespaces) ;; *) die "POD_POLICY_SCOPE must be own or namespaces";; esac
+VAP_API=1
+k api-resources --api-group=admissionregistration.k8s.io -o name 2>/dev/null | grep -q '^validatingadmissionpolicies\.' || VAP_API=0
+if [[ $VAP_API == 0 ]]; then
+  warn "the cluster does not serve ValidatingAdmissionPolicy (Kubernetes < 1.30): no admission policies (lab-orchestrator, lab pods)"
+  POD_POLICY=0
+fi
+PP_NAME=""; [[ $POD_POLICY == 1 ]] && PP_NAME="lab-orchestrator-pods$SUF"
+# The sandbox RuntimeClasses as a CEL list: <tier>=<RuntimeClass>[:fallback],...
+PP_SANDBOXES=""
+IFS=, read -ra _tiers <<<"${SANDBOXES:-${TIER_RUNTIME_CLASSES:-}}"
+for t in "${_tiers[@]}"; do
+  [[ -n $t ]] || continue
+  rc=${t#*=}; rc=${rc%%:*}
+  [[ $rc =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || die "sandbox RuntimeClass '$rc' is not a valid name"
+  [[ ",$PP_SANDBOXES," == *",'$rc',"* ]] || PP_SANDBOXES+="${PP_SANDBOXES:+,}'$rc'"
+done
+PP_SANDBOXES="[${PP_SANDBOXES//,/, }]"
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" TRC="${TIER_RUNTIME_CLASSES:-}" SBX="${SANDBOXES:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
+    | NS="$NS" SUF="$SUF" IMG="$IMG" PPS="$PP_SANDBOXES" PPSCOPE="$POD_POLICY_SCOPE" PPN="$PP_NAME" VAPAPI="$VAP_API" POL="$POD_POLICY" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" TRC="${TIER_RUNTIME_CLASSES:-}" SBX="${SANDBOXES:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
+        (select((.kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") and .metadata.name == "lab-orchestrator-pods" and strenv(POL) != "1") | .kind) = "Drop" |
+        (select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "lab-orchestrator-pods") | .spec.variables[] | select(.name == "manager") | .expression) |= sub("system:serviceaccount:cloudtrain-system:"; "system:serviceaccount:" + strenv(NS) + ":") |
+        (select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "lab-orchestrator-pods") | .spec.variables[] | select(.name == "sandboxes") | .expression) = strenv(PPS) |
+        (select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "lab-orchestrator-pods" and strenv(PPSCOPE) == "own") | .spec.matchConditions) = [{"name": "own-requests", "expression": "request.userInfo.username == '"'"'system:serviceaccount:" + strenv(NS) + ":lab-orchestrator'"'"'"}] |
+        (select((.kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") and strenv(VAPAPI) != "1") | .kind) = "Drop" |
+        (select(.kind == "Deployment" and strenv(PPN) != "") | .spec.template.spec.containers[0].args) += ["--pod-admission-policy=" + strenv(PPN)] |
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
         (select(.kind == "ClusterRole" or .kind == "Role" or .kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") | .metadata.name) += strenv(SUF) |
@@ -132,9 +166,10 @@ manifests() {
         (select(.kind == "Deployment" and strenv(SBX) != "") | .spec.template.spec.containers[0].args) += ["--sandboxes=" + strenv(SBX), "--sandbox-preflight=/etc/cloudtrain/sandbox-preflight/preflight.yaml"] |
         (select(.kind == "Deployment" and strenv(SBX) != "") | .spec.template.spec.containers[0].volumeMounts) += [{"name": "sandbox-preflight", "mountPath": "/etc/cloudtrain/sandbox-preflight", "readOnly": true}] |
         (select(.kind == "Deployment" and strenv(SBX) != "") | .spec.template.spec.volumes) += [{"name": "sandbox-preflight", "configMap": {"name": "lab-sandbox-preflight", "optional": true}}]' \
+    | yq 'select(.kind != "Drop")' \
     | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
-log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}${TIER_RUNTIME_CLASSES:+, tier runtime classes $TIER_RUNTIME_CLASSES}${SANDBOXES:+, sandboxes $SANDBOXES}"
+log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PP_NAME:+, pod policy $PP_NAME (scope $POD_POLICY_SCOPE, sandboxes $PP_SANDBOXES)}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}${TIER_RUNTIME_CLASSES:+, tier runtime classes $TIER_RUNTIME_CLASSES}${SANDBOXES:+, sandboxes $SANDBOXES}"
 k apply -f <(manifests) >/dev/null
 k -n "$NS" create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -o yaml | k apply -f - >/dev/null
 if [[ -n ${SANDBOX_PREFLIGHT:-} ]]; then # labctl preflight's verdict, whatever namespace it was written for
