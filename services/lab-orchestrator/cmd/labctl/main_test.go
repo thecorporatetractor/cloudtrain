@@ -87,3 +87,13 @@ func TestUsage(t *testing.T) {
 		t.Errorf("exit %d", code)
 	}
 }
+
+func TestLeftoversIgnoreTheSessionRoleBinding(t *testing.T) {
+	managed := map[string]string{"app.kubernetes.io/managed-by": "cloudtrain-lab-orchestrator"}
+	if !ignorable("RoleBinding", "lab-orchestrator-session", managed) || !ignorable("RoleBinding", "lab-orchestrator-session-ct-batch-system", managed) {
+		t.Error("the orchestrator's session RoleBinding is reported as a leftover")
+	}
+	if ignorable("RoleBinding", "lab-orchestrator-session", nil) || ignorable("RoleBinding", "vc-abc", managed) || ignorable("Secret", "lab-orchestrator-session", managed) {
+		t.Error("ignored a real leftover")
+	}
+}

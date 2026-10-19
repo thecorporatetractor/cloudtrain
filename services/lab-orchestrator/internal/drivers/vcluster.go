@@ -84,6 +84,9 @@ type VClusterDriver struct {
 	// host namespace (PodSecurityBaseline when empty). See
 	// HostNamespacePodSecurity.
 	PodSecurity string
+	// Access, when set, binds the manager's session permissions in every
+	// host namespace it creates (Helm installs the chart as the manager).
+	NamespaceAccess NamespaceAccess
 }
 
 // Pod Security Standard levels for vcluster host namespaces.
@@ -214,29 +217,68 @@ func (d *VClusterDriver) ensureHostNamespace(ctx context.Context, ref NodeRef) (
 		return false, nil
 	case err == nil:
 		// Namespaces created before Pod Security was enforced (or with
-		// another level) are brought in line before the vcluster syncs
-		// anything into them.
-		return true, d.enforcePodSecurity(ctx, ns)
+		// another level, or before the lab label) are brought in line
+		// before the vcluster syncs anything into them.
+		if err := d.enforcePodSecurity(ctx, ns); err != nil {
+			return false, err
+		}
+		return true, d.grant(ctx, ns.Name)
 	case !apierrors.IsNotFound(err):
 		return false, err
 	}
 	labels := SessionLabels(ref.Session)
 	labels[LabelSessionNamespace] = LabelValue(ref.Namespace())
 	labels[LabelNode] = LabelValue(ref.Node.Name)
-	for k, v := range d.HostNamespacePodSecurity() {
+	for k, v := range d.hostNamespaceLabels() {
 		labels[k] = v
 	}
 	ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: d.hostNS(ref), Labels: labels}}
 	if err := d.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, err
 	}
-	return true, nil
+	return true, d.grant(ctx, ns.Name)
 }
 
-// enforcePodSecurity patches the Pod Security labels of an existing host
-// namespace when they differ.
+// hostNamespaceLabels: Pod Security plus the lab label (the manager binds
+// its session permissions only in lab namespaces).
+func (d *VClusterDriver) hostNamespaceLabels() map[string]string {
+	l := d.HostNamespacePodSecurity()
+	l[LabelLabNamespace] = "true"
+	return l
+}
+
+func (d *VClusterDriver) grant(ctx context.Context, ns string) error {
+	if d.NamespaceAccess == nil {
+		return nil
+	}
+	return d.NamespaceAccess.Ensure(ctx, ns)
+}
+
+// grantExisting binds the session permissions in an existing host
+// namespace (Status, Hibernate, Reset, Destroy), also in one created before
+// the lab label existed. A terminating or missing namespace is left alone.
+func (d *VClusterDriver) grantExisting(ctx context.Context, ref NodeRef) error {
+	if d.NamespaceAccess == nil {
+		return nil
+	}
+	ns := &corev1.Namespace{}
+	err := d.reader().Get(ctx, client.ObjectKey{Name: d.hostNS(ref)}, ns)
+	if apierrors.IsNotFound(err) || (err == nil && (ns.DeletionTimestamp != nil || !ownedBySession(ref.Session, ns))) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := d.enforcePodSecurity(ctx, ns); err != nil {
+		return err
+	}
+	return d.grant(ctx, ns.Name)
+}
+
+// enforcePodSecurity patches the Pod Security labels (and the lab label) of
+// an existing host namespace when they differ.
 func (d *VClusterDriver) enforcePodSecurity(ctx context.Context, ns *corev1.Namespace) error {
-	want := d.HostNamespacePodSecurity()
+	want := d.hostNamespaceLabels()
 	missing := map[string]string{}
 	for k, v := range want {
 		if ns.Labels[k] != v {
@@ -512,6 +554,9 @@ func (d *VClusterDriver) publish(ctx context.Context, ref NodeRef, release, inst
 // Status observes the vcluster.
 func (d *VClusterDriver) Status(ctx context.Context, ref NodeRef) (NodeState, error) {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
+	if err := d.grantExisting(ctx, ref); err != nil {
+		return NodeState{}, err
+	}
 	if ref.Session.Spec.Hibernate {
 		return d.hibernateState(ctx, ref, release)
 	}
@@ -547,6 +592,9 @@ func (d *VClusterDriver) Connect(_ context.Context, ref NodeRef, access labsv1.A
 // Provision scales it back up on a fresh volume.
 func (d *VClusterDriver) Reset(ctx context.Context, ref NodeRef) error {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
+	if err := d.grantExisting(ctx, ref); err != nil {
+		return err
+	}
 	if err := d.deleteSynced(ctx, ref, release); err != nil {
 		return err
 	}
@@ -586,6 +634,23 @@ func (d *VClusterDriver) deleteSynced(ctx context.Context, ref NodeRef, release 
 // outside it. ErrInProgress until the control-plane and synced pods are gone.
 func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
+	// A terminating host namespace takes everything in it along (and its
+	// RoleBinding goes early, so the manager may no longer read it); a gone
+	// one leaves only the session-side kubeconfig Secret.
+	host := &corev1.Namespace{}
+	switch err := d.reader().Get(ctx, client.ObjectKey{Name: d.hostNS(ref)}, host); {
+	case apierrors.IsNotFound(err):
+		_, err := deleteIfOwned(ctx, d.Client, d.reader(), ref.Session,
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: KubeconfigSecretName(ref)}})
+		return err
+	case err != nil:
+		return err
+	case host.DeletionTimestamp != nil && ownedBySession(ref.Session, host):
+		return inProgress("vcluster namespace %s is terminating", d.hostNS(ref))
+	}
+	if err := d.grantExisting(ctx, ref); err != nil {
+		return err
+	}
 	wl, err := d.workload(ctx, ref, release)
 	switch {
 	case err != nil:
@@ -614,14 +679,17 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 			return err
 		}
 	}
-	// The chart's cluster-scoped RBAC: helm uninstall misses it when the
-	// release record went first (e.g. the whole namespace is being deleted).
+	// The chart's cluster-scoped RBAC, from releases installed before
+	// deploy/vcluster/values.yaml turned it off: helm uninstall misses it
+	// when the release record went first (e.g. the whole namespace is being
+	// deleted). The scoped manager may not touch ClusterRoles (Forbidden):
+	// an operator removes such leftovers (labctl verify reports them).
 	crName := "vc-" + release + "-v-" + d.hostNS(ref)
 	for _, obj := range []client.Object{
 		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: crName}},
 		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: crName}},
 	} {
-		if err := d.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+		if err := d.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsForbidden(err) {
 			return err
 		}
 	}
@@ -712,6 +780,9 @@ func (d *VClusterDriver) scale(ctx context.Context, wl client.Object, n int32) e
 // persistence keeps running.
 func (d *VClusterDriver) Hibernate(ctx context.Context, ref NodeRef) error {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
+	if err := d.grantExisting(ctx, ref); err != nil {
+		return err
+	}
 	wl, err := d.workload(ctx, ref, release)
 	if err != nil || wl == nil {
 		return err
