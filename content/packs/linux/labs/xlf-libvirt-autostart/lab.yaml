@@ -49,8 +49,15 @@ spec:
         set -eu
         export DEBIAN_FRONTEND=noninteractive
         install -d -m 0700 /var/lib/cloudtrain
-        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null 2>&1 || true
-        command -v virsh >/dev/null 2>&1 || apt-get install -y -q libvirt-daemon-system libvirt-clients qemu-system-x86 >/dev/null 2>&1 || { echo "BLOCKED: libvirt/qemu packages are not in the ubuntu mirror (image gap)" | tee /var/lib/cloudtrain/xlf-libvirt-missing; exit 0; }
+        if ! command -v virsh >/dev/null 2>&1; then
+          ok=0
+          for try in 1 2 3 4; do
+            apt-get -o DPkg::Lock::Timeout=120 update -q >/dev/null 2>&1 || true
+            if apt-get -o DPkg::Lock::Timeout=120 install -y -q libvirt-daemon-system libvirt-clients qemu-system-x86 >/dev/null 2>&1; then ok=1; break; fi
+            sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "BLOCKED: libvirt/qemu packages could not be installed" | tee /var/lib/cloudtrain/xlf-libvirt-missing; exit 1; }
+        fi
         systemctl enable --now libvirtd >/dev/null 2>&1 || systemctl enable --now libvirtd.socket >/dev/null 2>&1 || true
         for i in $(seq 20); do virsh -c qemu:///system list >/dev/null 2>&1 && break; sleep 1; done
         virsh -c qemu:///system destroy xlf-guest{{n}} >/dev/null 2>&1 || true
