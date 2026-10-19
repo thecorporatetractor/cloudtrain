@@ -1,0 +1,347 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: incident-capstone-ticketing
+  title: "Incident: ticket sales stop during the morning peak"
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 60
+  tags: [capstone, incident, troubleshooting, use-method]
+  version: 1
+spec:
+  description: |
+    It is the morning peak and ticket sales have stopped. The ticket API on
+    **`tkt-app-01`** (`ssh tkt-app-01`; you have `sudo`) must answer on **TCP port {{port}}**
+    (`/health` returns `ok ...`). The on-call notes say three unrelated things went wrong
+    overnight. You have 60 minutes.
+
+    Restore service **and keep the data**:
+
+    - the unit is `tr-ticket-api.service`, running as the unprivileged user `tr-ticket`;
+    - live sales data is in `{{mnt}}/current` (the ledger `ledger.db` must survive
+      untouched); everything under `{{mnt}}/archive` has already been shipped to head office
+      and may be removed;
+    - the ticket service has its own resolver configuration; the site resolver answers on
+      **`127.0.0.54`**. Leave the machine's own DNS settings (eth0, systemd-resolved) alone.
+
+    Then write a short USE-method report to **`/home/learner/incident-report.txt`**, one
+    line per cause, in this form:
+
+    ```
+    disk=<the filesystem mount point that was saturated>
+    resolver=<the nameserver address the service was wrongly sent to>
+    unit=<the path the unit's EnvironmentFile pointed to that did not exist>
+    ```
+
+    The grader fetches `/health` from the workstation.
+  objectives:
+    - Work through utilisation, saturation and errors for storage, network and service
+    - Fix three independent faults without destroying data, and document the causes
+  params:
+    port:
+      type: choice
+      values: ["8085", "8086"]
+    mnt:
+      type: choice
+      values: [/var/lib/tr-sales, /srv/tr-sales]
+    bad:
+      type: choice
+      values: [127.0.0.35, 127.0.0.36]
+    dbnet:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tkt-app-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["512Mi"]}
+        access: [ssh, console]
+  setup:
+    - on: tkt-app-01
+      file: {path: /usr/local/libexec/tr-resolver, source: assets/tr-resolver.py, mode: "0755"}
+    - on: tkt-app-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        id tr-ticket >/dev/null 2>&1 || useradd -r -M -d /nonexistent -s /usr/sbin/nologin tr-ticket
+        systemctl stop tr-ticket-api.service 2>/dev/null || true
+        umount {{mnt}} 2>/dev/null || true
+        sed -i '\#LABEL=tr-sales#d' /etc/fstab
+        rm -f /home/learner/incident-report.txt
+        # site resolver (separate address: eth0 and systemd-resolved stay as they are)
+        mkdir -p /etc/tr-resolver /etc/tr
+        printf '# tallowmere.test, ticket site\ntkt-db.tallowmere.test 10.60.{{dbnet}}.14\n' > /etc/tr-resolver/zone.txt
+        printf '[Unit]\nDescription=Tallowmere site resolver (training build)\nAfter=network.target\n\n[Service]\nExecStart=/usr/bin/python3 /usr/local/libexec/tr-resolver 127.0.0.54\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-resolver.service
+        # the ticket API
+        install -d -m 0755 /opt/tr-ticket
+        cat > /opt/tr-ticket/api.py <<'EOPY'
+        import os, socket, sys
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        limit = os.environ.get("TR_PEAK_LIMIT")
+        if not limit:
+            sys.stderr.write("TR_PEAK_LIMIT is not set\n")
+            sys.exit(3)
+        mnt = os.environ["TR_SALES_DIR"]
+        name = os.environ["TR_DB_NAME"]
+        port = int(os.environ["TR_PORT"])
+
+        def probe():
+            try:
+                ip = socket.getaddrinfo(name, None, socket.AF_INET)[0][4][0]
+            except OSError as e:
+                return None, "cannot resolve %s: %s" % (name, e)
+            try:
+                q = os.path.join(mnt, "current", "queue.dat")
+                if os.path.exists(q) and os.path.getsize(q) > 4 * 1024 * 1024:
+                    open(q, "wb").close()
+                with open(q, "ab") as f:
+                    f.write(b"x" * 65536)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError as e:
+                return None, "cannot write sales queue: %s" % e
+            return ip, ""
+
+        probe_result = probe()
+        if probe_result[0] is None:
+            sys.stderr.write(probe_result[1] + "\n")
+            sys.exit(4)
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                ip, err = probe()
+                body = ("ok peak=%s db=%s\n" % (limit, ip)) if ip else ("error: %s\n" % err)
+                self.send_response(200 if ip else 503)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body.encode())
+            def log_message(self, *a):
+                pass
+
+        HTTPServer(("0.0.0.0", port), H).serve_forever()
+        EOPY
+        printf 'TR_PEAK_LIMIT=240\nTR_SALES_DIR={{mnt}}\nTR_DB_NAME=tkt-db.tallowmere.test\nTR_PORT={{port}}\n' > /etc/tr/ticket.env
+        # fault 2: the service sees a resolver configuration that points nowhere
+        echo "nameserver {{bad}}" > /etc/tr/ticket-resolv.conf
+        # fault 3: the EnvironmentFile name is wrong (the real file is ticket.env)
+        printf '[Unit]\nDescription=Tallowmere ticket API\nAfter=network.target tr-resolver.service\nStartLimitIntervalSec=0\n\n[Service]\nUser=tr-ticket\nEnvironmentFile=/etc/tr/ticket.conf\nBindReadOnlyPaths=/etc/tr/ticket-resolv.conf:/etc/resolv.conf\nExecStart=/usr/bin/python3 /opt/tr-ticket/api.py\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-ticket-api.service
+        # fault 1: the sales filesystem is full
+        wipefs -a /dev/vdc >/dev/null
+        mkfs.ext4 -q -m 0 -L tr-sales /dev/vdc
+        mkdir -p {{mnt}}
+        echo "LABEL=tr-sales {{mnt}} ext4 defaults,nofail 0 2" >> /etc/fstab
+        systemctl daemon-reload
+        mount {{mnt}}
+        mkdir -p {{mnt}}/current {{mnt}}/archive
+        head -c 1M /dev/urandom > {{mnt}}/current/ledger.db
+        (cd {{mnt}}/current && sha256sum ledger.db) > $V/ledger.sha
+        chown -R tr-ticket:tr-ticket {{mnt}}/current
+        for m in 01 02 03; do head -c 40M /dev/urandom > {{mnt}}/archive/exports-2026-$m.bin; done
+        dd if=/dev/zero of={{mnt}}/archive/spool.bin bs=1M 2>/dev/null || true
+        sync
+        systemctl daemon-reload
+        systemctl enable --now tr-resolver.service >/dev/null 2>&1
+        systemctl enable tr-ticket-api.service >/dev/null 2>&1
+        systemctl start tr-ticket-api.service >/dev/null 2>&1 || true
+        [ "$(df -B1M --output=avail {{mnt}} | tail -1 | tr -d ' ')" -lt 2 ]
+  checks:
+    - id: health
+      description: The ticket API answers /health with ok from the workstation
+      type: shell
+      on: workstation
+      skills: [linux.performance.use-method]
+      weight: 3
+      timeoutSec: 30
+      command: curl -s -m 8 http://tkt-app-01:{{port}}/health || echo unreachable
+      expect: {match: exact, value: "ok peak=240 db=10.60.{{dbnet}}.14"}
+    - id: disk-space
+      description: The sales filesystem has free space again and is still mounted from fstab
+      type: shell
+      on: tkt-app-01
+      skills: [linux.storage.space-analysis]
+      weight: 1.5
+      command: |
+        a=$(df -B1M --output=avail {{mnt}} | tail -1 | tr -d ' ')
+        f=$(awk '!/^[[:space:]]*#/ && $2 == "{{mnt}}" {print "fstab"}' /etc/fstab | head -1)
+        m=$(findmnt -n -o TARGET {{mnt}} >/dev/null 2>&1 && echo mounted || echo unmounted)
+        [ "$a" -ge 50 ] && echo "free-ok $m ${f:-nofstab}" || echo "free=$a $m ${f:-nofstab}"
+      expect: {match: exact, value: "free-ok mounted fstab"}
+    - id: ledger-intact
+      description: The live ledger is untouched
+      type: shell
+      on: tkt-app-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: |
+        cd {{mnt}}/current 2>/dev/null && sha256sum -c /var/lib/cloudtrain/ledger.sha >/dev/null 2>&1 && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+    - id: unit-state
+      description: tr-ticket-api.service is enabled and running without restart loops
+      type: shell
+      on: tkt-app-01
+      skills: [linux.systemd.journal]
+      weight: 1.5
+      command: |
+        sleep 3
+        n=$(systemctl show -p NRestarts --value tr-ticket-api.service)
+        echo "$(systemctl is-enabled tr-ticket-api.service) $(systemctl is-active tr-ticket-api.service) restarts-ok=$([ "${n:-0}" -le 20 ] && echo yes || echo no)"
+      expect: {match: exact, value: "enabled active restarts-ok=yes"}
+    - id: user-kept
+      description: The service still runs as tr-ticket, not as root
+      type: shell
+      on: tkt-app-01
+      skills: [linux.systemd.journal]
+      weight: 1
+      command: |
+        p=$(systemctl show -p MainPID --value tr-ticket-api.service)
+        [ "${p:-0}" -gt 0 ] && ps -o user= -p "$p" | tr -d ' ' || echo not-running
+      expect: {match: exact, value: tr-ticket}
+    - id: report-disk
+      description: The report names the saturated filesystem
+      type: shell
+      on: tkt-app-01
+      skills: [linux.performance.use-method]
+      weight: 0.5
+      command: sed -n 's/^disk=//p' /home/learner/incident-report.txt 2>/dev/null | tail -1 | tr -d ' '
+      expect: {match: exact, value: "{{mnt}}"}
+    - id: report-resolver
+      description: The report names the wrong nameserver
+      type: shell
+      on: tkt-app-01
+      skills: [linux.net.name-resolution]
+      weight: 0.5
+      command: sed -n 's/^resolver=//p' /home/learner/incident-report.txt 2>/dev/null | tail -1 | tr -d ' '
+      expect: {match: exact, value: "{{bad}}"}
+    - id: report-unit
+      description: The report names the missing EnvironmentFile path
+      type: shell
+      on: tkt-app-01
+      skills: [linux.performance.use-method]
+      weight: 0.5
+      command: sed -n 's/^unit=//p' /home/learner/incident-report.txt 2>/dev/null | tail -1 | tr -d ' '
+      expect: {match: exact, value: "/etc/tr/ticket.conf"}
+  hints:
+    - title: Start with the service
+      command: systemctl status tr-ticket-api; journalctl -u tr-ticket-api -n 30 --no-pager
+      body: "USE method: for each resource look at utilisation, saturation and errors. The journal shows the first error; fixing it exposes the next one, so there are several."
+      cost: 1
+    - title: Storage
+      command: df -h; sudo du -sh /var/lib/tr-sales/* /srv/tr-sales/* 2>/dev/null
+      body: "A full filesystem blocks writes. Only the archive directory may be removed; the live ledger and current/ must stay."
+      cost: 2
+    - title: The unit's view of DNS
+      command: systemctl cat tr-ticket-api
+      body: "BindReadOnlyPaths= replaces a file in the service's view of the filesystem. Check which file replaces resolv.conf for this service and where its nameserver points; do not touch the machine's own DNS settings."
+      cost: 2
+    - title: The environment file
+      body: "systemd fails a unit whose EnvironmentFile does not exist. Compare the path in systemctl cat with the files in /etc/tr/."
+      cost: 1
+  misconceptions:
+    - id: restart-only
+      description: Restarts the service without fixing any cause.
+      feedback: "A restart does not free space, repair the resolver view or the environment file; read the journal."
+      expectFail: [health, disk-space, unit-state, user-kept, report-disk, report-resolver, report-unit]
+      mutation:
+        on: tkt-app-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+
+    - id: ledger-deleted
+      description: Frees the space by deleting everything on the filesystem, including the live ledger.
+      feedback: "Only the shipped archive may go; the ledger is the live record of sales."
+      expectFail: [ledger-intact]
+      mutation:
+        on: tkt-app-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo rm -rf {{mnt}}/archive/* {{mnt}}/current
+          sudo mkdir -p {{mnt}}/current
+          sudo chown tr-ticket:tr-ticket {{mnt}}/current
+          sync
+          echo 'nameserver 127.0.0.54' | sudo tee /etc/tr/ticket-resolv.conf >/dev/null
+          sudo sed -i 's#^EnvironmentFile=.*#EnvironmentFile=/etc/tr/ticket.env#' /etc/systemd/system/tr-ticket-api.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart tr-ticket-api.service
+          printf 'disk={{mnt}}\nresolver={{bad}}\nunit=/etc/tr/ticket.conf\n' > /home/learner/incident-report.txt
+    - id: runs-as-root
+      description: Gets the service started by running it as root.
+      feedback: "The service must stay unprivileged."
+      expectFail: [user-kept]
+      mutation:
+        on: tkt-app-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo rm -rf {{mnt}}/archive/*
+          sync
+          echo 'nameserver 127.0.0.54' | sudo tee /etc/tr/ticket-resolv.conf >/dev/null
+          sudo sed -i 's#^EnvironmentFile=.*#EnvironmentFile=/etc/tr/ticket.env#; s#^User=.*#User=root#' /etc/systemd/system/tr-ticket-api.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart tr-ticket-api.service
+          printf 'disk={{mnt}}\nresolver={{bad}}\nunit=/etc/tr/ticket.conf\n' > /home/learner/incident-report.txt
+    - id: wrong-report
+      description: Fixes everything but names the wrong nameserver in the report.
+      feedback: "The report must name the nameserver address the service's resolver file pointed to before the fix."
+      expectFail: [report-resolver]
+      mutation:
+        on: tkt-app-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo rm -rf {{mnt}}/archive/*
+          sync
+          echo 'nameserver 127.0.0.54' | sudo tee /etc/tr/ticket-resolv.conf >/dev/null
+          sudo sed -i 's#^EnvironmentFile=.*#EnvironmentFile=/etc/tr/ticket.env#' /etc/systemd/system/tr-ticket-api.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart tr-ticket-api.service
+          printf 'disk={{mnt}}\nresolver=127.0.0.53\nunit=/etc/tr/ticket.conf\n' > /home/learner/incident-report.txt
+  solution:
+    explanation: |
+      Three independent faults. 1) The sales filesystem was full of archive exports: removing
+      the shipped archive frees space and the live current/ directory stays. 2) The unit
+      replaces resolv.conf with a file that points at a dead nameserver; the site resolver
+      is 127.0.0.54. 3) The unit's EnvironmentFile pointed at ticket.conf instead of
+      ticket.env. The report names the mount point, the dead nameserver and the missing file.
+    steps:
+      - on: tkt-app-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo rm -rf {{mnt}}/archive/*
+          sync
+          echo 'nameserver 127.0.0.54' | sudo tee /etc/tr/ticket-resolv.conf >/dev/null
+          sudo sed -i 's#^EnvironmentFile=.*#EnvironmentFile=/etc/tr/ticket.env#' /etc/systemd/system/tr-ticket-api.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart tr-ticket-api.service
+          printf 'disk={{mnt}}\nresolver={{bad}}\nunit=/etc/tr/ticket.conf\n' > /home/learner/incident-report.txt
+    alternatives:
+      - id: symlink-env
+        description: Provide the file the unit expects instead of editing the unit, and point the bind at the file by symlink.
+        steps:
+          - on: tkt-app-01
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              sudo rm -rf {{mnt}}/archive/*
+              sudo ln -sf /etc/tr/ticket.env /etc/tr/ticket.conf
+              printf 'nameserver 127.0.0.54\n' | sudo tee /etc/tr/ticket-resolv.conf >/dev/null
+              sudo systemctl restart tr-ticket-api.service
+              printf 'disk={{mnt}}\nresolver={{bad}}\nunit=/etc/tr/ticket.conf\n' > /home/learner/incident-report.txt

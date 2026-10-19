@@ -1,0 +1,213 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: libvirt-test-vm
+  title: Create and snapshot a test VM with libvirt
+  domain: linux
+  frameworks: [lfcs:operations-deployment, linuxplus:system-management]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [virtualization, libvirt, kvm, snapshots]
+  version: 1
+spec:
+  description: |
+    Release engineering tests timetable updates on throw-away guests. The libvirt host
+    **`tr-virt-01`** (`ssh tr-virt-01`; you have `sudo`) holds a prepared disk image,
+    **`/var/lib/libvirt/images/depot-base.qcow2`**, and an isolated libvirt network
+    **`tr-isolated`** (no forwarding to the outside).
+
+    On `tr-virt-01`, using the system libvirt instance (`qemu:///system`):
+
+    1. Define and start a guest named **`{{vm}}`** from that image: **{{mem}} MiB** of memory,
+       1 vCPU, one virtio network interface on **`tr-isolated`**. This host may have no
+       hardware acceleration, so use `--virt-type qemu` if `/dev/kvm` does not exist.
+    2. Take a snapshot named **`pre-patch`**, then a second snapshot named
+       **`post-patch`**.
+    3. Revert the guest to **`pre-patch`**.
+
+    The guest has no operating system in the image; it only needs to be defined, started and
+    snapshotted.
+  objectives:
+    - Create a libvirt guest from an existing disk image on a given network
+    - Take named snapshots and revert to one
+  params:
+    vm:
+      type: choice
+      values: [tt-test-a, tt-test-b]
+    mem:
+      type: choice
+      values: ["256", "384"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-virt-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh, console]
+  setup:
+    - on: tr-virt-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        export DEBIAN_FRONTEND=noninteractive
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null 2>&1 || true
+        if ! command -v virsh >/dev/null 2>&1 || ! command -v virt-install >/dev/null 2>&1; then
+          apt-get install -y -q libvirt-daemon-system libvirt-clients qemu-system-x86 qemu-utils virtinst >/dev/null 2>&1 || { echo "BLOCKED: libvirt/qemu packages are not in the ubuntu mirror (image gap)" | tee /var/lib/cloudtrain/libvirt-missing; exit 0; }
+        fi
+        systemctl enable --now libvirtd >/dev/null 2>&1 || systemctl enable --now libvirtd.socket >/dev/null 2>&1 || true
+        for i in $(seq 20); do virsh -c qemu:///system list >/dev/null 2>&1 && break; sleep 1; done
+        for d in tt-test-a tt-test-b; do
+          virsh -c qemu:///system destroy $d >/dev/null 2>&1 || true
+          virsh -c qemu:///system snapshot-list $d --name 2>/dev/null | grep . | while read -r s; do virsh -c qemu:///system snapshot-delete $d "$s" --metadata >/dev/null 2>&1 || true; done
+          virsh -c qemu:///system undefine $d --nvram >/dev/null 2>&1 || virsh -c qemu:///system undefine $d >/dev/null 2>&1 || true
+        done
+        install -d /var/lib/libvirt/images
+        rm -f /var/lib/libvirt/images/depot-base.qcow2
+        qemu-img create -f qcow2 /var/lib/libvirt/images/depot-base.qcow2 1G >/dev/null
+        if ! virsh -c qemu:///system net-info tr-isolated >/dev/null 2>&1; then
+          cat > /tmp/tr-isolated.xml <<'EON'
+        <network>
+          <name>tr-isolated</name>
+          <bridge name='virbr-trisol' stp='on' delay='0'/>
+          <ip address='192.168.150.1' netmask='255.255.255.0'/>
+        </network>
+        EON
+          virsh -c qemu:///system net-define /tmp/tr-isolated.xml >/dev/null
+          rm -f /tmp/tr-isolated.xml
+        fi
+        virsh -c qemu:///system net-start tr-isolated >/dev/null 2>&1 || true
+        virsh -c qemu:///system net-autostart tr-isolated >/dev/null 2>&1 || true
+  checks:
+    - id: guest
+      description: "{{vm}} is defined with {{mem}} MiB, 1 vCPU and is running"
+      type: shell
+      on: tr-virt-01
+      skills: [linux.virt.libvirt]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        i=$(virsh -c qemu:///system dominfo {{vm}} 2>/dev/null) || { echo undefined; exit 0; }
+        m=$(echo "$i" | awk '/^Max memory/ {print int($3 / 1024)}'); c=$(echo "$i" | awk '/^CPU\(s\)/ {print $2}'); s=$(echo "$i" | awk -F': *' '/^State/ {print $2}')
+        echo "mem=$m cpu=$c state=$s"
+      expect: {match: exact, value: "mem={{mem}} cpu=1 state=running"}
+    - id: disk-and-network
+      description: The guest uses depot-base.qcow2 and a virtio NIC on tr-isolated
+      type: shell
+      on: tr-virt-01
+      skills: [linux.virt.libvirt]
+      weight: 2
+      command: |
+        d=$(virsh -c qemu:///system domblklist {{vm}} 2>/dev/null | awk '$2 == "/var/lib/libvirt/images/depot-base.qcow2" {print "disk"}')
+        n=$(virsh -c qemu:///system domiflist {{vm}} 2>/dev/null | awk '$3 == "tr-isolated" && $4 == "virtio" {print "net"}')
+        echo "${d:-nodisk} ${n:-nonet}"
+      expect: {match: exact, value: "disk net"}
+    - id: snapshots
+      description: Snapshots pre-patch and post-patch both exist
+      type: shell
+      on: tr-virt-01
+      skills: [linux.virt.libvirt]
+      weight: 1.5
+      command: |
+        virsh -c qemu:///system snapshot-list {{vm}} --name 2>/dev/null | grep . | sort | paste -sd,
+      expect: {match: exact, value: "post-patch,pre-patch"}
+    - id: reverted
+      description: The current snapshot is pre-patch (the guest was reverted)
+      type: shell
+      on: tr-virt-01
+      skills: [linux.virt.libvirt]
+      weight: 2
+      command: |
+        virsh -c qemu:///system snapshot-current {{vm}} --name 2>/dev/null || echo none
+      expect: {match: exact, value: pre-patch}
+  hints:
+    - title: Define it in one command
+      command: virt-install --help | head -30
+      body: "virt-install --import --name NAME --memory MB --vcpus 1 --disk path=IMAGE --network network=tr-isolated,model=virtio --osinfo detect=on,require=off --noautoconsole --virt-type qemu. --import skips the installer."
+      cost: 2
+    - title: Snapshots
+      command: virsh snapshot-create-as --help
+      body: "virsh snapshot-create-as NAME --name pre-patch, then post-patch, then virsh snapshot-revert NAME pre-patch."
+      cost: 1
+  misconceptions:
+    - id: no-revert
+      description: Takes both snapshots but never reverts.
+      feedback: "The newest snapshot stays current until you run snapshot-revert."
+      expectFail: [reverted]
+      mutation:
+        on: tr-virt-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo virt-install --import --name {{vm}} --memory {{mem}} --vcpus 1 --disk path=/var/lib/libvirt/images/depot-base.qcow2,format=qcow2 --network network=tr-isolated,model=virtio --osinfo detect=on,require=off --noautoconsole --virt-type qemu
+          sudo virsh snapshot-create-as {{vm}} pre-patch
+          sudo virsh snapshot-create-as {{vm}} post-patch
+    - id: default-network
+      description: Attaches the guest to user-mode networking instead of tr-isolated.
+      feedback: "The test guests must stay on the isolated network."
+      expectFail: [disk-and-network]
+      mutation:
+        on: tr-virt-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo virt-install --import --name {{vm}} --memory {{mem}} --vcpus 1 --disk path=/var/lib/libvirt/images/depot-base.qcow2,format=qcow2 --network user,model=virtio --osinfo detect=on,require=off --noautoconsole --virt-type qemu
+          sudo virsh snapshot-create-as {{vm}} pre-patch
+          sudo virsh snapshot-create-as {{vm}} post-patch
+          sudo virsh snapshot-revert {{vm}} pre-patch
+  solution:
+    explanation: |
+      virt-install --import defines and starts a guest on the existing disk; snapshot-create-as
+      takes named snapshots and snapshot-revert makes pre-patch current again.
+      BLOCKED this round: libvirt and qemu are not in the ubuntu mirror, so the lab cannot
+      run until they are added (software emulation avoids nested virtualisation).
+    steps:
+      - on: tr-virt-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          virt=qemu; [ -e /dev/kvm ] && virt=kvm
+          sudo virt-install --import --name {{vm}} --memory {{mem}} --vcpus 1 --disk path=/var/lib/libvirt/images/depot-base.qcow2,format=qcow2 --network network=tr-isolated,model=virtio --osinfo detect=on,require=off --noautoconsole --virt-type $virt
+          sudo virsh snapshot-create-as {{vm}} pre-patch
+          sudo virsh snapshot-create-as {{vm}} post-patch
+          sudo virsh snapshot-revert {{vm}} pre-patch
+          sudo virsh snapshot-current {{vm}} --name
+    alternatives:
+      - id: define-xml
+        description: Write the domain XML by hand, define and start it.
+        steps:
+          - on: tr-virt-01
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cat > /tmp/{{vm}}.xml <<'EOX'
+              <domain type='qemu'>
+                <name>{{vm}}</name>
+                <memory unit='MiB'>{{mem}}</memory>
+                <vcpu>1</vcpu>
+                <os><type arch='x86_64' machine='q35'>hvm</type></os>
+                <devices>
+                  <disk type='file' device='disk'>
+                    <driver name='qemu' type='qcow2'/>
+                    <source file='/var/lib/libvirt/images/depot-base.qcow2'/>
+                    <target dev='vda' bus='virtio'/>
+                  </disk>
+                  <interface type='network'>
+                    <source network='tr-isolated'/>
+                    <model type='virtio'/>
+                  </interface>
+                </devices>
+              </domain>
+              EOX
+              sudo virsh define /tmp/{{vm}}.xml
+              sudo virsh start {{vm}}
+              sudo virsh snapshot-create-as {{vm}} pre-patch
+              sudo virsh snapshot-create-as {{vm}} post-patch
+              sudo virsh snapshot-revert {{vm}} pre-patch

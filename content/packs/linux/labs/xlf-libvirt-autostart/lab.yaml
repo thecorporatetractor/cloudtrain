@@ -1,0 +1,150 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-libvirt-autostart
+  title: Make an existing VM start with its host
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, libvirt, virtualization, autostart]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The libvirt guest **`xlf-guest{{n}}`** is defined on this host (system instance,
+    `qemu:///system`) but is shut off. Make it:
+
+    - start **automatically** when the host's libvirt starts;
+    - have **{{mem}} MiB** of memory in its persistent configuration (both the maximum and
+      the current allocation);
+    - **running** now.
+  objectives:
+    - Set a libvirt guest to autostart and change its persistent memory size
+  params:
+    n:
+      type: int
+      min: 10
+      max: 99
+    mem:
+      type: choice
+      values: ["192", "256"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        export DEBIAN_FRONTEND=noninteractive
+        install -d -m 0700 /var/lib/cloudtrain
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null 2>&1 || true
+        command -v virsh >/dev/null 2>&1 || apt-get install -y -q libvirt-daemon-system libvirt-clients qemu-system-x86 >/dev/null 2>&1 || { echo "BLOCKED: libvirt/qemu packages are not in the ubuntu mirror (image gap)" | tee /var/lib/cloudtrain/xlf-libvirt-missing; exit 0; }
+        systemctl enable --now libvirtd >/dev/null 2>&1 || systemctl enable --now libvirtd.socket >/dev/null 2>&1 || true
+        for i in $(seq 20); do virsh -c qemu:///system list >/dev/null 2>&1 && break; sleep 1; done
+        virsh -c qemu:///system destroy xlf-guest{{n}} >/dev/null 2>&1 || true
+        virsh -c qemu:///system undefine xlf-guest{{n}} >/dev/null 2>&1 || true
+        cat > /tmp/xlf-guest{{n}}.xml <<'EOX'
+        <domain type='qemu'>
+          <name>xlf-guest{{n}}</name>
+          <memory unit='MiB'>128</memory>
+          <currentMemory unit='MiB'>128</currentMemory>
+          <vcpu>1</vcpu>
+          <os><type arch='x86_64' machine='q35'>hvm</type></os>
+          <devices/>
+        </domain>
+        EOX
+        virsh -c qemu:///system define /tmp/xlf-guest{{n}}.xml >/dev/null
+        rm -f /tmp/xlf-guest{{n}}.xml
+  checks:
+    - id: autostart
+      description: The guest is set to autostart
+      type: shell
+      on: tr-ops-01
+      skills: [linux.virt.libvirt]
+      weight: 1.5
+      command: |
+        virsh -c qemu:///system dominfo xlf-guest{{n}} 2>/dev/null | awk -F': *' '/^Autostart/ {print $2}'
+      expect: {match: exact, value: enable}
+    - id: memory
+      description: The persistent configuration has {{mem}} MiB, maximum and current
+      type: shell
+      on: tr-ops-01
+      skills: [linux.virt.libvirt]
+      weight: 2
+      command: |
+        x=$(virsh -c qemu:///system dumpxml --inactive xlf-guest{{n}} 2>/dev/null)
+        m=$(echo "$x" | sed -n 's#.*<memory unit=.KiB.>\([0-9]*\)</memory>.*#\1#p'); c=$(echo "$x" | sed -n 's#.*<currentMemory unit=.KiB.>\([0-9]*\)</currentMemory>.*#\1#p')
+        echo "max=$((${m:-0} / 1024)) current=$((${c:-0} / 1024))"
+      expect: {match: exact, value: "max={{mem}} current={{mem}}"}
+    - id: running
+      description: The guest is running
+      type: shell
+      on: tr-ops-01
+      skills: [linux.virt.libvirt]
+      weight: 1.5
+      command: |
+        virsh -c qemu:///system domstate xlf-guest{{n}} 2>/dev/null
+      expect: {match: exact, value: running}
+  misconceptions:
+    - id: not-started
+      description: Sets autostart and memory but forgets to start the guest.
+      feedback: "Autostart only applies when libvirt starts; start the guest now as well."
+      expectFail: [running]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          sudo virsh autostart xlf-guest{{n}}
+          sudo virsh setmaxmem xlf-guest{{n}} {{mem}}M --config
+          sudo virsh setmem xlf-guest{{n}} {{mem}}M --config
+    - id: no-autostart
+      description: Starts the guest with the new memory size but does not enable autostart.
+      feedback: "virsh autostart marks the guest to start with libvirt."
+      expectFail: [autostart]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          sudo virsh setmaxmem xlf-guest{{n}} {{mem}}M --config
+          sudo virsh setmem xlf-guest{{n}} {{mem}}M --config
+          sudo virsh start xlf-guest{{n}}
+  solution:
+    explanation: |
+      virsh autostart enables autostart; setmaxmem then setmem with --config change the
+      persistent maximum and current memory; virsh start boots the guest with them.
+      BLOCKED this round: libvirt and qemu are not in the ubuntu mirror.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 60
+        run: |
+          set -e
+          sudo virsh autostart xlf-guest{{n}}
+          sudo virsh setmaxmem xlf-guest{{n}} {{mem}}M --config
+          sudo virsh setmem xlf-guest{{n}} {{mem}}M --config
+          sudo virsh start xlf-guest{{n}}
+    alternatives:
+      - id: edit-xml
+        description: Edit the persistent XML with virsh edit semantics through a script and then start.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            timeoutSec: 60
+            run: |
+              set -e
+              sudo virsh dumpxml --inactive xlf-guest{{n}} | sed "s#<memory unit='KiB'>[0-9]*#<memory unit='KiB'>$(({{mem}} * 1024))#; s#<currentMemory unit='KiB'>[0-9]*#<currentMemory unit='KiB'>$(({{mem}} * 1024))#" > /tmp/xlf-guest{{n}}.edit.xml
+              sudo virsh define /tmp/xlf-guest{{n}}.edit.xml
+              sudo virsh autostart xlf-guest{{n}}
+              sudo virsh start xlf-guest{{n}}

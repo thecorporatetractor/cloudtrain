@@ -1,0 +1,252 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: cloud-init-new-depot-host
+  title: Write and apply user-data for a new depot host and fix its failing module
+  domain: linux
+  frameworks: [linuxplus:automation-scripting, lpic1:install-packages]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [cloud-init, provisioning, user-data, nocloud]
+  version: 1
+spec:
+  description: |
+    New depot hosts are provisioned from a cloud-init user-data file. The draft for
+    depot **`depot-ctl-7`** is on the lab host **`tr-prov-01`** (`ssh tr-prov-01`; you have
+    `sudo`) at **`/home/learner/depot-user-data.yaml`**. It passes the schema check but one
+    of its modules fails when it runs.
+
+    Make the file correct, then prove it by applying it **on this host** the way a first
+    boot would, from a NoCloud seed:
+
+    - the user **`{{user}}`** with group `sudo`, shell `/bin/bash` and the SSH key the
+      draft already contains;
+    - the package **`{{pkg}}`** (the depot agent stand-in) installed from the mirror;
+    - the file **`/etc/tr-depot/agent.conf`** written with mode `0640` and the line
+      `site={{site}}`;
+    - the file passes `cloud-init schema --config-file`.
+
+    Apply it: put the file at `/var/lib/cloud/seed/nocloud/user-data` (with a
+    `meta-data` file next to it), run `cloud-init clean --logs`, then
+    `cloud-init init`, `cloud-init modules --mode=config` and
+    `cloud-init modules --mode=final`. The host's network, host name and SSH host keys are
+    protected by a configuration set up for you (`/etc/cloud/cloud.cfg.d/98-tr-keep.cfg`):
+    do not remove it. The check for the last step reads cloud-init's own status: no stage
+    may report errors.
+
+    Booting a brand-new VM from the file needs nested virtualisation and is not part of this
+    lab.
+  objectives:
+    - Write user-data with users, packages and write_files and validate it
+    - Apply user-data from a NoCloud seed and read cloud-init status and logs to find a failing module
+  params:
+    user:
+      type: choice
+      values: [depot-ops, depot-run]
+    pkg:
+      type: choice
+      values: [tmux, rsync]
+    site:
+      type: choice
+      values: [north-yard, east-yard]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-prov-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-prov-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        command -v cloud-init >/dev/null
+        key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example'
+        echo "$key" > /var/lib/cloudtrain/depot.pub
+        # protect the machine's own identity while cloud-init is re-run in place
+        cat > /etc/cloud/cloud.cfg.d/98-tr-keep.cfg <<'EOC'
+        network: {config: disabled}
+        preserve_hostname: true
+        ssh_deletekeys: false
+        ssh_genkeytypes: []
+        disable_root: false
+        ssh_pwauth: false
+        EOC
+        rm -rf /var/lib/cloud/seed/nocloud
+        dpkg -s {{pkg}} >/dev/null 2>&1 && apt-get remove -y -q {{pkg}} >/dev/null 2>&1 || true
+        userdel -r {{user}} 2>/dev/null || true
+        rm -rf /etc/tr-depot
+        cat > /home/learner/depot-user-data.yaml <<EOT
+        #cloud-config
+        users:
+          - name: {{user}}
+            groups: [sudo]
+            shell: /bin/bash
+            ssh_authorized_keys:
+              - $key
+        package_update: true
+        packages:
+          - {{pkg}}x
+        write_files:
+          - path: /etc/tr-depot/agent.conf
+            permissions: '0640'
+            content: |
+              site={{site}}
+              role=depot
+        EOT
+        chown learner:learner /home/learner/depot-user-data.yaml
+        cloud-init schema --config-file /home/learner/depot-user-data.yaml >/dev/null
+  checks:
+    - id: schema
+      description: The file passes cloud-init schema validation
+      type: shell
+      on: tr-prov-01
+      skills: [linux.virt.cloud-init]
+      weight: 1
+      timeoutSec: 60
+      command: cloud-init schema --config-file /home/learner/depot-user-data.yaml >/dev/null 2>&1 && echo valid || echo invalid
+      expect: {match: exact, value: valid}
+    - id: user
+      description: "{{user}} exists in group sudo with the key from the file"
+      type: shell
+      on: tr-prov-01
+      skills: [linux.virt.cloud-init]
+      weight: 2
+      command: |
+        id -nG {{user}} 2>/dev/null | tr ' ' '\n' | grep -qx sudo || { echo no-user-or-group; exit 0; }
+        [ "$(getent passwd {{user}} | cut -d: -f7)" = /bin/bash ] || { echo shell; exit 0; }
+        grep -qF "$(awk '{print $2}' /var/lib/cloudtrain/depot.pub)" /home/{{user}}/.ssh/authorized_keys 2>/dev/null && echo ok || echo no-key
+      expect: {match: exact, value: ok}
+    - id: package
+      description: "{{pkg}} is installed"
+      type: shell
+      on: tr-prov-01
+      skills: [linux.virt.cloud-init]
+      weight: 2
+      command: dpkg-query -W -f='${db:Status-Status}' {{pkg}} 2>/dev/null || echo missing
+      expect: {match: exact, value: installed}
+    - id: agent-conf
+      description: /etc/tr-depot/agent.conf has mode 0640 and the site line
+      type: shell
+      on: tr-prov-01
+      skills: [linux.virt.cloud-init]
+      weight: 1.5
+      command: |
+        m=$(stat -c %a /etc/tr-depot/agent.conf 2>/dev/null)
+        grep -qx 'site={{site}}' /etc/tr-depot/agent.conf 2>/dev/null && echo "site-ok mode=$m" || echo "site-missing mode=$m"
+      expect: {match: exact, value: "site-ok mode=640"}
+    - id: applied-clean
+      description: cloud-init applied the seed and no stage reports errors
+      type: shell
+      on: tr-prov-01
+      skills: [linux.virt.cloud-init]
+      weight: 2.5
+      timeoutSec: 30
+      command: |
+        python3 - <<'PY'
+        import json
+        try:
+            v1 = json.load(open("/run/cloud-init/status.json"))["v1"]
+        except Exception:
+            print("no-status"); raise SystemExit
+        if "NoCloud" not in str(v1.get("datasource", "")):
+            print("not-from-seed"); raise SystemExit
+        bad = []
+        for k, s in v1.items():
+            if isinstance(s, dict) and s.get("errors"):
+                bad.append(k)
+        fin = v1.get("modules-final", {}).get("finished")
+        print("clean" if not bad and fin else ("errors:" + ",".join(bad) if bad else "final-not-run"))
+        PY
+      expect: {match: exact, value: clean}
+    - id: seed-matches
+      description: The seed holds the same user-data as the corrected file
+      type: shell
+      on: tr-prov-01
+      skills: [linux.virt.cloud-init]
+      weight: 0.5
+      command: cmp -s /var/lib/cloud/seed/nocloud/user-data /home/learner/depot-user-data.yaml && echo same || echo differs
+      expect: {match: exact, value: same}
+  hints:
+    - title: Find the failing module
+      command: sudo cloud-init status --long; sudo grep -iE 'warn|fail|error' /var/log/cloud-init.log | tail
+      body: "After a run, cloud-init status --long names the stage and module with errors. The packages module is the one that talks to the mirror."
+      cost: 1
+    - title: Apply in place
+      body: "mkdir -p /var/lib/cloud/seed/nocloud; copy the file to user-data; put 'instance-id: depot-ctl-7-<n>' in meta-data; cloud-init clean --logs; then cloud-init init, modules --mode=config, modules --mode=final. Use a new instance-id each time you re-apply."
+      cost: 2
+    - title: Check the package name
+      command: apt-cache policy {{pkg}}
+      body: "A name that does not exist in the mirror makes apt fail the whole install step."
+      cost: 1
+  misconceptions:
+    - id: not-applied
+      description: Corrects the file but never runs cloud-init.
+      feedback: "A file on disk provisions nothing; seed it and run the stages."
+      expectFail: [user, package, agent-conf, applied-clean, seed-matches]
+      mutation:
+        on: tr-prov-01
+        as: learner
+        run: sed -i 's/{{pkg}}x/{{pkg}}/' /home/learner/depot-user-data.yaml
+    - id: typo-kept
+      description: Applies the draft as it is, with the wrong package name.
+      feedback: "The schema accepts any package name; the failure only shows when apt runs. Read cloud-init status --long and fix the name."
+      expectFail: [package, applied-clean]
+      mutation:
+        on: tr-prov-01
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          sudo mkdir -p /var/lib/cloud/seed/nocloud
+          sudo cp /home/learner/depot-user-data.yaml /var/lib/cloud/seed/nocloud/user-data
+          echo "instance-id: depot-ctl-7-a" | sudo tee /var/lib/cloud/seed/nocloud/meta-data >/dev/null
+          sudo cloud-init clean --logs
+          sudo cloud-init init
+          sudo cloud-init modules --mode=config
+          sudo cloud-init modules --mode=final || true
+  solution:
+    explanation: |
+      The draft installs "{{pkg}}x", which is not a package, so the packages module fails
+      (cloud-init status --long shows the failing stage). After correcting the name, the file
+      is placed in the NoCloud seed with a meta-data file, cloud-init state is cleaned and the
+      stages are run in order.
+    steps:
+      - on: tr-prov-01
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          sed -i 's/{{pkg}}x/{{pkg}}/' /home/learner/depot-user-data.yaml
+          cloud-init schema --config-file /home/learner/depot-user-data.yaml
+          sudo mkdir -p /var/lib/cloud/seed/nocloud
+          sudo cp /home/learner/depot-user-data.yaml /var/lib/cloud/seed/nocloud/user-data
+          echo "instance-id: depot-ctl-7-b" | sudo tee /var/lib/cloud/seed/nocloud/meta-data >/dev/null
+          sudo cloud-init clean --logs
+          sudo cloud-init init
+          sudo cloud-init modules --mode=config
+          sudo cloud-init modules --mode=final
+          sudo cloud-init status --long
+    alternatives:
+      - id: seed-by-dir-cp
+        description: Install the file into the seed with install -D and add a local-hostname line to meta-data.
+        steps:
+          - on: tr-prov-01
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              sed -i 's/{{pkg}}x/{{pkg}}/' /home/learner/depot-user-data.yaml
+              sudo install -D -m 0644 /home/learner/depot-user-data.yaml /var/lib/cloud/seed/nocloud/user-data
+              printf 'instance-id: depot-ctl-7-c\nlocal-hostname: depot-ctl-7\n' | sudo tee /var/lib/cloud/seed/nocloud/meta-data >/dev/null
+              sudo cloud-init clean --logs
+              sudo cloud-init init
+              sudo cloud-init modules --mode=config
+              sudo cloud-init modules --mode=final

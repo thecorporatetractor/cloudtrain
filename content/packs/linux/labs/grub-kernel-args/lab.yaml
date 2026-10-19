@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: grub-kernel-args
+  title: Add audit to every boot entry and try the older kernel for one boot
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain, lpic1:install-packages, linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [boot, grub, grubby, kernel-arguments]
+  version: 1
+spec:
+  description: |
+    The audit team wants process accounting on the control host **`tr-kern-01`**
+    (`ssh tr-kern-01`; you have `sudo`), and the console should stop hiding boot messages.
+    The host has two boot entries: the current kernel and an older one, kept as a
+    fallback (**Tallowmere previous kernel**).
+
+    On `tr-kern-01`:
+
+    - add the kernel argument **`audit=1`** and remove **`quiet`** for **every** installed
+      kernel entry, and make sure kernels installed **later** get the same command line;
+    - make the **older entry** the one used by the **next boot only**
+      (`grub2-reboot`): the saved default entry must stay the current kernel.
+
+    Do not reboot and do not delete either entry. Rebooting into the older kernel and
+    confirming `/proc/cmdline` afterwards is part of the real procedure; it cannot be
+    graded over ssh here.
+  objectives:
+    - Change kernel arguments for all entries and for future kernels with grubby
+    - Choose a next-boot-only entry without changing the saved default
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-kern-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-kern-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        mid=$(cat /etc/machine-id)
+        cur=$(grubby --default-kernel)
+        src=$(ls /boot/loader/entries/*.conf | grep -v 0-tr-previous | head -1)
+        prev=/boot/loader/entries/${mid}-0-tr-previous.conf
+        if [ ! -f "$prev" ]; then
+          cp "$src" "$prev"
+          sed -i 's/^title .*/title Tallowmere previous kernel/; s/^version .*/version 0-tr-previous/' "$prev"
+        fi
+        # both entries start with quiet and without audit
+        grubby --update-kernel=ALL --args=quiet --remove-args=audit
+        [ -f /etc/kernel/cmdline ] || sed 's/BOOT_IMAGE=[^ ]* *//' /proc/cmdline > /etc/kernel/cmdline
+        grep -qw quiet /etc/kernel/cmdline || sed -i 's/ *$/ quiet/' /etc/kernel/cmdline
+        sed -i 's/ *audit=[^ ]*//' /etc/kernel/cmdline
+        grubby --set-default="$cur"
+        grub2-editenv - unset next_entry || true
+        id=$(grub2-editenv list | sed -n 's/^saved_entry=//p')
+        echo "$id" > /var/lib/cloudtrain/grub-saved.id
+        basename "$prev" .conf > /var/lib/cloudtrain/grub-prev.id
+  checks:
+    - id: audit-all
+      description: Every boot entry has audit=1
+      type: shell
+      on: tr-kern-01
+      skills: [linux.boot.grub]
+      weight: 2
+      command: |
+        n=$(grubby --info=ALL 2>/dev/null | grep -c '^args=' || true)
+        m=$(grubby --info=ALL 2>/dev/null | grep '^args=' | grep -cE '[" ]audit=1([" ]|$)' || true)
+        [ "$n" -ge 2 ] && [ "$n" = "$m" ] && echo all || echo "$m of $n"
+      expect: {match: exact, value: all}
+    - id: quiet-gone
+      description: No boot entry has quiet
+      type: shell
+      on: tr-kern-01
+      skills: [linux.boot.grub]
+      weight: 1.5
+      command: |
+        m=$(grubby --info=ALL 2>/dev/null | grep '^args=' | grep -cE '[" ]quiet([" ]|$)' || true)
+        echo "quiet-entries=$m"
+      expect: {match: exact, value: "quiet-entries=0"}
+    - id: future-cmdline
+      description: The command line for future kernels has audit=1 and no quiet
+      type: shell
+      on: tr-kern-01
+      skills: [linux.boot.grub]
+      weight: 1.5
+      command: |
+        c=$( { cat /etc/kernel/cmdline 2>/dev/null; grep '^GRUB_CMDLINE_LINUX=' /etc/default/grub 2>/dev/null; } )
+        a=no; q=no
+        echo "$c" | grep -qE '(^|[" ])audit=1([" ]|$)' && a=yes
+        echo "$c" | grep -qE '(^|[" ])quiet([" ]|$)' && q=yes
+        echo "audit=$a quiet=$q"
+      expect: {match: exact, value: "audit=yes quiet=no"}
+    - id: next-boot-previous
+      description: The next boot only uses the older entry
+      type: shell
+      on: tr-kern-01
+      skills: [linux.boot.grub]
+      weight: 2
+      command: |
+        n=$(grub2-editenv list 2>/dev/null | sed -n 's/^next_entry=//p')
+        [ -n "$n" ] && [ "$n" = "$(cat /var/lib/cloudtrain/grub-prev.id)" ] && echo previous || echo "next_entry=${n:-unset}"
+      expect: {match: exact, value: previous}
+    - id: default-kept
+      description: The saved default entry is still the current kernel and both entries exist
+      type: shell
+      on: tr-kern-01
+      skills: [linux.boot.grub]
+      weight: 1
+      command: |
+        s=$(grub2-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')
+        [ "$s" = "$(cat /var/lib/cloudtrain/grub-saved.id)" ] && [ -f "/boot/loader/entries/$(cat /var/lib/cloudtrain/grub-prev.id).conf" ] && echo kept || echo "saved=$s"
+      expect: {match: exact, value: kept}
+  hints:
+    - title: Show the entries
+      command: sudo grubby --info=ALL
+      body: "Each BLS entry has an index, a title and an args line. grubby --default-kernel names the default one."
+      cost: 0
+    - title: Change all entries at once
+      body: "grubby --update-kernel=ALL --args=... --remove-args=... edits every entry. New kernels copy /etc/kernel/cmdline, so change it too."
+      cost: 2
+    - title: One boot only
+      command: sudo grub2-reboot --help
+      body: "grub2-reboot <entry id> sets next_entry in the grub environment block; grub clears it after one use. grub2-set-default or grubby --set-default would change the permanent default instead."
+      cost: 2
+  misconceptions:
+    - id: default-only
+      description: Changes only the default entry with --update-kernel=DEFAULT.
+      feedback: "DEFAULT edits one entry. --update-kernel=ALL edits all of them, and /etc/kernel/cmdline covers future kernels."
+      expectFail: [audit-all, quiet-gone, future-cmdline]
+      mutation:
+        on: tr-kern-01
+        as: learner
+        run: |
+          sudo grubby --update-kernel=DEFAULT --args=audit=1 --remove-args=quiet
+          sudo grub2-reboot "$(sudo cat /var/lib/cloudtrain/grub-prev.id)"
+    - id: permanent-default
+      description: Makes the older kernel the permanent default instead of a one-off.
+      feedback: "grub2-reboot sets next_entry for one boot; the saved default must stay the current kernel."
+      expectFail: [next-boot-previous, default-kept]
+      mutation:
+        on: tr-kern-01
+        as: learner
+        run: |
+          sudo grubby --update-kernel=ALL --args=audit=1 --remove-args=quiet
+          sudo sed -i 's/ *quiet//; s/ *$/ audit=1/' /etc/kernel/cmdline
+          sudo grubby --set-default="/boot/loader/entries/$(sudo cat /var/lib/cloudtrain/grub-prev.id).conf" 2>/dev/null || sudo grub2-set-default "$(sudo cat /var/lib/cloudtrain/grub-prev.id)"
+    - id: no-future
+      description: Edits the existing entries but not the default command line.
+      feedback: "A kernel installed later gets its command line from /etc/kernel/cmdline; update it as well."
+      expectFail: [future-cmdline]
+      mutation:
+        on: tr-kern-01
+        as: learner
+        run: |
+          sudo grubby --update-kernel=ALL --args=audit=1 --remove-args=quiet
+          sudo grub2-reboot "$(sudo cat /var/lib/cloudtrain/grub-prev.id)"
+  solution:
+    explanation: |
+      grubby --update-kernel=ALL applies --args and --remove-args to every BLS entry;
+      /etc/kernel/cmdline holds the command line copied by kernel-install for kernels
+      installed later. grub2-reboot <id> writes next_entry once, leaving saved_entry alone.
+    steps:
+      - on: tr-kern-01
+        as: learner
+        run: |
+          set -e
+          sudo grubby --update-kernel=ALL --args=audit=1 --remove-args=quiet
+          sudo sed -i 's/ *quiet\b//; s/ *audit=[^ ]*//; s/ *$/ audit=1/' /etc/kernel/cmdline
+          sudo grub2-reboot "$(sudo cat /var/lib/cloudtrain/grub-prev.id)"
+          sudo grub2-editenv list
+    alternatives:
+      - id: bls-by-hand
+        description: Edit the options line of each BLS entry file directly instead of using grubby.
+        steps:
+          - on: tr-kern-01
+            as: learner
+            run: |
+              set -e
+              sudo sed -i '/^options/{s/ quiet\b//; s/ audit=[^ ]*//; s/$/ audit=1/}' /boot/loader/entries/*.conf
+              sudo sed -i 's/ *quiet\b//; s/ *audit=[^ ]*//; s/ *$/ audit=1/' /etc/kernel/cmdline
+              sudo grub2-reboot "$(sudo cat /var/lib/cloudtrain/grub-prev.id)"

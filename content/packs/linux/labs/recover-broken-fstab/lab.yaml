@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: recover-broken-fstab
+  title: Repair an fstab entry that would send the host into emergency mode
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems, lfcs:operations-deployment, linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [boot, recovery, fstab, emergency-mode]
+  version: 1
+spec:
+  description: |
+    After a change window the schedule host **`tr-sched-1`** (`ssh tr-sched-1`; you have
+    `sudo`) has a typo in `/etc/fstab`. The entry for the schedule volume (ext4, label
+    **`TT-SCHED`**) at **`{{mp}}`** carries a wrong UUID. On its next boot the host would
+    wait for a device that does not exist and fall into emergency mode, because the entry
+    is not `nofail`.
+
+    Repair the host as you would from emergency mode, but over ssh:
+
+    - correct the entry in `/etc/fstab` so it refers to the volume **by its real UUID**;
+    - mount it at `{{mp}}` now, with the schedule data intact;
+    - leave `/etc/fstab` valid for `findmnt --verify`.
+
+    Do not reformat the volume and do not hide the problem with `nofail`: the volume is
+    required for the host to be useful. The console part (entering the root password at
+    the emergency prompt, `mount -o remount,rw /`, `systemctl daemon-reload`, `exit`)
+    cannot be driven here; the end state is graded.
+  objectives:
+    - Find the typo in an fstab entry with findmnt --verify and blkid
+    - Repair the entry and mount the volume without reformatting
+  params:
+    mp:
+      type: choice
+      values: ["/srv/sched", "/srv/roster"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-sched-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-sched-1
+      timeoutSec: 120
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        if ! blkid -L TT-SCHED >/dev/null 2>&1; then
+          wipefs -a /dev/vdc >/dev/null
+          mkfs.ext4 -q -L TT-SCHED /dev/vdc
+        fi
+        umount {{mp}} 2>/dev/null || true
+        mkdir -p {{mp}}
+        t=$(mktemp -d); mount LABEL=TT-SCHED $t
+        for d in 01 02 03 04; do echo "service pattern $d" > $t/pattern-$d.txt; done
+        umount $t; rmdir $t
+        uuid=$(blkid -s UUID -o value /dev/vdc)
+        echo "$uuid" > /var/lib/cloudtrain/sched.uuid
+        # corrupt the last character of the UUID
+        last=${uuid#"${uuid%?}"}
+        if [ "$last" = 0 ]; then bad=1; else bad=0; fi
+        badu="${uuid%?}$bad"
+        sed -i '\#[[:space:]]{{mp}}[[:space:]]#d' /etc/fstab
+        echo "UUID=$badu {{mp}} ext4 defaults 0 2" >> /etc/fstab
+        systemctl daemon-reload
+  checks:
+    - id: mounted
+      description: TT-SCHED is mounted at {{mp}} with its data
+      type: shell
+      on: tr-sched-1
+      skills: [linux.storage.mounts, linux.boot.recovery]
+      weight: 1.5
+      command: '[ "$(findmnt -n -o SOURCE {{mp}} 2>/dev/null)" = "$(blkid -L TT-SCHED)" ] && [ -f {{mp}}/pattern-04.txt ] && echo mounted || echo no'
+      expect: {match: exact, value: mounted}
+    - id: fstab-uuid
+      description: The fstab entry refers to the real UUID and /etc/fstab passes findmnt --verify
+      type: shell
+      on: tr-sched-1
+      skills: [linux.storage.mounts, linux.boot.recovery]
+      weight: 2
+      command: |
+        u=$(blkid -s UUID -o value "$(blkid -L TT-SCHED)")
+        r=$(awk -v u="UUID=$u" '!/^[[:space:]]*#/ && $2 == "{{mp}}" {gsub("\"", "", $1); print ($1 == u ? "uuid" : "other:" $1)}' /etc/fstab | tail -1)
+        if [ "$r" = uuid ] && ! findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; then r=invalid-fstab; fi
+        echo "$r"
+      expect: {match: exact, value: uuid}
+    - id: not-reformatted
+      description: The volume still has its original UUID and no nofail workaround
+      type: shell
+      on: tr-sched-1
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: |
+        [ "$(blkid -s UUID -o value "$(blkid -L TT-SCHED)")" = "$(cat /var/lib/cloudtrain/sched.uuid)" ] || { echo reformatted; exit 0; }
+        o=$(findmnt --fstab -n -o OPTIONS {{mp}} 2>/dev/null)
+        echo ",$o," | grep -q ',nofail,' && echo nofail-hack || echo original
+      expect: {match: exact, value: original}
+  hints:
+    - title: What would fail at boot
+      command: findmnt --verify
+      body: "findmnt --verify checks every fstab line without rebooting and names the entry whose source does not exist."
+      cost: 0
+    - title: The real UUID
+      command: sudo blkid -L TT-SCHED; sudo blkid /dev/vdc
+      body: "blkid prints the UUID of the filesystem. Copy it into the fstab line, then systemctl daemon-reload and mount the volume."
+      cost: 1
+  misconceptions:
+    - id: nofail-hack
+      description: Adds nofail so the host boots, leaving the wrong UUID in place.
+      feedback: "nofail only hides the missing device; the schedule volume is still not mounted. Fix the UUID."
+      expectFail: [mounted, fstab-uuid, not-reformatted]
+      mutation:
+        on: tr-sched-1
+        as: learner
+        run: |
+          sudo sed -i 's#\(^UUID=[^ ]* {{mp}} ext4 \)defaults#\1defaults,nofail#' /etc/fstab
+          sudo systemctl daemon-reload
+    - id: by-device
+      description: Replaces the UUID with the device name.
+      feedback: "It works today, but device names change when disks are added; use the UUID."
+      expectFail: [fstab-uuid]
+      mutation:
+        on: tr-sched-1
+        as: learner
+        run: |
+          sudo sed -i 's#^UUID=[^ ]* {{mp}} #/dev/vdc {{mp}} #' /etc/fstab
+          sudo systemctl daemon-reload
+          sudo mount {{mp}}
+    - id: reformatted
+      description: Reformats the volume to get a new UUID and loses the data.
+      feedback: "mkfs destroys the schedule data; the entry only needed the correct UUID."
+      expectFail: [mounted, not-reformatted]
+      mutation:
+        on: tr-sched-1
+        as: learner
+        run: |
+          sudo mkfs.ext4 -q -F -L TT-SCHED /dev/vdc
+          u=$(sudo blkid -s UUID -o value /dev/vdc)
+          sudo sed -i "s#^UUID=[^ ]* {{mp}} #UUID=$u {{mp}} #" /etc/fstab
+          sudo systemctl daemon-reload
+          sudo mount {{mp}}
+  solution:
+    explanation: |
+      findmnt --verify points at the entry whose UUID does not exist; blkid gives the real
+      one. Correct the line, daemon-reload so systemd regenerates the mount unit, and mount.
+    steps:
+      - on: tr-sched-1
+        as: learner
+        run: |
+          set -e
+          sudo findmnt --verify || true
+          u=$(sudo blkid -s UUID -o value "$(sudo blkid -L TT-SCHED)")
+          sudo sed -i "s#^UUID=[^ ]* {{mp}} #UUID=$u {{mp}} #" /etc/fstab
+          sudo systemctl daemon-reload
+          sudo mount {{mp}}
+          findmnt {{mp}}
+    alternatives:
+      - id: rewrite-line
+        description: Drop the old line and append a corrected one instead of editing in place.
+        steps:
+          - on: tr-sched-1
+            as: learner
+            run: |
+              set -e
+              u=$(sudo blkid -s UUID -o value /dev/disk/by-label/TT-SCHED)
+              sudo grep -v '[[:space:]]{{mp}}[[:space:]]' /etc/fstab | sudo tee /etc/fstab.new >/dev/null
+              echo "UUID=$u {{mp}} ext4 defaults 0 2" | sudo tee -a /etc/fstab.new >/dev/null
+              sudo mv /etc/fstab.new /etc/fstab
+              sudo systemctl daemon-reload
+              sudo mount -a

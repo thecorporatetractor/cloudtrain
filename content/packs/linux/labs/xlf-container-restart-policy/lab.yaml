@@ -1,0 +1,171 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-container-restart-policy
+  title: Run a container that restarts and keeps its data
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, containers, podman, restart-policy]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The image **`registry.tallowmere.test/pis-web:1`** is already in the local image store
+    (there is no registry: always use `--pull=never`). It serves the directory `/data` on
+    TCP port 8000.
+
+    As root with podman, run a detached container named **`{{name}}`** from it with:
+
+    - host port **`{{port}}`** published to container port 8000;
+    - a **named volume** `{{vol}}` mounted at `/data`;
+    - a restart policy of **`always`**.
+
+    Do not use a bind mount, and do not publish any other port.
+  objectives:
+    - Run a container with a published port, a named volume and a restart policy
+  params:
+    name:
+      type: choice
+      values: [pis-board, pis-display]
+    vol:
+      type: choice
+      values: [pis-data, pis-content]
+    port:
+      type: choice
+      values: ["8081", "8091"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        if ! command -v podman >/dev/null 2>&1; then
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q podman >/dev/null
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q netavark aardvark-dns >/dev/null 2>&1 || true
+        podman rm -f {{name}} >/dev/null 2>&1 || true
+        podman volume rm -f {{vol}} >/dev/null 2>&1 || true
+        if ! podman image exists registry.tallowmere.test/pis-web:1; then
+          # no registry is reachable: build a tiny root filesystem around the host's python3 and import it
+          r=$(mktemp -d)
+          py=$(readlink -f /usr/bin/python3); ver=$(basename "$py")
+          mkdir -p "$r/usr/bin" "$r/usr/lib" "$r/data" "$r/tmp" "$r/etc"
+          cp "$py" "$r/usr/bin/$ver"; ln -s "$ver" "$r/usr/bin/python3"
+          cp -a "/usr/lib/$ver" "$r/usr/lib/"
+          rm -rf "$r/usr/lib/$ver/test" "$r/usr/lib/$ver/idlelib" "$r/usr/lib/$ver/tkinter" "$r/usr/lib/$ver/turtledemo"
+          { echo "$py"; find "$r/usr/lib/$ver" -name '*.so*'; } | while read -r f; do
+            ldd "$f" 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i}'
+          done | sort -u | while read -r l; do cp -L --parents "$l" "$r/"; done
+          echo 'root:x:0:0:root:/:/bin/false' > "$r/etc/passwd"
+          tar -C "$r" -c . | podman import --change 'CMD ["python3","-m","http.server","8000","--directory","/data"]' --change 'ENV PATH=/usr/bin' --change 'EXPOSE 8000' --change 'VOLUME /data' - registry.tallowmere.test/pis-web:1 >/dev/null
+          rm -rf "$r"
+        fi
+        podman run --rm --pull=never registry.tallowmere.test/pis-web:1 python3 -c 'import http.server, socket, json'
+  checks:
+    - id: running
+      description: The container {{name}} is running from the image
+      type: shell
+      on: tr-ops-01
+      skills: [linux.internals.podman]
+      weight: 1
+      command: |
+        podman inspect {{name}} 2>/dev/null | python3 -c 'import json, sys; d = json.load(sys.stdin)[0]; print(str(d["State"]["Running"]).lower(), d["ImageName"])' 2>/dev/null || echo none
+      expect: {match: exact, value: "true registry.tallowmere.test/pis-web:1"}
+    - id: restart-policy
+      description: The restart policy is always
+      type: shell
+      on: tr-ops-01
+      skills: [linux.internals.podman]
+      weight: 2
+      command: |
+        podman inspect {{name}} 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["HostConfig"]["RestartPolicy"]["Name"])' 2>/dev/null || echo none
+      expect: {match: exact, value: always}
+    - id: port
+      description: Host port {{port}} is published to container port 8000 and answers
+      type: shell
+      on: tr-ops-01
+      skills: [linux.internals.podman]
+      weight: 1.5
+      command: |
+        p=$(podman inspect {{name}} 2>/dev/null | python3 -c '
+        import json, sys
+        d = json.load(sys.stdin)[0]["NetworkSettings"]["Ports"]
+        print(",".join(sorted(k + ">" + b["HostPort"] for k, v in d.items() for b in (v or []))))' 2>/dev/null)
+        c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:{{port}}/ 2>/dev/null)
+        echo "$p $c"
+      expect: {match: exact, value: "8000/tcp>{{port}} 200"}
+    - id: named-volume
+      description: The named volume {{vol}} is mounted at /data and receives its data
+      type: shell
+      on: tr-ops-01
+      skills: [linux.internals.podman]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        t=$(podman inspect {{name}} 2>/dev/null | python3 -c '
+        import json, sys
+        m = [x for x in json.load(sys.stdin)[0]["Mounts"] if x["Destination"] == "/data"]
+        print(m[0]["Type"] + ":" + m[0].get("Name", "") if m else "none")' 2>/dev/null)
+        [ "$t" = "volume:{{vol}}" ] || { echo "mount=$t"; exit 0; }
+        podman exec {{name}} python3 -c 'open("/data/probe.txt", "w").write("kept")' 2>/dev/null
+        mp=$(podman volume inspect {{vol}} 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["Mountpoint"])' 2>/dev/null)
+        [ "$(cat "$mp/probe.txt" 2>/dev/null)" = kept ] && echo volume-ok || echo not-in-volume
+      expect: {match: exact, value: volume-ok}
+  misconceptions:
+    - id: bind-mount
+      description: Uses a bind-mounted host directory instead of a named volume.
+      feedback: "The task asks for a named volume; podman volume create or -v NAME:/data creates one that podman manages."
+      expectFail: [named-volume]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 60
+        run: |
+          sudo mkdir -p /srv/pis-bind
+          sudo podman run -d --pull=never --name {{name}} --restart always -p {{port}}:8000 -v /srv/pis-bind:/data registry.tallowmere.test/pis-web:1
+    - id: on-failure
+      description: Uses the on-failure restart policy.
+      feedback: "on-failure restarts only after a non-zero exit; the task asks for always, which also restarts a container that exited cleanly."
+      expectFail: [restart-policy]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 60
+        run: sudo podman run -d --pull=never --name {{name}} --restart on-failure -p {{port}}:8000 -v {{vol}}:/data registry.tallowmere.test/pis-web:1
+  solution:
+    explanation: podman run -d with --restart always, -p HOST:8000 and -v VOLUME:/data (a name, not a path, makes it a named volume).
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 60
+        run: |
+          set -e
+          sudo podman run -d --pull=never --name {{name}} --restart always -p {{port}}:8000 -v {{vol}}:/data registry.tallowmere.test/pis-web:1
+          sudo podman ps
+    alternatives:
+      - id: volume-first
+        description: Create the volume first and use --restart=always with --publish.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            timeoutSec: 60
+            run: |
+              set -e
+              sudo podman volume create {{vol}}
+              sudo podman run -d --pull=never --name {{name}} --restart=always --publish {{port}}:8000 --volume {{vol}}:/data registry.tallowmere.test/pis-web:1

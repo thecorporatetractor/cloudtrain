@@ -1,0 +1,219 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ssh-hardening-fail2ban
+  title: Harden SSH on the public ticket host and ban repeated failures
+  domain: linux
+  frameworks: [linuxplus:security, lpic2:system-security]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ssh, sshd, hardening, fail2ban]
+  version: 1
+spec:
+  description: |
+    The public ticket-sales host **`tkt-web-02`** (`ssh tkt-web-02`; you have `sudo`) still
+    accepts passwords and root logins, and negotiates every cipher the daemon knows. The
+    security review wants:
+
+    - **password authentication off** and **root login off**, with public-key
+      authentication left on;
+    - the SSH ciphers limited to exactly this approved set: **`{{ciphers}}`**;
+    - a fail2ban jail for `sshd` that is **enabled**, bans an address for **10 minutes**
+      (`bantime`) after **5** failed logins (`maxretry`).
+
+    Put the sshd settings where they take effect (this host has drop-in files under
+    `/etc/ssh/sshd_config.d`; the first value for a keyword wins), keep `sshd -t` clean,
+    reload the daemon and do not lock yourself out: your own key login must keep working.
+    Write the jail in `/etc/fail2ban/jail.d/` or `/etc/fail2ban/jail.local`.
+  objectives:
+    - Find the effective sshd configuration with sshd -T and the drop-in precedence rules
+    - Configure a fail2ban sshd jail with ban time and retry limits
+  params:
+    ciphers:
+      type: choice
+      values:
+        - "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com"
+        - "aes256-gcm@openssh.com,aes128-gcm@openssh.com"
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tkt-web-02
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tkt-web-02
+      timeoutSec: 120
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        mkdir -p /etc/ssh/sshd_config.d
+        cat > /etc/ssh/sshd_config.d/10-tkt-legacy.conf <<'EOC'
+        # left from the migration from the old ticket host
+        PasswordAuthentication yes
+        PermitRootLogin yes
+        EOC
+        rm -f /etc/ssh/sshd_config.d/00-*.conf /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.local 2>/dev/null || true
+        sshd -t
+        systemctl reload ssh
+  checks:
+    - id: password-off
+      description: Password authentication is off in the effective configuration
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.ssh-hardening]
+      weight: 1.5
+      command: sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}'
+      expect: {match: exact, value: "no"}
+    - id: root-off
+      description: Root login is off in the effective configuration
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.ssh-hardening]
+      weight: 1.5
+      command: sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}'
+      expect: {match: exact, value: "no"}
+    - id: pubkey-on
+      description: Public-key authentication is still on and the daemon runs
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.ssh-hardening]
+      weight: 1
+      command: |
+        p=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
+        echo "$p $(systemctl is-active ssh)"
+      expect: {match: exact, value: "yes active"}
+    - id: ciphers
+      description: Exactly the approved ciphers are offered
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.ssh-hardening]
+      weight: 2
+      command: |
+        have=$(sshd -T 2>/dev/null | awk '$1 == "ciphers" {print $2}' | tr ',' '\n' | sort | paste -sd,)
+        want=$(echo '{{ciphers}}' | tr ',' '\n' | sort | paste -sd,)
+        [ -n "$have" ] && [ "$have" = "$want" ] && echo exact-set || echo "have:$have"
+      expect: {match: exact, value: exact-set}
+    - id: config-valid
+      description: sshd -t accepts the configuration
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.ssh-hardening]
+      weight: 0.5
+      command: sshd -t >/dev/null 2>&1 && echo valid || echo invalid
+      expect: {match: exact, value: valid}
+    - id: jail
+      description: The sshd jail is enabled with maxretry 5 and bantime 10 minutes
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.ssh-hardening]
+      weight: 2.5
+      command: |
+        python3 - <<'PY'
+        import configparser, glob, os
+        def unit(v):
+            v = v.strip().lower()
+            m = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+            try:
+                return int(float(v[:-1]) * m[v[-1]]) if v[-1] in m else int(v)
+            except Exception:
+                return -1
+        files = ["/etc/fail2ban/jail.conf"] + sorted(glob.glob("/etc/fail2ban/jail.d/*.conf"))
+        files += ["/etc/fail2ban/jail.local"] + sorted(glob.glob("/etc/fail2ban/jail.d/*.local"))
+        cp = configparser.RawConfigParser(strict=False)
+        cp.optionxform = str
+        for f in files:
+            if os.path.exists(f):
+                try:
+                    cp.read(f)
+                except Exception:
+                    pass
+        if not cp.has_section("sshd"):
+            print("no-sshd-jail")
+        else:
+            g = lambda k, d="": cp.get("sshd", k, fallback=d).split(";")[0].split("#")[0].strip()
+            print("enabled=%s maxretry=%s bantime=%d" % (g("enabled", "false").lower(), g("maxretry", "none"), unit(g("bantime", "0"))))
+        PY
+      expect: {match: exact, value: "enabled=true maxretry=5 bantime=600"}
+  hints:
+    - title: Which setting wins
+      command: sudo sshd -T | grep -Ei 'passwordauth|permitroot|ciphers'; ls /etc/ssh/sshd_config.d
+      body: "sshd reads sshd_config.d/*.conf in order at the top of sshd_config, and the first value for a keyword wins. A file called 00-... is read before 10-..."
+      cost: 1
+    - title: Jail syntax
+      body: "[sshd] enabled = true, maxretry = 5, bantime = 10m in /etc/fail2ban/jail.d/sshd.local. fail2ban is in neither package mirror of this lab, so the jail is graded from its configuration."
+      cost: 1
+  misconceptions:
+    - id: main-file-only
+      description: Edits /etc/ssh/sshd_config but leaves the earlier drop-in in place.
+      feedback: "The Include of sshd_config.d comes first, so 10-tkt-legacy.conf still wins. Check with sshd -T."
+      expectFail: [password-off, root-off]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '\nPasswordAuthentication no\nPermitRootLogin no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          printf '%s\n' 'Ciphers {{ciphers}}' | sudo tee /etc/ssh/sshd_config.d/00-ciphers.conf >/dev/null
+          sudo mkdir -p /etc/fail2ban
+          printf '[sshd]\nenabled = true\nmaxretry = 5\nbantime = 10m\n' | sudo tee /etc/fail2ban/jail.local >/dev/null
+          sudo systemctl reload ssh
+    - id: short-ban
+      description: Hardens sshd correctly but writes a jail with a 60 second ban and 3 retries.
+      feedback: "The review asks for maxretry 5 and a ten minute bantime."
+      expectFail: [jail]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '%s\n' 'PasswordAuthentication no' 'PermitRootLogin no' 'Ciphers {{ciphers}}' | sudo tee /etc/ssh/sshd_config.d/00-harden.conf >/dev/null
+          sudo mkdir -p /etc/fail2ban/jail.d
+          printf '[sshd]\nenabled = true\nmaxretry = 3\nbantime = 60\n' | sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null
+          sudo systemctl reload ssh
+    - id: wrong-ciphers
+      description: Allows an extra, unapproved cipher.
+      feedback: "The approved set is exact; remove everything else from Ciphers."
+      expectFail: [ciphers]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '%s\n' 'PasswordAuthentication no' 'PermitRootLogin no' 'Ciphers {{ciphers}},aes128-ctr' | sudo tee /etc/ssh/sshd_config.d/00-harden.conf >/dev/null
+          sudo mkdir -p /etc/fail2ban/jail.d
+          printf '[sshd]\nenabled = true\nmaxretry = 5\nbantime = 10m\n' | sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null
+          sudo systemctl reload ssh
+  solution:
+    explanation: |
+      A drop-in named 00-... is read before the legacy 10-... file, so its values win.
+      sshd -T shows the effective result. The jail is a [sshd] section with enabled, maxretry
+      and bantime. fail2ban itself is not in the lab mirrors, so installing it is best effort.
+    steps:
+      - on: tkt-web-02
+        as: learner
+        run: |
+          set -e
+          printf '%s\n' 'PasswordAuthentication no' 'PermitRootLogin no' 'PubkeyAuthentication yes' 'Ciphers {{ciphers}}' | sudo tee /etc/ssh/sshd_config.d/00-harden.conf >/dev/null
+          sudo sshd -t
+          sudo systemctl reload ssh
+          sudo apt-get install -y -q fail2ban >/dev/null 2>&1 || echo "fail2ban package not available in this lab; writing the jail only"
+          sudo mkdir -p /etc/fail2ban/jail.d
+          printf '[sshd]\nenabled = true\nmaxretry = 5\nbantime = 10m\n' | sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null
+          sudo sshd -T | grep -Ei 'passwordauth|permitroot|^ciphers'
+    alternatives:
+      - id: edit-legacy
+        description: Edit the legacy drop-in in place and use jail.local with a seconds value.
+        steps:
+          - on: tkt-web-02
+            as: learner
+            run: |
+              set -e
+              sudo sed -i 's/^PasswordAuthentication .*/PasswordAuthentication no/; s/^PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config.d/10-tkt-legacy.conf
+              echo 'Ciphers {{ciphers}}' | sudo tee -a /etc/ssh/sshd_config.d/10-tkt-legacy.conf >/dev/null
+              sudo sshd -t
+              sudo systemctl reload ssh
+              sudo mkdir -p /etc/fail2ban
+              printf '[DEFAULT]\nbantime = 600\n\n[sshd]\nenabled = true\nmaxretry = 5\n' | sudo tee /etc/fail2ban/jail.local >/dev/null

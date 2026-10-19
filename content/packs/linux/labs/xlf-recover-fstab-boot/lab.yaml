@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-recover-fstab-boot
+  title: Make a host with a bad fstab entry boot cleanly
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: hard
+  estimatedMinutes: 12
+  tags: [exam, boot, fstab, recovery]
+  version: 1
+spec:
+  description: |
+    **Host:** the Enterprise Linux node `tr-sec-01` (`ssh tr-sec-01`, then `sudo -i`)
+
+    The gate volume is an ext4 image file, `/var/lib/tr-gate/gate-{{n}}.img`, that
+    `/etc/fstab` mounts at **`/srv/gate-{{n}}`**. A typo in that fstab line means the node
+    would drop into emergency mode at its next boot.
+
+    Fix the fstab line so the volume mounts **now and at boot**: keep the entry (no
+    commenting out, no `nofail` workaround) and do not recreate the image.
+  objectives:
+    - Find and fix an fstab entry that would fail at boot
+  params:
+    n:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-sec-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-sec-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        install -d /var/lib/tr-gate /srv/gate-{{n}}
+        umount /srv/gate-{{n}} 2>/dev/null || true
+        if [ ! -f /var/lib/tr-gate/gate-{{n}}.img ]; then
+          truncate -s 64M /var/lib/tr-gate/gate-{{n}}.img
+          mkfs.ext4 -q -F -L GATE{{n}} /var/lib/tr-gate/gate-{{n}}.img
+        fi
+        t=$(mktemp -d); mount -o loop /var/lib/tr-gate/gate-{{n}}.img $t
+        echo "gate {{n}} open" > $t/status.txt
+        umount $t; rmdir $t
+        blkid -s UUID -o value /var/lib/tr-gate/gate-{{n}}.img > /var/lib/cloudtrain/gate-{{n}}.uuid
+        sed -i '\#/srv/gate-{{n}}#d' /etc/fstab
+        echo "/var/lib/tr-gate/gate-{{n}}.imag /srv/gate-{{n}} ext4 loop,defaults 0 0" >> /etc/fstab
+        systemctl daemon-reload
+  checks:
+    - id: mounted
+      description: The image is mounted at /srv/gate-{{n}} with its data
+      type: shell
+      on: tr-sec-01
+      skills: [linux.boot.recovery]
+      weight: 1.5
+      command: |
+        [ "$(findmnt -n -o FSTYPE /srv/gate-{{n}} 2>/dev/null)" = ext4 ] && [ "$(cat /srv/gate-{{n}}/status.txt 2>/dev/null)" = "gate {{n}} open" ] && echo mounted || echo no
+      expect: {match: exact, value: mounted}
+    - id: fstab-fixed
+      description: The fstab entry points at the real image and /etc/fstab verifies
+      type: shell
+      on: tr-sec-01
+      skills: [linux.boot.recovery]
+      weight: 2
+      command: |
+        src=$(awk '!/^[[:space:]]*#/ && $2 == "/srv/gate-{{n}}" {print $1}' /etc/fstab | tail -1)
+        if [ "$src" != /var/lib/tr-gate/gate-{{n}}.img ]; then echo "src:${src:-none}"; exit 0; fi
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1 && echo fixed || echo invalid
+      expect: {match: exact, value: fixed}
+    - id: untouched-image
+      description: The image keeps its UUID and the entry has no nofail
+      type: shell
+      on: tr-sec-01
+      skills: [linux.boot.recovery]
+      weight: 1
+      command: |
+        [ "$(blkid -s UUID -o value /var/lib/tr-gate/gate-{{n}}.img 2>/dev/null)" = "$(cat /var/lib/cloudtrain/gate-{{n}}.uuid)" ] || { echo recreated; exit 0; }
+        o=$(findmnt --fstab -n -o OPTIONS /srv/gate-{{n}} 2>/dev/null)
+        echo ",$o," | grep -q ',nofail,' && echo nofail || echo original
+      expect: {match: exact, value: original}
+  misconceptions:
+    - id: nofail-only
+      description: Adds nofail and leaves the wrong image path.
+      feedback: "nofail hides the failure; the volume is still not mounted."
+      expectFail: [mounted, fstab-fixed, untouched-image]
+      mutation:
+        on: tr-sec-01
+        as: learner
+        run: |
+          sudo sed -i 's#\(^/var/lib/tr-gate/gate-{{n}}.imag .*loop,\)defaults#\1defaults,nofail#' /etc/fstab
+          sudo systemctl daemon-reload
+    - id: manual-mount
+      description: Mounts the image by hand and leaves the fstab line broken.
+      feedback: "A manual mount disappears at reboot, and the broken line still stops the boot."
+      expectFail: [fstab-fixed]
+      mutation:
+        on: tr-sec-01
+        as: learner
+        run: sudo mount -o loop /var/lib/tr-gate/gate-{{n}}.img /srv/gate-{{n}}
+  solution:
+    explanation: findmnt --verify reports the source that does not exist; correct the path (.imag to .img), reload systemd and mount.
+    steps:
+      - on: tr-sec-01
+        as: learner
+        run: |
+          set -e
+          sudo findmnt --verify || true
+          sudo sed -i 's#gate-{{n}}\.imag#gate-{{n}}.img#' /etc/fstab
+          sudo systemctl daemon-reload
+          sudo mount /srv/gate-{{n}}
+    alternatives:
+      - id: mount-a
+        description: Edit the line and let mount -a mount it.
+        steps:
+          - on: tr-sec-01
+            as: learner
+            run: |
+              set -e
+              sudo sed -i 's#gate-{{n}}\.imag#gate-{{n}}.img#' /etc/fstab
+              sudo systemctl daemon-reload
+              sudo mount -a
