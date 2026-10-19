@@ -7,7 +7,12 @@ distributed as separate images and not linked into CloudTrain. The IaC workstati
 (tools/images/iac) ships Terraform under BUSL-1.1 (source-available, not open source; see the
 iac licensingNote in content/curriculum.yaml) unless built with IAC_CLI=tofu. The Ansible control
 node image (tools/images/ansible) ships ansible-core and its tools under GPL-3.0-or-later as
-separate programs with their licence texts; CloudTrain code does not import or link them.
+separate programs with their licence texts; CloudTrain code does not import or link them. It
+also ships ansible-rulebook and drools_jpy (Apache-2.0) with OpenJDK 17 from the Ubuntu archive
+(GPL-2.0 with the Classpath Exception) and psycopg (LGPL-3.0), as separate programs. The Docker
+host VM image (docker-vm:29) ships cosign, notation and Trivy (Apache-2.0) as unmodified release
+binaries, the BuildKit and buildkit-syft-scanner images (Apache-2.0) and an offline Trivy
+vulnerability DB (public advisory data, under each source's terms).
 
 ## JavaScript / TypeScript (pnpm workspace)
 

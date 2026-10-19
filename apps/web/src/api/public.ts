@@ -1,6 +1,7 @@
 import { queryOptions, useQuery } from '@tanstack/react-query';
 import type { PublicCatalog, PublicExamDetail, PublicPathDetail, SiteConfig } from './types';
-import { request } from './client';
+import { ApiError, request } from './client';
+import { STATIC_SITE, staticDataUrl } from '@/lib/siteMode';
 
 /*
  * The public website API (packages/api-types/public.d.ts): the site configuration
@@ -9,13 +10,22 @@ import { request } from './client';
  */
 
 const enc = encodeURIComponent;
+
+/** The public documents: the gateway's `/api/public/*`, or the exported `/data/*.json` files in the static website build. */
+const get = <T>(api: string, file: string): Promise<T> =>
+  STATIC_SITE
+    ? fetch(staticDataUrl(file)).then((r) => {
+        if (!r.ok) throw new ApiError(r.status, r.status === 404 ? 'Not found' : 'Request failed', r.status === 404 ? 'not_found' : undefined);
+        return r.json() as Promise<T>;
+      })
+    : request<T>(api);
 const HOUR = 3_600_000;
 
 export const publicQueries = {
-  site: () => queryOptions({ queryKey: ['public', 'site'], queryFn: () => request<SiteConfig>('/api/public/site'), staleTime: HOUR, gcTime: 2 * HOUR }),
-  catalog: () => queryOptions({ queryKey: ['public', 'catalog'], queryFn: () => request<PublicCatalog>('/api/public/catalog'), staleTime: 10 * 60_000 }),
-  path: (id: string) => queryOptions({ queryKey: ['public', 'path', id], queryFn: () => request<PublicPathDetail>(`/api/public/paths/${enc(id)}`), staleTime: 10 * 60_000 }),
-  exam: (id: string) => queryOptions({ queryKey: ['public', 'exam', id], queryFn: () => request<PublicExamDetail>(`/api/public/exams/${enc(id)}`), staleTime: 10 * 60_000 }),
+  site: () => queryOptions({ queryKey: ['public', 'site'], queryFn: () => get<SiteConfig>('/api/public/site', 'site.json'), staleTime: HOUR, gcTime: 2 * HOUR }),
+  catalog: () => queryOptions({ queryKey: ['public', 'catalog'], queryFn: () => get<PublicCatalog>('/api/public/catalog', 'catalog.json'), staleTime: 10 * 60_000 }),
+  path: (id: string) => queryOptions({ queryKey: ['public', 'path', id], queryFn: () => get<PublicPathDetail>(`/api/public/paths/${enc(id)}`, `paths/${enc(id)}.json`), staleTime: 10 * 60_000 }),
+  exam: (id: string) => queryOptions({ queryKey: ['public', 'exam', id], queryFn: () => get<PublicExamDetail>(`/api/public/exams/${enc(id)}`, `exams/${enc(id)}.json`), staleTime: 10 * 60_000 }),
 };
 
 export const useSite = () => useQuery(publicQueries.site());

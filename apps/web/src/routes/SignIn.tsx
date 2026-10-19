@@ -9,6 +9,7 @@ import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Button, Field, Input } from '@/components/ui';
 import { signInRoute } from '@/router';
 import { apiUrl } from '@/lib/runtimeConfig';
+import { APP_URL, STATIC_SITE } from '@/lib/siteMode';
 
 /**
  * Identity-first sign-in. Step 1 asks for the email; the gateway's discovery
@@ -17,6 +18,42 @@ import { apiUrl } from '@/lib/runtimeConfig';
  * starts the OIDC flow at Keycloak; mock mode completes the login in place.
  */
 export function SignIn() {
+  return STATIC_SITE ? <StaticSignIn /> : <PlatformSignIn />;
+}
+
+/** The static website build has no sign-in of its own: hand over to the platform, or say so. */
+function StaticSignIn() {
+  const search = signInRoute.useSearch();
+  const brand = useBrandName();
+  const target = APP_URL ? `${APP_URL}/sign-in${search.returnTo && search.returnTo.startsWith('/') && !search.returnTo.startsWith('//') ? `?returnTo=${encodeURIComponent(search.returnTo)}` : ''}` : '';
+  useEffect(() => {
+    if (target) window.location.replace(target);
+  }, [target]);
+  return (
+    <div className="site-container site-page site-page-narrow">
+      <h1 className="site-h1">{target ? 'Taking you to sign in' : 'Sign-in is not available here'}</h1>
+      <p className="muted" style={{ marginTop: 12 }}>
+        {target ? (
+          <>
+            If nothing happens, <a href={target}>continue to {brand}</a>.
+          </>
+        ) : (
+          <>This site presents {brand}; the platform is not open to the public yet. You can browse the catalog, or join the early-access waitlist on the home page.</>
+        )}
+      </p>
+      <div className="row" style={{ gap: 10, marginTop: 24, flexWrap: 'wrap' }}>
+        <Link to="/catalog" search={{}} className="btn btn-secondary btn-md">
+          Browse the catalog
+        </Link>
+        <Link to="/" hash="waitlist" className="btn btn-primary btn-md">
+          Join the waitlist
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+function PlatformSignIn() {
   const search = signInRoute.useSearch();
   const navigate = useNavigate();
   const me = useMe();

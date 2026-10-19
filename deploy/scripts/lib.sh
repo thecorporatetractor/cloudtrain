@@ -141,10 +141,11 @@ node_arch() {
 }
 
 # load_image <image> <node...>: put a local Docker image on kind nodes, only where missing.
-#  - A pulled image (it has RepoDigests, so its tag is registry-owned) is skipped on a node
-#    that has it by name. A locally built image is compared by Docker's index digest, because
-#    `kind load` compares Docker's image ID with the CRI image ID and with the containerd
-#    image store those differ, so it would re-import every time.
+#  - Skipped on a node that already has the same digest under that name: the RepoDigest when
+#    the image has one (pulled images, and local builds with the containerd image store),
+#    else Docker's image ID. A name-only check kept a rebuilt image under an unchanged tag
+#    (cloudtrain/docker-vm:29) from ever reaching the nodes; `kind load`'s own check compares
+#    Docker's image ID with the CRI image ID, which differ with the containerd image store.
 #  - `kind load` imports with --all-platforms. With Docker's containerd image store the
 #    saved archive is a multi-platform index whose other-platform layers are absent, and the
 #    import fails ("content digest ...: not found"). Fallback per node: `docker save
@@ -152,12 +153,14 @@ node_arch() {
 #    `crictl pull` inside the node (public images only).
 # KIND_LOAD_VERBOSE=1 logs when nothing needs loading.
 load_image() {
-  local img=$1 id node arch todo=() pulled=0; shift
+  local img=$1 id node arch todo=() rd; shift
   id=$(docker image inspect -f '{{.Id}}' "$img") || return 1
-  [[ -n $(docker image inspect -f '{{join .RepoDigests ""}}' "$img") ]] && pulled=1
+  # A RepoDigest (pulled images, and local builds with the containerd image store) is the
+  # digest the node stores: compare that, so a rebuilt image under the same tag is reloaded.
+  rd=$(docker image inspect -f '{{range .RepoDigests}}{{.}} {{end}}' "$img" | awk '{print $1}')
+  [[ -n $rd ]] && id=${rd#*@}
   for node in "$@"; do
-    if ((pulled)); then node_has_image "$node" "$img" && continue
-    else node_has_image "$node" "$img" "$id" && continue; fi
+    node_has_image "$node" "$img" "$id" && continue
     todo+=("$node")
   done
   ((${#todo[@]})) || { [[ ${KIND_LOAD_VERBOSE:-0} == 1 ]] && log "ok: $img already on $*"; return 0; }
@@ -166,8 +169,7 @@ load_image() {
   if kind load docker-image --name "$CLUSTER_NAME" --nodes "${nodelist%,}" "$img" >/dev/null 2>&1; then return 0; fi
   warn "kind load $img failed; retrying per node with a single-platform save"
   for node in "${todo[@]}"; do
-    if ((pulled)); then node_has_image "$node" "$img" && continue
-    else node_has_image "$node" "$img" "$id" && continue; fi
+    node_has_image "$node" "$img" "$id" && continue
     arch=$(node_arch "$node")
     if docker save --platform "linux/$arch" "$img" 2>/dev/null \
         | docker exec -i "$node" ctr -n k8s.io images import --digests - >/dev/null 2>&1; then

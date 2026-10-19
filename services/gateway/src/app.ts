@@ -21,6 +21,8 @@ import { registerPlatformRoutes } from './routes/platform.js';
 import { registerPublicRoutes } from './routes/public.js';
 import { registerBillingRoutes } from './billing/routes.js';
 import type { BillingService } from './billing/service.js';
+import type { WaitlistStore } from './waitlist/store.js';
+import { registerWaitlistRoutes } from './waitlist/routes.js';
 import type { SessionService } from './sessions/service.js';
 import { bridge, clampSize, send } from './terminal/bridge.js';
 import { TerminalHub } from './terminal/hub.js';
@@ -66,7 +68,7 @@ export interface AppDeps {
    * The public website (`/api/public/*`, no sign-in): site configuration plus the read-only
    * catalog from content/ and the exam catalog. Omitted = not served.
    */
-  site?: { config: SiteConfig; exams?: ExamCatalog; ratePerMinute?: number };
+  site?: { config: SiteConfig; exams?: ExamCatalog; ratePerMinute?: number; waitlist?: { store?: WaitlistStore; perHour?: number } };
   /** Plans, entitlements and Stripe (test mode) under `/api/billing/*`; omitted = not served. */
   billing?: BillingService;
 }
@@ -300,6 +302,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   if (deps.billing) registerBillingRoutes(app, deps.billing);
   if (deps.site) registerPublicRoutes(app, { content, site: deps.site.config, ...(deps.site.exams ? { exams: deps.site.exams } : {}), ...(deps.site.ratePerMinute ? { ratePerMinute: deps.site.ratePerMinute } : {}) });
+  if (deps.site) registerWaitlistRoutes(app, { site: deps.site.config, ...(deps.site.waitlist?.store ? { store: deps.site.waitlist.store } : {}), ...(deps.site.waitlist?.perHour ? { perHour: deps.site.waitlist.perHour } : {}) });
 
   /* ---------------------------------- exams ---------------------------------- */
 

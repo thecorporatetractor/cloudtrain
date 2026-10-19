@@ -18,7 +18,7 @@ spec:
     **`{{addr}}`**, apply the configuration now, and make sure it is the same after a
     reboot.
 
-    Do not touch `eth0`: its address and the default route must stay as they are.
+    Do not touch the management interface (the one carrying the default route): its address and the default route must stay as they are.
   objectives:
     - Configure a static address for a second interface in Netplan
     - Apply it without disturbing the management interface
@@ -68,6 +68,9 @@ spec:
         rm -f /etc/netplan/*eth1*.yaml /etc/netplan/70-netplan-set.yaml
         ip addr flush dev eth1 || true
         ip -br link show eth1 | grep -q eth1
+        # remember which interface carries the default route (eth0 or a predictable name such as enp1s0)
+        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, > /var/lib/tr-mgmt-if
+        grep -q . /var/lib/tr-mgmt-if
   checks:
     - id: address-live
       description: eth1 carries {{addr}} now
@@ -83,16 +86,18 @@ spec:
       on: tr-lp-01
       skills: [linux.net.persistent-config]
       weight: 2
-      command: netplan get ethernets.eth1.addresses 2>/dev/null | tr -d ' \n-'
+      command: netplan get ethernets.eth1.addresses 2>/dev/null | tr -d " \n\"'-"
       expect: {match: exact, value: "{{addr}}"}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the management interface
       type: shell
       on: tr-lp-01
       skills: [linux.net.persistent-config]
       weight: 1
-      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+      command: |
+        cur=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        [ -n "$cur" ] && [ "$cur" = "$(cat /var/lib/tr-mgmt-if 2>/dev/null)" ] && echo ok
+      expect: {match: exact, value: ok}
   misconceptions:
     - id: ip-addr-only
       description: Adds the address with ip addr and never writes it to Netplan.
@@ -115,7 +120,7 @@ spec:
           printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [{{addr}}]\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
           sudo chmod 0600 /etc/netplan/60-eth1.yaml
   solution:
-    explanation: A file in /etc/netplan declares the address for eth1 and netplan apply renders it for systemd-networkd; eth0's stanza is left alone.
+    explanation: A file in /etc/netplan declares the address for eth1 and netplan apply renders it for systemd-networkd; the management interface stanza is left alone.
     steps:
       - on: tr-lp-01
         as: learner

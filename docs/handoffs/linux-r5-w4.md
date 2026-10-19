@@ -67,13 +67,12 @@ sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam comp
 
 ## Blockers and risks (recorded in the curriculum notes)
 
-- iperf-throughput-baseline: BLOCKED, iperf3 is in neither package list. Add `iperf3` to
-  `tools/mirrors/packages-noble.txt` (and el10) and rebuild the VM image; setup fails with a clear
-  message until then.
-- netem-impaired-link: BLOCKED, `sch_netem` ships in linux-modules-extra (Ubuntu) / kernel-modules-extra
-  (EL10) and neither package is in the mirror lists, so the apt/dnf fallback in setup cannot succeed.
-  Add `linux-modules-extra-<kernel>` (noble) or `kernel-modules-extra` (el10) to `tools/mirrors/packages-*.txt`
-  and rebuild the VM image, or confirm sch_netem.ko is already in /lib/modules of the image.
+- iperf-throughput-baseline: unblocked 2026-10-19. `iperf3` is in `tools/mirrors/packages-noble.txt`
+  and `packages-el10.txt`, so in the mirror and the VM images' local repos; a full `labctl verify`
+  passed on the remote verify VM.
+- netem-impaired-link: not blocked. `sch_netem` and `sch_tbf` ship in linux-modules of the ubuntu-vm
+  kernel (6.8.0-142-generic), not only in linux-modules-extra; a full `labctl verify` passed on the
+  remote verify VM (2026-10-19).
 - Kernel modules assumed present, with a clear setup failure otherwise: `ip_gre`, `bridge`,
   `bonding`, `wireguard`, `sch_tbf`.
 - Reboot-graded labs check persistence from configuration only, until verify can reboot.
@@ -94,7 +93,7 @@ sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam comp
 
 All 23: veth-netns-plumbing, subnet-plan-depots, runtime-routes-two-sites, tcpdump-lost-heartbeats,
 fix-routing-asymmetric, bridge-vlan-namespaces, mtu-mismatch-tunnel, netem-impaired-link,
-iperf-throughput-baseline (blocked), nftables-from-scratch, nat-port-redirect-gateway,
+iperf-throughput-baseline, nftables-from-scratch, nat-port-redirect-gateway,
 firewall-ticket-api, fix-firewall-blocks-app, firewalld-zones-el, static-ip-persistent, nmcli-bond-el,
 bond-active-backup, xlf-static-ip-netplan, xlf-bond-config, chrony-timezone-depot,
 chrony-server-isolated, wireguard-depot-tunnel, dhcp-server-depot.

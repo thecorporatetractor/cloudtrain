@@ -17,6 +17,7 @@ import type { FakeOidcProvider } from './fake-oidc.js';
 import { createTestDb, type TestDb } from './pg.js';
 import { loadSiteConfig } from '../src/site/config.js';
 import path from 'node:path';
+import { PgWaitlistStore } from '../src/waitlist/store.js';
 
 /** Test auth: the principal is loaded from the database for the user named in `x-test-user`. */
 export class HeaderAuthenticator implements Authenticator {
@@ -89,7 +90,7 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
   const answers = new AnswerService(sessions, new PgAnswerStore(ps), { ratePerMinute: opts.answerRatePerMinute ?? 20, resolve: events.resolveScope });
   // The public website routes are part of the surface (DAST scans them too).
   const site = await loadSiteConfig(path.join(repo, 'content/site.yaml'));
-  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, site: { config: site }, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
+  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, site: { config: site, waitlist: { store: new PgWaitlistStore(t.db) } }, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
   return {
     t,
     app,

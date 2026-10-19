@@ -89,6 +89,27 @@ async function ctfSteps(page, hint = true) {
   }
 }
 
+/** The landing page's waitlist section at the top of the viewport. */
+const toWaitlist = async (p) => {
+  await p.evaluate(() => document.getElementById('waitlist')?.scrollIntoView({ block: 'start' }));
+  await p.waitForTimeout(300);
+};
+/** Fills the waitlist form (mock API: `already@example.com` is on the list already). */
+const fillWaitlist = (email) => async (p) => {
+  await toWaitlist(p);
+  await p.getByLabel('Work or personal email').fill(email);
+  await p.locator('input[name=organisation]').fill('Quillmoor Rail');
+  await p.locator('select[name=role]').selectOption('Team lead or manager');
+  await p.getByLabel('An organisation or team').check();
+  await p.getByLabel(/I agree that CloudTrain may store/).check();
+};
+const submitWaitlist = (email, done) => async (p) => {
+  await fillWaitlist(email)(p);
+  await p.getByRole('button', { name: 'Join the waitlist' }).click();
+  await p.getByText(done).first().waitFor();
+  await p.waitForTimeout(300);
+};
+
 /** [name, persona, url, waitFor, extra steps, viewport (default 1440 x 900)] */
 const PHONE = { width: 390, height: 844 };
 const TABLET = { width: 768, height: 1024 };
@@ -97,6 +118,12 @@ const VIEWS = [
   ['landing', 'none', '/', 'How a lab works'],
   ['landing-phone', 'none', '/', 'How a lab works', undefined, PHONE],
   ['landing-tablet', 'none', '/', 'How a lab works', undefined, TABLET],
+  ['waitlist', 'none', '/', 'Join the early-access waitlist', toWaitlist],
+  ['waitlist-filled', 'none', '/', 'Join the early-access waitlist', fillWaitlist('ada@quillmoor.example')],
+  ['waitlist-errors', 'none', '/', 'Join the early-access waitlist', async (p) => (await toWaitlist(p), await p.getByLabel('Work or personal email').fill('ada@'), await p.getByRole('button', { name: 'Join the waitlist' }).click(), await p.getByText('Enter a valid email address').first().waitFor())],
+  ['waitlist-success', 'none', '/', 'Join the early-access waitlist', submitWaitlist('ada@quillmoor.example', 'You are on the list')],
+  ['waitlist-duplicate', 'none', '/', 'Join the early-access waitlist', submitWaitlist('already@example.com', 'You are already on the list')],
+  ['waitlist-phone', 'none', '/', 'Join the early-access waitlist', toWaitlist, PHONE],
   ['site-menu-phone', 'none', '/', 'How a lab works', async (p) => (await p.getByRole('button', { name: 'Open menu' }).click(), await p.getByRole('dialog').waitFor()), PHONE],
   ['catalog-public', 'none', '/catalog', 'Everything you can practise'],
   ['catalog-public-domain', 'none', '/catalog?domain=kubernetes', 'Kubernetes'],
@@ -110,6 +137,7 @@ const VIEWS = [
   ['faq', 'none', '/faq', 'Frequently asked questions', async (p) => p.locator('details').first().click()],
   ['contact', 'none', '/contact', 'Talk to us'],
   ['legal-terms', 'none', '/legal/terms', 'Terms of service'],
+  ['legal-privacy', 'none', '/legal/privacy', 'Early-access waitlist'],
   ['site-signed-in', 'learner', '/about', 'Go to dashboard'],
   ['sign-in', 'none', '/sign-in', 'Sign in'],
   ['sign-in-sso', 'none', '/sign-in', 'Sign in', async (p) => (await p.getByLabel('Work email').fill('lena.varga@quillmoor.example'), await p.getByRole('button', { name: 'Continue' }).click(), await p.getByText('Continue with').waitFor())],
@@ -200,7 +228,7 @@ try {
   }
   if (!storage) {
     for (const theme of ['light', 'cream']) {
-      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'waitlist'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
         if (only?.length && !only.includes(name)) continue;
         const { ctx, page } = await session(theme, persona);
         try {

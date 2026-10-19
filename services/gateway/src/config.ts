@@ -80,6 +80,8 @@ export interface Config {
   siteConfigFile: string;
   /** Requests per minute one client address may make to `/api/public/*` (CT_PUBLIC_RATE_PER_MINUTE, default 120). */
   publicRatePerMinute: number;
+  /** Waitlist submissions one client address may make per hour (CT_WAITLIST_RATE_PER_HOUR, default 10). */
+  waitlistRatePerHour: number;
   /**
    * Stripe billing, TEST MODE ONLY in this version (CT_BILLING_ENABLED=1, STRIPE_MODE=test,
    * STRIPE_SECRET_KEY=sk_test_..., STRIPE_WEBHOOK_SECRET=whsec_...). loadConfig refuses a
@@ -230,6 +232,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     answerRatePerMinute: Math.max(1, num(env.CT_ANSWER_RATE_PER_MINUTE, 10)),
     siteConfigFile: env.CT_SITE_CONFIG ? fromRoot(env.CT_SITE_CONFIG) : path.join(contentDir, 'site.yaml'),
     publicRatePerMinute: Math.max(1, num(env.CT_PUBLIC_RATE_PER_MINUTE, 120)),
+    waitlistRatePerHour: Math.max(1, num(env.CT_WAITLIST_RATE_PER_HOUR, 10)),
     ...(ttl > 0 ? { sessionTtlMinutes: ttl } : {}),
     logLevel: env.CT_LOG_LEVEL ?? 'info',
     databaseUrl: env.CT_DATABASE_URL ?? 'postgres://cloudtrain_app:app-dev-only@127.0.0.1:55432/cloudtrain',

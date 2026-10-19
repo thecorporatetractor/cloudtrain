@@ -20,7 +20,8 @@
 #                    podman, buildah base images (tools/images/kubeadm-addons)
 #   docker-vm        ${DOCKER_VM_IMAGE}                             catalog docker-vm:29
 #                    (Ubuntu cloud image + Docker Engine 29, buildx, compose, rootless extras;
-#                    tools/images/docker-vm/preload-images.txt preloaded, lock/docker-vm.lock)
+#                    tools/images/docker-vm/preload-images.txt preloaded, lock/docker-vm.lock;
+#                    cosign, notation, trivy + offline DB pinned in deploy/versions.env)
 #   el-vm/ubuntu-vm need the mirror content: tools/mirrors/build-content.sh (task mirror:content)
 #
 # Steps:
@@ -292,6 +293,29 @@ if [[ $GUEST == docker-vm ]]; then
   n0=${#LOCKED[@]}
   lock_check "$LOCKDIR/docker-vm.lock" "${DIMAGES[@]}"
   printf '%s\n' "${LOCKED[@]:$n0}" > "$WORK/in/docker-images.txt"
+  # Supply-chain CLIs (cosign, trivy, notation) and the offline Trivy DB, sha256-pinned in
+  # deploy/versions.env; the guest installs them from $WORK/in/tools.
+  T="$WORK/in/tools"; mkdir -p "$T"
+  fetch_pinned "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+    "$COSIGN_BINARY_SHA256" "$CACHE/cosign-${COSIGN_VERSION}-linux-amd64"
+  fetch_pinned "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz" \
+    "$TRIVY_TARBALL_SHA256" "$CACHE/trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+  fetch_pinned "https://github.com/notaryproject/notation/releases/download/${NOTATION_VERSION}/notation_${NOTATION_VERSION#v}_linux_amd64.tar.gz" \
+    "$NOTATION_TARBALL_SHA256" "$CACHE/notation_${NOTATION_VERSION#v}_linux_amd64.tar.gz"
+  TRIVY_DB="$CACHE/trivy-db-${TRIVY_DB_LAYER_SHA256:0:16}.tar.gz"
+  if ! echo "${TRIVY_DB_LAYER_SHA256}  $TRIVY_DB" | sha256sum -c --status 2>/dev/null; then
+    log "downloading the Trivy DB layer sha256:${TRIVY_DB_LAYER_SHA256:0:12} ($TRIVY_DB_CREATED)"
+    tok=$(curl -fsS "https://ghcr.io/token?scope=repository:${TRIVY_DB_REPO}:pull" | jq -r .token)
+    curl -fSL --retry 3 -H "Authorization: Bearer $tok" -o "$TRIVY_DB.tmp" \
+      "https://ghcr.io/v2/${TRIVY_DB_REPO}/blobs/sha256:${TRIVY_DB_LAYER_SHA256}" \
+      || die "Trivy DB layer not downloadable (upstream may have dropped it: refresh TRIVY_DB_* in deploy/versions.env)"
+    echo "${TRIVY_DB_LAYER_SHA256}  $TRIVY_DB.tmp" | sha256sum -c --status || die "Trivy DB sha256 mismatch"
+    mv "$TRIVY_DB.tmp" "$TRIVY_DB"
+  fi
+  cp "$CACHE/cosign-${COSIGN_VERSION}-linux-amd64" "$T/cosign"
+  cp "$CACHE/trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz" "$T/trivy.tar.gz"
+  cp "$CACHE/notation_${NOTATION_VERSION#v}_linux_amd64.tar.gz" "$T/notation.tar.gz"
+  cp "$TRIVY_DB" "$T/trivy-db.tar.gz"
 fi
 if [[ $GUEST == el-vm || $GUEST == ubuntu-vm ]]; then
   MIRROR="$CACHE/mirror/$MIRROR_SNAPSHOT"
@@ -357,6 +381,12 @@ DOCKER_APT_KEY_FPR=${DOCKER_APT_KEY_FPR}
 DOCKER_CE_VERSION=${DOCKER_CE_VERSION}
 DOCKER_BUILDX_VERSION=${DOCKER_BUILDX_VERSION}
 DOCKER_COMPOSE_VERSION=${DOCKER_COMPOSE_VERSION}
+COSIGN_VERSION=${COSIGN_VERSION}
+TRIVY_VERSION=${TRIVY_VERSION}
+NOTATION_VERSION=${NOTATION_VERSION}
+TRIVY_DB_REPO=${TRIVY_DB_REPO}
+TRIVY_DB_LAYER_SHA256=${TRIVY_DB_LAYER_SHA256}
+TRIVY_DB_CREATED=${TRIVY_DB_CREATED}
 K8S_APT_KEY_FPR=${K8S_APT_KEY_FPR}
 BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 GIT_REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
