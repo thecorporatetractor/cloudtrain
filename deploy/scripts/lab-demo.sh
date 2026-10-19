@@ -53,21 +53,7 @@ docker image inspect "$JUMP_IMAGE" >/dev/null 2>&1 || LOAD_INTO_KIND=0 "$REPO_RO
 # Only nodes that can run VMs (KVM device advertised) need the 2+ GB golden image.
 VM_NODES=$(k get nodes -o json | jq -r '.items[] | select((.status.allocatable["devices.kubevirt.io/kvm"] // "0") != "0") | .metadata.name')
 [[ -n $VM_NODES ]] || die "no node advertises devices.kubevirt.io/kvm (run: task dev:verify-kvm)"
-# `kind load` compares Docker's image ID with the CRI image ID; with Docker's
-# containerd image store those differ, so it re-imports (~1 min for the golden
-# image) every time. Compare against containerd's index digest instead.
-load_image() {  # load_image <image> <node...>
-  local img=$1 id node todo=(); shift
-  id=$(docker image inspect -f '{{.Id}}' "$img")
-  for node in "$@"; do
-    docker exec "$node" ctr -n k8s.io images ls -q "name==docker.io/$img" 2>/dev/null | grep -q . &&
-      [[ $(docker exec "$node" ctr -n k8s.io images ls "name==docker.io/$img" 2>/dev/null) == *"$id"* ]] && continue
-    todo+=("$node")
-  done
-  ((${#todo[@]})) || return 0
-  log "loading $img into ${todo[*]}"
-  kind load docker-image --name "$CLUSTER_NAME" --nodes "$(IFS=,; echo "${todo[*]}")" "$img" >/dev/null || die "kind load $img failed"
-}
+# load_image <image> <node...> (lib.sh): skips nodes that have it, falls back when `kind load` fails.
 # shellcheck disable=SC2086
 load_image "$NODE_IMAGE" $VM_NODES
 # shellcheck disable=SC2046
