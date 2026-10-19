@@ -69,7 +69,9 @@ func NADConfig(provider string) string {
 
 // NADConfigTuning is NADConfig with the CNI tuning plugin chained behind
 // kube-ovn (Options.RouterTuning). Without cni-args tuning changes nothing,
-// so the hosts on such a link are wired as before.
+// so the hosts on such a link are wired as before. The empty sysctl map is
+// required: tuning (v1.9.1) merges args.cni.sysctl into it and panics on a
+// nil map.
 func NADConfigTuning(provider string) string {
-	return fmt.Sprintf(`{"cniVersion":"0.3.1","name":%q,"plugins":[%s,{"type":"tuning"}]}`, provider, NADConfig(provider))
+	return fmt.Sprintf(`{"cniVersion":"0.3.1","name":%q,"plugins":[%s,{"type":"tuning","sysctl":{}}]}`, provider, NADConfig(provider))
 }

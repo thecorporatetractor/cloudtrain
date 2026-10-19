@@ -391,7 +391,8 @@ func TestRouterTuning(t *testing.T) {
 				Name    string           `json:"name"`
 				Plugins []map[string]any `json:"plugins"`
 			}
-			if err := json.Unmarshal([]byte(cfg), &list); err != nil || list.Name == "" || len(list.Plugins) != 2 || list.Plugins[0]["type"] != "kube-ovn" || list.Plugins[1]["type"] != "tuning" {
+			if err := json.Unmarshal([]byte(cfg), &list); err != nil || list.Name == "" || len(list.Plugins) != 2 || list.Plugins[0]["type"] != "kube-ovn" || list.Plugins[1]["type"] != "tuning" ||
+				list.Plugins[1]["sysctl"] == nil {
 				t.Errorf("tuning NAD config %s: %v", cfg, err)
 			}
 		}
