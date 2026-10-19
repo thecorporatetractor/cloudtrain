@@ -236,11 +236,12 @@ spec:
       cd /home/learner/claims-automation
       ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-migrate.sum >/dev/null 2>&1 || { echo group-vars-edited; exit 0; }
       r=""
-      if grep -rIqsi 'allow_broken_conditionals' . /home/learner/.bashrc /home/learner/.profile /home/learner/.bash_profile /home/learner/.ansible.cfg /home/learner/.config 2>/dev/null; then r="$r escape-hatch-file"; fi
+      # searched as the learner under a time bound (a FIFO or a link to a huge file cannot stall or leak through the grader)
+      if ct-ansible run . timeout 30 grep -rIqsi -D skip 'allow_broken_conditionals' . /home/learner/.bashrc /home/learner/.profile /home/learner/.bash_profile /home/learner/.ansible.cfg /home/learner/.config 2>/dev/null; then r="$r escape-hatch-file"; fi
       ct-ansible run . ansible-config dump --only-changed 2>/dev/null | grep -qi 'ALLOW_BROKEN_CONDITIONALS' && r="$r escape-hatch-config"
       [ -z "$(ct-ansible run . printenv ANSIBLE_ALLOW_BROKEN_CONDITIONALS)" ] || r="$r escape-hatch-env"
-      for f in deploy-release render-tuning capacity; do [ -s $f.yml ] || r="$r missing-$f"; done
-      grep -q 'Shard markers' capacity.yml && grep -q 'Production tuning' render-tuning.yml && grep -q 'Fast path marker' deploy-release.yml || r="$r tasks-removed"
+      for f in deploy-release render-tuning capacity; do ct-ansible run . test -s $f.yml || r="$r missing-$f"; done
+      ct-ansible run . timeout 20 sh -c "grep -q 'Shard markers' capacity.yml && grep -q 'Production tuning' render-tuning.yml && grep -q 'Fast path marker' deploy-release.yml" 2>/dev/null || r="$r tasks-removed"
       echo "${r:-ok}"
     expect:
       match: exact

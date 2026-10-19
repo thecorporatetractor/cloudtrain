@@ -377,6 +377,43 @@ spec:
     expect:
       match: exact
       value: ok
+  - id: drains-through-balancer
+    description: lb-update.yml is the rolling play - it updates claims_web in batches (serial) and delegates tasks to the balancer ov-lb1
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.delegation
+    weight: 2
+    timeoutSec: 60
+    command: |
+      # the playbook is read as the learner; the structure is judged by a parser that runs as root on the text only
+      cd /
+      ct-ansible run /home/learner/claims-automation timeout 20 head -c 262144 lb-update.yml 2>/dev/null | /opt/ansible/bin/python3 -I -c '
+      import sys, yaml
+      try:
+          plays = yaml.safe_load(sys.stdin.read())
+      except Exception:
+          print("unparsable"); raise SystemExit
+      if not isinstance(plays, list):
+          print("no-play"); raise SystemExit
+      def walk(tasks):
+          for t in tasks or []:
+              if isinstance(t, dict):
+                  yield t
+                  for k in ("block", "rescue", "always"):
+                      yield from walk(t.get(k))
+      ok = False
+      for pl in plays:
+          if not isinstance(pl, dict) or pl.get("hosts") != "claims_web" or "serial" not in pl:
+              continue
+          for t in walk(pl.get("tasks")):
+              d = t.get("delegate_to")
+              if isinstance(d, str) and "ov-lb1" in d:
+                  ok = True
+      print("ok" if ok else "not-draining-through-balancer")'
+    expect:
+      match: exact
+      value: ok
   - id: update-rerun
     description: lb-update.yml runs again without changes
     type: shell
@@ -406,6 +443,7 @@ spec:
     feedback: Clients keep being sent to the node while it restarts; disable it in the balancer first, and enable it afterwards.
     expectFail:
     - no-failed-requests
+    - drains-through-balancer
     mutation:
       'on': ov-ctl
       as: learner

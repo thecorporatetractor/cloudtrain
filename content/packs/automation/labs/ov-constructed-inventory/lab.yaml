@@ -80,7 +80,7 @@ spec:
       EOF
       printf '[defaults]\ninventory = inventory\n' > $p/ansible.cfg
       chown -R learner:learner $p
-      sha256sum $p/inventory/01-hosts.yml > /var/tmp/.ct-constructed.sum
+      sha256sum $p/inventory/01-hosts.yml $p/ansible.cfg > /var/tmp/.ct-constructed.sum
   checks:
   - id: constructed-source
     description: The inventory directory holds a constructed inventory source next to the unchanged host file
@@ -90,10 +90,20 @@ spec:
     - automation.inventory.dynamic
     weight: 1
     command: |
-      cd /home/learner/claims-automation
+      cd /
       ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-constructed.sum >/dev/null 2>&1 || { echo static-inventory-edited; exit 0; }
-      f=$(grep -lE '^plugin: *(ansible\.builtin\.)?constructed' inventory/*.yml inventory/*.yaml 2>/dev/null | head -1)
-      [ -n "$f" ] && echo ok || echo no-constructed-source
+      # Every source besides 01-hosts.yml must be a plain constructed-plugin file: a hand-written static group file, an ini or
+      # script source, a symlink or a subdirectory would let the groups be typed in instead of derived.
+      ct-ansible run /home/learner/claims-automation timeout 30 sh -c '
+        n=0
+        for f in $(find inventory -mindepth 1 ! -name 01-hosts.yml 2>/dev/null | head -50); do
+          [ -f "$f" ] && [ ! -L "$f" ] || { echo "static-source:$f"; exit 0; }
+          case $f in *.yml|*.yaml) ;; *) echo "static-source:$f"; exit 0;; esac
+          head -c 65536 "$f" | grep -qE "^plugin: *(ansible\.builtin\.)?constructed *$" || { echo "static-source:$f"; exit 0; }
+          head -c 65536 "$f" | grep -qE "^(keyed_groups|groups):" || { echo "no-rules:$f"; exit 0; }
+          n=$((n+1))
+        done
+        [ "$n" -ge 1 ] && echo ok || echo no-constructed-source'
     expect:
       match: exact
       value: ok
@@ -107,28 +117,42 @@ spec:
     timeoutSec: 120
     command: |
       /opt/ansible/bin/python3 -I - <<'EOF'
-      import json, subprocess, sys
-      out = subprocess.run(['ct-ansible', 'run', '/home/learner/claims-automation', 'ansible-inventory', '--list'], capture_output=True, text=True).stdout
+      import json, subprocess
+      def load(args):
+          out = subprocess.run(['ct-ansible', 'run', '/home/learner/claims-automation'] + args, capture_output=True, text=True, timeout=100).stdout
+          return json.loads(out)
+      def judge(inv, rows):
+          want = {}
+          for h, (osf, tier, mem) in rows.items():
+              want.setdefault('os_' + osf, set()).add(h)
+              want.setdefault('tier_' + tier, set()).add(h)
+              if mem > 4096:
+                  want.setdefault('big_mem', set()).add(h)
+          bad = [g for g, hs in want.items() if set(inv.get(g, {}).get('hosts', [])) != hs]
+          extra = [g for g in inv if g not in want and g not in ('_meta', 'all', 'claims', 'quoting', 'ungrouped')]
+          return sorted(bad) + ['extra:' + ','.join(sorted(extra))] * bool(extra)
+      real = {'ov-claims-web1': ('el', 'gold', {{memweb1}}), 'ov-claims-web2': ('el', '{{tierweb2}}', {{memweb2}}),
+              'ov-db-1': ('el', 'gold', 4096), 'ov-quote-api1': ('deb', 'bronze', {{memquote}})}
+      # the same sources against a different estate: groups that were typed in instead of derived do not follow
+      alt = {'ov-claims-web1': ('deb', 'silver', 3000), 'ov-claims-web2': ('el', 'gold', 9000),
+             'ov-db-1': ('deb', 'bronze', 4097), 'ov-quote-api1': ('el', 'silver', 4096)}
       try:
-          inv = json.loads(out)
+          inv = load(['ansible-inventory', '--list'])
       except Exception:
           print('inventory-does-not-load'); raise SystemExit
-      mem = {'ov-claims-web1': {{memweb1}}, 'ov-claims-web2': {{memweb2}}, 'ov-db-1': 4096, 'ov-quote-api1': {{memquote}}}
-      tier = {'ov-claims-web1': 'gold', 'ov-claims-web2': '{{tierweb2}}', 'ov-db-1': 'gold', 'ov-quote-api1': 'bronze'}
-      osf = {'ov-claims-web1': 'el', 'ov-claims-web2': 'el', 'ov-db-1': 'el', 'ov-quote-api1': 'deb'}
-      want = {}
-      for h in mem:
-          want.setdefault('os_' + osf[h], set()).add(h)
-          want.setdefault('tier_' + tier[h], set()).add(h)
-          if mem[h] > 4096:
-              want.setdefault('big_mem', set()).add(h)
-      bad = []
-      for g, hs in want.items():
-          got = set(inv.get(g, {}).get('hosts', []))
-          if got != hs:
-              bad.append(g)
-      extra = [g for g in inv if g not in want and g not in ('_meta', 'all', 'claims', 'quoting', 'ungrouped')]
-      print(' '.join(sorted(bad) + ['extra:' + ','.join(sorted(extra))] * bool(extra)) or 'ok')
+      res = judge(inv, real)
+      if res:
+          print(' '.join(res)); raise SystemExit
+      hosts = "all:\n  children:\n    claims:\n      hosts:\n"
+      for h, (osf, tier, mem) in alt.items():
+          hosts += "        %s: {os_family: %s, tier: %s, mem_mb: %d}\n" % (h, osf, tier, mem)
+      script = 'd=$(mktemp -d) && cp -r inventory "$d/inventory" && rm -f "$d/inventory/01-hosts.yml" && printf "%s" "$1" > "$d/inventory/01-hosts.yml" && timeout 60 ansible-inventory -i "$d/inventory" --list; rm -rf "$d"'
+      try:
+          inv2 = load(['sh', '-c', script, 'sh', hosts])
+      except Exception:
+          print('groups-not-derived'); raise SystemExit
+      res = judge(inv2, alt)
+      print('groups-not-derived' if res else 'ok')
       EOF
     expect:
       match: exact
@@ -187,6 +211,34 @@ spec:
         groups:
           big_mem: mem_mb | int >= 4096
         EOF
+  - id: static-groups
+    description: Types the groups into a static inventory file and adds an empty constructed file so the plugin check passes.
+    feedback: The groups must be derived from the host variables by the constructed plugin; a static group file stops following the hosts when they change.
+    expectFail:
+    - constructed-source
+    - groups-graph
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        python3 - <<'PYEOF'
+        import json, subprocess
+        inv = json.loads(subprocess.run(['ansible-inventory', '--list'], capture_output=True, text=True).stdout)
+        meta = inv['_meta']['hostvars']
+        groups = {}
+        for h, v in meta.items():
+            groups.setdefault('os_' + v['os_family'], []).append(h)
+            groups.setdefault('tier_' + v['tier'], []).append(h)
+            if int(v['mem_mb']) > 4096:
+                groups.setdefault('big_mem', []).append(h)
+        lines = ['all:', '  children:']
+        for g, hs in groups.items():
+            lines += ['    %s:' % g, '      hosts:'] + ['        %s: {}' % h for h in hs]
+        open('inventory/02-groups.yml', 'w').write('\n'.join(lines) + '\n')
+        open('inventory/03-constructed.yml', 'w').write('plugin: ansible.builtin.constructed\n')
+        PYEOF
   - id: source-outside-inventory
     description: Saves the constructed source next to the playbooks instead of in the inventory directory.
     feedback: The configured inventory is the inventory directory; a source outside it is never read.

@@ -199,9 +199,11 @@ spec:
       cd /home/learner/policy-db
       # make the credentials file differ once, so a run that changes it would print the difference
       ct-ansible run /home/learner ssh ovauto@ov-db-1 "sudo -n sh -c 'echo junk >> /etc/ov/policy-db/credentials'" >/dev/null 2>&1
-      probe=$(ct-ansible run . env ANSIBLE_NOCOLOR=1 ansible-playbook db-login.yml --diff -vv 2>&1)
+      # the output is produced by the stock callback only: a project callback or action plugin cannot hide the secret from this check
+      E="env ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_CALLBACKS_ENABLED= ANSIBLE_CALLBACK_PLUGINS=/var/empty ANSIBLE_ACTION_PLUGINS=/var/empty ANSIBLE_RETRY_FILES_ENABLED=0"
+      probe=$(ct-ansible run . $E ansible-playbook db-login.yml --diff -vv 2>&1)
       printf '%s' "$probe" | grep -q 'Ov-db-{{dbpw}}' && { echo leak; exit 0; }
-      out=$(ct-ansible run . env ANSIBLE_NOCOLOR=1 ansible-playbook db-login.yml -vv 2>&1)
+      out=$(ct-ansible run . $E ansible-playbook db-login.yml -vv 2>&1)
       printf '%s' "$out" | grep -q 'Ov-db-{{dbpw}}' && { echo leak; exit 0; }
       printf '%s\n' "$out" | awk '/^PLAY RECAP/ {r=1; next}
         r && /:/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "changed") c += kv[2]; if (kv[1] == "failed") f += kv[2]; if (kv[1] == "unreachable") u += kv[2] } n++ }
