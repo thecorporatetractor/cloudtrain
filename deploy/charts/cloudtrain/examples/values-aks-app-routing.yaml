@@ -1,0 +1,42 @@
+# AKS with the application routing add-on (managed NGINX):
+#   az aks approuting enable -g <rg> -n <cluster>
+# TLS: cert-manager here; app routing can also take a Key Vault certificate
+# (annotation kubernetes.azure.com/tls-cert-keyvault-uri, then tls.mode: external
+# is not needed - the add-on writes the Secret named in tls.secretName).
+# Managed NGINX gets security patches only until November 2026: the Gateway API
+# (Istio-based app routing, or Application Gateway for Containers) is the long-term
+# path - see values-envoy-gateway.yaml for the Gateway API shape.
+host: labs.example.com
+global:
+  imageRegistry: myacr.azurecr.io/cloudtrain        # ACR import of GHCR (docs/deploy.md)
+exposure:
+  type: ingress
+  ingress:
+    className: webapprouting.kubernetes.azure.com
+    annotations:
+      # Terminal WebSockets stay open while a learner works.
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+tls:
+  enabled: true
+  mode: certManager
+  secretName: cloudtrain-tls
+  certManager:
+    issuerRef: {name: letsencrypt, kind: ClusterIssuer}
+gateway:
+  existingSecret: cloudtrain-gateway
+  oidc:
+    issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+    clientId: <app-registration-client-id>
+  # Azure CNI overlay pod CIDR (default 10.244.0.0/16) holds the NGINX pods.
+  trustProxy: "10.244.0.0/16"
+orchestrator:
+  storageClass: managed-csi-premium
+  images:
+    mirrors:
+      - ghcr.io/thecorporatetractor/cloudtrain=myacr.azurecr.io/cloudtrain
+networkPolicy:
+  enabled: true
+  ingressNamespaceSelector:
+    matchLabels: {kubernetes.io/metadata.name: app-routing-system}

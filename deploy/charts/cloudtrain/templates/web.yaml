@@ -1,0 +1,109 @@
+{{- if .Values.web.enabled }}
+{{- $w := .Values.web }}
+{{- $name := printf "%s-web" (include "ct.fullname" .) }}
+{{- $rc := $w.runtimeConfig }}
+{{- if or (regexMatch "[\"'\\\\<>]" (toString $rc.apiBase)) (regexMatch "[\"'\\\\<>]" (toString $rc.environment)) }}
+{{- fail "web.runtimeConfig values must not contain quotes, backslashes or angle brackets" }}
+{{- end }}
+{{- range $k, $v := $w.csp }}
+{{- if regexMatch "[\";\\\\]" (toString $v) }}
+{{- fail (printf "web.csp.%s must be space-separated sources (no quotes or semicolons)" $k) }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+  {{- with $w.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ct.selector" (list . "web") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $w.port }}
+      targetPort: http
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ $w.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ct.selector" (list . "web") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ct.labels" . | nindent 8 }}
+        app.kubernetes.io/name: cloudtrain-web
+        app.kubernetes.io/component: web
+      {{- with $w.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "ct.pullSecrets" . | nindent 6 }}
+      {{- include "ct.podSecurity" . | nindent 6 }}
+      containers:
+        - name: web
+          image: {{ include "ct.image" (list . $w) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - {name: http, containerPort: {{ $w.port }}}
+          env:
+            - {name: CT_WEB_PORT, value: {{ $w.port | quote }}}
+            - {name: CT_API_BASE, value: {{ $rc.apiBase | quote }}}
+            - {name: CT_ENVIRONMENT, value: {{ $rc.environment | quote }}}
+            - {name: CT_CSP_SCRIPT_SRC, value: {{ $w.csp.scriptSrc | quote }}}
+            - {name: CT_CSP_CONNECT_SRC, value: {{ $w.csp.connectSrc | quote }}}
+            - {name: CT_CSP_IMG_SRC, value: {{ $w.csp.imgSrc | quote }}}
+            - {name: CT_CSP_FRAME_SRC, value: {{ $w.csp.frameSrc | quote }}}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+          {{- include "ct.containerSecurity" . | nindent 10 }}
+          resources:
+            {{- toYaml $w.resources | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with $w.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if $w.affinity }}
+        {{- toYaml $w.affinity | nindent 8 }}
+        {{- else }}
+        # Spread replicas over nodes when possible.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "ct.selector" (list . "web") | nindent 20 }}
+        {{- end }}
+{{- end }}

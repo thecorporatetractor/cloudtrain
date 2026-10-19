@@ -1,0 +1,261 @@
+{{- include "ct.validate" . }}
+{{- if .Values.gateway.enabled }}
+{{- $fullname := include "ct.fullname" . }}
+{{- $g := .Values.gateway }}
+{{- $name := printf "%s-gateway" $fullname }}
+{{- $public := include "ct.publicUrl" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+---
+# LabTemplates/LabSessions/ExamTemplates/ExamSessions in the sessions namespace and
+# terminal exec into lab pods there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $g.sessionsNamespace }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  - apiGroups: [labs.cloudtrain.dev]
+    resources: [labtemplates, labsessions, examtemplates, examsessions]
+    verbs: [get, list, watch, create, patch, update, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $g.sessionsNamespace }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- if $g.clusterCapacity }}
+---
+# Read-only, for the admin capacity view (nodes, pods, VMIs, pools, sessions).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-capacity-{{ .Release.Namespace }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list]
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [list]
+  - apiGroups: [labs.cloudtrain.dev]
+    resources: [labsessions, warmpools]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-capacity-{{ .Release.Namespace }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}-capacity-{{ .Release.Namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if and $g.secrets.create (not $g.existingSecret) }}
+---
+{{- $prev := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $session := $g.secrets.sessionSecret }}
+{{- if and (not $session) $prev }}{{ $session = index $prev.data "CT_SESSION_SECRET" | b64dec }}{{ end }}
+{{- if not $session }}{{ $session = randAlphaNum 48 }}{{ end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+type: Opaque
+stringData:
+  CT_SESSION_SECRET: {{ $session | quote }}
+  CT_OIDC_CLIENT_SECRET: {{ required "gateway.secrets.oidcClientSecret is required with gateway.secrets.create" $g.secrets.oidcClientSecret | quote }}
+  {{- with $g.secrets.keycloakAdminClientSecret }}
+  CT_KEYCLOAK_ADMIN_CLIENT_SECRET: {{ . | quote }}
+  {{- end }}
+  {{- if not .Values.postgres.demo.enabled }}
+  CT_DATABASE_URL: {{ required "gateway.secrets.databaseUrl is required (or postgres.demo.enabled)" $g.secrets.databaseUrl | quote }}
+  {{- with $g.secrets.databaseOwnerUrl }}
+  CT_DATABASE_OWNER_URL: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- with $g.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ct.selector" (list . "gateway") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $g.port }}
+      targetPort: http
+      appProtocol: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ $g.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ct.selector" (list . "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ct.labels" . | nindent 8 }}
+        app.kubernetes.io/name: cloudtrain-gateway
+        app.kubernetes.io/component: gateway
+      {{- with $g.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- include "ct.pullSecrets" . | nindent 6 }}
+      {{- include "ct.podSecurity" . | nindent 6 }}
+      {{- if $g.migrate }}
+      initContainers:
+        - name: migrate
+          image: {{ include "ct.image" (list . $g) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          args: [dist/db/cli.js, migrate]
+          env:
+            {{- include "ct.gatewayDbEnv" . | nindent 12 }}
+          {{- include "ct.containerSecurity" . | nindent 10 }}
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "ct.image" (list . $g) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - {name: http, containerPort: {{ $g.port }}}
+          env:
+            - {name: CT_HOST, value: "0.0.0.0"}
+            - {name: CT_PORT, value: {{ $g.port | quote }}}
+            - {name: CT_KUBE_CONTEXT, value: in-cluster}
+            - {name: CT_NAMESPACE, value: {{ $g.sessionsNamespace | quote }}}
+            - {name: CT_PUBLIC_URL, value: {{ $public | quote }}}
+            - {name: CT_WEB_URL, value: {{ $public | quote }}}
+            - {name: CT_TRUST_PROXY, value: {{ $g.trustProxy | quote }}}
+            {{- with $g.corsOrigins }}
+            - {name: CT_CORS_ORIGINS, value: {{ join "," . | quote }}}
+            {{- end }}
+            - {name: CT_LOG_LEVEL, value: {{ $g.logLevel | quote }}}
+            - {name: CT_OIDC_ISSUER, value: {{ $g.oidc.issuer | quote }}}
+            - {name: CT_OIDC_CLIENT_ID, value: {{ $g.oidc.clientId | quote }}}
+            {{- with $g.keycloak.url }}
+            - {name: CT_KEYCLOAK_URL, value: {{ . | quote }}}
+            - {name: CT_KEYCLOAK_REALM, value: {{ $g.keycloak.realm | quote }}}
+            - {name: CT_KEYCLOAK_ADMIN_CLIENT_ID, value: {{ $g.keycloak.adminClientId | quote }}}
+            {{- end }}
+            {{- with $g.platformIdps }}
+            - {name: CT_PLATFORM_IDPS, value: {{ . | quote }}}
+            {{- end }}
+            {{- with $g.smtp.host }}
+            - {name: CT_SMTP_HOST, value: {{ . | quote }}}
+            - {name: CT_SMTP_PORT, value: {{ $g.smtp.port | quote }}}
+            - {name: CT_SMTP_FROM, value: {{ $g.smtp.from | quote }}}
+            {{- end }}
+            - name: CT_SESSION_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "ct.gatewaySecret" . }}, key: CT_SESSION_SECRET}}
+            - name: CT_OIDC_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "ct.gatewaySecret" . }}, key: CT_OIDC_CLIENT_SECRET}}
+            - name: CT_KEYCLOAK_ADMIN_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: {{ include "ct.gatewaySecret" . }}, key: CT_KEYCLOAK_ADMIN_CLIENT_SECRET, optional: true}}
+            {{- include "ct.gatewayDbEnv" . | nindent 12 }}
+            {{- with $g.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 3
+            failureThreshold: 40
+          {{- include "ct.containerSecurity" . | nindent 10 }}
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with $g.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if $g.affinity }}
+        {{- toYaml $g.affinity | nindent 8 }}
+        {{- else }}
+        # Spread replicas over nodes when possible.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "ct.selector" (list . "gateway") | nindent 20 }}
+        {{- end }}
+{{- end }}

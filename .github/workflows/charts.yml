@@ -1,0 +1,49 @@
+# Helm charts (deploy/charts): embedded copies in sync with their sources, lint
+# and render every example values file, the chart's behaviour tests
+# (tools/charts/test.sh), and kube-linter + Trivy (HIGH+) over the rendered
+# manifests. Blocking for chart changes.
+name: charts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - deploy/charts/**
+      - deploy/images/**
+      - services/lab-orchestrator/config/**
+      - tools/charts/**
+      - .github/workflows/charts.yml
+      - .github/scripts/install-tools.sh
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  charts:
+    name: helm (lint, template, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/install-tools.sh helm kube-linter trivy
+      - run: helm version --short && yq --version
+      - name: Chart tests (sync, lint, render, behaviour)
+        run: OUT=rendered bash tools/charts/test.sh
+      - name: Gate - kube-linter on the rendered examples
+        run: kube-linter lint rendered/values-*.yaml
+      - name: Gate - Trivy HIGH/CRITICAL on the rendered examples
+        run: >-
+          trivy config --severity HIGH,CRITICAL --exit-code 1
+          --ignorefile .github/iac/trivyignore.yaml rendered
