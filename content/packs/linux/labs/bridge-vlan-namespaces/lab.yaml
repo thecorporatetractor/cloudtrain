@@ -1,0 +1,202 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: bridge-vlan-namespaces
+  title: Wire two VLANs through a Linux bridge between namespaces
+  domain: linux
+  frameworks: [lfcs:networking, linuxplus:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [bridge, vlan, namespaces, switching, networking]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`). The depot hosts below are
+    network namespaces on it (`sudo ip netns exec <host> <command>`). Each has its veth end
+    inside the namespace already configured and up; the other end of each cable is an
+    interface on `tr-net-01` that is **down and not attached to anything**.
+
+    | host | address (all in {{net}}.0/24) | cable end on tr-net-01 | VLAN |
+    |---|---|---|---|
+    | `ticketing-1` | {{net}}.21 | `tk1` | 20 |
+    | `ticketing-2` | {{net}}.22 | `tk2` | 20 |
+    | `signalling-1` | {{net}}.31 | `sg1` | 30 |
+    | `signalling-2` | {{net}}.32 | `sg2` | 30 |
+
+    Turn `tr-net-01` into the depot switch: create **one Linux bridge** called **`br-tr`** with
+    **VLAN filtering** enabled, attach the four cable ends as untagged **access ports** (each
+    port's PVID is its host's VLAN and only that VLAN is allowed on it), and bring everything
+    up. Hosts in the same VLAN must reach each other and hosts in different VLANs must not, even
+    though all four addresses share one /24. A ping matrix is the proof.
+
+    Do not touch `eth0`. The change is runtime only.
+  objectives:
+    - Create a VLAN-aware bridge and attach ports to it
+    - Configure access ports with a PVID and untagged egress
+    - Verify VLAN isolation with a ping matrix
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  params:
+    net:
+      type: choice
+      values: ["10.68.0", "10.68.8"]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        for m in bridge; do
+          modprobe $m 2>/dev/null || grep -q "/$m.ko" /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || { echo "kernel module '$m' is not available on this image: the VLAN bridge lab cannot run" >&2; exit 1; }
+        done
+        ip link del br-tr 2>/dev/null || true
+        for p in tk1 tk2 sg1 sg2; do ip link del $p 2>/dev/null || true; done
+        for n in ticketing-1 ticketing-2 signalling-1 signalling-2; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        mk() { # ns hostend addr
+          ip link add $2 type veth peer name $2-p
+          ip link set $2-p netns $1 name eth0
+          ip -n $1 addr add $3/24 dev eth0
+          ip -n $1 link set eth0 up
+        }
+        mk ticketing-1 tk1 {{net}}.21
+        mk ticketing-2 tk2 {{net}}.22
+        mk signalling-1 sg1 {{net}}.31
+        mk signalling-2 sg2 {{net}}.32
+  checks:
+    - id: vlan-aware-bridge
+      description: One bridge with VLAN filtering on holds all four cable ends
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.bridges-bonds]
+      weight: 1.5
+      command: |
+        m=""
+        for p in tk1 tk2 sg1 sg2; do
+          x=$(ip -d link show $p 2>/dev/null | grep -o ' master [^ ]*' | awk '{print $2}')
+          [ -n "$x" ] && [ -z "$m" -o "$m" = "$x" ] && m=$x || { echo "split-or-unattached"; exit 0; }
+        done
+        echo "$(cat /sys/class/net/$m/bridge/vlan_filtering 2>/dev/null) $m"
+      expect: {match: exact, value: "1 br-tr"}
+    - id: pvids
+      description: Each access port has the PVID of its VLAN and nothing else
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.bridges-bonds]
+      weight: 2
+      command: |
+        out=""
+        for p in tk1 tk2 sg1 sg2; do
+          v=$(bridge vlan show dev $p 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "PVID") print $(i - 1)}')
+          all=$(bridge vlan show dev $p 2>/dev/null | awk '$1 == "'$p'" {print $2; next} NF >= 1 && $1 ~ /^[0-9]+$/ {print $1}' | paste -sd+)
+          out="$out $p=$v/$all"
+        done
+        echo $out
+      expect: {match: exact, value: "tk1=20/20 tk2=20/20 sg1=30/30 sg2=30/30"}
+    - id: ports-up
+      description: The bridge and all four ports are up
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.bridges-bonds]
+      weight: 0.5
+      command: |
+        n=0; for i in br-tr tk1 tk2 sg1 sg2; do ip -br link show $i 2>/dev/null | awk '{print $2}' | grep -qx UP && n=$((n + 1)); done; echo "up=$n"
+      expect: {match: exact, value: "up=5"}
+    - id: same-vlan
+      description: Hosts in the same VLAN reach each other
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.bridges-bonds, linux.net.ip-config]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        a=$(ip netns exec ticketing-1 ping -c2 -W2 {{net}}.22 >/dev/null 2>&1 && echo up || echo down)
+        b=$(ip netns exec signalling-1 ping -c2 -W2 {{net}}.32 >/dev/null 2>&1 && echo up || echo down)
+        echo "$a $b"
+      expect: {match: exact, value: "up up"}
+    - id: isolated
+      description: Hosts in different VLANs cannot reach each other
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.bridges-bonds]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        ip netns exec ticketing-1 ping -c2 -W2 {{net}}.22 >/dev/null 2>&1 && ip netns exec signalling-1 ping -c2 -W2 {{net}}.32 >/dev/null 2>&1 || { echo "not-configured"; exit 0; }
+        a=$(ip netns exec ticketing-1 ping -c2 -W1 {{net}}.31 >/dev/null 2>&1 && echo leak || echo blocked)
+        b=$(ip netns exec signalling-2 ping -c2 -W1 {{net}}.22 >/dev/null 2>&1 && echo leak || echo blocked)
+        echo "$a $b"
+      expect: {match: exact, value: "blocked blocked"}
+  hints:
+    - title: One bridge, VLAN aware
+      command: sudo ip link add br-tr type bridge vlan_filtering 1
+      body: "Without vlan_filtering a bridge ignores VLAN settings and behaves like a dumb hub: every port sees every other port."
+      cost: 0
+    - title: Attach and bring up
+      body: "ip link set <port> master br-tr attaches a cable end; each end and the bridge must also be set up. New ports start in VLAN 1."
+      cost: 1
+    - title: Access ports
+      command: sudo bridge vlan add dev tk1 vid 20 pvid untagged
+      body: "bridge vlan show lists what each port carries. Remove the default VLAN 1 from each port (bridge vlan del dev <port> vid 1) and add its own VLAN with pvid untagged so untagged host frames land in it."
+      cost: 1
+  misconceptions:
+    - id: no-vlan-filtering
+      description: Attaches the four ports to a plain bridge and expects VLANs to separate them.
+      feedback: "A bridge only honours VLANs when vlan_filtering is 1; without it all ports share one broadcast domain."
+      expectFail: [vlan-aware-bridge, pvids, isolated]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo ip link add br-tr type bridge
+          for p in tk1 tk2 sg1 sg2; do sudo ip link set $p master br-tr; sudo ip link set $p up; done
+          sudo ip link set br-tr up
+    - id: default-pvid
+      description: Turns VLAN filtering on but leaves every port in the default VLAN 1.
+      feedback: "With filtering on, ports still start in VLAN 1. Give each port its own PVID (and remove VLAN 1) or all hosts remain in one VLAN."
+      expectFail: [pvids, isolated]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo ip link add br-tr type bridge vlan_filtering 1
+          for p in tk1 tk2 sg1 sg2; do sudo ip link set $p master br-tr; sudo ip link set $p up; done
+          sudo ip link set br-tr up
+  solution:
+    explanation: A bridge with vlan_filtering 1 plus a per-port PVID (untagged) makes each port an access port; frames from a port are placed in its VLAN and only leave through ports of the same VLAN.
+    steps:
+      - on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo ip link add br-tr type bridge vlan_filtering 1
+          for p in tk1 tk2 sg1 sg2; do sudo ip link set $p master br-tr; sudo ip link set $p up; done
+          sudo ip link set br-tr up
+          for p in tk1 tk2; do sudo bridge vlan del dev $p vid 1; sudo bridge vlan add dev $p vid 20 pvid untagged; done
+          for p in sg1 sg2; do sudo bridge vlan del dev $p vid 1; sudo bridge vlan add dev $p vid 30 pvid untagged; done
+          sleep 2
+          sudo ip netns exec ticketing-1 ping -c2 -W2 {{net}}.22
+    alternatives:
+      - id: filtering-after
+        description: Create a plain bridge, attach the ports, then switch VLAN filtering on before assigning PVIDs.
+        steps:
+          - on: tr-net-01
+            as: learner
+            run: |
+              set -e
+              sudo ip link add br-tr type bridge
+              for p in tk1 tk2 sg1 sg2; do sudo ip link set $p master br-tr; sudo ip link set $p up; done
+              sudo ip link set br-tr up
+              sudo ip link set br-tr type bridge vlan_filtering 1
+              for p in tk1 tk2; do sudo bridge vlan add dev $p vid 20 pvid untagged; sudo bridge vlan del dev $p vid 1; done
+              for p in sg1 sg2; do sudo bridge vlan add dev $p vid 30 pvid untagged; sudo bridge vlan del dev $p vid 1; done
+              sleep 2

@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: netem-impaired-link
+  title: Reproduce a lossy depot radio link
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [tc, netem, traffic-control, tbf, networking]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`). The depot at the end of the
+    radio link is the network namespace `depot-radio` (10.70.1.2); `tr-net-01` reaches it
+    over the interface **`depot0`** (10.70.1.1/24).
+
+    The radio vendor wants to test their modem against a bad link, and the backup sync must
+    not saturate it. On `tr-net-01`, shape the egress of **`depot0`** (and only that
+    interface):
+
+    1. add **{{delay}} ms** of delay and **{{loss}}% packet loss** with `tc` **netem**;
+    2. cap the traffic to **{{rate}} Mbit/s** with a **token bucket filter (tbf)**, in the
+       same qdisc tree as the netem qdisc.
+
+    `ping 10.70.1.2` should now show a round trip of about {{delay}} ms. The change is
+    runtime only. Do not touch `eth0`.
+  objectives:
+    - Attach a netem qdisc with delay and loss to an interface
+    - Chain a token bucket filter to cap the rate
+    - Verify the effect with ping and tc qdisc show
+  params:
+    delay:
+      type: choice
+      values: ["120", "150", "200"]
+    loss:
+      type: choice
+      values: ["2", "3", "5"]
+    rate:
+      type: choice
+      values: ["5", "8", "10"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        if ! modprobe sch_netem 2>/dev/null; then
+          # netem ships in linux-modules-extra on some Ubuntu kernels
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null 2>&1 || true
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q linux-modules-extra-$(uname -r) >/dev/null 2>&1 || true
+          modprobe sch_netem 2>/dev/null || { echo "kernel module 'sch_netem' is not available on this image (linux-modules-extra missing): the netem lab cannot run" >&2; exit 1; }
+        fi
+        modprobe sch_tbf 2>/dev/null || true
+        ip netns del depot-radio 2>/dev/null || true
+        ip link del depot0 2>/dev/null || true
+        ip netns add depot-radio; ip -n depot-radio link set lo up
+        ip link add depot0 type veth peer name depot0-p
+        ip link set depot0-p netns depot-radio name eth0
+        ip addr add 10.70.1.1/24 dev depot0; ip link set depot0 up
+        ip -n depot-radio addr add 10.70.1.2/24 dev eth0; ip -n depot-radio link set eth0 up
+        tc qdisc del dev depot0 root 2>/dev/null || true
+        ping -c1 -W2 10.70.1.2 >/dev/null
+  checks:
+    - id: netem-params
+      description: A netem qdisc on depot0 has the requested delay and loss
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.traffic-control]
+      weight: 2
+      command: |
+        tc qdisc show dev depot0 | python3 -c '
+        import re, sys
+        t = sys.stdin.read()
+        m = re.search(r"qdisc netem .*", t)
+        if not m:
+            print("no-netem"); raise SystemExit
+        d = re.search(r"delay ([0-9.]+)(us|ms|s)\b", m.group(0))
+        l = re.search(r"loss ([0-9.]+)%", m.group(0))
+        ms = float(d.group(1)) * {"us": 0.001, "ms": 1, "s": 1000}[d.group(2)] if d else -1
+        lo = float(l.group(1)) if l else -1
+        print("ok" if abs(ms - {{delay}}) < 0.5 and abs(lo - {{loss}}) < 0.01 else "delay=%s loss=%s" % (ms, lo))
+        '
+      expect: {match: exact, value: ok}
+    - id: tbf-rate
+      description: A token bucket filter on depot0 caps the rate
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.traffic-control]
+      weight: 2
+      command: |
+        tc qdisc show dev depot0 | python3 -c '
+        import re, sys
+        t = sys.stdin.read()
+        m = re.search(r"qdisc tbf .*?rate ([0-9.]+)([KMG]?)bit", t)
+        if not m:
+            print("no-tbf"); raise SystemExit
+        bits = float(m.group(1)) * {"": 1, "K": 1e3, "M": 1e6, "G": 1e9}[m.group(2)]
+        print("ok" if abs(bits - {{rate}} * 1e6) < 1e3 else "rate=%s" % bits)
+        '
+      expect: {match: exact, value: ok}
+    - id: delay-live
+      description: The round trip to the depot shows the added delay
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.traffic-control]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        a=$(ping -c 10 -i 0.2 -W 3 -q 10.70.1.2 2>/dev/null | awk -F/ '/^rtt|^round-trip/ {print $5}')
+        awk -v a="${a:-0}" 'BEGIN { print (a >= {{delay}} && a <= {{delay}} + 40) ? "ok" : "avg=" a }'
+      expect: {match: exact, value: ok}
+    - id: only-depot-link
+      description: eth0 has no netem or tbf qdisc
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.traffic-control]
+      weight: 0.5
+      command: |
+        tc qdisc show dev depot0 | grep -q 'qdisc netem' || { echo not-configured; exit 0; }
+        tc qdisc show dev eth0 | grep -Ec 'netem|tbf' || true
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: Start with netem
+      command: "sudo tc qdisc add dev depot0 root handle 1: netem delay 100ms loss 1%"
+      body: "netem emulates delay, jitter, loss and reordering on egress. Check it with tc qdisc show dev depot0 and a ping from this host."
+      cost: 0
+    - title: Chain the token bucket
+      command: "sudo tc qdisc add dev depot0 parent 1:1 handle 10: tbf rate 5mbit burst 64kbit latency 400ms"
+      body: "netem is classless, but it can hold a child qdisc: attach the tbf to the netem handle (parent 1:1). The rate, burst and latency parameters are all required."
+      cost: 1
+    - title: Order does not matter
+      body: "You may also make tbf the root qdisc and attach netem below it. What matters is that both are on depot0 and the effects add up."
+      cost: 1
+  misconceptions:
+    - id: netem-without-cap
+      description: Adds delay and loss but never caps the rate.
+      feedback: "netem does not limit bandwidth. Add a tbf (or similar) qdisc with the requested rate in the same tree."
+      expectFail: [tbf-rate]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo tc qdisc add dev depot0 root handle 1: netem delay {{delay}}ms loss {{loss}}%
+    - id: wrong-delay
+      description: Uses a much smaller delay than requested.
+      feedback: "The vendor needs {{delay}} ms; check the unit (ms) and verify with ping."
+      expectFail: [netem-params, delay-live]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo tc qdisc add dev depot0 root handle 1: netem delay 12ms loss {{loss}}%
+          sudo tc qdisc add dev depot0 parent 1:1 handle 10: tbf rate {{rate}}mbit burst 64kbit latency 400ms
+  solution:
+    explanation: A netem qdisc at the root of depot0 adds the delay and loss; a tbf qdisc attached below it limits the rate. The two compose, so the vendor's modem sees a slow, lossy, capped link.
+    steps:
+      - on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo tc qdisc add dev depot0 root handle 1: netem delay {{delay}}ms loss {{loss}}%
+          sudo tc qdisc add dev depot0 parent 1:1 handle 10: tbf rate {{rate}}mbit burst 64kbit latency 400ms
+          tc qdisc show dev depot0
+          ping -c3 -W3 10.70.1.2
+    alternatives:
+      - id: tbf-root
+        description: Make tbf the root qdisc and attach netem below it.
+        steps:
+          - on: tr-net-01
+            as: learner
+            run: |
+              set -e
+              sudo tc qdisc add dev depot0 root handle 1: tbf rate {{rate}}mbit burst 64kbit latency 400ms
+              sudo tc qdisc add dev depot0 parent 1:1 handle 10: netem delay {{delay}}ms loss {{loss}}%

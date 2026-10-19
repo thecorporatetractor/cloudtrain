@@ -1,0 +1,190 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: chrony-timezone-depot
+  title: Set the depot host's clock source and time zone
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain, lfcs:networking, lpic1:essential-services]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [chrony, ntp, timezone, timedatectl]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`), a depot host that has no
+    internet access. The depot's in-lab time server is **`tr-ntp-1`** (10.72.1.2, reachable
+    by that name from `tr-net-01`); it runs as a network namespace on this host, so it keeps
+    answering NTP on UDP 123.
+
+    - Point **chrony** at `tr-ntp-1` as a time source (a `server ... iburst` line is enough)
+      and make the running `chronyd` use it.
+    - Set the system time zone to **{{tz}}**.
+    - Confirm that the host reports a synchronised clock (`chronyc sources`, `chronyc tracking`
+      and `timedatectl`).
+
+    The configuration must survive a reboot.
+  objectives:
+    - Add a time source to chrony and make the daemon use it
+    - Set the time zone with timedatectl
+    - Verify synchronisation with chronyc and timedatectl
+  params:
+    tz:
+      type: choice
+      values: [Europe/London, Europe/Dublin, Atlantic/Reykjavik, Europe/Lisbon]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        systemctl stop tr-ntp-1.service 2>/dev/null || true
+        ip netns del tr-ntp-1 2>/dev/null || true
+        ip link del ntp0 2>/dev/null || true
+        ip netns add tr-ntp-1; ip -n tr-ntp-1 link set lo up
+        ip link add ntp0 type veth peer name ntp0p
+        ip link set ntp0p netns tr-ntp-1
+        ip addr add 10.72.1.1/24 dev ntp0; ip link set ntp0 up
+        ip -n tr-ntp-1 addr add 10.72.1.2/24 dev ntp0p; ip -n tr-ntp-1 link set ntp0p up
+        sed -i '/tr-ntp-1/d' /etc/hosts
+        echo "10.72.1.2 tr-ntp-1 tr-ntp-1.tallowmere.test" >> /etc/hosts
+        # the depot time server: a second chronyd, bound to the namespace address, serving its local clock
+        # config lives under /etc/chrony so the enforced AppArmor profile for chronyd allows reading it
+        printf 'bindaddress 10.72.1.2\nlocal stratum 8\nallow 10.72.1.0/24\ncmdport 0\nbindcmdaddress /\npidfile /run/chrony/tr-ntp-1.pid\ndriftfile /var/lib/chrony/tr-ntp-1.drift\n' > /etc/chrony/tr-ntp-1.conf
+        systemd-run -q --unit=tr-ntp-1 --collect -p NetworkNamespacePath=/run/netns/tr-ntp-1 /usr/sbin/chronyd -x -d -f /etc/chrony/tr-ntp-1.conf
+        # the host: default chrony, no depot source yet, UTC
+        rm -f /etc/chrony/sources.d/*.sources /etc/chrony/conf.d/*.conf
+        timedatectl set-timezone Etc/UTC
+        systemctl enable chrony >/dev/null 2>&1 || true
+        systemctl restart chrony
+        sleep 2
+        systemctl is-active tr-ntp-1.service >/dev/null
+        # the depot server must answer NTP before setup finishes
+        python3 - <<'EOP'
+        import socket, sys
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+        try:
+            s.sendto(b"\x23" + b"\0" * 47, ("10.72.1.2", 123)); d = s.recv(512)
+            sys.exit(0 if len(d) >= 48 else 1)
+        except Exception as e:
+            print("tr-ntp-1 does not answer NTP: %s" % e); sys.exit(1)
+        EOP
+  checks:
+    - id: source-configured
+      description: chrony is configured with tr-ntp-1 as a time source
+      type: shell
+      on: tr-net-01
+      skills: [linux.systemd.time-locale, linux.net.time-sync]
+      weight: 1.5
+      command: |
+        cat /etc/chrony/chrony.conf /etc/chrony/conf.d/*.conf /etc/chrony/sources.d/*.sources 2>/dev/null | awk '$1 == "server" || $1 == "pool" || $1 == "peer" {print $2}' | grep -Ex 'tr-ntp-1|tr-ntp-1\.tallowmere\.test|10\.72\.1\.2' | head -1 | grep -q . && echo configured || echo missing
+      expect: {match: exact, value: configured}
+    - id: source-selected
+      description: The running chronyd has selected tr-ntp-1 as its synchronisation source
+      type: shell
+      on: tr-net-01
+      skills: [linux.systemd.time-locale, linux.net.time-sync]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        for i in $(seq 40); do
+          s=$(chronyc -n sources 2>/dev/null | awk '/^\^\*/ {print $2}')
+          [ "$s" = 10.72.1.2 ] && { echo selected; exit 0; }
+          sleep 2
+        done
+        echo "selected=${s:-none}"
+      expect: {match: exact, value: selected}
+    - id: clock-synchronised
+      description: The system reports a synchronised clock
+      type: shell
+      on: tr-net-01
+      skills: [linux.systemd.time-locale, linux.net.time-sync]
+      weight: 1
+      timeoutSec: 90
+      command: |
+        for i in $(seq 30); do
+          v=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+          [ "$v" = yes ] && { echo yes; exit 0; }
+          sleep 2
+        done
+        echo "${v:-unknown}"
+      expect: {match: exact, value: "yes"}
+    - id: timezone
+      description: The time zone is {{tz}}
+      type: shell
+      on: tr-net-01
+      skills: [linux.systemd.time-locale, linux.net.time-sync]
+      weight: 1
+      command: echo "$(timedatectl show -p Timezone --value) $(readlink /etc/localtime | sed 's#.*zoneinfo/##')"
+      expect: {match: exact, value: "{{tz}} {{tz}}"}
+  hints:
+    - title: Where chrony reads sources
+      body: "On Ubuntu /etc/chrony/chrony.conf includes /etc/chrony/sources.d/*.sources. A line 'server tr-ntp-1 iburst' in a new .sources file adds a source; the existing pool lines point at the internet and stay unreachable."
+      cost: 0
+    - title: Make the daemon notice
+      command: sudo chronyc reload sources
+      body: "chronyd reads its configuration at start (sources.d can be reloaded with chronyc reload sources); restart the chrony service if in doubt. chronyc sources marks the selected source with ^*."
+      cost: 1
+    - title: Time zone
+      command: sudo timedatectl set-timezone {{tz}}
+      body: "timedatectl list-timezones lists valid names. The zone is stored as the /etc/localtime symlink."
+      cost: 0
+  misconceptions:
+    - id: wrong-zone
+      description: Syncs correctly but sets a different time zone.
+      feedback: "The depot runs on {{tz}}; check timedatectl for the zone that is actually set."
+      expectFail: [timezone]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          echo 'server tr-ntp-1 iburst' | sudo tee /etc/chrony/sources.d/depot.sources >/dev/null
+          sudo systemctl restart chrony
+          sudo timedatectl set-timezone Europe/Paris
+    - id: not-reloaded
+      description: Adds the server to the configuration but never restarts or reloads chrony.
+      feedback: "chronyd keeps the sources it read at start. Run chronyc reload sources or restart the service, then watch chronyc sources."
+      expectFail: [source-selected, clock-synchronised]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          echo 'server tr-ntp-1 iburst' | sudo tee /etc/chrony/sources.d/depot.sources >/dev/null
+          sudo timedatectl set-timezone {{tz}}
+  solution:
+    explanation: A server line in a chrony sources file adds tr-ntp-1; a restart (or reload sources) makes chronyd poll it and, as the only reachable source, select it; timedatectl set-timezone stores the zone.
+    steps:
+      - on: tr-net-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          echo 'server tr-ntp-1 iburst' | sudo tee /etc/chrony/sources.d/depot.sources >/dev/null
+          sudo systemctl restart chrony
+          sudo timedatectl set-timezone {{tz}}
+          sleep 10
+          chronyc sources
+    alternatives:
+      - id: edit-main-config
+        description: Put the server line in chrony.conf and comment out the pools.
+        steps:
+          - on: tr-net-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo sed -i 's/^\(pool\|server\) /#&/' /etc/chrony/chrony.conf
+              echo 'server tr-ntp-1 iburst' | sudo tee -a /etc/chrony/chrony.conf >/dev/null
+              sudo systemctl restart chrony
+              sudo timedatectl set-timezone {{tz}}
+              sleep 10

@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nmcli-bond-el
+  title: Configure a second IPv4 and IPv6 address on a connection
+  domain: linux
+  frameworks: [rhcsa-aligned:networking]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [networkmanager, nmcli, ipv6, dns, persistence]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-el-01`** (`ssh tr-el-01`; you have `sudo`), an Enterprise Linux host managed
+    by **NetworkManager**. Its only NIC, `eth0`, gets its main address from DHCP and your ssh
+    session runs over it.
+
+    Add a second address on the **existing connection of `eth0`** with `nmcli`, without
+    replacing what DHCP gives you:
+
+    - **10.40.9.20/24** and **fd00:40:9::20/64** as additional addresses;
+    - the DNS server **{{dns}}** (kept in addition to what DHCP provides);
+    - IPv4 must stay on **DHCP** (`ipv4.method auto`) and the default route must not change;
+    - the connection profile must be saved (survives a reboot) **and** active now.
+
+    Static IPv6 addresses need an `ipv6.method` that allows them (`auto`, `manual`, ...); the
+    profile is set up that way (setup adjusts it if the image default does not allow it).
+
+    Careful: `nmcli connection up` re-activates the connection and can drop your ssh session for
+    a few seconds; `nmcli device reapply eth0` applies the changed profile to the running
+    interface more gently. If you lose the connection, use the node's console.
+  objectives:
+    - Add secondary IPv4 and IPv6 addresses to an existing connection with nmcli
+    - Set a DNS server on the connection
+    - Apply the profile to the running interface without breaking the session
+  params:
+    dns:
+      type: choice
+      values: ["10.53.0.53", "10.53.1.10", "10.53.2.2"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        dev=$(ip -4 route show default | awk '{print $5; exit}')
+        con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
+        [ -n "$con" ]
+        echo "$dev" > $V/nm.dev; echo "$con" > $V/nm.con
+        # start clean if a previous run added the extra addresses
+        if nmcli -g ipv4.addresses con show "$con" | grep -q 10.40.9.20; then
+          nmcli con mod "$con" -ipv4.addresses 10.40.9.20/24 -ipv6.addresses fd00:40:9::20/64 ipv4.dns "" || true
+          nmcli device reapply "$dev" || true
+        fi
+        ip -4 -o addr show dev "$dev" scope global | awk '$4 !~ /^10\.40\.9\./ {print $4; exit}' > $V/nm.addr
+        ip -4 route show default | awk '{print $3; exit}' > $V/nm.gw
+        [ "$(nmcli -g ipv4.method con show "$con")" = auto ]
+        # NetworkManager refuses static ipv6.addresses when ipv6.method is ignore, disabled or link-local;
+        # switch such a profile to auto (harmless for IPv4/ssh) so the task is solvable on any image default
+        case "$(nmcli -g ipv6.method con show "$con")" in
+          auto|dhcp|manual|shared) : ;;
+          *) nmcli con mod "$con" ipv6.method auto; nmcli device reapply "$dev" || true ;;
+        esac
+        test -s $V/nm.addr && test -s $V/nm.gw
+  checks:
+    - id: profile-addresses
+      description: The saved connection profile has both extra addresses
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.persistent-config]
+      weight: 2
+      command: |
+        con=$(cat /var/lib/cloudtrain/nm.con)
+        a=$(nmcli -g ipv4.addresses con show "$con" 2>/dev/null | tr -d '\\')
+        b=$(nmcli -g ipv6.addresses con show "$con" 2>/dev/null | tr -d '\\' | tr 'A-Z' 'a-z')
+        echo ",$a," | sed 's/ //g' | grep -qF ',10.40.9.20/24,' && echo ",$b," | sed 's/ //g' | grep -qF ',fd00:40:9::20/64,' && echo saved || echo "v4=$a v6=$b"
+      expect: {match: exact, value: saved}
+    - id: live-addresses
+      description: The running interface carries both addresses
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.persistent-config]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        dev=$(cat /var/lib/cloudtrain/nm.dev)
+        for i in 1 2 3 4 5; do
+          ip -4 addr show dev $dev | grep -q '10\.40\.9\.20/24' && ip -6 addr show dev $dev | grep -v tentative | grep -qi 'fd00:40:9::20/64' && { echo live; exit 0; }
+          sleep 1
+        done
+        echo missing
+      expect: {match: exact, value: live}
+    - id: dns-server
+      description: The connection lists the requested DNS server
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: |
+        con=$(cat /var/lib/cloudtrain/nm.con)
+        d=$(nmcli -g ipv4.dns con show "$con" 2>/dev/null | tr -d '\\ ')
+        echo ",$d," | grep -qF ',{{dns}},' && echo dns || echo "dns=$d"
+      expect: {match: exact, value: dns}
+    - id: dhcp-kept
+      description: IPv4 is still DHCP and the original address and default route are unchanged
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.persistent-config]
+      weight: 0.5
+      command: |
+        V=/var/lib/cloudtrain; con=$(cat $V/nm.con); dev=$(cat $V/nm.dev)
+        m=$(nmcli -g ipv4.method con show "$con" 2>/dev/null)
+        ip -4 -o addr show dev $dev | awk '{print $4}' | grep -qxF "$(cat $V/nm.addr)" || { echo "address-lost"; exit 0; }
+        [ "$(ip -4 route show default | awk '{print $3; exit}')" = "$(cat $V/nm.gw)" ] || { echo "gateway-changed"; exit 0; }
+        [ "$m" = auto ] && echo kept || echo "method=$m"
+      expect: {match: exact, value: kept}
+  hints:
+    - title: Add, do not replace
+      command: sudo nmcli con mod "<connection>" +ipv4.addresses 10.40.9.20/24
+      body: "A plus sign appends a value to a multi-valued property; without it nmcli replaces the list. Find the connection name with nmcli -g GENERAL.CONNECTION device show eth0."
+      cost: 0
+    - title: IPv6 and DNS
+      body: "The same +ipv6.addresses works for IPv6, and ipv4.dns takes the server (use +ipv4.dns to keep other servers). IPv6 can stay on its automatic method while carrying a static address; NetworkManager rejects ipv6.addresses when ipv6.method is ignore, disabled or link-local."
+      cost: 1
+    - title: Apply without dropping the session
+      command: sudo nmcli device reapply eth0
+      body: "reapply pushes the changed settings to the running device. nmcli con up would deactivate and reactivate the connection."
+      cost: 1
+  misconceptions:
+    - id: ip-addr-only
+      description: Adds the addresses with ip addr, which NetworkManager does not store.
+      feedback: "ip addr add changes the running interface only; the profile (and the DNS server) must be edited with nmcli con mod."
+      expectFail: [profile-addresses, dns-server]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          dev=$(cat /var/lib/cloudtrain/nm.dev 2>/dev/null || ip -4 route show default | awk '{print $5; exit}')
+          sudo ip addr add 10.40.9.20/24 dev "$dev"
+          sudo ip addr add fd00:40:9::20/64 dev "$dev"
+    - id: profile-not-applied
+      description: Edits the profile but never applies it to the running interface.
+      feedback: "nmcli con mod only edits the saved profile. Apply it with nmcli device reapply (or re-activate the connection)."
+      expectFail: [live-addresses]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
+          sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}}
+  solution:
+    explanation: nmcli con mod with + appends the extra addresses and the DNS server to the existing profile (keeping DHCP); device reapply activates the changed profile on the running interface without a full re-activation.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
+          sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}}
+          sudo nmcli device reapply "$dev"
+          sleep 3
+          ip -br addr show dev "$dev"
+    alternatives:
+      - id: profile-plus-ip
+        description: Save the profile with nmcli con mod and put the addresses on the running interface with ip addr.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: |
+              set -e
+              dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
+              sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}}
+              sudo ip addr add 10.40.9.20/24 dev "$dev"
+              sudo ip addr add fd00:40:9::20/64 dev "$dev"
+              sleep 2

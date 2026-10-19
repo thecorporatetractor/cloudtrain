@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tcpdump-lost-heartbeats
+  title: Capture the missing signalling heartbeats
+  domain: linux
+  frameworks: [lpic2:networking, linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [tcpdump, capture, udp, troubleshooting, namespaces]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`). It is the signalling
+    **collector**; the other hosts are network namespaces on it (use
+    `sudo ip netns exec <host> <command>`).
+
+    The signalling box **`tr-signal-03`** sends a UDP heartbeat to the collector
+    (**10.65.2.2, UDP port 5140**) twice a second, but `tr-collector.service` on this host
+    records nothing. The path is:
+
+    ```
+    tr-signal-03 (10.65.1.2)  --[s-eth0 | r-in]--  rtr  --[r-out | sig-up]--  collector (10.65.2.2)
+    ```
+
+    `rtr` is a router namespace (interfaces `r-in` 10.65.1.1 and `r-out` 10.65.2.1). Exactly one
+    hop is silently discarding the heartbeats. Do not fix it yet: find it.
+
+    1. Capture the heartbeats with `tcpdump` (filter on UDP port 5140) on an **interface where
+       the heartbeats are visible** and save at least a few packets to
+       **`~/answers/heartbeats.pcap`** (`-w`).
+    2. Write the name of the hop that drops them to **`~/answers/drop.txt`**, as one word:
+       `tr-signal-03` (the sender never puts them on the wire), `rtr` (the router drops them) or
+       `collector` (they arrive here but are dropped before the service).
+  objectives:
+    - Capture packets with tcpdump using interface and port filters
+    - Compare captures taken on both sides of a hop
+    - Locate where traffic disappears
+  params:
+    dropat:
+      type: choice
+      values: [tr-signal-03, rtr, collector]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        for u in tr-collector tr-signal-sender; do systemctl stop $u.service 2>/dev/null || true; done
+        nft delete table inet trhb 2>/dev/null || true
+        for n in tr-signal-03 rtr; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        ip link del sig-up 2>/dev/null || true
+        ip link add sig-up type veth peer name r-out
+        ip link set r-out netns rtr
+        ip addr add 10.65.2.2/24 dev sig-up; ip link set sig-up up
+        ip -n rtr addr add 10.65.2.1/24 dev r-out; ip -n rtr link set r-out up
+        ip link add s-eth0 type veth peer name r-in
+        ip link set s-eth0 netns tr-signal-03
+        ip link set r-in netns rtr
+        ip -n tr-signal-03 addr add 10.65.1.2/24 dev s-eth0; ip -n tr-signal-03 link set s-eth0 up
+        ip -n tr-signal-03 route add default via 10.65.1.1
+        ip -n rtr addr add 10.65.1.1/24 dev r-in; ip -n rtr link set r-in up
+        ip netns exec rtr sysctl -q -w net.ipv4.ip_forward=1
+        # collector service
+        install -d -m 0755 /usr/local/libexec /var/lib/tr-heartbeat
+        : > /var/lib/tr-heartbeat/received.log
+        cat > /usr/local/libexec/tr-collector.py <<'EOPY'
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 5140))
+        while True:
+            data, addr = s.recvfrom(512)
+            with open("/var/lib/tr-heartbeat/received.log", "a") as f:
+                f.write("%s %s\n" % (addr[0], data.decode(errors="replace")))
+        EOPY
+        cat > /usr/local/libexec/tr-heartbeat-sender.py <<'EOPY'
+        import socket, time
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        n = 0
+        while True:
+            n += 1
+            try:
+                s.sendto(("HB tr-signal-03 %d" % n).encode(), ("10.65.2.2", 5140))
+            except OSError:
+                pass
+            time.sleep(0.5)
+        EOPY
+        printf '[Unit]\nDescription=Tallowmere heartbeat collector\n[Service]\nExecStart=/usr/bin/python3 /usr/local/libexec/tr-collector.py\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-collector.service
+        printf '[Unit]\nDescription=Tallowmere heartbeat sender\n[Service]\nNetworkNamespacePath=/run/netns/tr-signal-03\nExecStart=/usr/bin/python3 /usr/local/libexec/tr-heartbeat-sender.py\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-signal-sender.service
+        # the fault, at the requested hop
+        if [ "{{dropat}}" = tr-signal-03 ]; then
+          ip netns exec tr-signal-03 nft -f - <<'EONFT'
+        table inet trhb {
+          chain output {
+            type filter hook output priority 0; policy accept;
+            udp dport 5140 drop
+          }
+        }
+        EONFT
+        elif [ "{{dropat}}" = rtr ]; then
+          ip netns exec rtr nft -f - <<'EONFT'
+        table inet trhb {
+          chain forward {
+            type filter hook forward priority 0; policy accept;
+            udp dport 5140 drop
+          }
+        }
+        EONFT
+        else
+          nft -f - <<'EONFT'
+        table inet trhb {
+          chain input {
+            type filter hook input priority 0; policy accept;
+            udp dport 5140 drop
+          }
+        }
+        EONFT
+        fi
+        echo "{{dropat}}" > $V/drop.hop
+        systemctl daemon-reload
+        systemctl enable --now tr-collector.service tr-signal-sender.service >/dev/null 2>&1
+        rm -rf /home/learner/answers; install -d -o learner -g learner -m 0755 /home/learner/answers
+        sleep 3
+        [ ! -s /var/lib/tr-heartbeat/received.log ]
+  checks:
+    - id: hop
+      description: drop.txt names the hop that drops the heartbeats
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.capture]
+      weight: 2.5
+      command: |
+        got=$(tr -d ' \t\r\n' < /home/learner/answers/drop.txt 2>/dev/null | tr 'A-Z' 'a-z')
+        [ "$got" = "$(cat /var/lib/cloudtrain/drop.hop)" ] && echo correct || echo "answer=${got:-none}"
+      expect: {match: exact, value: correct}
+    - id: capture
+      description: heartbeats.pcap holds captured heartbeat packets from tr-signal-03
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.capture]
+      weight: 1.5
+      command: |
+        if [ "{{dropat}}" = tr-signal-03 ]; then
+          # the sender never emits the packets: the evidence is a valid, empty capture taken on the path
+          tcpdump -nr /home/learner/answers/heartbeats.pcap >/dev/null 2>&1 && echo captured || echo "no-capture"
+          exit 0
+        fi
+        n=$(tcpdump -nr /home/learner/answers/heartbeats.pcap 'src host 10.65.1.2 and udp dst port 5140' 2>/dev/null | wc -l)
+        [ "$n" -ge 3 ] && echo captured || echo "packets=$n"
+      expect: {match: exact, value: captured}
+    - id: fault-intact
+      description: The sender and the collector are still running and the fault is not touched
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.capture]
+      weight: 0.5
+      command: |
+        a=$(systemctl is-active tr-signal-sender.service tr-collector.service | paste -sd,)
+        n=$(wc -l < /var/lib/tr-heartbeat/received.log)
+        echo "$a received=$n"
+      expect: {match: exact, value: "active,active received=0"}
+  hints:
+    - title: Capture where you can
+      command: sudo ip netns exec rtr tcpdump -ni r-in udp port 5140
+      body: "A packet capture shows what reaches an interface, before the firewall of that host. Run the same filter on the interfaces on both sides of each hop (r-in, r-out, sig-up)."
+      cost: 0
+    - title: Compare the sides
+      body: "If packets show on r-in but not on r-out, the router discards them. If they show on sig-up but the collector log stays empty, the drop happens inside this host."
+      cost: 1
+    - title: Save a capture
+      command: sudo timeout 6 tcpdump -Z root -ni <iface> -w ~/answers/heartbeats.pcap udp port 5140
+      body: "-w writes the raw packets; -Z root keeps tcpdump from dropping privileges so it can write into your directory (you can also capture to /tmp and copy)."
+      cost: 1
+  misconceptions:
+    - id: blames-sender
+      description: Decides from the empty collector log alone, without comparing captures on both sides of each hop.
+      feedback: "An empty log only says the packets did not reach the service. Capture on both sides of each hop (r-in, r-out, sig-up) to see where they stop."
+      expectFail: [hop]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo timeout 5 ip netns exec rtr tcpdump -Z root -ni r-in -w /home/learner/answers/heartbeats.pcap 'udp port 5140' >/dev/null 2>&1 || true
+          sudo chown learner:learner /home/learner/answers/heartbeats.pcap
+          if [ "{{dropat}}" = tr-signal-03 ]; then echo collector; else echo tr-signal-03; fi > /home/learner/answers/drop.txt
+    - id: no-capture-saved
+      description: Guesses the right hop but never saves a capture of the heartbeats.
+      feedback: "The task asks for evidence: capture the UDP 5140 packets with tcpdump -w on an interface where they are visible."
+      expectFail: [capture]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          if [ "{{dropat}}" != tr-signal-03 ]; then
+            sudo timeout 4 tcpdump -Z root -ni eth0 -w /home/learner/answers/heartbeats.pcap 'tcp port 22' >/dev/null 2>&1 || true
+            sudo chown learner:learner /home/learner/answers/heartbeats.pcap
+          fi
+          echo "{{dropat}}" > /home/learner/answers/drop.txt
+  solution:
+    explanation: Capturing on r-in shows whether the heartbeats leave tr-signal-03 at all (none there means the sender side drops them). Capturing on r-out tells the router apart from the collector - no packets there means the router drops them, packets there with an empty collector log means the host drops them.
+    steps:
+      - on: tr-net-01
+        as: learner
+        timeoutSec: 60
+        run: |
+          set -e
+          sudo timeout 5 ip netns exec rtr tcpdump -Z root -ni r-in -w /home/learner/answers/heartbeats.pcap 'udp port 5140' >/dev/null 2>&1 || true
+          sudo chown learner:learner /home/learner/answers/heartbeats.pcap
+          i=$(sudo timeout 4 ip netns exec rtr tcpdump -ni r-in -c1 'udp port 5140' 2>/dev/null | wc -l)
+          n=$(sudo timeout 4 ip netns exec rtr tcpdump -ni r-out -c1 'udp port 5140' 2>/dev/null | wc -l)
+          if [ "$i" -eq 0 ]; then echo tr-signal-03; elif [ "$n" -eq 0 ]; then echo rtr; else echo collector; fi > /home/learner/answers/drop.txt
+          cat /home/learner/answers/drop.txt

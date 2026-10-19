@@ -1,0 +1,218 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: firewalld-zones-el
+  title: Separate station and office traffic with firewall zones
+  domain: linux
+  frameworks: [rhcsa-aligned:security, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [firewalld, zones, sources, persistence]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-el-01`** (`ssh tr-el-01`; you have `sudo`), an Enterprise Linux host running
+    **firewalld**. Two client networks are modelled as network namespaces on it
+    (`sudo ip netns exec <name> <command>`):
+
+    | network | client | cable end on tr-el-01 |
+    |---|---|---|
+    | station network {{stn}}.0/24 | namespace `station` ({{stn}}.20) | `zn-stn` ({{stn}}.1) |
+    | office network 10.40.6.0/24 | namespace `office` (10.40.6.20) | `zn-off` (10.40.6.1) |
+
+    The host serves HTTPS on **443** and SSH on 22. Use firewalld **zones bound to source
+    addresses** so that:
+
+    - traffic from the **station network {{stn}}.0/24** is handled by its own zone that allows
+      **only HTTPS** (no SSH, no other service or port);
+    - traffic from the **office network 10.40.6.0/24** is handled by a different zone that
+      allows **HTTPS and SSH** only;
+    - both zones are **permanent and active now** (create them, bind the sources, allow the
+      services, then make the running firewall match).
+
+    Name the zones as you like (for example `tr-station` and `tr-office`). Leave the default
+    zone, and with it the SSH access on `eth0`, as it is.
+  objectives:
+    - Create custom firewalld zones and bind source networks to them
+    - Allow exact services per zone
+    - Keep the permanent and runtime configuration in step
+  params:
+    stn:
+      type: choice
+      values: ["10.40.5", "10.44.5"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        systemctl stop tr-zone-https.service 2>/dev/null || true
+        systemctl enable --now firewalld >/dev/null 2>&1
+        for z in tr-station tr-office; do firewall-cmd -q --permanent --delete-zone=$z 2>/dev/null || true; done
+        firewall-cmd -q --reload
+        for n in station office; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        for l in zn-stn zn-off; do ip link del $l 2>/dev/null || true; done
+        mk() { # ns hostif hostaddr peeraddr
+          ip link add $2 type veth peer name $2-p
+          ip link set $2-p netns $1 name eth0
+          ip addr add $3 dev $2; ip link set $2 up
+          ip -n $1 addr add $4 dev eth0; ip -n $1 link set eth0 up
+          command -v nmcli >/dev/null 2>&1 && nmcli device set $2 managed no >/dev/null 2>&1 || true
+        }
+        mk station zn-stn {{stn}}.1/24 {{stn}}.20/24
+        mk office zn-off 10.40.6.1/24 10.40.6.20/24
+        mkdir -p /srv/tr-zone-https; echo "tr-zone-https" > /srv/tr-zone-https/index.html
+        systemd-run -q --unit=tr-zone-https --collect /usr/bin/python3 -m http.server 443 --directory /srv/tr-zone-https
+        sleep 1
+        ! ip netns exec station curl -4 -s -m 3 http://{{stn}}.1:443/ >/dev/null
+  checks:
+    - id: zones-runtime
+      description: The running firewall has one zone per network with exactly the right services
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      command: |
+        z1=$(firewall-cmd --get-zone-of-source={{stn}}.0/24 2>/dev/null); z2=$(firewall-cmd --get-zone-of-source=10.40.6.0/24 2>/dev/null)
+        for z in "$z1" "$z2"; do case "$z" in ""|"no zone"*) echo "unbound"; exit 0;; esac; done
+        [ "$z1" != "$z2" ] || { echo "same-zone"; exit 0; }
+        s1=$(firewall-cmd --zone=$z1 --list-services | tr ' ' '\n' | sort | paste -sd,)$(firewall-cmd --zone=$z1 --list-ports)
+        s2=$(firewall-cmd --zone=$z2 --list-services | tr ' ' '\n' | sort | paste -sd,)$(firewall-cmd --zone=$z2 --list-ports)
+        [ "$s1" = https ] && [ "$s2" = https,ssh ] && echo ok || echo "station=$s1 office=$s2"
+      expect: {match: exact, value: ok}
+    - id: station-probe
+      description: The station network gets HTTPS but not SSH
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        h=$(ip netns exec station curl -4 -s -m 5 http://{{stn}}.1:443/ 2>/dev/null | grep -q tr-zone-https && echo yes || echo no)
+        s=$(timeout 6 ip netns exec station bash -c 'exec 3<>/dev/tcp/{{stn}}.1/22 && head -c 4 <&3' 2>/dev/null)
+        echo "https=$h ssh=$([ "$s" = "SSH-" ] && echo yes || echo no)"
+      expect: {match: exact, value: "https=yes ssh=no"}
+    - id: office-probe
+      description: The office network gets HTTPS and SSH
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        h=$(ip netns exec office curl -4 -s -m 5 http://10.40.6.1:443/ 2>/dev/null | grep -q tr-zone-https && echo yes || echo no)
+        s=$(timeout 6 ip netns exec office bash -c 'exec 3<>/dev/tcp/10.40.6.1/22 && head -c 4 <&3' 2>/dev/null)
+        echo "https=$h ssh=$([ "$s" = "SSH-" ] && echo yes || echo no)"
+      expect: {match: exact, value: "https=yes ssh=yes"}
+    - id: zones-permanent
+      description: The permanent configuration has the same two zones
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      command: |
+        z1=$(firewall-cmd --permanent --get-zone-of-source={{stn}}.0/24 2>/dev/null); z2=$(firewall-cmd --permanent --get-zone-of-source=10.40.6.0/24 2>/dev/null)
+        for z in "$z1" "$z2"; do case "$z" in ""|"no zone"*) echo "unbound"; exit 0;; esac; done
+        [ "$z1" != "$z2" ] || { echo "same-zone"; exit 0; }
+        s1=$(firewall-cmd --permanent --zone=$z1 --list-services | tr ' ' '\n' | sort | paste -sd,)$(firewall-cmd --permanent --zone=$z1 --list-ports)
+        s2=$(firewall-cmd --permanent --zone=$z2 --list-services | tr ' ' '\n' | sort | paste -sd,)$(firewall-cmd --permanent --zone=$z2 --list-ports)
+        [ "$s1" = https ] && [ "$s2" = https,ssh ] && echo ok || echo "station=$s1 office=$s2"
+      expect: {match: exact, value: ok}
+    - id: default-zone-kept
+      description: The default zone still allows SSH
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 0.5
+      command: firewall-cmd --permanent --zone=$(firewall-cmd --get-default-zone) --query-service=ssh
+      expect: {match: exact, value: "yes"}
+  hints:
+    - title: A zone per network
+      command: sudo firewall-cmd --permanent --new-zone=tr-station
+      body: "New zones can only be created in the permanent configuration, and a reload is needed before the running firewall knows them. A source address bound to a zone sends that network's traffic to the zone."
+      cost: 0
+    - title: Bind and allow
+      command: sudo firewall-cmd --permanent --zone=tr-station --add-source={{stn}}.0/24
+      body: "Add the source and the services (--add-service=https) to each zone. A new zone allows nothing by default, so the station zone needs only https."
+      cost: 1
+    - title: Make them live
+      body: "firewall-cmd --reload applies the permanent configuration. Check with firewall-cmd --get-active-zones and --list-all --zone=<name>."
+      cost: 1
+  misconceptions:
+    - id: no-reload
+      description: Creates the zones permanently but never reloads.
+      feedback: "Permanent changes do not touch the running firewall until firewall-cmd --reload."
+      expectFail: [zones-runtime, station-probe, office-probe]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo firewall-cmd --permanent --new-zone=tr-station
+          sudo firewall-cmd --permanent --zone=tr-station --add-source={{stn}}.0/24
+          sudo firewall-cmd --permanent --zone=tr-station --add-service=https
+          sudo firewall-cmd --permanent --new-zone=tr-office
+          sudo firewall-cmd --permanent --zone=tr-office --add-source=10.40.6.0/24
+          sudo firewall-cmd --permanent --zone=tr-office --add-service=https
+          sudo firewall-cmd --permanent --zone=tr-office --add-service=ssh
+    - id: ssh-in-station
+      description: Gives the station zone SSH as well.
+      feedback: "The station network may use HTTPS only; SSH belongs to the office zone."
+      expectFail: [zones-runtime, station-probe, zones-permanent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo firewall-cmd --permanent --new-zone=tr-station
+          sudo firewall-cmd --permanent --zone=tr-station --add-source={{stn}}.0/24
+          sudo firewall-cmd --permanent --zone=tr-station --add-service=https
+          sudo firewall-cmd --permanent --zone=tr-station --add-service=ssh
+          sudo firewall-cmd --permanent --new-zone=tr-office
+          sudo firewall-cmd --permanent --zone=tr-office --add-source=10.40.6.0/24
+          sudo firewall-cmd --permanent --zone=tr-office --add-service=https
+          sudo firewall-cmd --permanent --zone=tr-office --add-service=ssh
+          sudo firewall-cmd --reload
+  solution:
+    explanation: Two custom zones, each bound to its source network and allowing only the services it needs, handled before the default zone; a reload makes the permanent configuration active.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo firewall-cmd --permanent --new-zone=tr-station
+          sudo firewall-cmd --permanent --zone=tr-station --add-source={{stn}}.0/24
+          sudo firewall-cmd --permanent --zone=tr-station --add-service=https
+          sudo firewall-cmd --permanent --new-zone=tr-office
+          sudo firewall-cmd --permanent --zone=tr-office --add-source=10.40.6.0/24
+          sudo firewall-cmd --permanent --zone=tr-office --add-service=https
+          sudo firewall-cmd --permanent --zone=tr-office --add-service=ssh
+          sudo firewall-cmd --reload
+          sudo firewall-cmd --get-active-zones
+    alternatives:
+      - id: runtime-to-permanent
+        description: Create the empty zones permanently, configure them live and copy the running state with --runtime-to-permanent.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: |
+              set -e
+              sudo firewall-cmd --permanent --new-zone=tr-station
+              sudo firewall-cmd --permanent --new-zone=tr-office
+              sudo firewall-cmd --reload
+              sudo firewall-cmd --zone=tr-station --add-source={{stn}}.0/24
+              sudo firewall-cmd --zone=tr-station --add-service=https
+              sudo firewall-cmd --zone=tr-office --add-source=10.40.6.0/24
+              sudo firewall-cmd --zone=tr-office --add-service=https
+              sudo firewall-cmd --zone=tr-office --add-service=ssh
+              sudo firewall-cmd --runtime-to-permanent

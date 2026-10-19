@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nat-port-redirect-gateway
+  title: NAT the depot network and redirect a legacy port
+  domain: linux
+  frameworks: [lfcs:networking, lpic2:system-security, linuxplus:security]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [nat, nftables, masquerade, dnat, forwarding]
+  version: 1
+spec:
+  description: |
+    Work on the depot gateway **`tr-el-01`** (`ssh tr-el-01`; you have `sudo`). The other
+    machines are network namespaces on it (`sudo ip netns exec <name> <command>`):
+
+    | host | address | role |
+    |---|---|---|
+    | `depot-a` | 10.61.1.10/24 (gateway 10.61.1.1 on interface `gw-a`) | depot client |
+    | `depot-b` | 10.61.2.10/24 (gateway 10.61.2.1 on interface `gw-b`) | timetable API on **TCP 80** |
+    | `upstream` | 198.51.100.2/24 (gateway side `gw-up`, 198.51.100.1) | the outside world |
+
+    `upstream` has **no route** to the depot networks, so it only answers hosts that appear to
+    come from 198.51.100.1. Configure the gateway so that:
+
+    - **IPv4 forwarding** is on;
+    - traffic from the depot networks **10.61.0.0/16** leaving through `gw-up` is
+      **masqueraded**, so depot hosts can reach `upstream` (`http://198.51.100.2:9000/whoami`
+      tells you which address it saw);
+    - **TCP 8080 on the gateway** is redirected (destination NAT) to the timetable API at
+      **10.61.2.10:80**, for clients on the depot side and from upstream;
+    - all of it **persists across reboots**.
+
+    `firewalld` is disabled on this gateway and the `nftables` service is not enabled yet.
+    Do not change `eth0` or the default route of the gateway.
+  objectives:
+    - Enable IPv4 forwarding persistently with sysctl.d
+    - Masquerade a source network on an uplink and DNAT a port to another host
+    - Save the nftables ruleset so the nftables service loads it at boot
+  params:
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        for u in tr-api-b tr-whoami; do systemctl stop $u.service 2>/dev/null || true; done
+        systemctl disable --now firewalld nftables >/dev/null 2>&1 || true
+        nft flush ruleset
+        mkdir -p /etc/nftables; rm -f /etc/nftables/tr-*.nft /etc/sysctl.d/*forward*.conf
+        printf '# Tallowmere gateway: keep rules in /etc/nftables/*.nft and include them here\n' > /etc/sysconfig/nftables.conf
+        sysctl -q -w net.ipv4.ip_forward=0
+        for n in depot-a depot-b upstream; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        for l in gw-a gw-b gw-up; do ip link del $l 2>/dev/null || true; done
+        mk() { # ns hostif hostaddr peeraddr
+          ip link add $2 type veth peer name $2-p
+          ip link set $2-p netns $1 name eth0
+          ip addr add $3 dev $2; ip link set $2 up
+          ip -n $1 addr add $4 dev eth0; ip -n $1 link set eth0 up
+          command -v nmcli >/dev/null 2>&1 && nmcli device set $2 managed no >/dev/null 2>&1 || true
+        }
+        mk depot-a gw-a 10.61.1.1/24 10.61.1.10/24
+        mk depot-b gw-b 10.61.2.1/24 10.61.2.10/24
+        mk upstream gw-up 198.51.100.1/24 198.51.100.2/24
+        ip -n depot-a route add default via 10.61.1.1
+        ip -n depot-b route add default via 10.61.2.1
+        mkdir -p /srv/tr-api-b; echo "timetable {{token}}" > /srv/tr-api-b/index.html
+        install -d -m 0755 /usr/local/libexec
+        cat > /usr/local/libexec/tr-whoami.py <<'EOPY'
+        import http.server
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = (self.client_address[0] + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("0.0.0.0", 9000), H).serve_forever()
+        EOPY
+        systemd-run -q --unit=tr-api-b --collect -p NetworkNamespacePath=/run/netns/depot-b /usr/bin/python3 -m http.server 80 --directory /srv/tr-api-b
+        systemd-run -q --unit=tr-whoami --collect -p NetworkNamespacePath=/run/netns/upstream /usr/bin/python3 /usr/local/libexec/tr-whoami.py
+        for i in $(seq 15); do ip netns exec depot-b curl -s -m 2 http://10.61.2.10/ | grep -q "timetable {{token}}" && break; sleep 1; done
+        ip netns exec depot-b curl -s -m 3 http://10.61.2.10/ | grep -q "timetable {{token}}"
+        ip netns exec upstream curl -s -m 3 http://198.51.100.2:9000/whoami | grep -q 198.51.100.2
+  checks:
+    - id: dnat-depot
+      description: A depot client reaches the timetable API through port 8080 on the gateway
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.nat-forwarding]
+      weight: 2
+      timeoutSec: 30
+      command: ip netns exec depot-a curl -4 -s -m 8 http://10.61.1.1:8080/ 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "timetable {{token}}"}
+    - id: dnat-uplink
+      description: The upstream host reaches the API through the gateway's uplink address
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.nat-forwarding]
+      weight: 1
+      timeoutSec: 30
+      command: ip netns exec upstream curl -4 -s -m 8 http://198.51.100.1:8080/ 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "timetable {{token}}"}
+    - id: masquerade
+      description: Upstream sees depot traffic as coming from the gateway
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.nat-forwarding]
+      weight: 2
+      timeoutSec: 30
+      command: ip netns exec depot-a curl -4 -s -m 8 http://198.51.100.2:9000/whoami 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "198.51.100.1"}
+    - id: forwarding-persistent
+      description: IPv4 forwarding is on now and in the boot configuration
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.nat-forwarding]
+      weight: 1
+      command: |
+        b=$(systemd-analyze cat-config sysctl.d 2>/dev/null | tr -d ' \t' | awk -F= '$1 == "net.ipv4.ip_forward" || $1 == "net/ipv4/ip_forward" {v = $2} END {print v}')
+        echo "now=$(sysctl -n net.ipv4.ip_forward) boot=${b:-0}"
+      expect: {match: exact, value: "now=1 boot=1"}
+    - id: rules-persistent
+      description: The saved nftables configuration loads the NAT rules and the service is enabled
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.nat-forwarding]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        [ "$(systemctl is-enabled nftables 2>/dev/null)" = enabled ] || { echo not-enabled; exit 0; }
+        nft -c -f /etc/sysconfig/nftables.conf >/dev/null 2>&1 || { echo invalid; exit 0; }
+        ip netns del trchk 2>/dev/null; ip netns add trchk
+        ip netns exec trchk nft -f /etc/sysconfig/nftables.conf >/dev/null 2>&1
+        r=$(ip netns exec trchk nft list ruleset 2>/dev/null)
+        ip netns del trchk 2>/dev/null
+        echo "$r" | grep -Eq 'masquerade|snat' && echo "$r" | grep -Eq 'dport 8080.*dnat( ip)? to 10\.61\.2\.10:80' && echo persistent || echo incomplete
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Two hooks
+      body: "NAT happens in the nat table: DNAT in a prerouting chain (priority dstnat), masquerade in a postrouting chain (priority srcnat). Remember that forwarded packets also need net.ipv4.ip_forward=1."
+      cost: 0
+    - title: Test the pieces
+      command: sudo ip netns exec upstream curl -s http://198.51.100.2:9000/whoami
+      body: "Without masquerade, upstream cannot answer 10.61.x.x at all. With it, /whoami prints the gateway's uplink address. Use curl from depot-a to check the DNAT."
+      cost: 1
+    - title: Persist both parts
+      body: "sysctl.d holds the forwarding setting. For nftables on Enterprise Linux the nftables service loads /etc/sysconfig/nftables.conf, which may include files from /etc/nftables/. Check with nft -c -f before enabling."
+      cost: 1
+  misconceptions:
+    - id: runtime-only
+      description: Configures forwarding and the NAT rules live and never saves them.
+      feedback: "Live nft rules and sysctl -w are lost at boot. Save the table to a file included by /etc/sysconfig/nftables.conf, enable nftables and put ip_forward in /etc/sysctl.d."
+      expectFail: [forwarding-persistent, rules-persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo sysctl -q -w net.ipv4.ip_forward=1
+          sudo nft add table ip trnat
+          sudo nft 'add chain ip trnat prerouting { type nat hook prerouting priority dstnat; }'
+          sudo nft 'add chain ip trnat postrouting { type nat hook postrouting priority srcnat; }'
+          sudo nft add rule ip trnat prerouting tcp dport 8080 dnat to 10.61.2.10:80
+          sudo nft add rule ip trnat postrouting ip saddr 10.61.0.0/16 oifname gw-up masquerade
+    - id: no-masquerade
+      description: Persists the port redirect and forwarding but forgets the masquerade rule.
+      feedback: "The redirect alone does not let depot hosts reach upstream: it has no route back to 10.61.0.0/16. Add a masquerade rule for traffic leaving through gw-up."
+      expectFail: [masquerade, rules-persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/60-forwarding.conf >/dev/null
+          sudo sysctl -q -p /etc/sysctl.d/60-forwarding.conf
+          printf '%s\n' 'table ip trnat {' '  chain prerouting {' '    type nat hook prerouting priority dstnat; policy accept;' '    tcp dport 8080 dnat to 10.61.2.10:80' '  }' '}' | sudo tee /etc/nftables/tr-nat.nft >/dev/null
+          echo 'include "/etc/nftables/tr-nat.nft"' | sudo tee -a /etc/sysconfig/nftables.conf >/dev/null
+          sudo systemctl enable nftables >/dev/null 2>&1
+          sudo nft -f /etc/nftables/tr-nat.nft
+  solution:
+    explanation: A nat table with a prerouting DNAT for port 8080 and a postrouting masquerade for 10.61.0.0/16 out of gw-up does the translation; saving it in /etc/nftables and including it from /etc/sysconfig/nftables.conf with the nftables service enabled loads it at boot; a sysctl.d file keeps forwarding on.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/60-forwarding.conf >/dev/null
+          sudo sysctl -q -p /etc/sysctl.d/60-forwarding.conf
+          printf '%s\n' 'table ip trnat {' '  chain prerouting {' '    type nat hook prerouting priority dstnat; policy accept;' '    tcp dport 8080 dnat to 10.61.2.10:80' '  }' '  chain postrouting {' '    type nat hook postrouting priority srcnat; policy accept;' '    ip saddr 10.61.0.0/16 oifname "gw-up" masquerade' '  }' '}' | sudo tee /etc/nftables/tr-nat.nft >/dev/null
+          echo 'include "/etc/nftables/tr-nat.nft"' | sudo tee -a /etc/sysconfig/nftables.conf >/dev/null
+          sudo nft -c -f /etc/sysconfig/nftables.conf
+          sudo systemctl enable nftables
+          sudo nft -f /etc/nftables/tr-nat.nft
+    alternatives:
+      - id: single-file
+        description: Put the table directly in /etc/sysconfig/nftables.conf instead of an include.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: |
+              set -e
+              echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/60-forwarding.conf >/dev/null
+              sudo sysctl -q -p /etc/sysctl.d/60-forwarding.conf
+              printf '%s\n' 'table ip trnat {' '  chain prerouting {' '    type nat hook prerouting priority dstnat; policy accept;' '    tcp dport 8080 dnat to 10.61.2.10:80' '  }' '  chain postrouting {' '    type nat hook postrouting priority srcnat; policy accept;' '    ip saddr 10.61.0.0/16 oifname "gw-up" masquerade' '  }' '}' | sudo tee -a /etc/sysconfig/nftables.conf >/dev/null
+              sudo nft -c -f /etc/sysconfig/nftables.conf
+              sudo systemctl enable nftables
+              sudo nft -f /etc/sysconfig/nftables.conf
