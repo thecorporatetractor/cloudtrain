@@ -10,6 +10,7 @@ import YAML from "yaml";
 import { validateSite } from "@cloudtrain/lab-schema";
 
 /** Website routes an internal link may point at (apps/web/src/router.tsx, public section). */
+/** (Section links such as `/#waitlist` resolve against the route before the hash.) */
 export const SITE_ROUTES = ["/", "/catalog", "/pricing", "/about", "/faq", "/contact", "/legal/terms", "/legal/privacy", "/sign-in"];
 
 /**
@@ -94,6 +95,16 @@ export async function checkSite(file, ctx, findings) {
   if (plans.filter((pl) => pl.highlight).length > 1) warn("/plans/items", "more than one highlighted plan");
   if (doc.flags.showPricing && plans.length === 0) warn("/flags/showPricing", "pricing is shown but no plans are configured");
 
+  // Waitlist: the consent checkbox links to /legal/privacy, so that notice has to cover the waitlist.
+  if (doc.waitlist?.enabled) {
+    if (!doc.legal.privacy.sections.some((s) => /waitlist|early.access/i.test(`${s.title} ${s.paragraphs.join(" ")}`))) {
+      err("/legal/privacy", "the waitlist is enabled but the privacy notice does not describe it (add a waitlist section)");
+    }
+    const f = doc.waitlist.fields ?? {};
+    if (f.interest?.required && f.interest.enabled === false) err("/waitlist/fields/interest", "a required field cannot be disabled");
+    if (f.organisation?.required && f.organisation.enabled === false) err("/waitlist/fields/organisation", "a required field cannot be disabled");
+    if (f.role?.required && f.role.enabled === false) err("/waitlist/fields/role", "a required field cannot be disabled");
+  }
   if (!/not affiliated/i.test(doc.legal.alignmentNotice)) err("/legal/alignmentNotice", "the alignment notice must say the platform is not affiliated with the certifying bodies");
   for (const [k, legal] of Object.entries({ terms: doc.legal.terms, privacy: doc.legal.privacy })) {
     if (legal.placeholder && !legal.sections.some((s) => /placeholder|draft/i.test(s.title) || s.paragraphs.some((p) => /placeholder|draft/i.test(p)))) {

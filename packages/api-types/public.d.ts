@@ -136,6 +136,67 @@ export interface SitePlans {
 /** CSS custom property overrides: `--token` -> value. */
 export type SiteTokenMap = Record<string, string>;
 
+/** A waitlist form field: shown when `enabled` (default true), mandatory when `required`. */
+export interface SiteWaitlistField {
+  enabled?: boolean;
+  required?: boolean;
+  label?: string;
+  placeholder?: string;
+}
+
+/** The early-access waitlist section (POST /api/public/waitlist). */
+export interface SiteWaitlist {
+  enabled: boolean;
+  eyebrow?: string;
+  title?: string;
+  body?: string;
+  submitLabel?: string;
+  emailLabel?: string;
+  /** Text of the consent checkbox before the link to the privacy page. */
+  consentLabel?: string;
+  privacyLinkLabel?: string;
+  note?: string;
+  successTitle?: string;
+  successBody?: string;
+  duplicateTitle?: string;
+  duplicateBody?: string;
+  errorMessage?: string;
+  fields?: {
+    organisation?: SiteWaitlistField;
+    /** `options` turns the field into a select; absent is free text. */
+    role?: SiteWaitlistField & { options?: string[] };
+    interest?: SiteWaitlistField & { enterpriseLabel?: string; individualLabel?: string };
+  };
+}
+
+export type WaitlistInterest = 'enterprise' | 'individual';
+
+/** POST /api/public/waitlist. `website` is the honeypot: real visitors never fill it. */
+export interface WaitlistRequest {
+  email: string;
+  organisation?: string;
+  role?: string;
+  interest?: WaitlistInterest;
+  consent: boolean;
+  website?: string;
+}
+
+/** `created`: added; `duplicate`: the address was already on the list (nothing changed). */
+export interface WaitlistResponse {
+  status: 'created' | 'duplicate';
+}
+
+/** One row of the admin list (GET /api/platform/waitlist). */
+export interface WaitlistEntry {
+  id: string;
+  email: string;
+  organisation: string | null;
+  role: string | null;
+  interest: WaitlistInterest | null;
+  consentAt: string;
+  createdAt: string;
+}
+
 export interface SiteConfig {
   apiVersion: 'cloudtrain.dev/v1';
   kind: 'Site';
@@ -212,6 +273,8 @@ export interface SiteConfig {
   plans?: SitePlans;
   /** The closing call to action; the buttons default to the hero's. */
   closing?: { title: string; body?: string; primaryCta?: SiteCta; secondaryCta?: SiteCta };
+  /** The early-access waitlist section on the landing page. */
+  waitlist?: SiteWaitlist;
 }
 
 /* ================================================================ public catalog */

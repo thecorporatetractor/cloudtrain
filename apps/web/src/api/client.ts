@@ -19,6 +19,7 @@ import type {
   ValidateResponse,
 } from './types';
 import { apiCredentials, apiUrl } from '@/lib/runtimeConfig';
+import { STATIC_SITE } from '@/lib/siteMode';
 
 export class ApiError extends Error {
   constructor(
@@ -91,6 +92,8 @@ export const queries = {
     queryOptions({
       queryKey: ['me'],
       queryFn: async () => {
+        // The static website build has no session and no API to ask.
+        if (STATIC_SITE) throw new ApiError(401, 'Not signed in', 'unauthenticated');
         const me = await request<Me>('/api/me');
         setCsrfToken(me.csrfToken);
         return me;

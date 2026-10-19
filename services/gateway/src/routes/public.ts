@@ -157,20 +157,27 @@ export function publicPathDetail(content: Content, id: string): PublicPathDetail
 
 /* ------------------------------------------------------------ rate limit */
 
-/** Fixed one-minute window per client address, in memory (one gateway process). */
+/** Fixed window (one minute by default) per client address, in memory (one gateway process). */
 export class RateLimiter {
   private readonly hits = new Map<string, { count: number; resetAt: number }>();
   constructor(
     private readonly perMinute: number,
     private readonly now: () => number = Date.now,
+    private readonly windowMs: number = 60_000,
   ) {}
+
+  /** Seconds until the key's window resets (at least 1). */
+  resetIn(key: string): number {
+    const h = this.hits.get(key);
+    return h ? Math.max(1, Math.ceil((h.resetAt - this.now()) / 1000)) : Math.ceil(this.windowMs / 1000);
+  }
 
   /** Counts one request; returns the remaining budget and when the window resets, or `null` when over the limit. */
   take(key: string): { remaining: number; resetAt: number } | null {
     const t = this.now();
     let h = this.hits.get(key);
     if (!h || h.resetAt <= t) {
-      h = { count: 0, resetAt: t + 60_000 };
+      h = { count: 0, resetAt: t + this.windowMs };
       this.hits.set(key, h);
       if (this.hits.size > 10_000) for (const [k, v] of this.hits) if (v.resetAt <= t) this.hits.delete(k);
     }

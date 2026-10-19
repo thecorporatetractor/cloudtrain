@@ -8,6 +8,7 @@ import type { SiteConfig } from '@/api/types';
 import { BrandLockup, BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Dropdown, Tooltip } from '@/components/ui';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
+import { APP_URL, STATIC_SITE } from '@/lib/siteMode';
 import { cn } from '@/lib/utils';
 import { linkKey, SiteAnchor } from './util';
 
@@ -121,6 +122,8 @@ export function SiteLayout({ children }: { children: ReactNode }) {
 export function SessionButton({ size = 'md', className }: { size?: 'sm' | 'md' | 'lg'; className?: string }) {
   const me = useMe();
   const location = useRouterState({ select: (s) => s.location });
+  // The static website build has no platform behind it unless VITE_APP_URL names one.
+  if (STATIC_SITE && !APP_URL) return null;
   if (me.isSuccess) {
     return (
       <Link to="/" className={cn('btn btn-primary', `btn-${size}`, className)}>

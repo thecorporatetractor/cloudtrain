@@ -50,6 +50,14 @@ the database. `ETag` + `Cache-Control: public, max-age=300`; 429 `rate_limited` 
 | `GET /public/catalog` | `PublicCatalog` (domains with counts, paths and courses, labs, exam simulations without pool ids, frameworks, skill names) | public |
 | `GET /public/paths/:id` | `PublicPathDetail` (sections, labs in order, related paths); 404 unknown | public |
 | `GET /public/exams/:id` | `PublicExamDetail` (objectives with weights and pool sizes, rules, report contents); 404 unknown | public |
+| `POST /public/waitlist` | `WaitlistRequest` (`email`, optional `organisation`, `role`, `interest`, `consent: true`, honeypot `website`) | `WaitlistResponse`: 201 `created`, 200 `duplicate` (same address in any case); 422 `invalid` with `details.fields`; 429 `rate_limited` (`CT_WAITLIST_RATE_PER_HOUR` per client address, `Retry-After`); 404 while `waitlist.enabled` is off. Unlike the other public routes this one writes (Postgres, no email is sent) | public |
+
+### Waitlist administration
+
+| Method + path | Response | Permission |
+|---|---|---|
+| `GET /platform/waitlist` (`?limit=`, default and maximum 10000) | `{ entries: WaitlistEntry[], total }`, newest first | `org.manage` (platform admin) |
+| `GET /platform/waitlist.csv` | `text/csv` download: `email,organisation,role,interest,consent_at,created_at`; cells that start with `=`, `+`, `-` or `@` are prefixed with `'` so a spreadsheet does not run them | `org.manage` (platform admin) |
 
 ## Billing (Stripe, test mode, `CT_BILLING_ENABLED`)
 

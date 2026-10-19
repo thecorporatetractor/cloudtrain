@@ -524,6 +524,18 @@ export interface DB {
   billing_subscriptions: BillingSubscriptionsTable;
   billing_entitlements: BillingEntitlementsTable;
   billing_events: BillingEventsTable;
+  waitlist_entries: WaitlistEntriesTable;
+}
+
+/** Early-access waitlist (0008_waitlist): not tenant data, no org_id. */
+export interface WaitlistEntriesTable {
+  id: Generated<string>;
+  email: string;
+  organisation: string | null;
+  role: string | null;
+  interest: 'enterprise' | 'individual' | null;
+  consent_at: Timestamp;
+  created_at: CreatedAt;
 }
 
 export type CtfEventRow = Selectable<CtfEventsTable>;
