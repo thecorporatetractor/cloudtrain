@@ -28,7 +28,7 @@ spec:
        with `podman kube play`.
     2. Write the pod manifest **`~/catalogue.yaml`** (`kind: Pod`, name **`catalogue`**) with the API and the
        database as containers, host port **8080** published, and the password supplied only through
-       `secretKeyRef` (name `catalogue-db`, key `password`). The database must be started from a config
+       `secretKeyRef` or a secret volume (name `catalogue-db`, key `password`). The database must be started from a config
        file rather than a password on its command line.
     3. Create the pod with **`podman kube play ~/catalogue.yaml`**. `http://127.0.0.1:8080/` returns
        `catalogue ok db=authenticated`.
@@ -206,7 +206,7 @@ spec:
       weight: 1.5
       command: |
         px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
-        n=$(px podman ps -a --format json 2>/dev/null | jq -r '[.[] | select(.PodName == "catalogue" and (.Image | test("redis")))] | .[0].Names[0] // ""')
+        n=$(px podman ps -a --filter pod=catalogue 2>/dev/null | awk '/redis/ {print $NF; exit}')
         [ -n "$n" ] || { echo no-db; exit 0; }
         px podman exec "$n" redis-cli PING 2>&1 | grep -q NOAUTH && echo auth-required || echo open
       expect: {match: exact, value: "auth-required"}
@@ -219,7 +219,7 @@ spec:
       weight: 1.5
       command: |
         f=/home/media/catalogue.yaml
-        if [ -s $f ] && grep -q '^kind: Pod' $f && grep -q secretKeyRef $f && ! grep -qF 'Copperleaf-{{pin}}' $f; then echo clean; else echo bad; fi
+        if [ -s $f ] && grep -q '^kind: Pod' $f && grep -qE "secretKeyRef|secretName" $f && ! grep -qF 'Copperleaf-{{pin}}' $f; then echo clean; else echo bad; fi
       expect: {match: exact, value: "clean"}
     - id: replayed
       description: "The pod was recreated from the manifest after it was written"
@@ -313,7 +313,7 @@ spec:
       Turn the password file into a Kubernetes Secret manifest and play it, which creates the Podman secret. Write the pod manifest so both containers read the password through secretKeyRef, and play it; Redis writes its config from the variable, so the password is on no command line.
     steps:
       - on: cl-podman-01
-        as: learner
+        as: admin
         run: |
           X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
           cd /
@@ -352,7 +352,7 @@ spec:
         description: "Mount the secret as a volume and use REDIS_PASSWORD_FILE."
         steps:
           - on: cl-podman-01
-            as: learner
+            as: admin
             run: |
               X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
               cd /
