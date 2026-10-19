@@ -17,7 +17,7 @@ spec:
     for that network is **10.64.20.2** (reachable on the interface `v-rem`). Two
     monitoring endpoints must answer on port 8080 again: **10.91.{{o}}.10** and
     **10.91.{{o}}.200**. Find out why the traffic does not get through and fix the host's
-    routing. Do not change the host's default route or `eth0`: your SSH session depends on
+    routing. Do not change the host's default route or its primary interface: your SSH session depends on
     them.
   objectives:
     - Read the routing table and ask the kernel for the path with ip route get
@@ -44,6 +44,7 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
+        ip -4 route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, > /var/lib/cloudtrain/default-dev
         ROLE=rem; NET=10.64.20
         for u in tr-rem-10 tr-rem-200; do systemctl stop $u.service 2>/dev/null || true; systemctl reset-failed $u.service 2>/dev/null || true; done
         ip netns del tr-$ROLE 2>/dev/null || true
@@ -102,13 +103,15 @@ spec:
         ip -4 route get 10.91.{{o}}.10 2>/dev/null | awk '{for (i = 1; i <= NF; i++) { if ($i == "via") v = $(i + 1); if ($i == "dev") d = $(i + 1) }} END {print v, d}'
       expect: {match: exact, value: "10.64.20.2 v-rem"}
     - id: default-kept
-      description: The default route still goes through eth0
+      description: The default route still goes through the primary interface
       type: shell
       on: tr-lp-01
       skills: [linux.net.ip-config]
       weight: 1
-      command: ip -4 route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+      command: |
+        now=$(ip -4 route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        if [ -n "$now" ] && [ "$now" = "$(cat /var/lib/cloudtrain/default-dev 2>/dev/null)" ]; then echo kept; else echo "${now:-none}"; fi
+      expect: {match: exact, value: kept}
   misconceptions:
     - id: bad-gateway-only
       description: Replaces the wrong gateway but forgets the blackhole route.
