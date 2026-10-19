@@ -1,0 +1,171 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: auditd-watch-identity
+  title: Audit changes to the account files and find who made them
+  domain: linux
+  frameworks:
+  - linuxplus:security
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - audit
+  - auditd
+  - ausearch
+  - security
+  version: 1
+spec:
+  description: |
+    Compliance wants every change to the local identity files on **`tr-aud-01`** (`ssh tr-aud-01`; you have
+    `sudo`) recorded with the key **`{{key}}`**.
+
+    1. Add **persistent** audit rules (a file in `/etc/audit/rules.d/`) that watch writes and attribute
+       changes of `/etc/passwd`, `/etc/shadow`, `/etc/group` and the directory `/etc/sudoers.d/`, load them with
+       `augenrules --load`, and confirm with `auditctl -l`.
+    2. Make a harmless change that touches one of these files (for example create and remove a test user).
+    3. With `ausearch`, find out **who** made the change: the login identity (`auid`), which differs from the effective
+       user when `sudo` is used. Write **`/home/learner/answers/audit.txt`** with `auid=<login user>` and
+       `file=<one of the watched files that the recorded event names>`.
+  objectives:
+  - Write persistent watch rules with a key
+  - Attribute an event to the login user with ausearch
+  params:
+    key:
+      type: choice
+      values:
+      - identity
+      - tt-identity
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-aud-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-aud-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      install -d -o learner -g learner /home/learner/answers; rm -f /home/learner/answers/audit.txt
+      rpm -q audit >/dev/null 2>&1 || dnf -y -q install audit >/dev/null
+      systemctl enable --now auditd >/dev/null 2>&1 || true
+      rm -f /etc/audit/rules.d/*identity*.rules
+      augenrules --load >/dev/null 2>&1 || true
+      auditctl -D >/dev/null 2>&1 || true
+      userdel -r tr-auditprobe >/dev/null 2>&1 || true
+      auditctl -s | grep -q 'enabled 1'
+  checks:
+  - id: rules-file
+    description: 'The rules are persistent: four watches with the key and write/attribute permissions'
+    type: shell
+    'on': tr-aud-01
+    skills: &id001
+    - linux.security.audit
+    weight: 2.5
+    command: |
+      n=0; for p in /etc/passwd /etc/shadow /etc/group /etc/sudoers.d; do
+        cat /etc/audit/rules.d/*.rules 2>/dev/null | grep -v '^#' | awk -v p="$p" '($1=="-w" && ($2==p || $2==p"/")) || ($1=="-a")' | grep -E -- "-p *[wa]*w[wa]*a[wa]*|-p *[wa]*a[wa]*w[wa]*" | grep -q -- "-k {{key}}" && n=$((n+1))
+      done; echo "watches=$n/4"
+    expect:
+      match: exact
+      value: watches=4/4
+  - id: rules-loaded
+    description: The rules are loaded in the kernel
+    type: shell
+    'on': tr-aud-01
+    skills: *id001
+    weight: 2
+    command: |
+      n=0; for p in /etc/passwd /etc/shadow /etc/group /etc/sudoers.d; do auditctl -l 2>/dev/null | grep -- "-w $p" | grep -q "key={{key}}" && n=$((n+1)); done; echo "loaded=$n/4"
+    expect:
+      match: exact
+      value: loaded=4/4
+  - id: event
+    description: At least one event is recorded with the key
+    type: shell
+    'on': tr-aud-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      [ "$(ausearch -k {{key}} --raw 2>/dev/null | grep -c "^type=")" -gt 0 ] && echo recorded || echo none
+    expect:
+      match: exact
+      value: recorded
+  - id: who
+    description: The login user and a changed file are named correctly
+    type: shell
+    'on': tr-aud-01
+    skills: *id001
+    weight: 2.5
+    command: |
+      a=$(sed -n 's/^auid=//p' /home/learner/answers/audit.txt 2>/dev/null | head -1); f=$(sed -n 's/^file=//p' /home/learner/answers/audit.txt 2>/dev/null | head -1)
+      ev=$(ausearch -k {{key}} -i 2>/dev/null)
+      exp=$(echo "$ev" | grep -o ' auid=[^ ]*' | tail -1 | cut -d= -f2)
+      echo "$ev" | grep -Eo 'name=/etc/(passwd|shadow|group|sudoers\.d/?[^ ]*)' | cut -d= -f2 | grep -qxF -- "$f" && [ "$a" = "$exp" ] && [ -n "$a" ] && [ "$a" != root ] && echo ok || echo "auid=$a file=$f exp=$exp"
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Rule syntax
+    body: -w /etc/passwd -p wa -k identity (w = write, a = attribute change).
+    cost: 0
+  - title: Who
+    body: ausearch -k identity -i; look at auid= (login) versus uid= (effective).
+    cost: 1
+  misconceptions:
+  - id: runtime-only
+    description: Loads the watches with auditctl and writes no rules file.
+    feedback: auditctl -w rules vanish at reboot or restart; put them in /etc/audit/rules.d/*.rules and
+      run augenrules --load.
+    expectFail:
+    - rules-file
+    mutation:
+      'on': tr-aud-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        for p in /etc/passwd /etc/shadow /etc/group /etc/sudoers.d; do sudo auditctl -w $p -p wa -k {{key}}; done
+        sudo useradd tr-auditprobe; sudo userdel -r tr-auditprobe
+        a=$(sudo ausearch -k {{key}} -i | grep -o ' auid=[^ ]*' | tail -1 | cut -d= -f2)
+        printf 'auid=%s\nfile=/etc/passwd\n' "$a" > /home/learner/answers/audit.txt
+  - id: uid-not-auid
+    description: Reports the effective user (root) instead of the login user.
+    feedback: Under sudo the uid is root; the audit login uid (auid) still names the person who logged
+      in.
+    expectFail:
+    - who
+    mutation:
+      'on': tr-aud-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf -- '-w /etc/passwd -p wa -k {{key}}\n-w /etc/shadow -p wa -k {{key}}\n-w /etc/group -p wa -k {{key}}\n-w /etc/sudoers.d/ -p wa -k {{key}}\n' | sudo tee /etc/audit/rules.d/identity.rules >/dev/null
+        sudo augenrules --load >/dev/null
+        sudo useradd tr-auditprobe; sudo userdel -r tr-auditprobe
+        printf 'auid=root\nfile=/etc/passwd\n' > /home/learner/answers/audit.txt
+  solution:
+    explanation: |
+      A watch rule is -w PATH -p wa -k KEY; files in /etc/audit/rules.d are merged and loaded by augenrules --load. ausearch
+      -k KEY -i prints decoded events, where auid is the login identity that survives sudo.
+    steps:
+    - 'on': tr-aud-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        printf -- '-w /etc/passwd -p wa -k {{key}}\n-w /etc/shadow -p wa -k {{key}}\n-w /etc/group -p wa -k {{key}}\n-w /etc/sudoers.d/ -p wa -k {{key}}\n' | sudo tee /etc/audit/rules.d/identity.rules >/dev/null
+        sudo augenrules --load; sudo auditctl -l
+        sudo useradd tr-auditprobe; sudo userdel -r tr-auditprobe
+        sudo ausearch -k {{key}} -i | tail -12
+        a=$(sudo ausearch -k {{key}} -i | grep -o ' auid=[^ ]*' | tail -1 | cut -d= -f2)
+        printf 'auid=%s\nfile=/etc/passwd\n' "$a" > /home/learner/answers/audit.txt

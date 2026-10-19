@@ -1,0 +1,244 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: intrusion-persistence-sweep
+  title: Sweep a compromised kiosk for the intruder's persistence
+  domain: linux
+  frameworks:
+  - linuxplus:security
+  difficulty: hard
+  estimatedMinutes: 40
+  tags:
+  - security
+  - incident-response
+  - persistence
+  - forensics
+  - hunt
+  version: 1
+spec:
+  description: |
+    The ticket kiosk **`tr-kiosk-01`** (`ssh tr-kiosk-01`; you have `sudo`) was compromised through a vendor
+    account. The intruder left **four** ways back in: a rogue **user account** (with sudo rights), an extra
+    **SSH key** in the kiosk user's `authorized_keys`, a **scheduled job**, and a **modified service**.
+    There is also a hidden payload they all call.
+
+    Find all four, remove them (the legitimate kiosk user, its own key, the legitimate `tr-ticket-sync` cron job and
+    the unmodified `tr-kiosk.service` must stay), and record each in **`/home/learner/incident.txt`**:
+
+    ```
+    user=<rogue account>
+    key=<comment of the extra SSH key>
+    job=<path of the scheduled job file>
+    service=<name of the modified unit, without .service>
+    ```
+    Hint for the sweep: check accounts with UID 0 or sudo rights, `authorized_keys`, `/etc/cron*`, systemd timers and
+    `systemctl cat` of units, `find -newer`, and look at file attributes (`lsattr`) when a removal fails.
+  objectives:
+  - Sweep users, keys, scheduled jobs and units for persistence
+  - Remove the persistence cleanly and document it
+  params:
+    rogue:
+      type: choice
+      values:
+      - svc-update
+      - sysmon-helper
+    cronf:
+      type: choice
+      values:
+      - sysstat-update
+      - apt-refresh
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-kiosk-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-kiosk-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      V=/var/lib/cloudtrain; install -d -m 0700 $V
+      rm -f /home/learner/incident.txt
+      chattr -i /etc/cron.d/{{cronf}} 2>/dev/null || true
+      id kiosk >/dev/null 2>&1 || useradd -m -s /bin/bash kiosk
+      id {{rogue}} >/dev/null 2>&1 && userdel -r {{rogue}} || true
+      install -d -m 0700 -o kiosk -g kiosk /home/kiosk/.ssh
+      rm -f /tmp/k1 /tmp/k1.pub /tmp/k2 /tmp/k2.pub
+      ssh-keygen -q -t ed25519 -N '' -C 'ada@tallowmere.example' -f /tmp/k1
+      ssh-keygen -q -t ed25519 -N '' -C 'maint@mirror.example' -f /tmp/k2
+      cat /tmp/k1.pub /tmp/k2.pub > /home/kiosk/.ssh/authorized_keys
+      chown kiosk:kiosk /home/kiosk/.ssh/authorized_keys; chmod 0600 /home/kiosk/.ssh/authorized_keys
+      rm -f /tmp/k1 /tmp/k1.pub /tmp/k2 /tmp/k2.pub
+      useradd -m -s /bin/bash -u 1409 {{rogue}}
+      echo '{{rogue}} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-{{rogue}}; chmod 0440 /etc/sudoers.d/90-{{rogue}}
+      printf '#!/bin/sh\ndate >> /var/tmp/.beacon\n' > /usr/lib/.sysupd; chmod 0755 /usr/lib/.sysupd
+      printf '*/5 * * * * root /usr/lib/.sysupd\n' > /etc/cron.d/{{cronf}}; chmod 0644 /etc/cron.d/{{cronf}}; chattr +i /etc/cron.d/{{cronf}}
+      printf '*/10 * * * * root /usr/local/bin/tr-ticket-sync\n' > /etc/cron.d/tr-ticket-sync
+      printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/tr-ticket-sync; chmod 0755 /usr/local/bin/tr-ticket-sync
+      printf '#!/bin/sh\nexec sleep 100000\n' > /usr/local/bin/tr-kiosk; chmod 0755 /usr/local/bin/tr-kiosk
+      printf '[Unit]\nDescription=Ticket kiosk\n[Service]\nExecStart=/usr/local/bin/tr-kiosk\nExecStartPost=/usr/lib/.sysupd\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-kiosk.service
+      systemctl daemon-reload; systemctl enable --now tr-kiosk.service >/dev/null 2>&1
+      systemctl is-active tr-kiosk.service >/dev/null
+  checks:
+  - id: user-gone
+    description: The rogue account and its sudo rule are gone
+    type: shell
+    'on': tr-kiosk-01
+    skills: &id001
+    - linux.security.privilege-audit
+    - linux.security.integrity
+    - linux.systemd.units
+    weight: 1.5
+    command: |
+      ! getent passwd {{rogue}} >/dev/null && ! ls /etc/sudoers.d/ | grep -q {{rogue}} && ! grep -rq "{{rogue}}" /etc/sudoers /etc/sudoers.d 2>/dev/null && echo clean || echo present
+    expect:
+      match: exact
+      value: clean
+  - id: key-gone
+    description: The extra key is removed and the legitimate key is kept
+    type: shell
+    'on': tr-kiosk-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      k=/home/kiosk/.ssh/authorized_keys; if grep -q "maint@mirror.example" $k 2>/dev/null; then echo rogue-key-present; elif grep -q "ada@tallowmere.example" $k; then echo clean; else echo legit-key-lost; fi
+    expect:
+      match: exact
+      value: clean
+  - id: job-gone
+    description: The rogue scheduled job is removed and the legitimate one stays
+    type: shell
+    'on': tr-kiosk-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      lsattr /etc/cron.d/{{cronf}} >/dev/null 2>&1 && echo present || { [ -f /etc/cron.d/tr-ticket-sync ] && ! grep -rq sysupd /etc/cron* /var/spool/cron 2>/dev/null && echo clean || echo wrong; }
+    expect:
+      match: exact
+      value: clean
+  - id: service-restored
+    description: tr-kiosk.service no longer calls the payload, is active and has no drop-ins
+    type: shell
+    'on': tr-kiosk-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      if [ "$(systemctl show -P ExecStartPost tr-kiosk.service)" = "" ] && [ -z "$(systemctl show -P DropInPaths tr-kiosk.service)" ] && ! grep -rq sysupd /etc/systemd/system && systemctl is-active tr-kiosk.service >/dev/null && systemctl show -P ExecStart tr-kiosk.service | grep -q "path=/usr/local/bin/tr-kiosk ;"; then echo restored; else echo modified; fi
+    expect:
+      match: exact
+      value: restored
+  - id: payload-gone
+    description: The hidden payload is removed
+    type: shell
+    'on': tr-kiosk-01
+    skills: *id001
+    weight: 1
+    command: |
+      [ ! -e /usr/lib/.sysupd ] && echo gone || echo present
+    expect:
+      match: exact
+      value: gone
+  - id: incident-file
+    description: incident.txt names all four items correctly
+    type: shell
+    'on': tr-kiosk-01
+    skills: *id001
+    weight: 2
+    command: |
+      f=/home/learner/incident.txt
+      u=$(sed -n 's/^user=//p' $f 2>/dev/null | head -1); k=$(sed -n 's/^key=//p' $f 2>/dev/null | head -1); j=$(sed -n 's/^job=//p' $f 2>/dev/null | head -1); s=$(sed -n 's/^service=//p' $f 2>/dev/null | head -1); s=${s%.service}
+      [ "$u" = "{{rogue}}" ] && [ "$k" = maint@mirror.example ] && [ "$j" = "/etc/cron.d/{{cronf}}" ] && [ "$s" = tr-kiosk ] && echo complete || echo "u=$u k=$k j=$j s=$s"
+    expect:
+      match: exact
+      value: complete
+  - id: legit-intact
+    description: The legitimate kiosk user, cron job and unit are untouched
+    type: shell
+    'on': tr-kiosk-01
+    skills: *id001
+    weight: 1
+    command: |
+      id kiosk >/dev/null 2>&1 && [ -x /usr/local/bin/tr-ticket-sync ] && systemctl is-enabled tr-kiosk.service >/dev/null 2>&1 && echo intact || echo damaged
+    expect:
+      match: exact
+      value: intact
+  hints:
+  - title: Accounts
+    body: 'awk -F: ''$3==0'' /etc/passwd; ls /etc/sudoers.d; getent passwd | awk -F: ''$3>=1000'''
+    cost: 0
+  - title: Units and cron
+    body: systemctl cat tr-kiosk.service; grep -r . /etc/cron.d; lsattr /etc/cron.d
+    cost: 1
+  misconceptions:
+  - id: sudoers-left
+    description: Deletes the rogue user but forgets its sudoers file.
+    feedback: 'Persistence often has several parts: the account, its sudo rule, its keys and files. Remove
+      the sudoers.d entry too.'
+    expectFail:
+    - user-gone
+    mutation:
+      'on': tr-kiosk-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo userdel -r {{rogue}}
+        sudo sed -i '/maint@mirror.example/d' /home/kiosk/.ssh/authorized_keys
+        sudo chattr -i /etc/cron.d/{{cronf}} 2>/dev/null; sudo rm -f /etc/cron.d/{{cronf}}
+        sudo sed -i '/sysupd/d' /etc/systemd/system/tr-kiosk.service; sudo rm -f /usr/lib/.sysupd; sudo systemctl daemon-reload; sudo systemctl restart tr-kiosk.service
+        printf 'user={{rogue}}\nkey=maint@mirror.example\njob=/etc/cron.d/{{cronf}}\nservice=tr-kiosk\n' > /home/learner/incident.txt
+  - id: wipe-keys
+    description: Wipes the whole authorized_keys file.
+    feedback: Only the unknown key goes; the legitimate key of the kiosk operator must stay.
+    expectFail:
+    - key-gone
+    mutation:
+      'on': tr-kiosk-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo userdel -r {{rogue}} 2>/dev/null; sudo rm -f /etc/sudoers.d/90-{{rogue}}
+        sudo sh -c ': > /home/kiosk/.ssh/authorized_keys'
+        sudo chattr -i /etc/cron.d/{{cronf}} 2>/dev/null; sudo rm -f /etc/cron.d/{{cronf}}
+        sudo sed -i '/sysupd/d' /etc/systemd/system/tr-kiosk.service; sudo rm -f /usr/lib/.sysupd; sudo systemctl daemon-reload; sudo systemctl restart tr-kiosk.service
+        printf 'user={{rogue}}\nkey=maint@mirror.example\njob=/etc/cron.d/{{cronf}}\nservice=tr-kiosk\n' > /home/learner/incident.txt
+  - id: unrecorded
+    description: Cleans everything and writes nothing down.
+    feedback: The incident file is the deliverable for the report.
+    expectFail:
+    - incident-file
+    mutation:
+      'on': tr-kiosk-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo userdel -r {{rogue}} 2>/dev/null; sudo rm -f /etc/sudoers.d/90-{{rogue}}
+        sudo sed -i '/maint@mirror.example/d' /home/kiosk/.ssh/authorized_keys
+        sudo chattr -i /etc/cron.d/{{cronf}} 2>/dev/null; sudo rm -f /etc/cron.d/{{cronf}}
+        sudo sed -i '/sysupd/d' /etc/systemd/system/tr-kiosk.service; sudo rm -f /usr/lib/.sysupd; sudo systemctl daemon-reload; sudo systemctl restart tr-kiosk.service
+  solution:
+    explanation: |
+      Typical persistence: an extra account with a sudoers.d rule, an extra authorized_keys line, a cron.d file (here immutable,
+      chattr -i first) and an ExecStartPost added to a unit; all of them call the hidden /usr/lib/.sysupd.
+    steps:
+    - 'on': tr-kiosk-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo userdel -r {{rogue}} 2>/dev/null; sudo rm -f /etc/sudoers.d/90-{{rogue}}
+        sudo sed -i '/maint@mirror.example/d' /home/kiosk/.ssh/authorized_keys
+        sudo chattr -i /etc/cron.d/{{cronf}} 2>/dev/null; sudo rm -f /etc/cron.d/{{cronf}}
+        sudo sed -i '/sysupd/d' /etc/systemd/system/tr-kiosk.service; sudo rm -f /usr/lib/.sysupd; sudo systemctl daemon-reload; sudo systemctl restart tr-kiosk.service
+        sudo rm -f /usr/lib/.sysupd
+        printf 'user={{rogue}}\nkey=maint@mirror.example\njob=/etc/cron.d/{{cronf}}\nservice=tr-kiosk\n' > /home/learner/incident.txt

@@ -1,0 +1,186 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kernel-hardening-sysctls
+  title: Apply the kernel hardening baseline and block unused modules
+  domain: linux
+  frameworks:
+  - linuxplus:security
+  - cks:system-hardening
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - kernel
+  - sysctl
+  - hardening
+  - modprobe
+  - security
+  version: 1
+spec:
+  description: |
+    The security baseline for **`tr-khd-01`** (`ssh tr-khd-01`; you have `sudo`) is in
+    `/etc/tr-baseline/sysctl.baseline` (eight kernel settings). Apply it so that it is effective **now and
+    after reboot**, using a file in `/etc/sysctl.d/`.
+
+    The same baseline says the kernel modules **`usb-storage`**, **`cramfs`** and **`freevxfs`** are not used on
+    servers and must not be loadable, even by an explicit `modprobe`.
+
+    The grading is reboot-graded: persistence is checked from configuration until verify can reboot hosts.
+  objectives:
+  - Persist and apply sysctl hardening settings
+  - Prevent module loading with modprobe.d install rules
+  params:
+    ptrace:
+      type: choice
+      values:
+      - '2'
+      - '3'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-khd-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-khd-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      mkdir -p /etc/tr-baseline
+      cat > /etc/tr-baseline/sysctl.baseline <<'EOB'
+      kernel.kptr_restrict = 2
+      kernel.yama.ptrace_scope = {{ptrace}}
+      kernel.sysrq = 0
+      fs.suid_dumpable = 0
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.tcp_syncookies = 1
+      EOB
+      rm -f /etc/sysctl.d/*hardening*.conf /etc/modprobe.d/*tr-*.conf
+      sysctl -w kernel.kptr_restrict=1 kernel.sysrq=176 fs.suid_dumpable=2 net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.all.accept_redirects=1 net.ipv4.conf.all.send_redirects=1 net.ipv4.tcp_syncookies=0 >/dev/null
+      sysctl -w kernel.yama.ptrace_scope=1 >/dev/null
+      for m in usb-storage cramfs freevxfs; do modprobe -r $m >/dev/null 2>&1 || true; done
+  checks:
+  - id: live
+    description: All eight settings have the baseline values now
+    type: shell
+    'on': tr-khd-01
+    skills: &id001
+    - linux.security.kernel-hardening
+    weight: 2
+    command: |
+      n=0; t=0
+      while IFS= read -r l; do k=${l%% =*}; v=${l#*= }; t=$((t+1)); [ "$(sysctl -n $k 2>/dev/null)" = "$v" ] && n=$((n+1)); done < /etc/tr-baseline/sysctl.baseline
+      echo "live=$n/$t"
+    expect:
+      match: exact
+      value: live=8/8
+  - id: persistent
+    description: The merged sysctl.d configuration sets all eight at boot
+    type: shell
+    'on': tr-khd-01
+    skills: *id001
+    weight: 3
+    command: |
+      n=0; t=0
+      systemd-analyze cat-config sysctl.d 2>/dev/null | sed 's/[#;].*//' | sed -E 's/[[:space:]]*=[[:space:]]*/=/; s/^[[:space:]]+//; s/[[:space:]]+$//' | awk -F= 'NF>=2 {a[$1]=$2} END{for (k in a) print k "=" a[k]}' > /tmp/.eff
+      while IFS= read -r l; do k=${l%% =*}; v=${l#*= }; t=$((t+1)); grep -qx "$k=$v" /tmp/.eff && n=$((n+1)); done < /etc/tr-baseline/sysctl.baseline
+      rm -f /tmp/.eff; echo "persisted=$n/$t"
+    expect:
+      match: exact
+      value: persisted=8/8
+  - id: modules
+    description: The three modules cannot be loaded, even explicitly
+    type: shell
+    'on': tr-khd-01
+    skills:
+    - linux.security.kernel-hardening
+    - linux.security.attack-surface
+    weight: 3
+    command: |
+      n=0; for m in usb-storage cramfs freevxfs; do modprobe -n -v $m 2>&1 | grep -Eq 'install (/bin/false|/bin/true|/usr/bin/false|/usr/bin/true)' && ! lsmod | grep -q "^$(echo $m | tr - _) " && n=$((n+1)); done; echo "blocked=$n/3"
+    expect:
+      match: exact
+      value: blocked=3/3
+  hints:
+  - title: Baseline file
+    body: /etc/tr-baseline/sysctl.baseline already uses sysctl.d syntax.
+    cost: 0
+  - title: Modules
+    body: modprobe -n -v NAME shows what a modprobe would do; install NAME /bin/false blocks it.
+    cost: 1
+  misconceptions:
+  - id: runtime-only
+    description: Sets the values with sysctl -w and writes no file.
+    feedback: 'sysctl -w is lost at reboot: put the settings in /etc/sysctl.d/*.conf and apply with sysctl
+      --system.'
+    expectFail:
+    - persistent
+    mutation:
+      'on': tr-khd-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        while IFS= read -r l; do sudo sysctl -w "$(echo "$l" | tr -d ' ')" >/dev/null; done < /etc/tr-baseline/sysctl.baseline
+        for m in usb-storage cramfs freevxfs; do echo "install $m /bin/false" | sudo tee -a /etc/modprobe.d/tr-blocked.conf >/dev/null; done
+  - id: file-not-applied
+    description: Writes the file but never loads it.
+    feedback: Run sysctl --system (or sysctl -p FILE) so the running kernel matches the file.
+    expectFail:
+    - live
+    mutation:
+      'on': tr-khd-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo cp /etc/tr-baseline/sysctl.baseline /etc/sysctl.d/90-tr-hardening.conf
+        for m in usb-storage cramfs freevxfs; do echo "install $m /bin/false" | sudo tee -a /etc/modprobe.d/tr-blocked.conf >/dev/null; done
+  - id: blacklist-only
+    description: Only blacklists the modules.
+    feedback: blacklist only stops automatic (alias) loading; an explicit modprobe still loads the module.
+      Use install NAME /bin/false.
+    expectFail:
+    - modules
+    mutation:
+      'on': tr-khd-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo cp /etc/tr-baseline/sysctl.baseline /etc/sysctl.d/90-tr-hardening.conf; sudo sysctl --system >/dev/null
+        for m in usb-storage cramfs freevxfs; do echo "blacklist $m" | sudo tee -a /etc/modprobe.d/tr-blocked.conf >/dev/null; done
+  solution:
+    explanation: |
+      The baseline file is valid sysctl.d syntax, so copying it to /etc/sysctl.d/90-tr-hardening.conf and running sysctl --system
+      applies and persists it. install NAME /bin/false in /etc/modprobe.d makes every modprobe of the module a no-op failure.
+    steps:
+    - 'on': tr-khd-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo cp /etc/tr-baseline/sysctl.baseline /etc/sysctl.d/90-tr-hardening.conf
+        sudo sysctl --system >/dev/null
+        for m in usb-storage cramfs freevxfs; do echo "install $m /bin/false" | sudo tee -a /etc/modprobe.d/tr-blocked.conf >/dev/null; done
+        modprobe -n -v usb-storage
+    alternatives:
+    - id: per-key-files
+      description: Write the settings with tee as separate lines and load with sysctl -p.
+      steps:
+      - 'on': tr-khd-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo sh -c 'cat /etc/tr-baseline/sysctl.baseline > /etc/sysctl.d/60-tr-kernel.conf'
+          sudo sysctl -p /etc/sysctl.d/60-tr-kernel.conf >/dev/null
+          for m in usb-storage cramfs freevxfs; do echo "install $m /bin/true" | sudo tee -a /etc/modprobe.d/tr-blocked.conf >/dev/null; done

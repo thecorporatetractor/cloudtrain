@@ -1,0 +1,207 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: podman-run-timetable-api
+  title: Run the timetable API in a container with persistent data
+  domain: linux
+  frameworks:
+  - lfcs:operations-deployment
+  - rhcsa-aligned:containers
+  - linuxplus:services-users
+  difficulty: medium
+  estimatedMinutes: 15
+  tags:
+  - containers
+  - podman
+  - volumes
+  - restart-policy
+  version: 1
+spec:
+  description: |
+    The image **`registry.tallowmere.test/timetable-api:1`** is in the local image store of
+    **`tr-pod-01`** (`ssh tr-pod-01`; you have `sudo`; use root podman). The host has no registry access, so
+    run with `--pull=never`. The API listens on port 8080 inside the container and serves the files in
+    `/data`.
+
+    Start a detached container named **`timetable-api`** that:
+
+    - publishes host port **{{port}}** to container port 8080;
+    - mounts the host directory **`/srv/tt-data`** (it holds `stations.txt`) at `/data`, so the data
+      outlives the container;
+    - is restarted on failure (`on-failure`), either through the podman restart policy or a Quadlet unit.
+
+    `curl http://127.0.0.1:{{port}}/stations.txt` must return the station list.
+  objectives:
+  - Run a container with a published port and a bind mount
+  - Choose a restart policy
+  params:
+    port:
+      type: choice
+      values:
+      - '8080'
+      - '8088'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-pod-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-pod-01
+    timeoutSec: 180
+    run: |
+      set -eu
+
+      rpm -q podman netavark aardvark-dns >/dev/null 2>&1 || dnf -y -q install podman netavark aardvark-dns >/dev/null
+      if ! podman image exists registry.tallowmere.test/timetable-api:1; then
+      rm -rf /tmp/r; mkdir -p /tmp/r
+      dnf -y -q --installroot=/tmp/r --releasever=10 --setopt=install_weak_deps=0 install python3 coreutils-single almalinux-release >/dev/null
+      [ -e /tmp/r/etc/os-release ] || cp /etc/os-release /tmp/r/etc/os-release
+      mkdir -p /tmp/r/data /tmp/r/usr/local/bin
+      cat > /tmp/r/usr/local/bin/ttapi <<'EOPY'
+      #!/usr/bin/python3
+      import http.server, os
+      os.chdir("/data")
+      class H(http.server.SimpleHTTPRequestHandler):
+          def log_message(self, *a): pass
+          def do_GET(self):
+              if self.path == "/":
+                  self.send_response(200); self.end_headers(); self.wfile.write(b"timetable-api-ok\n"); return
+              super().do_GET()
+      http.server.HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+      EOPY
+      chmod 0755 /tmp/r/usr/local/bin/ttapi
+      tar -C /tmp/r -c . | podman import --change 'CMD ["/usr/local/bin/ttapi"]' - registry.tallowmere.test/timetable-api:1 >/dev/null
+      rm -rf /tmp/r
+      fi
+      podman image exists registry.tallowmere.test/timetable-api:1
+
+      podman rm -f timetable-api >/dev/null 2>&1 || true
+      systemctl stop timetable-api.service >/dev/null 2>&1 || true
+      rm -f /etc/containers/systemd/timetable-api.container
+      mkdir -p /srv/tt-data
+      printf 'Alder\nBrook\nCinder\n' > /srv/tt-data/stations.txt
+  checks:
+  - id: running
+    description: timetable-api is running from the local image
+    type: shell
+    'on': tr-pod-01
+    skills: &id001
+    - linux.internals.podman
+    weight: 1
+    command: |
+      podman container inspect timetable-api 2>/dev/null | python3 -c '
+      import json, sys
+      try: d = json.load(sys.stdin)[0]
+      except Exception: print("no-container"); sys.exit()
+      print("running" if d["State"]["Running"] and d["ImageName"].endswith("timetable-api:1") else "wrong")
+      '
+    expect:
+      match: exact
+      value: running
+  - id: served
+    description: The data is served on port {{port}}
+    type: shell
+    'on': tr-pod-01
+    skills: *id001
+    weight: 2
+    command: |
+      curl -fs --max-time 5 http://127.0.0.1:{{port}}/stations.txt 2>/dev/null | head -1 || echo down
+    expect:
+      match: exact
+      value: Alder
+  - id: bind-mount
+    description: /srv/tt-data is bind-mounted at /data
+    type: shell
+    'on': tr-pod-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      podman container inspect timetable-api 2>/dev/null | python3 -c '
+      import json, sys
+      try: d = json.load(sys.stdin)[0]
+      except Exception: print("no-container"); sys.exit()
+      print("bind" if any(m["Source"] == "/srv/tt-data" and m["Destination"] == "/data" for m in d["Mounts"]) else "no-bind")
+      '
+    expect:
+      match: exact
+      value: bind
+  - id: restart
+    description: The restart policy is on-failure (podman or systemd)
+    type: shell
+    'on': tr-pod-01
+    skills:
+    - linux.internals.podman
+    - linux.systemd.units
+    weight: 1.5
+    command: |
+      p=$(podman container inspect timetable-api 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["HostConfig"]["RestartPolicy"]["Name"])' 2>/dev/null)
+      s=$(systemctl show -P Restart timetable-api.service 2>/dev/null)
+      [ "$p" = on-failure ] || [ "$s" = on-failure ] && echo on-failure || echo "podman=$p systemd=$s"
+    expect:
+      match: exact
+      value: on-failure
+  hints:
+  - title: Flags
+    body: -d, --name, -p HOST:CONTAINER, -v HOSTDIR:/data:Z, --restart on-failure, --pull=never
+    cost: 0
+  - title: SELinux
+    body: On an enforcing host the :Z suffix relabels the bind-mounted directory for the container.
+    cost: 1
+  misconceptions:
+  - id: no-policy
+    description: Starts the container without a restart policy.
+    feedback: Add --restart on-failure (or Restart=on-failure in a Quadlet unit) so a crash is recovered.
+    expectFail:
+    - restart
+    mutation:
+      'on': tr-pod-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo podman run -d --pull=never --name timetable-api -p {{port}}:8080 -v /srv/tt-data:/data:Z registry.tallowmere.test/timetable-api:1
+  - id: anon-volume
+    description: Uses a named volume, so the host directory is not what the API serves.
+    feedback: Mount the host directory /srv/tt-data with -v /srv/tt-data:/data to keep data outside the
+      container.
+    expectFail:
+    - served
+    - bind-mount
+    mutation:
+      'on': tr-pod-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo podman run -d --pull=never --name timetable-api --restart on-failure -p {{port}}:8080 -v ttdata:/data registry.tallowmere.test/timetable-api:1
+  solution:
+    explanation: |
+      podman run publishes the port with -p, bind-mounts the directory with -v (:Z relabels it for SELinux)
+      and --restart on-failure sets the policy. The same can be a Quadlet .container file.
+    steps:
+    - 'on': tr-pod-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo podman run -d --pull=never --name timetable-api --restart on-failure -p {{port}}:8080 -v /srv/tt-data:/data:Z registry.tallowmere.test/timetable-api:1
+        sleep 2; curl -s http://127.0.0.1:{{port}}/stations.txt
+    alternatives:
+    - id: quadlet
+      description: Run it as a Quadlet unit instead of podman run.
+      steps:
+      - 'on': tr-pod-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          printf '[Container]\nImage=registry.tallowmere.test/timetable-api:1\nContainerName=timetable-api\nPublishPort={{port}}:8080\nVolume=/srv/tt-data:/data:Z\nPull=never\n[Service]\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/containers/systemd/timetable-api.container >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl start timetable-api.service; sleep 3

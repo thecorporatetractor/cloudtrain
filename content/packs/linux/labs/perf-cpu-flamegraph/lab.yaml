@@ -1,0 +1,187 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: perf-cpu-flamegraph
+  title: Profile the route planner and find its hottest function
+  domain: linux
+  frameworks:
+  - lpic2:capacity
+  difficulty: hard
+  estimatedMinutes: 25
+  tags:
+  - performance
+  - perf
+  - profiling
+  - flamegraph
+  version: 1
+spec:
+  description: |
+    The route planner on **`tr-perf-01`** (`ssh tr-perf-01`; you have `sudo`) runs as
+    `tr-route-plan.service` (Python 3.12 with `-X perf`, so `perf` can see Python function names as
+    `py::name:file`). It burns CPU in one of its functions while running a test plan.
+
+    Profile the running service for about 20 seconds with `perf record -g` (use the software
+    `cpu-clock` event: hardware counters are not exposed to the guest), then:
+
+    - keep the recording as **`/home/learner/answers/perf.data`**;
+    - write the collapsed stacks (one line per unique stack, `frame;frame;... count`: the input of a flame
+      graph) to **`/home/learner/answers/folded.txt`**;
+    - write the name of the hottest function (without `py::` or the file name) to
+      **`/home/learner/answers/hot.txt`**.
+  objectives:
+  - Record a CPU profile with perf and fold the stacks
+  - Identify the hottest function from a profile
+  params:
+    hot:
+      type: choice
+      values:
+      - solve_shortest
+      - score_edges
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-perf-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-perf-01
+    timeoutSec: 300
+    run: |
+      set -eu
+      install -d -o learner -g learner /home/learner/answers
+      rm -f /home/learner/answers/hot.txt /home/learner/answers/perf.data /home/learner/answers/folded.txt
+      command -v perf >/dev/null || apt-get -y -qq install linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 || apt-get -y -qq install linux-tools-generic >/dev/null 2>&1 || true
+      command -v perf >/dev/null || { echo "perf is not installed (image gap: linux-tools-generic)" >&2; exit 1; }
+      echo -1 > /proc/sys/kernel/perf_event_paranoid
+      systemctl stop tr-route-plan.service >/dev/null 2>&1 || true
+      cat > /usr/local/bin/tr-route-plan <<'EOPY'
+      #!/usr/bin/python3
+      import os
+      HOT = os.environ.get("HOT_FN", "solve_shortest")
+      W = {"load_timetable": 20000, "expand_nodes": 60000, "solve_shortest": 60000, "score_edges": 60000}
+      W[HOT] = 900000
+      def spin(n):
+          s = 0
+          for i in range(n):
+              s += i * i % 7
+          return s
+      def load_timetable(): return spin(W["load_timetable"])
+      def expand_nodes(): return spin(W["expand_nodes"])
+      def solve_shortest(): return spin(W["solve_shortest"])
+      def score_edges(): return spin(W["score_edges"])
+      while True:
+          load_timetable(); expand_nodes(); solve_shortest(); score_edges()
+      EOPY
+      chmod 0755 /usr/local/bin/tr-route-plan
+      printf '[Unit]\nDescription=Route planner\n[Service]\nEnvironment=HOT_FN={{hot}}\nExecStart=/usr/bin/python3 -X perf /usr/local/bin/tr-route-plan\nNice=5\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-route-plan.service
+      systemctl daemon-reload; systemctl start tr-route-plan.service; sleep 2
+      systemctl is-active tr-route-plan.service >/dev/null
+  checks:
+  - id: hot-answer
+    description: hot.txt names the hottest function
+    type: shell
+    'on': tr-perf-01
+    skills: &id001
+    - linux.performance.cpu
+    weight: 2
+    command: |
+      got=$(head -1 /home/learner/answers/hot.txt 2>/dev/null | sed "s/^py:://; s/:.*//"); [ "$got" = "{{hot}}" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: profile
+    description: perf.data is a real profile of the planner that contains the hot function
+    type: shell
+    'on': tr-perf-01
+    skills: *id001
+    weight: 2
+    timeoutSec: 60
+    command: |
+      f=/home/learner/answers/perf.data
+      [ -s $f ] && perf report -i $f --stdio --no-children 2>/dev/null | grep -q '{{hot}}' && echo ok || echo no-profile
+    expect:
+      match: exact
+      value: ok
+  - id: folded
+    description: folded.txt is in collapsed-stack format with the hot function on the heaviest line
+    type: shell
+    'on': tr-perf-01
+    skills: *id001
+    weight: 2
+    command: |
+      f=/home/learner/answers/folded.txt
+      [ -s $f ] && awk 'NF>=2 && $NF ~ /^[0-9]+$/ {if ($NF+0 > m) {m=$NF+0; l=$0}} END{print l}' $f | grep -q '{{hot}}' && echo ok || echo no
+    expect:
+      match: exact
+      value: ok
+  - id: still-running
+    description: The planner is left running
+    type: shell
+    'on': tr-perf-01
+    skills: *id001
+    weight: 0.5
+    command: |
+      systemctl is-active tr-route-plan.service
+    expect:
+      match: exact
+      value: active
+  hints:
+  - title: Record
+    body: sudo perf record -g -e cpu-clock -p PID -o perf.data -- sleep 20; sudo perf report -i perf.data
+      --stdio --no-children | head -30
+    cost: 0
+  - title: Fold
+    body: perf script prints one stack per sample; join the frame names with ";" and count identical stacks.
+    cost: 2
+  misconceptions:
+  - id: wrong-function
+    description: Reports the second-heaviest function.
+    feedback: Report the function with the largest self time in the profile, not the one that calls the
+      most.
+    expectFail:
+    - hot-answer
+    mutation:
+      'on': tr-perf-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        echo expand_nodes > /home/learner/answers/hot.txt
+  - id: no-profile
+    description: Answers from top without recording a profile.
+    feedback: The profile and folded stacks are part of the deliverable.
+    expectFail:
+    - profile
+    - folded
+    mutation:
+      'on': tr-perf-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        echo {{hot}} > /home/learner/answers/hot.txt
+  solution:
+    explanation: |
+      perf record -g -e cpu-clock -p PID -- sleep 20 samples the planner; perf script prints each sample's stack, and folding
+      them by stack (awk) gives the flame graph input. The function with the most samples is the hot one.
+    steps:
+    - 'on': tr-perf-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        P=$(systemctl show -P MainPID tr-route-plan.service)
+        sudo perf record -g -e cpu-clock -p $P -o /home/learner/answers/perf.data -- sleep 20
+        sudo chown learner /home/learner/answers/perf.data
+        sudo perf script -i /home/learner/answers/perf.data -F ip,sym 2>/dev/null | awk '
+          /^$/ { if (s != "") c[s]++; s = ""; next } { n = $2; sub(/^py::/, "", n); sub(/:.*/, "", n); s = (s == "" ? n : n ";" s) }
+          END { for (k in c) print k, c[k] }' > /home/learner/answers/folded.txt
+        echo {{hot}} > /home/learner/answers/hot.txt

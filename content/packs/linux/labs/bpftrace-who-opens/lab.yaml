@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: bpftrace-who-opens
+  title: Trace which process opens the signalling database
+  domain: linux
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 20
+  tags:
+  - performance
+  - tracing
+  - bpftrace
+  - ebpf
+  version: 1
+spec:
+  description: |
+    Only `tr-sigd` and `tr-sig-backup` are approved to open **`/srv/sig/db`** on **`tr-bpf-01`**
+    (`ssh tr-bpf-01`; you have `sudo`; the list is in `/etc/tr-sig/approved-readers`). Something else
+    is opening it too. Using a **bpftrace** one-liner on the `openat` syscall, log every process that opens
+    the file for about a minute. Save your script as **`/home/learner/answers/opens.bt`**, then write
+    **`/home/learner/answers/opens.txt`** with:
+
+    ```
+    unexpected=<comm of the process that is not approved>
+    pid=<its PID>
+    ```
+  objectives:
+  - Trace a syscall with a bpftrace one-liner
+  - Pick the unexpected actor from the trace output
+  params:
+    rogue:
+      type: choice
+      values:
+      - tr-fare-sync
+      - tr-census
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-bpf-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-bpf-01
+    timeoutSec: 300
+    run: |
+      set -eu
+      install -d -o learner -g learner /home/learner/answers
+      rm -f /home/learner/answers/opens.txt /home/learner/answers/opens.bt
+      command -v bpftrace >/dev/null || apt-get -y -qq install bpftrace >/dev/null 2>&1 || true
+      command -v bpftrace >/dev/null || { echo "bpftrace is not installed (image gap)" >&2; exit 1; }
+      [ -e /sys/kernel/btf/vmlinux ] || { echo "kernel BTF missing" >&2; exit 1; }
+      mkdir -p /srv/sig /etc/tr-sig; echo db > /srv/sig/db
+      printf 'tr-sigd\ntr-sig-backup\n' > /etc/tr-sig/approved-readers
+      for n in tr-sigd:4 tr-sig-backup:6 {{rogue}}:7; do
+        name=${n%%:*}; pause=${n##*:}
+        pkill -x $name >/dev/null 2>&1 || true
+        printf '#!/bin/sh\nwhile :; do exec 3</srv/sig/db; exec 3<&-; sleep %s; done\n' $pause > /usr/local/bin/$name
+        chmod 0755 /usr/local/bin/$name
+        setsid /usr/local/bin/$name </dev/null >/dev/null 2>&1 &
+      done
+      sleep 2
+      pgrep -x {{rogue}} >/dev/null
+  checks:
+  - id: unexpected
+    description: The unexpected process is named
+    type: shell
+    'on': tr-bpf-01
+    skills: &id001
+    - linux.performance.tracing
+    weight: 2
+    command: |
+      got=$(sed -n "s/^unexpected=//p" /home/learner/answers/opens.txt 2>/dev/null | head -1); [ "$got" = "{{rogue}}" ] && ! grep -qx "$got" /etc/tr-sig/approved-readers && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: pid
+    description: Its PID is right
+    type: shell
+    'on': tr-bpf-01
+    skills: *id001
+    weight: 2
+    command: |
+      got=$(sed -n "s/^pid=//p" /home/learner/answers/opens.txt 2>/dev/null | head -1); [ "$got" = "$(pgrep -x {{rogue}} | head -1)" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: script
+    description: A bpftrace script on openat was saved
+    type: shell
+    'on': tr-bpf-01
+    skills: *id001
+    weight: 1
+    command: |
+      grep -q openat /home/learner/answers/opens.bt 2>/dev/null && grep -q /srv/sig/db /home/learner/answers/opens.bt && echo ok || echo no
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Tracepoint
+    body: tracepoint:syscalls:sys_enter_openat has args->filename; use str() and a filter.
+    cost: 0
+  - title: Comm
+    body: comm is the process name, pid the process id; run for at least one full cycle of the slowest
+      opener (7 s).
+    cost: 1
+  misconceptions:
+  - id: approved-name
+    description: Reports an approved reader.
+    feedback: 'Compare the comm values in the trace with /etc/tr-sig/approved-readers: the unexpected
+      one is not listed.'
+    expectFail:
+    - unexpected
+    - pid
+    mutation:
+      'on': tr-bpf-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'unexpected=tr-sigd\npid=%s\n' "$(pgrep -x tr-sigd | head -1)" > /home/learner/answers/opens.txt
+        printf 'tracepoint:syscalls:sys_enter_openat /str(args->filename) == "/srv/sig/db"/ { printf("%%s %%d\\n", comm, pid); }\n' > /home/learner/answers/opens.bt
+  - id: no-script
+    description: Finds the process with lsof and keeps no bpftrace script.
+    feedback: The task is to use a bpftrace one-liner; keep it as opens.bt.
+    expectFail:
+    - script
+    mutation:
+      'on': tr-bpf-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'unexpected={{rogue}}\npid=%s\n' "$(pgrep -x {{rogue}} | head -1)" > /home/learner/answers/opens.txt
+  solution:
+    explanation: |
+      A tracepoint on syscalls:sys_enter_openat filtered on the file name prints comm and pid for each open; running
+      it for a minute shows tr-sigd, tr-sig-backup and one more name that is not in the approved list.
+    steps:
+    - 'on': tr-bpf-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo timeout 30 bpftrace -e 'tracepoint:syscalls:sys_enter_openat /str(args->filename) == "/srv/sig/db"/ { printf("%s %d\n", comm, pid); }' | sort | uniq -c
+        printf 'tracepoint:syscalls:sys_enter_openat /str(args->filename) == "/srv/sig/db"/ { printf("%%s %%d\\n", comm, pid); }\n' > /home/learner/answers/opens.bt
+        printf 'unexpected={{rogue}}\npid=%s\n' "$(pgrep -x {{rogue}} | head -1)" > /home/learner/answers/opens.txt

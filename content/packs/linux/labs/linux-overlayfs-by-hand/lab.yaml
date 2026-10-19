@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: linux-overlayfs-by-hand
+  title: Assemble a container-style root filesystem with overlayfs
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - internals
+  - overlayfs
+  - mounts
+  - containers
+  version: 1
+spec:
+  description: |
+    Container images are stacks of read-only layers with a writable layer on top. On **`tr-ov-01`**
+    (`ssh tr-ov-01`; you have `sudo`) two read-only layers already exist: `/srv/layers/base` and
+    `/srv/layers/patch` (the patch layer is **above** base).
+
+    1. Mount an overlay at **`/srv/rootfs`** with `patch` over `base`, the writable layer
+       **`/srv/layers/upper`** and the work directory **`/srv/layers/work`**.
+    2. In the merged view change `conf/app.conf` so it reads `mode={{mode}}`, delete
+       `conf/legacy.conf`, and create `data/new-depot.txt`.
+    3. Look at what ended up in `/srv/layers/upper`, including the whiteout. The two lower layers must
+       stay untouched.
+  objectives:
+  - Mount an overlay with lowerdir, upperdir and workdir
+  - Explain copy-up and whiteouts from the upper layer
+  params:
+    mode:
+      type: choice
+      values:
+      - summer
+      - autumn
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-ov-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-ov-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      mountpoint -q /srv/rootfs && umount /srv/rootfs || true
+      rm -rf /srv/layers /srv/rootfs
+      mkdir -p /srv/layers/base/conf /srv/layers/base/data /srv/layers/patch/conf /srv/layers/upper /srv/layers/work /srv/rootfs /var/lib/cloudtrain
+      printf 'mode=winter\nregion=north\n' > /srv/layers/base/conf/app.conf
+      echo 'obsolete=1' > /srv/layers/base/conf/legacy.conf
+      printf 'Alder\nBrook\nCinder\n' > /srv/layers/base/data/stations.txt
+      echo 'site=tallowmere' > /srv/layers/patch/conf/site.conf
+      (cd /srv/layers; find base patch -type f -exec sha256sum {} + | sort -k2) | sha256sum > /var/lib/cloudtrain/layers.sum
+      chmod 0700 /var/lib/cloudtrain
+  checks:
+  - id: stack
+    description: /srv/rootfs is an overlay with patch above base, and the right upper and work dirs
+    type: shell
+    'on': tr-ov-01
+    skills: &id001
+    - linux.internals.overlayfs
+    weight: 2
+    command: |
+      findmnt -n -o FSTYPE /srv/rootfs 2>/dev/null | grep -qx overlay || { echo not-overlay; exit; }
+      o=$(findmnt -n -o OPTIONS /srv/rootfs)
+      echo "$o" | grep -q 'lowerdir=/srv/layers/patch:/srv/layers/base' && echo "$o" | grep -q 'upperdir=/srv/layers/upper' && echo "$o" | grep -q 'workdir=/srv/layers/work' && echo stack || echo wrong-options
+    expect:
+      match: exact
+      value: stack
+  - id: copy-up
+    description: The edit to app.conf lives in the upper layer and shows in the merged view
+    type: shell
+    'on': tr-ov-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      grep -qx 'mode={{mode}}' /srv/layers/upper/conf/app.conf 2>/dev/null && grep -qx 'mode={{mode}}' /srv/rootfs/conf/app.conf 2>/dev/null && grep -qx region=north /srv/rootfs/conf/app.conf && echo copied-up || echo no
+    expect:
+      match: exact
+      value: copied-up
+  - id: whiteout
+    description: legacy.conf is hidden by a whiteout in the upper layer
+    type: shell
+    'on': tr-ov-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      f=/srv/layers/upper/conf/legacy.conf
+      [ "$(stat -c '%F %t:%T' $f 2>/dev/null)" = "character special file 0:0" ] && [ ! -e /srv/rootfs/conf/legacy.conf ] && [ -f /srv/layers/base/conf/legacy.conf ] && echo whiteout || echo no
+    expect:
+      match: exact
+      value: whiteout
+  - id: new-file
+    description: new-depot.txt exists in the merged view and the upper layer
+    type: shell
+    'on': tr-ov-01
+    skills: *id001
+    weight: 1
+    command: |
+      [ -s /srv/rootfs/data/new-depot.txt ] && [ -s /srv/layers/upper/data/new-depot.txt ] && [ ! -e /srv/layers/base/data/new-depot.txt ] && echo created || echo no
+    expect:
+      match: exact
+      value: created
+  - id: lowers-pristine
+    description: The lower layers are unchanged
+    type: shell
+    'on': tr-ov-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      [ "$( (cd /srv/layers; find base patch -type f -exec sha256sum {} + | sort -k2) | sha256sum)" = "$(cat /var/lib/cloudtrain/layers.sum)" ] && echo pristine || echo modified
+    expect:
+      match: exact
+      value: pristine
+  hints:
+  - title: Mount options
+    body: mount -t overlay overlay -o lowerdir=TOP:BOTTOM,upperdir=...,workdir=... MOUNTPOINT
+    cost: 0
+  - title: Whiteouts
+    body: 'ls -l in the upper directory: a character device 0,0 hides a lower file.'
+    cost: 1
+  misconceptions:
+  - id: edit-lowers
+    description: Edits the lower directories directly.
+    feedback: 'The lower layers are meant to be read-only: changes go through the merged mount so they
+      are copied up into the upper layer.'
+    expectFail:
+    - copy-up
+    - whiteout
+    - new-file
+    - lowers-pristine
+    mutation:
+      'on': tr-ov-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo mount -t overlay overlay -o lowerdir=/srv/layers/patch:/srv/layers/base,upperdir=/srv/layers/upper,workdir=/srv/layers/work /srv/rootfs
+        sudo sed -i 's/^mode=.*/mode={{mode}}/' /srv/layers/base/conf/app.conf
+        sudo rm /srv/layers/base/conf/legacy.conf
+        echo depot=north | sudo tee /srv/layers/base/data/new-depot.txt >/dev/null
+  - id: wrong-order
+    description: Stacks base above patch.
+    feedback: The first lowerdir is the topmost layer; list patch before base.
+    expectFail:
+    - stack
+    mutation:
+      'on': tr-ov-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo mount -t overlay overlay -o lowerdir=/srv/layers/base:/srv/layers/patch,upperdir=/srv/layers/upper,workdir=/srv/layers/work /srv/rootfs
+        sudo sed -i 's/^mode=.*/mode={{mode}}/' /srv/rootfs/conf/app.conf
+        sudo rm /srv/rootfs/conf/legacy.conf
+        echo depot=north | sudo tee /srv/rootfs/data/new-depot.txt >/dev/null
+  solution:
+    explanation: |
+      An overlay mount merges lowerdir layers (leftmost on top) with a writable upperdir; workdir is
+      scratch space on the same filesystem as upperdir. Modifying a lower file copies it up, and
+      deleting one creates a 0:0 character device (whiteout) in the upper layer.
+    steps:
+    - 'on': tr-ov-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo mount -t overlay overlay -o lowerdir=/srv/layers/patch:/srv/layers/base,upperdir=/srv/layers/upper,workdir=/srv/layers/work /srv/rootfs
+        sudo sed -i 's/^mode=.*/mode={{mode}}/' /srv/rootfs/conf/app.conf
+        sudo rm /srv/rootfs/conf/legacy.conf
+        echo depot=north | sudo tee /srv/rootfs/data/new-depot.txt >/dev/null
+        sudo find /srv/layers/upper | sort; ls -l /srv/layers/upper/conf
+    alternatives:
+    - id: fstab-entry
+      description: Describe the overlay in /etc/fstab and mount it from there.
+      steps:
+      - 'on': tr-ov-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          echo 'overlay /srv/rootfs overlay lowerdir=/srv/layers/patch:/srv/layers/base,upperdir=/srv/layers/upper,workdir=/srv/layers/work,nofail 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/rootfs
+          sudo sed -i 's/^mode=.*/mode={{mode}}/' /srv/rootfs/conf/app.conf
+          sudo rm /srv/rootfs/conf/legacy.conf
+          echo depot=north | sudo tee /srv/rootfs/data/new-depot.txt >/dev/null
