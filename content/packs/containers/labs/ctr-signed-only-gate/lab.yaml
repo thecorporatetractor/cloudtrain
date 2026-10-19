@@ -18,7 +18,7 @@ spec:
        **SBOM** attestation, and **push** it.
     2. **Sign** the pushed digest with Notation. Issue a signing certificate chained to
        `~/release/copperleaf-ca.crt` (key material and `leaf.ext` are in `~/release/`),
-       register it with Notation, add the CA to the trust store `copperleaf` and import a
+       register the key and certificate chain in Notation's signing key list (`~/.config/notation/signingkeys.json`; `notation key add` only handles plugin keys), add the CA to the trust store `copperleaf` and import a
        trust policy that trusts only that store for the repository
        `localhost:5000/ad-insertion` (`notation policy import`).
     3. **Deploy**: `/usr/local/bin/cl-release-deploy <ref>` is the release gate; it runs
@@ -118,7 +118,7 @@ spec:
       expect: {match: exact, value: "refused (no valid signature): localhost:5000/ad-insertion:{{rel}}-unsigned"}
   hints:
     - title: One chain, four steps
-      body: "Build with --sbom=true --push, resolve the pushed digest, sign that digest with notation sign using a leaf certificate issued by copperleaf-ca (`openssl x509 -req -CA ... -extfile leaf.ext`, then `notation key add`), then import a trust policy that trusts only that CA before calling the gate."
+      body: "Build with --sbom=true --push, resolve the pushed digest, sign that digest with notation sign using a leaf certificate issued by copperleaf-ca (`openssl x509 -req -CA ... -extfile leaf.ext`, then register the key and chain in `~/.config/notation/signingkeys.json`, since `notation key add` only supports plugins), then import a trust policy that trusts only that CA before calling the gate."
       cost: 1
     - title: The gate is only as good as the policy
       body: "cl-release-deploy calls notation verify, which reads the policy loaded by `notation policy import`; if none is imported, or it is too permissive, the gate's decision is meaningless. A scope is a full repository name such as localhost:5000/ad-insertion (or a lone `*`), not a prefix wildcard."
@@ -140,7 +140,8 @@ spec:
           openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
           openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
           cat leaf.crt copperleaf-ca.crt > chain.crt
-          notation key add copperleaf-release leaf.key chain.crt
+          mkdir -p ~/.config/notation
+          jq -n --arg k "$PWD/leaf.key" --arg c "$PWD/chain.crt" '{keys: [{name: "copperleaf-release", keyPath: $k, certPath: $c}]}' > ~/.config/notation/signingkeys.json
           notation cert add -t ca -s copperleaf copperleaf-ca.crt
           jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/ad-insertion"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
           notation policy import --force trustpolicy.json
@@ -167,7 +168,8 @@ spec:
           openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
           openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
           cat leaf.crt copperleaf-ca.crt > chain.crt
-          notation key add copperleaf-release leaf.key chain.crt
+          mkdir -p ~/.config/notation
+          jq -n --arg k "$PWD/leaf.key" --arg c "$PWD/chain.crt" '{keys: [{name: "copperleaf-release", keyPath: $k, certPath: $c}]}' > ~/.config/notation/signingkeys.json
           cd ~/ads-src
           docker buildx build --sbom=true --provenance=false --push -t localhost:5000/ad-insertion:{{rel}} .
           d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
@@ -188,7 +190,8 @@ spec:
           openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
           openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
           cat leaf.crt copperleaf-ca.crt > chain.crt
-          notation key add copperleaf-release leaf.key chain.crt
+          mkdir -p ~/.config/notation
+          jq -n --arg k "$PWD/leaf.key" --arg c "$PWD/chain.crt" '{keys: [{name: "copperleaf-release", keyPath: $k, certPath: $c}]}' > ~/.config/notation/signingkeys.json
           notation cert add -t ca -s copperleaf copperleaf-ca.crt
           jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/ad-insertion"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
           notation policy import --force trustpolicy.json
@@ -214,7 +217,8 @@ spec:
               openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
               openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
               cat leaf.crt copperleaf-ca.crt > chain.crt
-              notation key add copperleaf-release leaf.key chain.crt
+              mkdir -p ~/.config/notation
+              jq -n --arg k "$PWD/leaf.key" --arg c "$PWD/chain.crt" '{keys: [{name: "copperleaf-release", keyPath: $k, certPath: $c}]}' > ~/.config/notation/signingkeys.json
               cd ~/ads-src
               docker buildx build --sbom=true --provenance=false --build-arg REBUILD=1 --push -t localhost:5000/ad-insertion:{{rel}}-unsigned .
               cl-release-deploy localhost:5000/ad-insertion:{{rel}}-unsigned || true
