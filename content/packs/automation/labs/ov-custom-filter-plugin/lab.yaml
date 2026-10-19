@@ -1,0 +1,547 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-custom-filter-plugin
+  title: Write a filter that masks policy numbers
+  domain: automation
+  frameworks:
+  - ex374-aligned:collections
+  difficulty: medium
+  estimatedMinutes: 25
+  tags:
+  - ansible
+  - plugins
+  - filters
+  - collections
+  version: 1
+spec:
+  description: |
+    Reports must never show full policy numbers. The project **`/home/learner/claims-collection`** has the skeleton of
+    the collection **`orrinvale.claims`** (under `collections/`), a claims report template and `report.yml`, which renders
+    `out/claims-report.txt` on the control node.
+
+    Add a **filter plugin `mask_policy`** to the collection:
+
+    - `value | orrinvale.claims.mask_policy` replaces every character except the **last four** with `*`;
+    - optional arguments `keep` (how many trailing characters to leave, default 4) and `char` (the mask character, default `*`);
+    - a value no longer than `keep` is returned unchanged, and numbers are converted to text first.
+
+    Use the filter in `templates/claims-report.txt.j2` so the report shows only masked numbers, run `report.yml`, and build
+    the collection with `ansible-galaxy collection build` into **`/home/learner/claims-collection/dist`** so that the plugin
+    ships in the tarball. Do not change the supplied variables, playbook or collection metadata.
+  objectives:
+  - Write a filter plugin inside a collection
+  - Use a collection filter by its fully qualified name
+  - Ship plugins in a collection build
+  params:
+    pa:
+      type: int
+      min: 10000
+      max: 99999
+    pb:
+      type: int
+      min: 10000
+      max: 99999
+    pc:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+  setup:
+  - 'on': ov-ctl
+    run: |
+      set -eu
+      p=/home/learner/claims-collection
+      c=$p/collections/ansible_collections/orrinvale/claims
+      install -d -o learner -g learner $p $c $c/plugins $p/templates $p/vars $p/out $p/dist
+      cat > $c/galaxy.yml <<'EOF'
+      namespace: orrinvale
+      name: claims
+      version: 1.0.0
+      readme: README.md
+      authors: [Orrin and Vale platform team]
+      description: Claims platform content
+      license: [GPL-3.0-or-later]
+      EOF
+      printf '# orrinvale.claims\n' > $c/README.md
+      printf '[defaults]\ninventory = inventory.ini\ncollections_path = ./collections\n' > $p/ansible.cfg
+      printf 'localhost ansible_connection=local\n' > $p/inventory.ini
+
+      cat > $p/vars/policies.yml <<'EOF'
+      policies:
+        - { holder: "Marlow Hauliers", number: "PN-2024-00{{pa}}" }
+        - { holder: "Vesper Dental",   number: "PN-2025-00{{pb}}" }
+        - { holder: "Quayle and Sons", number: "PN-2026-00{{pc}}" }
+      EOF
+      cat > $p/templates/claims-report.txt.j2 <<'EOF'
+      Claims report
+      {% for p in policies %}
+      {{ p.holder }}: {{ p.number }}
+      {% endfor %}
+      EOF
+      cat > $p/report.yml <<'EOF'
+      - name: Claims report
+        hosts: localhost
+        gather_facts: false
+        vars_files: [vars/policies.yml]
+        tasks:
+          - name: Write the report
+            ansible.builtin.template:
+              src: claims-report.txt.j2
+              dest: out/claims-report.txt
+              mode: "0644"
+      EOF
+      chown -R learner:learner $p
+      sha256sum $p/vars/policies.yml $p/report.yml $p/collections/ansible_collections/orrinvale/claims/galaxy.yml > /var/tmp/.ct-filter.sum
+  checks:
+  - id: filter-behaviour
+    description: orrinvale.claims.mask_policy keeps the last four characters by default, honours keep and char, leaves short values alone and accepts numbers
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.extensibility.filter-plugins
+    weight: 3
+    timeoutSec: 180
+    command: |
+      /opt/ansible/bin/python3 -I - <<'EOF'
+      import json, subprocess
+      def f(expr):
+          out = subprocess.run(['ct-ansible', 'run', '/home/learner/claims-collection', 'ansible', 'localhost', '-m', 'ansible.builtin.debug', '-a', json.dumps({'msg': '{{ ' + expr + ' }}'})], capture_output=True, text=True).stdout
+          i = out.find('=>')
+          try:
+              return json.loads(out[i + 2:])['msg']
+          except Exception:
+              return None
+      F = "orrinvale.claims.mask_policy"
+      cases = [
+       ("'PN-2024-0099871' | %s" % F, '*' * 11 + '9871'),
+       ("'PN-2024-0099871' | %s(keep=2)" % F, '*' * 13 + '71'),
+       ("'PN-2024-0099871' | %s(char='#')" % F, '#' * 11 + '9871'),
+       ("'AB12' | %s" % F, 'AB12'),
+       ("'AB1' | %s" % F, 'AB1'),
+       ("'' | %s" % F, ''),
+       ("12345678 | %s" % F, '****5678'),
+      ]
+      bad = [str(i + 1) for i, (e, w) in enumerate(cases) if f(e) != w]
+      print('ok' if not bad else 'cases:' + ','.join(bad))
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: report-masked
+    description: The report shows every policy number masked and no full number
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.extensibility.filter-plugins
+    weight: 2
+    command: |
+      f=/home/learner/claims-collection/out/claims-report.txt
+      [ -f $f ] || { echo no-report; exit 0; }
+      # read the learner's file as the learner, with a time and size bound, into a root-owned copy
+      snap=$(mktemp); trap 'rm -f "$snap"' EXIT
+      ct-ansible run /home/learner/claims-collection timeout 10 head -c 65536 out/claims-report.txt > "$snap" 2>/dev/null
+      /opt/ansible/bin/python3 -I - "$snap" <<'EOF'
+      import sys
+      t = open(sys.argv[1]).read().strip().split('\n')
+      nums = ['PN-2024-00{{pa}}', 'PN-2025-00{{pb}}', 'PN-2026-00{{pc}}']
+      holders = ['Marlow Hauliers', 'Vesper Dental', 'Quayle and Sons']
+      want = ['Claims report'] + ['%s: %s' % (h, '*' * (len(n) - 4) + n[-4:]) for h, n in zip(holders, nums)]
+      print('ok' if t == want else 'report-content')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: build-ships-filter
+    description: The collection tarball in dist/ contains the filter plugin, and the supplied files are unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.extensibility.filter-plugins
+    weight: 2
+    command: |
+      cd /home/learner/claims-collection
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-filter.sum >/dev/null 2>&1 || { echo supplied-files-changed; exit 0; }
+      t=$(ct-ansible run /home/learner/claims-collection timeout 10 bash -c 'ls -t dist/orrinvale-claims-*.tar.gz 2>/dev/null | head -1')
+      [ -n "$t" ] || { echo no-tarball; exit 0; }
+      l=$(ct-ansible run /home/learner/claims-collection timeout 30 bash -c 'set -o pipefail; tar -tzf "$1" | head -c 1048576' bash "$t" 2>/dev/null)
+      printf '%s\n' "$l" | grep -qx 'plugins/filter/mask_policy.py' && echo ok || echo filter-not-in-build
+    expect:
+      match: exact
+      value: ok
+  - id: report-rerun
+    description: report.yml runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.extensibility.filter-plugins
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/claims-collection report.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Plugin layout
+    body: Filter plugins live in `plugins/filter/` of the collection. A file defines a class `FilterModule` with a method `filters()` returning a dictionary of filter names and functions.
+    cost: 1
+  - title: Testing quickly
+    body: '`ansible localhost -m ansible.builtin.debug -a "msg={{ ''PN-1'' | orrinvale.claims.mask_policy }}"` runs a filter without a playbook (the project `ansible.cfg` already points at the collections directory).'
+    cost: 1
+  misconceptions:
+  - id: project-level-plugin
+    description: Puts the filter in a filter_plugins directory next to the playbook and calls it by its short name.
+    feedback: The filter belongs to the collection (plugins/filter) and is used by its fully qualified name, so it ships with the build.
+    expectFail:
+    - filter-behaviour
+    - build-ships-filter
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-collection
+        mkdir -p filter_plugins
+        cat > filter_plugins/mask_policy.py <<'EOF'
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        name: mask_policy
+        short_description: Mask a policy number
+        description:
+          - Replaces every character except the last ones with a mask character.
+        options:
+          _input:
+            description: Policy number (numbers are converted to text first).
+            type: raw
+            required: true
+          keep:
+            description: Number of trailing characters to keep.
+            type: int
+            default: 4
+          char:
+            description: Mask character.
+            type: str
+            default: "*"
+        '''
+
+        EXAMPLES = r'''
+        masked: "{{ 'PN-2024-0099871' | orrinvale.claims.mask_policy }}"
+        '''
+
+        RETURN = r'''
+        _value:
+          description: The masked text.
+          type: str
+        '''
+
+
+        def mask_policy(value, keep=4, char="*"):
+            text = "" if value is None else str(value)
+            keep = int(keep)
+            if len(text) <= keep:
+                return text
+            return char * (len(text) - keep) + text[len(text) - keep:]
+
+
+        class FilterModule(object):
+            def filters(self):
+                return {"mask_policy": mask_policy}
+        EOF
+        cat > templates/claims-report.txt.j2 <<'EOF'
+        Claims report
+        {% for p in policies %}
+        {{ p.holder }}: {{ p.number | mask_policy }}
+        {% endfor %}
+        EOF
+        ansible-playbook report.yml
+        c=collections/ansible_collections/orrinvale/claims
+        ansible-galaxy collection build $c --output-path dist --force
+  - id: masks-the-wrong-end
+    description: Masks the end of the number and keeps the beginning.
+    feedback: The last four characters stay visible, everything before them is masked.
+    expectFail:
+    - filter-behaviour
+    - report-masked
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-collection
+        c=collections/ansible_collections/orrinvale/claims
+        mkdir -p $c/plugins/filter
+        cat > $c/plugins/filter/mask_policy.py <<'EOF'
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        name: mask_policy
+        short_description: Mask a policy number
+        description:
+          - Replaces every character except the last ones with a mask character.
+        options:
+          _input:
+            description: Policy number (numbers are converted to text first).
+            type: raw
+            required: true
+          keep:
+            description: Number of trailing characters to keep.
+            type: int
+            default: 4
+          char:
+            description: Mask character.
+            type: str
+            default: "*"
+        '''
+
+        EXAMPLES = r'''
+        masked: "{{ 'PN-2024-0099871' | orrinvale.claims.mask_policy }}"
+        '''
+
+        RETURN = r'''
+        _value:
+          description: The masked text.
+          type: str
+        '''
+
+
+        def mask_policy(value, keep=4, char="*"):
+            text = "" if value is None else str(value)
+            keep = int(keep)
+            if len(text) <= keep:
+                return text
+            return text[:keep] + char * (len(text) - keep)
+
+
+        class FilterModule(object):
+            def filters(self):
+                return {"mask_policy": mask_policy}
+        EOF
+        cat > templates/claims-report.txt.j2 <<'EOF'
+        Claims report
+        {% for p in policies %}
+        {{ p.holder }}: {{ p.number | orrinvale.claims.mask_policy }}
+        {% endfor %}
+        EOF
+        ansible-playbook report.yml
+        ansible-galaxy collection build $c --output-path dist --force
+  - id: built-too-early
+    description: Builds the collection before the filter exists.
+    feedback: Rebuild the collection after adding the plugin, otherwise the tarball does not contain it.
+    expectFail:
+    - build-ships-filter
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-collection
+        c=collections/ansible_collections/orrinvale/claims
+        ansible-galaxy collection build $c --output-path dist --force
+        mkdir -p $c/plugins/filter
+        cat > $c/plugins/filter/mask_policy.py <<'EOF'
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        name: mask_policy
+        short_description: Mask a policy number
+        description:
+          - Replaces every character except the last ones with a mask character.
+        options:
+          _input:
+            description: Policy number (numbers are converted to text first).
+            type: raw
+            required: true
+          keep:
+            description: Number of trailing characters to keep.
+            type: int
+            default: 4
+          char:
+            description: Mask character.
+            type: str
+            default: "*"
+        '''
+
+        EXAMPLES = r'''
+        masked: "{{ 'PN-2024-0099871' | orrinvale.claims.mask_policy }}"
+        '''
+
+        RETURN = r'''
+        _value:
+          description: The masked text.
+          type: str
+        '''
+
+
+        def mask_policy(value, keep=4, char="*"):
+            text = "" if value is None else str(value)
+            keep = int(keep)
+            if len(text) <= keep:
+                return text
+            return char * (len(text) - keep) + text[len(text) - keep:]
+
+
+        class FilterModule(object):
+            def filters(self):
+                return {"mask_policy": mask_policy}
+        EOF
+        cat > templates/claims-report.txt.j2 <<'EOF'
+        Claims report
+        {% for p in policies %}
+        {{ p.holder }}: {{ p.number | orrinvale.claims.mask_policy }}
+        {% endfor %}
+        EOF
+        ansible-playbook report.yml
+  solution:
+    explanation: |
+      A filter plugin is a Python file in the collection's `plugins/filter` directory with a `FilterModule` class whose `filters()`
+      method maps names to functions. Inside the collection the filter is addressed as `orrinvale.claims.mask_policy`, so the
+      template calls `{{ p.number | orrinvale.claims.mask_policy }}`. The function converts to text, leaves values no longer than
+      `keep` alone and masks the rest. `ansible-galaxy collection build` then packs the plugin into
+      `dist/orrinvale-claims-1.0.0.tar.gz`; because the file is part of the collection tree, it ships automatically.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-collection
+        c=collections/ansible_collections/orrinvale/claims
+        mkdir -p $c/plugins/filter
+        cat > $c/plugins/filter/mask_policy.py <<'EOF'
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        name: mask_policy
+        short_description: Mask a policy number
+        description:
+          - Replaces every character except the last ones with a mask character.
+        options:
+          _input:
+            description: Policy number (numbers are converted to text first).
+            type: raw
+            required: true
+          keep:
+            description: Number of trailing characters to keep.
+            type: int
+            default: 4
+          char:
+            description: Mask character.
+            type: str
+            default: "*"
+        '''
+
+        EXAMPLES = r'''
+        masked: "{{ 'PN-2024-0099871' | orrinvale.claims.mask_policy }}"
+        '''
+
+        RETURN = r'''
+        _value:
+          description: The masked text.
+          type: str
+        '''
+
+
+        def mask_policy(value, keep=4, char="*"):
+            text = "" if value is None else str(value)
+            keep = int(keep)
+            if len(text) <= keep:
+                return text
+            return char * (len(text) - keep) + text[len(text) - keep:]
+
+
+        class FilterModule(object):
+            def filters(self):
+                return {"mask_policy": mask_policy}
+        EOF
+        cat > templates/claims-report.txt.j2 <<'EOF'
+        Claims report
+        {% for p in policies %}
+        {{ p.holder }}: {{ p.number | orrinvale.claims.mask_policy }}
+        {% endfor %}
+        EOF
+        ansible-playbook report.yml
+        ansible-galaxy collection build $c --output-path dist --force
+    alternatives:
+    - id: regex-implementation
+      description: Implements the masking with a regular expression instead of slicing.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-collection
+          c=collections/ansible_collections/orrinvale/claims
+          mkdir -p $c/plugins/filter
+          cat > $c/plugins/filter/mask_policy.py <<'EOF'
+          # -*- coding: utf-8 -*-
+          from __future__ import absolute_import, division, print_function
+          __metaclass__ = type
+
+          DOCUMENTATION = r'''
+          name: mask_policy
+          short_description: Mask a policy number
+          description:
+            - Replaces every character except the last ones with a mask character.
+          options:
+            _input:
+              description: Policy number (numbers are converted to text first).
+              type: raw
+              required: true
+            keep:
+              description: Number of trailing characters to keep.
+              type: int
+              default: 4
+            char:
+              description: Mask character.
+              type: str
+              default: "*"
+          '''
+
+          EXAMPLES = r'''
+          masked: "{{ 'PN-2024-0099871' | orrinvale.claims.mask_policy }}"
+          '''
+
+          RETURN = r'''
+          _value:
+            description: The masked text.
+            type: str
+          '''
+
+
+          def mask_policy(value, keep=4, char="*"):
+              import re
+              text = "" if value is None else str(value)
+              keep = int(keep)
+              return re.sub(r".(?=.{%d})" % keep, char, text) if keep > 0 else char * len(text)
+
+
+          class FilterModule(object):
+              def filters(self):
+                  return {"mask_policy": mask_policy}
+          EOF
+          cat > templates/claims-report.txt.j2 <<'EOF'
+          Claims report
+          {% for p in policies %}
+          {{ p.holder }}: {{ p.number | orrinvale.claims.mask_policy }}
+          {% endfor %}
+          EOF
+          ansible-playbook report.yml
+          ansible-galaxy collection build $c --output-path dist --force

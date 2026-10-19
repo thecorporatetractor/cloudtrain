@@ -1,0 +1,325 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-navigator-run-settings
+  title: Run playbooks through a navigator settings file
+  domain: automation
+  frameworks:
+  - ex294-aligned:run-content
+  difficulty: easy
+  estimatedMinutes: 15
+  tags:
+  - ansible
+  - navigator
+  - artifacts
+  version: 1
+spec:
+  description: |
+    The claims platform team standardises on **ansible-navigator**. In
+    **`/home/learner/claims-automation`** you find `inventory.yml` and a working `site.yml`
+    that configures the claims web nodes.
+
+    Add a project settings file **`ansible-navigator.yml`** that
+
+    - runs without execution environments (this workstation has no container engine),
+    - uses the non-interactive `stdout` mode, and
+    - saves the playbook artifact of every run under **`/home/learner/claims-automation/artifacts/`**.
+
+    Then run `site.yml` with `ansible-navigator run` so that an artifact file appears there. Do not
+    change `site.yml`; running it again must report no changes.
+  objectives:
+  - Configure ansible-navigator with a project settings file
+  - Run a playbook in stdout mode
+  - Keep playbook artifacts for later review
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      cat > $p/site.yml <<'EOF'
+      - name: Claims portal baseline
+        hosts: claims_web
+        become: true
+        vars:
+          portal_release: r{{rel}}
+        tasks:
+          - name: Portal configuration directory
+            ansible.builtin.file:
+              path: /etc/ov/claims-portal
+              state: directory
+              mode: "0755"
+          - name: Portal release marker
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/site.conf
+              content: |
+                release={{ portal_release }}
+                owner=claims-platform
+              mode: "0644"
+      EOF
+      chown learner:learner $p/site.yml
+      sha256sum $p/site.yml > /var/tmp/.ct-nav-site.sum
+      touch /var/tmp/.ct-nav-start
+  checks:
+  - id: navigator-config
+    description: ansible-navigator.yml in the project disables execution environments, uses stdout mode and saves artifacts under artifacts/
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.devworkflow.navigator
+    weight: 2
+    command: |
+      # reads learner-controlled files: run as the learner, with a time limit
+      ct-ansible run /home/learner/claims-automation timeout 30 /opt/ansible/bin/python3 -I - <<'EOF'
+      import os, yaml
+      try:
+          if os.path.getsize('/home/learner/claims-automation/ansible-navigator.yml') > 262144: raise ValueError('large')
+          d = yaml.safe_load(open('/home/learner/claims-automation/ansible-navigator.yml'))['ansible-navigator']
+      except Exception:
+          print('no-config'); raise SystemExit
+      r = []
+      if (d.get('execution-environment') or {}).get('enabled') is not False: r.append('ee')
+      if d.get('mode') != 'stdout': r.append('mode')
+      pa = d.get('playbook-artifact') or {}
+      proj = '/home/learner/claims-automation'
+      sa = str(pa.get('save-as', '')).replace('{playbook_dir}', proj)
+      if sa.startswith('~'): sa = '/home/learner' + sa[1:]
+      sa = os.path.normpath(os.path.join(proj, sa))
+      if not sa.startswith(proj + '/artifacts/'): r.append('save-as')
+      if pa.get('enable') is False: r.append('disabled')
+      print(' '.join(r) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: artifact-saved
+    description: A playbook artifact of a site.yml run exists under artifacts/ and parses
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.devworkflow.navigator
+    weight: 2
+    command: |
+      d=/home/learner/claims-automation/artifacts
+      f=$(ct-ansible run $d timeout 20 find $d -maxdepth 1 -type f -name '*.json' -newer /var/tmp/.ct-nav-start 2>/dev/null | head -1)
+      [ -n "$f" ] || { echo none; exit 0; }
+      ct-ansible run $d timeout 30 /opt/ansible/bin/python3 -I - "$f" <<'EOF'
+      import json, os, sys
+      try:
+          if os.path.getsize(sys.argv[1]) > 33554432: raise ValueError('large')
+          j = json.load(open(sys.argv[1]))
+      except Exception:
+          print('invalid'); raise SystemExit
+      t = json.dumps(j)
+      ok = isinstance(j.get('plays'), list) and j['plays'] and 'ov-claims-web1' in t and 'ov-claims-web2' in t and 'site.yml' in t
+      print('ok' if ok else 'incomplete')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: portal-claimsweb1
+    description: ov-claims-web1 has the portal release marker from site.yml
+    type: shell
+    'on': ov-claims-web1
+    skills: &a208
+    - automation.devworkflow.navigator
+    command: &chk_portal-n |
+      [ "$(cat /etc/ov/claims-portal/site.conf 2>/dev/null)" = "$(printf 'release=r{{rel}}\nowner=claims-platform')" ] && echo ok || echo wrong
+    expect:
+      match: exact
+      value: ok
+  - id: portal-claimsweb2
+    description: ov-claims-web2 has the portal release marker from site.yml
+    type: shell
+    'on': ov-claims-web2
+    skills: *a208
+    command: *chk_portal-n
+    expect:
+      match: exact
+      value: ok
+  - id: site-unchanged-idempotent
+    description: site.yml is unchanged and runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.devworkflow.navigator
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-nav-site.sum >/dev/null 2>&1 || { echo site-edited; exit 0; }
+      ct-ansible recap /home/learner/claims-automation site.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Where settings live
+    body: navigator reads `ansible-navigator.yml` from the current directory. The top-level key is `ansible-navigator`, with keys such as `execution-environment`, `mode` and `playbook-artifact`.
+    cost: 1
+  - title: Artifact settings
+    body: '`playbook-artifact` has `enable` and `save-as`. The save-as value may use `{playbook_dir}`, `{playbook_name}` and `{time_stamp}`. The command `ansible-navigator settings --sample` prints every option.'
+    cost: 2
+  misconceptions:
+  - id: ee-left-enabled
+    description: Saves artifacts but leaves execution environments enabled, so navigator tries to start a container.
+    feedback: 'There is no container engine here: set execution-environment enabled to false in the settings file.'
+    expectFail:
+    - navigator-config
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        mkdir -p artifacts
+        cat > ansible-navigator.yml <<'EOF'
+        ---
+        ansible-navigator:
+          execution-environment:
+            enabled: true
+          mode: stdout
+          playbook-artifact:
+            enable: true
+            save-as: "{playbook_dir}/artifacts/{playbook_name}-{time_stamp}.json"
+        EOF
+        ansible-navigator run site.yml || true
+  - id: default-artifact-path
+    description: Runs navigator with execution environments off but never configures where artifacts go.
+    feedback: The artifact must be saved under the project artifacts directory; set playbook-artifact save-as in the settings file.
+    expectFail:
+    - navigator-config
+    - artifact-saved
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        mkdir -p artifacts
+        cat > ansible-navigator.yml <<'EOF'
+        ansible-navigator:
+          execution-environment:
+            enabled: false
+          mode: stdout
+        EOF
+        ansible-navigator run site.yml
+  - id: plain-ansible-playbook
+    description: Runs ansible-playbook directly and expects a navigator artifact to appear.
+    feedback: ansible-playbook does not write playbook artifacts; run the playbook through ansible-navigator with the settings file.
+    expectFail:
+    - navigator-config
+    - artifact-saved
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        ansible-playbook site.yml
+  solution:
+    explanation: |
+      The project settings file `ansible-navigator.yml` turns execution environments off (the pod has no
+      container engine), selects the non-interactive stdout mode and tells navigator where to save the
+      playbook artifact. Running `ansible-navigator run site.yml` then configures the portal and leaves a JSON
+      artifact under `artifacts/`; the second run changes nothing.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        mkdir -p artifacts
+        cat > ansible-navigator.yml <<'EOF'
+        ---
+        ansible-navigator:
+          execution-environment:
+            enabled: false
+          mode: stdout
+          playbook-artifact:
+            enable: true
+            save-as: "{playbook_dir}/artifacts/{playbook_name}-{time_stamp}.json"
+        EOF
+        ansible-navigator run site.yml
+    alternatives:
+    - id: fixed-artifact-name
+      description: Flow-style settings and one artifact file per playbook name instead of a time stamp.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p artifacts
+          cat > ansible-navigator.yml <<'EOF'
+          ansible-navigator: {execution-environment: {enabled: false}, mode: stdout, playbook-artifact: {enable: true, save-as: "{playbook_dir}/artifacts/{playbook_name}-latest.json"}}
+          EOF
+          ansible-navigator run site.yml

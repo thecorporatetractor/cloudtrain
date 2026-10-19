@@ -1,0 +1,261 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-constructed-inventory
+  title: Group hosts by facts with a constructed inventory
+  domain: automation
+  frameworks:
+  - ex374-aligned:dynamic-inventory
+  difficulty: medium
+  estimatedMinutes: 25
+  tags:
+  - ansible
+  - inventory
+  - constructed
+  - groups
+  version: 1
+spec:
+  description: |
+    The inventory directory **`/home/learner/claims-automation/inventory`** holds `01-hosts.yml`, the claims
+    estate with a few variables per host: `os_family`, `tier` and `mem_mb`. Do not edit that file.
+
+    Add a constructed inventory source to the same directory so that `ansible-inventory --graph` shows
+
+    - a group **`os_<family>`** for every operating system family value,
+    - a group **`tier_<tier>`** for every tier value, and
+    - a group **`big_mem`** with every host that has **more than 4 GiB** of memory.
+
+    There must be no other new groups.
+  objectives:
+  - Use the constructed inventory plugin
+  - Create groups from host variables with keyed_groups
+  - Derive groups from an expression
+  params:
+    memweb1:
+      type: choice
+      values:
+      - 8192
+      - 12288
+    tierweb2:
+      type: choice
+      values:
+      - silver
+      - bronze
+    memweb2:
+      type: choice
+      values:
+      - 2048
+      - 6144
+    memquote:
+      type: choice
+      values:
+      - 1024
+      - 4096
+      - 16384
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+  setup:
+  - 'on': ov-ctl
+    run: |
+      set -eu
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p $p/inventory
+      cat > $p/inventory/01-hosts.yml <<'EOF'
+      all:
+        children:
+          claims:
+            hosts:
+              ov-claims-web1: {os_family: el, tier: gold, mem_mb: {{memweb1}}}
+              ov-claims-web2: {os_family: el, tier: {{tierweb2}}, mem_mb: {{memweb2}}}
+              ov-db-1: {os_family: el, tier: gold, mem_mb: 4096}
+          quoting:
+            hosts:
+              ov-quote-api1: {os_family: deb, tier: bronze, mem_mb: {{memquote}}}
+      EOF
+      printf '[defaults]\ninventory = inventory\n' > $p/ansible.cfg
+      chown -R learner:learner $p
+      sha256sum $p/inventory/01-hosts.yml > /var/tmp/.ct-constructed.sum
+  checks:
+  - id: constructed-source
+    description: The inventory directory holds a constructed inventory source next to the unchanged host file
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.inventory.dynamic
+    weight: 1
+    command: |
+      cd /home/learner/claims-automation
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-constructed.sum >/dev/null 2>&1 || { echo static-inventory-edited; exit 0; }
+      f=$(grep -lE '^plugin: *(ansible\.builtin\.)?constructed' inventory/*.yml inventory/*.yaml 2>/dev/null | head -1)
+      [ -n "$f" ] && echo ok || echo no-constructed-source
+    expect:
+      match: exact
+      value: ok
+  - id: groups-graph
+    description: ansible-inventory lists exactly the expected os_*, tier_* and big_mem groups with the right hosts
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.inventory.dynamic
+    weight: 4
+    timeoutSec: 120
+    command: |
+      /opt/ansible/bin/python3 -I - <<'EOF'
+      import json, subprocess, sys
+      out = subprocess.run(['ct-ansible', 'run', '/home/learner/claims-automation', 'ansible-inventory', '--list'], capture_output=True, text=True).stdout
+      try:
+          inv = json.loads(out)
+      except Exception:
+          print('inventory-does-not-load'); raise SystemExit
+      mem = {'ov-claims-web1': {{memweb1}}, 'ov-claims-web2': {{memweb2}}, 'ov-db-1': 4096, 'ov-quote-api1': {{memquote}}}
+      tier = {'ov-claims-web1': 'gold', 'ov-claims-web2': '{{tierweb2}}', 'ov-db-1': 'gold', 'ov-quote-api1': 'bronze'}
+      osf = {'ov-claims-web1': 'el', 'ov-claims-web2': 'el', 'ov-db-1': 'el', 'ov-quote-api1': 'deb'}
+      want = {}
+      for h in mem:
+          want.setdefault('os_' + osf[h], set()).add(h)
+          want.setdefault('tier_' + tier[h], set()).add(h)
+          if mem[h] > 4096:
+              want.setdefault('big_mem', set()).add(h)
+      bad = []
+      for g, hs in want.items():
+          got = set(inv.get(g, {}).get('hosts', []))
+          if got != hs:
+              bad.append(g)
+      extra = [g for g in inv if g not in want and g not in ('_meta', 'all', 'claims', 'quoting', 'ungrouped')]
+      print(' '.join(sorted(bad) + ['extra:' + ','.join(sorted(extra))] * bool(extra)) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Plugin file
+    body: 'An inventory source file named `*.yml` in the inventory directory that starts with `plugin: ansible.builtin.constructed` is a constructed source. `ansible-doc -t inventory ansible.builtin.constructed` documents `keyed_groups` and `groups`.'
+    cost: 1
+  - title: Names and conditions
+    body: '`keyed_groups` entries take `key`, `prefix` and `separator` (the default separator is an underscore). Entries in `groups` map a group name to a Jinja condition evaluated per host; variables from YAML flow mappings keep their type, but converting with `| int` is harmless.'
+    cost: 2
+  misconceptions:
+  - id: no-prefix
+    description: Creates keyed groups without a prefix, so the groups are named with a bare separator (_el, _deb, _gold...)
+    feedback: The groups must be called os_<family> and tier_<tier>; give each keyed group a prefix.
+    expectFail:
+    - groups-graph
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > inventory/02-constructed.yml <<'EOF'
+        plugin: ansible.builtin.constructed
+        strict: false
+        keyed_groups:
+          - key: os_family
+            prefix: ''
+          - key: tier
+            prefix: ''
+        groups:
+          big_mem: mem_mb | int > 4096
+        EOF
+  - id: at-least-4-gib
+    description: Uses greater-or-equal, so a host with exactly 4 GiB lands in big_mem.
+    feedback: 'The condition is "more than 4 GiB": exactly 4096 MB does not qualify.'
+    expectFail:
+    - groups-graph
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > inventory/02-constructed.yml <<'EOF'
+        plugin: ansible.builtin.constructed
+        strict: false
+        keyed_groups:
+          - key: os_family
+            prefix: os
+            separator: "_"
+          - key: tier
+            prefix: tier
+            separator: "_"
+        groups:
+          big_mem: mem_mb | int >= 4096
+        EOF
+  - id: source-outside-inventory
+    description: Saves the constructed source next to the playbooks instead of in the inventory directory.
+    feedback: The configured inventory is the inventory directory; a source outside it is never read.
+    expectFail:
+    - constructed-source
+    - groups-graph
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > constructed.yml <<'EOF'
+        plugin: ansible.builtin.constructed
+        strict: false
+        keyed_groups:
+          - key: os_family
+            prefix: os
+            separator: "_"
+          - key: tier
+            prefix: tier
+            separator: "_"
+        groups:
+          big_mem: mem_mb | int > 4096
+        EOF
+  solution:
+    explanation: |
+      `ansible.builtin.constructed` is an inventory plugin that builds groups from variables the other sources already set. A
+      file `inventory/02-constructed.yml` with `plugin: ansible.builtin.constructed` loads after `01-hosts.yml`. `keyed_groups` turns
+      the values of `os_family` and `tier` into `os_<family>` and `tier_<tier>` groups (prefix and separator); the `groups`
+      expression `mem_mb | int > 4096` creates `big_mem` for hosts with more than 4 GiB.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/claims-automation
+        cat > inventory/02-constructed.yml <<'EOF'
+        plugin: ansible.builtin.constructed
+        strict: false
+        keyed_groups:
+          - key: os_family
+            prefix: os
+            separator: "_"
+          - key: tier
+            prefix: tier
+            separator: "_"
+        groups:
+          big_mem: mem_mb | int > 4096
+        EOF
+        ansible-inventory --graph
+    alternatives:
+    - id: explicit-group-expressions
+      description: Spells every group out as a boolean expression instead of keyed_groups.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/claims-automation
+          cat > inventory/02-constructed.yml <<'EOF'
+          plugin: ansible.builtin.constructed
+          strict: false
+          groups:
+            os_el: os_family == 'el'
+            os_deb: os_family == 'deb'
+            tier_gold: tier == 'gold'
+            tier_silver: tier == 'silver'
+            tier_bronze: tier == 'bronze'
+            big_mem: mem_mb | int > 4096
+          EOF
+          ansible-inventory --graph

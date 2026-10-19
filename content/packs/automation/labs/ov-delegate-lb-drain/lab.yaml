@@ -1,0 +1,684 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-delegate-lb-drain
+  title: Drain web nodes from the load balancer during an update
+  domain: automation
+  frameworks:
+  - ex374-aligned:delegation
+  difficulty: hard
+  estimatedMinutes: 35
+  tags:
+  - ansible
+  - delegation
+  - serial
+  - haproxy
+  - rolling-update
+  version: 1
+spec:
+  description: |
+    The four claims web nodes (`claims_web` in **`/home/learner/claims-automation`**) sit behind the HAProxy balancer
+    `ov-lb1` (backend `claims_web`; the server names are the inventory host names; the admin socket is
+    `/run/haproxy/admin.sock` on `ov-lb1`). Clients are using the portal right now: a sampler on the control node (a process you cannot change) records the
+    number of healthy backends and the answer to a test request through the balancer, several times a second.
+
+    Write **`lb-update.yml`** to move the nodes to the new release `r{{rel}}` **without any interruption**:
+    for each node, take it out of rotation in the balancer (delegated to `ov-lb1`), write
+    `r{{rel}}` to `/etc/ov/claims-release` and restart the application with `/usr/local/sbin/ov-claims-ctl restart`
+    (it picks the release up at start), put the node back and let it prove healthy again before the next node is touched.
+
+    The balancer must never have fewer than **three** healthy backends, and no client request may fail. A second run, with
+    every node already on the new release, must report no changes.
+
+    The sampler records from the start of the session. If a try goes wrong (or you restart the application by hand),
+    put every node back with `ansible claims_web -b -m shell -a 'echo r1 > /etc/ov/claims-release && /usr/local/sbin/ov-claims-ctl restart'`,
+    wait until all four are healthy, then clear the records with `ov-lb-reset` on the control node and run again.
+  objectives:
+  - Delegate tasks to the load balancer
+  - Update nodes one at a time with serial
+  - Prove that an update caused no interruption
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    rel:
+      type: int
+      min: 2
+      max: 99
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-lb1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.5
+        memoryMiB: 512
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web3
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web4
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-lb1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth3
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth4
+      b: ov-claims-web3:eth1
+    - a: ov-ctl:eth5
+      b: ov-claims-web4:eth1
+  setup:
+  - 'on': ov-lb1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-lb1) a=50 ;; ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-claims-web3) a=13 ;; ov-claims-web4) a=14 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-claims-web*)
+          mkdir -p /etc/ov
+          echo r1 > /etc/ov/claims-release
+          cat > /usr/local/sbin/ov-claims-app <<'EOF'
+      #!/usr/bin/python3
+      import http.server
+      import os
+      import socketserver
+      import time
+
+      with open("/etc/ov/claims-release") as handle:
+          RELEASE = handle.read().strip()
+
+      START = time.time()
+
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              # warm-up: the application answers 503 for the first seconds after a start
+              warm = time.time() - START >= 8
+              body = ("claims-web %s\n" % RELEASE).encode() if warm else b"warming up\n"
+              self.send_response(200 if warm else 503)
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, *args):
+              pass
+
+
+      class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+          allow_reuse_address = True
+          daemon_threads = True
+
+
+      with open("/run/ov-claims-app.pid", "w") as handle:
+          handle.write(str(os.getpid()))
+      Server(("0.0.0.0", 8080), Handler).serve_forever()
+      EOF
+          cat > /usr/local/sbin/ov-claims-ctl <<'EOF'
+      #!/bin/sh
+      # control script of the claims web application (no service manager in this lab)
+      pidf=/run/ov-claims-app.pid
+      stop() { [ -f $pidf ] && kill "$(cat $pidf)" 2>/dev/null; rm -f $pidf; }
+      start() {
+        setsid nohup /usr/local/sbin/ov-claims-app >/var/log/ov-claims-app.log 2>&1 </dev/null &
+        i=0
+        while [ $i -lt 60 ]; do nc -z 127.0.0.1 8080 2>/dev/null && return 0; sleep 0.1; i=$((i+1)); done
+        return 1
+      }
+      case "$1" in
+        start) start ;;
+        stop) stop ;;
+        restart) stop; sleep 2; start ;;
+        *) echo "usage: ov-claims-ctl start|stop|restart" >&2; exit 2 ;;
+      esac
+      EOF
+          chmod 0755 /usr/local/sbin/ov-claims-app /usr/local/sbin/ov-claims-ctl
+          /usr/local/sbin/ov-claims-ctl stop
+          /usr/local/sbin/ov-claims-ctl start ;;
+        ov-lb1) mkdir -p /run/haproxy ;;
+      esac
+  - 'on': ov-lb1
+    timeoutSec: 600
+    run: |
+      set -eu
+      dnf -y install haproxy >/var/tmp/dnf-haproxy.log 2>&1 || { echo "haproxy does not install from the mirror: $(tail -4 /var/tmp/dnf-haproxy.log | tr '\n' ' ')" >&2; exit 1; }
+  - 'on': ov-claims-web1
+    run: *ov-node
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-claims-web3
+    run: *ov-node
+  - 'on': ov-claims-web4
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 420
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-lb1=10.70.0.50 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-claims-web3=10.70.0.13 ov-claims-web4=10.70.0.14
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-lb1 ov-claims-web1 ov-claims-web2 ov-claims-web3 ov-claims-web4
+  - 'on': ov-lb1
+    timeoutSec: 240
+    run: |
+      set -eu
+      cat > /etc/haproxy/haproxy.cfg <<'EOF'
+      global
+          stats socket /run/haproxy/admin.sock mode 666 level admin
+          maxconn 512
+
+      defaults
+          mode http
+          retries 0
+          timeout connect 1s
+          timeout client 5s
+          timeout server 5s
+
+      frontend claims
+          bind *:8080
+          default_backend claims_web
+
+      listen stats
+          bind *:8404
+          stats enable
+          stats uri /stats
+
+      backend claims_web
+          balance roundrobin
+          option httpchk GET /health
+          server ov-claims-web1 10.70.0.11:8080 check inter 1s fall 2 rise 3
+          server ov-claims-web2 10.70.0.12:8080 check inter 1s fall 2 rise 3
+          server ov-claims-web3 10.70.0.13:8080 check inter 1s fall 2 rise 3
+          server ov-claims-web4 10.70.0.14:8080 check inter 1s fall 2 rise 3
+      EOF
+      haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null
+      haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
+      i=0; while [ $i -lt 60 ]; do n=$(echo 'show stat' | nc -U /run/haproxy/admin.sock | awk -F, '$1=="claims_web" && $2 ~ /^ov-claims-web/ && $18 ~ /^UP/ {n++} END {print n+0}'); [ "$n" = 4 ] && break; sleep 1; i=$((i+1)); done
+      [ "$n" = 4 ] || { echo 'backends did not become healthy' >&2; exit 1; }
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      balancers:
+        hosts:
+          ov-lb1:
+      claims_web:
+        hosts:
+          ov-claims-web1:
+          ov-claims-web2:
+          ov-claims-web3:
+          ov-claims-web4:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+      # The evidence is recorded on the control node by a root process: the learner has root on the balancer and the
+      # nodes (through ovauto) but is unprivileged here, so the records cannot be rewritten by hand.
+      install -d -m 0755 /var/lib/ov-lb
+      cat > /usr/local/sbin/ov-lb-sampler <<'EOF'
+      #!/bin/sh
+      # records the number of healthy backends and the answer of the balancer, several times a second
+      H=/var/lib/ov-lb/healthy.log; R=/var/lib/ov-lb/requests.log; FLAG=/home/learner/.ov-lb-reset
+      (
+        while :; do
+          n=$(curl -s --max-time 2 'http://10.70.0.50:8404/stats;csv' 2>/dev/null | awk -F, '$1=="claims_web" && $2 ~ /^ov-claims-web/ && $18 ~ /^UP/ {n++} END {print n+0}')
+          echo "$(date +%s) $n" >> $H
+          sleep 0.5
+        done
+      ) &
+      (
+        while :; do
+          c=$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' http://10.70.0.50:8080/ 2>/dev/null)
+          echo "$(date +%s) $c" >> $R
+          sleep 0.2
+        done
+      ) &
+      (
+        while :; do
+          if [ -e "$FLAG" ]; then rm -f "$FLAG"; : > $H; : > $R; fi
+          sleep 0.5
+        done
+      ) &
+      wait
+      EOF
+      chmod 0755 /usr/local/sbin/ov-lb-sampler
+      cat > /usr/local/bin/ov-lb-reset <<'EOF'
+      #!/bin/sh
+      # start the observation window again (asks the sampler to clear its records)
+      touch /home/learner/.ov-lb-reset
+      sleep 2
+      EOF
+      chmod 0755 /usr/local/bin/ov-lb-reset
+      : > /var/lib/ov-lb/healthy.log
+      : > /var/lib/ov-lb/requests.log
+      chmod 0644 /var/lib/ov-lb/healthy.log /var/lib/ov-lb/requests.log
+      setsid nohup /usr/local/sbin/ov-lb-sampler >/dev/null 2>&1 </dev/null &
+      sleep 3
+  checks:
+  - id: serving-claimsweb1
+    description: ov-claims-web1 runs the new release and serves it
+    type: shell
+    'on': ov-claims-web1
+    skills: &a241
+    - automation.advanced.rolling
+    weight: 1
+    command: &chk_serving-n |
+      r=""
+      [ "$(cat /etc/ov/claims-release 2>/dev/null)" = "r{{rel}}" ] || r="$r release-file"
+      [ "$(curl -s --max-time 3 http://127.0.0.1:8080/)" = "claims-web r{{rel}}" ] || r="$r serving"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: serving-claimsweb2
+    description: ov-claims-web2 runs the new release and serves it
+    type: shell
+    'on': ov-claims-web2
+    skills: *a241
+    weight: 1
+    command: *chk_serving-n
+    expect:
+      match: exact
+      value: ok
+  - id: serving-claimsweb3
+    description: ov-claims-web3 runs the new release and serves it
+    type: shell
+    'on': ov-claims-web3
+    skills: *a241
+    weight: 1
+    command: *chk_serving-n
+    expect:
+      match: exact
+      value: ok
+  - id: serving-claimsweb4
+    description: ov-claims-web4 runs the new release and serves it
+    type: shell
+    'on': ov-claims-web4
+    skills: *a241
+    weight: 1
+    command: *chk_serving-n
+    expect:
+      match: exact
+      value: ok
+  - id: never-below-three
+    description: The balancer never had fewer than three healthy backends during the update, and a backend was out of rotation at some point
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.delegation
+    - automation.advanced.rolling
+    weight: 3
+    command: |
+      awk '{ if (NR == 1 || $2 < min) min = $2; if ($2 == 3) three++; n++ } END { if (n < 20) print "sampler-short"; else if (min < 3) print "min=" min; else if (!three) print "no-drain-seen"; else print "ok" }' /var/lib/ov-lb/healthy.log
+    expect:
+      match: exact
+      value: ok
+  - id: no-failed-requests
+    description: Not a single client request through the balancer failed during the update
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.delegation
+    weight: 3
+    command: |
+      n=$(wc -l < /var/lib/ov-lb/requests.log)
+      bad=$(awk '$2 != 200' /var/lib/ov-lb/requests.log | wc -l)
+      [ "$n" -ge 50 ] || { echo "sampler-short"; exit 0; }
+      [ "$bad" = 0 ] && echo ok || echo "failed-requests=$bad"
+    expect:
+      match: exact
+      value: ok
+  - id: all-backends-back
+    description: All four backends are healthy again at the end
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.rolling
+    weight: 1
+    command: |
+      sleep 4
+      tail -3 /var/lib/ov-lb/healthy.log | awk '$2 != 4 {bad++} END {print bad ? "not-all-healthy" : "ok"}'
+    expect:
+      match: exact
+      value: ok
+  - id: update-rerun
+    description: lb-update.yml runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.delegation
+    weight: 1
+    timeoutSec: 420
+    command: |
+      ct-ansible recap /home/learner/claims-automation lb-update.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Delegation
+    body: '`delegate_to: ov-lb1` runs a task on the balancer but with the variables of the current inventory host, so `{{ inventory_hostname }}` is the node being updated. The module `community.general.haproxy` enables, disables and drains servers through the admin socket.'
+    cost: 1
+  - title: Waiting
+    body: 'The application needs a few seconds after a start before it answers properly, and the balancer may count a re-enabled server as UP right away. Wait on the node itself (an `until` loop on its health URL) before you enable it again.'
+    cost: 2
+  - title: Only when needed
+    body: Read the current release first and wrap the update steps in a block with a `when`, so a second run touches nothing.
+    cost: 1
+  misconceptions:
+  - id: restart-without-drain
+    description: Restarts the application on each node in turn without taking it out of the balancer.
+    feedback: Clients keep being sent to the node while it restarts; disable it in the balancer first, and enable it afterwards.
+    expectFail:
+    - no-failed-requests
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 420
+      run: |
+        cd ~/claims-automation
+        cat > lb-update.yml <<'EOF'
+        - name: Roll out the new claims release behind the balancer
+          hosts: claims_web
+          become: true
+          serial: 1
+          tasks:
+            - name: Current release
+              ansible.builtin.slurp:
+                src: /etc/ov/claims-release
+              register: current_release
+
+            - name: Update this node
+              when: (current_release.content | b64decode | trim) != 'r{{rel}}'
+              block:
+                - name: New release
+                  ansible.builtin.copy:
+                    dest: /etc/ov/claims-release
+                    content: "r{{rel}}\n"
+                    mode: "0644"
+
+                - name: Restart the application
+                  ansible.builtin.command: /usr/local/sbin/ov-claims-ctl restart
+                  changed_when: true
+
+        EOF
+        ansible-playbook lb-update.yml
+  - id: two-at-a-time
+    description: Updates two nodes per batch to finish faster.
+    feedback: With two nodes out of rotation only two backends remain; the requirement is at least three at all times, so one at a time.
+    expectFail:
+    - never-below-three
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 420
+      run: |
+        cd ~/claims-automation
+        cat > lb-update.yml <<'EOF'
+        - name: Roll out the new claims release behind the balancer
+          hosts: claims_web
+          become: true
+          serial: 2
+          tasks:
+            - name: Current release
+              ansible.builtin.slurp:
+                src: /etc/ov/claims-release
+              register: current_release
+
+            - name: Update this node
+              when: (current_release.content | b64decode | trim) != 'r{{rel}}'
+              block:
+                - name: Take the node out of rotation
+                  community.general.haproxy:
+                    state: disabled
+                    host: "{{ inventory_hostname }}"
+                    backend: claims_web
+                    socket: /run/haproxy/admin.sock
+                    drain: true
+                    wait: true
+                  delegate_to: ov-lb1
+
+                - name: New release
+                  ansible.builtin.copy:
+                    dest: /etc/ov/claims-release
+                    content: "r{{rel}}\n"
+                    mode: "0644"
+
+                - name: Restart the application
+                  ansible.builtin.command: /usr/local/sbin/ov-claims-ctl restart
+                  changed_when: true
+
+                - name: Put the node back and wait until it is healthy
+                  community.general.haproxy:
+                    state: enabled
+                    host: "{{ inventory_hostname }}"
+                    backend: claims_web
+                    socket: /run/haproxy/admin.sock
+                    wait: true
+                    wait_retries: 30
+                    wait_interval: 1
+                  delegate_to: ov-lb1
+        EOF
+        ansible-playbook lb-update.yml
+  - id: no-wait-for-health
+    description: Enables the node again but does not wait for it to be healthy before the next one is drained.
+    feedback: The balancer needs the application to answer before it can serve; wait for the node to be ready before enabling it and before draining the next one.
+    expectFail:
+    - never-below-three
+    - no-failed-requests
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 420
+      run: |
+        cd ~/claims-automation
+        cat > lb-update.yml <<'EOF'
+        - name: Roll out the new claims release behind the balancer
+          hosts: claims_web
+          become: true
+          serial: 1
+          tasks:
+            - name: Current release
+              ansible.builtin.slurp:
+                src: /etc/ov/claims-release
+              register: current_release
+
+            - name: Update this node
+              when: (current_release.content | b64decode | trim) != 'r{{rel}}'
+              block:
+                - name: Take the node out of rotation
+                  community.general.haproxy:
+                    state: disabled
+                    host: "{{ inventory_hostname }}"
+                    backend: claims_web
+                    socket: /run/haproxy/admin.sock
+                    drain: true
+                    wait: true
+                  delegate_to: ov-lb1
+
+                - name: New release
+                  ansible.builtin.copy:
+                    dest: /etc/ov/claims-release
+                    content: "r{{rel}}\n"
+                    mode: "0644"
+
+                - name: Restart the application
+                  ansible.builtin.command: /usr/local/sbin/ov-claims-ctl restart
+                  changed_when: true
+
+                - name: Put the node back and wait until it is healthy
+                  community.general.haproxy:
+                    state: enabled
+                    host: "{{ inventory_hostname }}"
+                    backend: claims_web
+                    socket: /run/haproxy/admin.sock
+                  delegate_to: ov-lb1
+        EOF
+        ansible-playbook lb-update.yml
+  solution:
+    explanation: |
+      One node at a time (`serial: 1`): the HAProxy module, delegated to the balancer host (`delegate_to: ov-lb1`), drains and
+      disables the node, so no new requests reach it. The release file is written and the application restarted on the node
+      itself. The play waits until the application on the node answers its health URL (it is warming up after a start), and only then a
+      second delegated call enables the node in the balancer, before the next batch starts. The whole block runs only when the node is not yet on the new release, which makes the second run
+      change nothing. The sampler on the control node shows three healthy backends at the lowest and no failed client request.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 420
+      run: |
+        set -e
+        cd ~/claims-automation
+        cat > lb-update.yml <<'EOF'
+        - name: Roll out the new claims release behind the balancer
+          hosts: claims_web
+          become: true
+          serial: 1
+          tasks:
+            - name: Current release
+              ansible.builtin.slurp:
+                src: /etc/ov/claims-release
+              register: current_release
+
+            - name: Update this node
+              when: (current_release.content | b64decode | trim) != 'r{{rel}}'
+              block:
+                - name: Take the node out of rotation
+                  community.general.haproxy:
+                    state: disabled
+                    host: "{{ inventory_hostname }}"
+                    backend: claims_web
+                    socket: /run/haproxy/admin.sock
+                    drain: true
+                    wait: true
+                  delegate_to: ov-lb1
+
+                - name: New release
+                  ansible.builtin.copy:
+                    dest: /etc/ov/claims-release
+                    content: "r{{rel}}\n"
+                    mode: "0644"
+
+                - name: Restart the application
+                  ansible.builtin.command: /usr/local/sbin/ov-claims-ctl restart
+                  changed_when: true
+
+                - name: Wait until the application on the node answers
+                  ansible.builtin.uri:
+                    url: http://127.0.0.1:8080/health
+                  register: app_health
+                  until: app_health.status == 200
+                  retries: 30
+                  delay: 1
+                  changed_when: false
+
+                - name: Put the node back and wait until it is healthy
+                  community.general.haproxy:
+                    state: enabled
+                    host: "{{ inventory_hostname }}"
+                    backend: claims_web
+                    socket: /run/haproxy/admin.sock
+                    wait: true
+                    wait_retries: 30
+                    wait_interval: 1
+                  delegate_to: ov-lb1
+        EOF
+        ansible-playbook lb-update.yml
+    alternatives:
+    - id: admin-socket-with-nc
+      description: Talks to the HAProxy admin socket with nc and polls until the node is UP.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 420
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > lb-update.yml <<'EOF'
+          - name: Roll out the new claims release behind the balancer
+            hosts: claims_web
+            become: true
+            serial: 1
+            tasks:
+              - name: Current release
+                ansible.builtin.slurp:
+                  src: /etc/ov/claims-release
+                register: current_release
+
+              - name: Update this node
+                when: (current_release.content | b64decode | trim) != 'r{{rel}}'
+                block:
+                  - name: Take the node out of rotation
+                    ansible.builtin.shell: echo "disable server claims_web/{{ inventory_hostname }}" | nc -U /run/haproxy/admin.sock
+                    delegate_to: ov-lb1
+                    changed_when: true
+
+                  - name: New release
+                    ansible.builtin.copy:
+                      dest: /etc/ov/claims-release
+                      content: "r{{rel}}\n"
+                      mode: "0644"
+
+                  - name: Restart the application
+                    ansible.builtin.command: /usr/local/sbin/ov-claims-ctl restart
+                    changed_when: true
+
+                  - name: Wait until the application on the node answers
+                    ansible.builtin.uri:
+                      url: http://127.0.0.1:8080/health
+                    register: app_health
+                    until: app_health.status == 200
+                    retries: 30
+                    delay: 1
+                    changed_when: false
+
+                  - name: Put the node back
+                    ansible.builtin.shell: echo "enable server claims_web/{{ inventory_hostname }}" | nc -U /run/haproxy/admin.sock
+                    delegate_to: ov-lb1
+                    changed_when: true
+
+                  - name: Wait until the balancer reports the node healthy
+                    ansible.builtin.shell: echo "show stat" | nc -U /run/haproxy/admin.sock | awk -F, '$2=="{{ inventory_hostname }}" {print $18}'
+                    delegate_to: ov-lb1
+                    register: state
+                    until: state.stdout.strip() == 'UP'
+                    retries: 30
+                    delay: 1
+                    changed_when: false
+          EOF
+          ansible-playbook lb-update.yml

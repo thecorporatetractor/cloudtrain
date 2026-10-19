@@ -413,6 +413,25 @@ tools/slots/run.sh vm -- services/lab-orchestrator/bin/labctl exam run --context
   --session-label labs.cloudtrain.dev/verify=auto --allow-missing --auto-solve sim-el-automation
 ```
 
+## Round 5 wave 2 (tier-A pod fleets, 23 labs built, none run live)
+
+Built, status `built`: ov-navigator-run-settings, ov-git-push-playbooks, ov-tags-partial-runs, ov-custom-facts-tier,
+ov-register-disk-report, ov-vault-db-credentials, ov-collections-offline, ov-automate-archive-evidence,
+ov-devcontainer-workflow, ov-lint-clean-role, ov-molecule-role-tests, ov-debug-failing-play, ov-migrate-core-219,
+ov-ci-pipeline-lint-test, ov-constructed-inventory, ov-dynamic-inventory-cmdb, ov-lookups-filters-ipam,
+ov-privilege-scoping, ov-custom-filter-plugin, ov-python-module-check-mode, ov-build-publish-collection,
+ov-rolling-update-serial, ov-delegate-lb-drain. Pack courses added for the matching path modules.
+
+Adaptations and blockers:
+- ov-git-push-playbooks, ov-ci-pipeline-lint-test: gitea:1 is not in the catalog; an el-lab pod (ov-git) holds the bare repo (CI: a poller on ov-ctl, /usr/local/lib/ov-ci/runner.py, runs the pipeline file and records runs under /var/ci/runs).
+- ov-devcontainer-workflow: blocked: needs code-server in ansible-ctl and a gateway web-access proxy.
+- ov-vault-db-credentials: no DB module in the mirror; vaulted value goes to a credentials file.
+- ov-build-publish-collection: adapted: no Galaxy server image yet; publish = upload to an HTTP share (ov-share).
+- ov-delegate-lb-drain: needs haproxy from the el10 mirror in an el-lab pod (own setup step, 600 s; ov-lb1 has cpu 0.5 / 512 MiB); if it does not install, move to VMs.
+- ov-tags-partial-runs: removes the preinstalled tree package (no mirror dependency); the certificate uses openssl, not community.crypto (no python cryptography in the pods).
+
+Verify queue: all 23 on the remote batch runner (labctl verify, two seeds, mutations, alternatives).
+
 ## Open questions (user)
 
 - **Editor:** the image ships vim and nano. The curriculum lists code-server (browser VS Code,

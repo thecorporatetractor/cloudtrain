@@ -1,0 +1,458 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-tags-partial-runs
+  title: Run only the certificate part of the site playbook
+  domain: automation
+  frameworks:
+  - ex294-aligned:run-content
+  difficulty: easy
+  estimatedMinutes: 15
+  tags:
+  - ansible
+  - tags
+  - certificates
+  version: 1
+spec:
+  description: |
+    The portal certificate on the claims nodes expires within hours. The project
+    **`/home/learner/claims-automation`** has a `site.yml` that removes a legacy package,
+    writes a banner and manages the portal certificate (`/etc/ov/pki/portal.crt`) on all claims
+    nodes. Nobody wants the package removed during this emergency change.
+
+    Add the tag **`cert`** to the certificate tasks of `site.yml` (and only those), then run the
+    playbook with that tag only so the certificate is renewed everywhere and the package is
+    still installed on every node. Do not remove or rename tasks.
+  objectives:
+  - Tag the tasks that belong to one change
+  - Run a playbook with --tags
+  - List the tasks a tag selects before running
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    certdays:
+      type: choice
+      values:
+      - 90
+      - 180
+      - 365
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth3
+      b: ov-db-1:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      mkdir -p /etc/ov/pki
+      if [ ! -f /etc/ov/pki/portal.crt ]; then
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=portal.orrinvale.example" \
+          -keyout /etc/ov/pki/portal.key -out /etc/ov/pki/portal.crt >/dev/null 2>&1
+        chmod 0600 /etc/ov/pki/portal.key
+      fi
+      rpm -q tree >/dev/null 2>&1 || echo "the tree package is missing from the image" >&2
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-db-1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+          claims_db:
+            hosts:
+              ov-db-1:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+      cat > $p/site.yml <<'EOF'
+      - name: Claims baseline
+        hosts: claims
+        become: true
+        tasks:
+          - name: Retire the legacy tree utility
+            ansible.builtin.dnf:
+              name: tree
+              state: absent
+              disablerepo: "*"
+
+          - name: Portal banner
+            ansible.builtin.copy:
+              dest: /etc/ov/portal-banner
+              content: "Orrin and Vale claims portal\n"
+              mode: "0644"
+
+          - name: Portal certificate expiry
+            ansible.builtin.command: openssl x509 -checkend 2592000 -noout -in /etc/ov/pki/portal.crt
+            register: portal_cert
+            changed_when: false
+            failed_when: false
+
+          - name: Portal certificate renewal
+            ansible.builtin.command: >-
+              openssl req -x509 -newkey rsa:2048 -nodes -days {{certdays}}
+              -subj /CN=portal.orrinvale.example
+              -keyout /etc/ov/pki/portal.key -out /etc/ov/pki/portal.crt
+            when: portal_cert.rc != 0
+
+          - name: Portal certificate key permissions
+            ansible.builtin.file:
+              path: /etc/ov/pki/portal.key
+              mode: "0600"
+      EOF
+      chown learner:learner $p/site.yml
+      touch /var/tmp/.ct-tags-start
+  checks:
+  - id: state-claimsweb1
+    description: 'ov-claims-web1: the certificate no longer expires soon and the legacy package is still installed'
+    type: shell
+    'on': ov-claims-web1
+    skills: &a189
+    - automation.content.tags
+    weight: 2
+    command: &chk_state-n |
+      r=""
+      openssl x509 -noout -checkend $((30*86400)) -in /etc/ov/pki/portal.crt >/dev/null 2>&1 || r="$r cert-expiring"
+      rpm -q tree >/dev/null 2>&1 || r="$r package-removed"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: state-claimsweb2
+    description: 'ov-claims-web2: the certificate no longer expires soon and the legacy package is still installed'
+    type: shell
+    'on': ov-claims-web2
+    skills: *a189
+    weight: 2
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: state-db1
+    description: 'ov-db-1: the certificate no longer expires soon and the legacy package is still installed'
+    type: shell
+    'on': ov-db-1
+    skills: *a189
+    weight: 2
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: tag-selection
+    description: Selecting the certificate tag lists only the three certificate tasks, and the playbook still has all five tasks
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.content.tags
+    weight: 2
+    command: |
+      cd /home/learner/claims-automation
+      all=$(ct-ansible run . ansible-playbook site.yml --list-tasks 2>/dev/null | grep -c '^      .*TAGS:')
+      sel=$(ct-ansible run . ansible-playbook site.yml --list-tasks --tags cert 2>/dev/null | grep '^      .*TAGS:')
+      n=$(printf '%s\n' "$sel" | grep -c '^      .*TAGS:')
+      [ "$all" = 5 ] || { echo "tasks=$all"; exit 0; }
+      printf '%s\n' "$sel" | grep -qiE 'legacy|banner' && { echo "non-cert-tasks-selected"; exit 0; }
+      [ "$n" = 3 ] && echo cert-only || echo "selected=$n"
+    expect:
+      match: exact
+      value: cert-only
+  - id: tagged-rerun
+    description: Running only the certificate tag again reports no changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.content.tags
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/claims-automation site.yml --tags cert
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Which tasks?
+    body: 'Three tasks deal with the certificate: the expiry check, the renewal and the key permissions. The renewal reads the result of the expiry check, so tagging one without the other breaks a tags-only run.'
+    cost: 1
+  - title: Check before you run
+    body: '`ansible-playbook site.yml --list-tasks --tags cert` shows what a tag selects without touching any host.'
+    cost: 1
+  misconceptions:
+  - id: tags-only-renewal
+    description: Tags only the renewal task, so the tasks it depends on are skipped by the tags-only run.
+    feedback: The renewal task needs the result of the expiry check; every task the certificate work depends on has to carry the tag.
+    expectFail:
+    - state-claimsweb1
+    - state-claimsweb2
+    - state-db1
+    - tag-selection
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > site.yml <<'EOF'
+        - name: Claims baseline
+          hosts: claims
+          become: true
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Portal banner
+              ansible.builtin.copy:
+                dest: /etc/ov/portal-banner
+                content: "Orrin and Vale claims portal\n"
+                mode: "0644"
+
+            - name: Portal certificate expiry
+              ansible.builtin.command: openssl x509 -checkend 2592000 -noout -in /etc/ov/pki/portal.crt
+              register: portal_cert
+              changed_when: false
+              failed_when: false
+
+            - name: Portal certificate renewal
+              ansible.builtin.command: >-
+                openssl req -x509 -newkey rsa:2048 -nodes -days {{certdays}}
+                -subj /CN=portal.orrinvale.example
+                -keyout /etc/ov/pki/portal.key -out /etc/ov/pki/portal.crt
+              when: portal_cert.rc != 0
+              tags: cert
+
+            - name: Portal certificate key permissions
+              ansible.builtin.file:
+                path: /etc/ov/pki/portal.key
+                mode: "0600"
+        EOF
+        ansible-playbook site.yml --tags cert || true
+  - id: tag-everything
+    description: Gives every task the certificate tag, so the tag run removes the package too.
+    feedback: Only the certificate tasks may carry the tag; the package task must not run in a tags-only run.
+    expectFail:
+    - state-claimsweb1
+    - state-claimsweb2
+    - state-db1
+    - tag-selection
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > site.yml <<'EOF'
+        - name: Claims baseline
+          hosts: claims
+          become: true
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+              tags: cert
+
+            - name: Portal banner
+              ansible.builtin.copy:
+                dest: /etc/ov/portal-banner
+                content: "Orrin and Vale claims portal\n"
+                mode: "0644"
+              tags: cert
+
+            - name: Portal certificate expiry
+              ansible.builtin.command: openssl x509 -checkend 2592000 -noout -in /etc/ov/pki/portal.crt
+              register: portal_cert
+              changed_when: false
+              failed_when: false
+              tags: cert
+
+            - name: Portal certificate renewal
+              ansible.builtin.command: >-
+                openssl req -x509 -newkey rsa:2048 -nodes -days {{certdays}}
+                -subj /CN=portal.orrinvale.example
+                -keyout /etc/ov/pki/portal.key -out /etc/ov/pki/portal.crt
+              when: portal_cert.rc != 0
+              tags: cert
+
+            - name: Portal certificate key permissions
+              ansible.builtin.file:
+                path: /etc/ov/pki/portal.key
+                mode: "0600"
+              tags: cert
+        EOF
+        ansible-playbook site.yml --tags cert
+  - id: full-run-no-tags
+    description: Skips tagging and simply runs the whole playbook.
+    feedback: 'Run only the certificate part: tag those tasks and select the tag; the package task must not run.'
+    expectFail:
+    - state-claimsweb1
+    - state-claimsweb2
+    - state-db1
+    - tag-selection
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        ansible-playbook site.yml
+  solution:
+    explanation: |
+      Put `tags: cert` on the three certificate tasks (expiry check, renewal and key permissions; the renewal depends on the
+      check) and nothing else, then run `ansible-playbook site.yml --tags cert`. Only those tasks run, the
+      certificate is renewed and the package task never executes. A second tag run changes nothing.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        cat > site.yml <<'EOF'
+        - name: Claims baseline
+          hosts: claims
+          become: true
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+              tags: packages
+
+            - name: Portal banner
+              ansible.builtin.copy:
+                dest: /etc/ov/portal-banner
+                content: "Orrin and Vale claims portal\n"
+                mode: "0644"
+
+            - name: Portal certificate expiry
+              ansible.builtin.command: openssl x509 -checkend 2592000 -noout -in /etc/ov/pki/portal.crt
+              register: portal_cert
+              changed_when: false
+              failed_when: false
+              tags: cert
+
+            - name: Portal certificate renewal
+              ansible.builtin.command: >-
+                openssl req -x509 -newkey rsa:2048 -nodes -days {{certdays}}
+                -subj /CN=portal.orrinvale.example
+                -keyout /etc/ov/pki/portal.key -out /etc/ov/pki/portal.crt
+              when: portal_cert.rc != 0
+              tags: cert
+
+            - name: Portal certificate key permissions
+              ansible.builtin.file:
+                path: /etc/ov/pki/portal.key
+                mode: "0600"
+              tags: cert
+        EOF
+        ansible-playbook site.yml --tags cert
+    alternatives:
+    - id: block-with-tag
+      description: Wraps the three certificate tasks in one block that carries the tag.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > site.yml <<'EOF'
+          - name: Claims baseline
+            hosts: claims
+            become: true
+            tasks:
+              - name: Retire the legacy tree utility
+                ansible.builtin.dnf:
+                  name: tree
+                  state: absent
+                  disablerepo: "*"
+
+              - name: Portal banner
+                ansible.builtin.copy:
+                  dest: /etc/ov/portal-banner
+                  content: "Orrin and Vale claims portal\n"
+                  mode: "0644"
+
+              - name: Portal certificate tasks
+                tags: [cert]
+                block:
+                  - name: Portal certificate expiry
+                    ansible.builtin.command: openssl x509 -checkend 2592000 -noout -in /etc/ov/pki/portal.crt
+                    register: portal_cert
+                    changed_when: false
+                    failed_when: false
+
+                  - name: Portal certificate renewal
+                    ansible.builtin.command: >-
+                      openssl req -x509 -newkey rsa:2048 -nodes -days {{certdays}}
+                      -subj /CN=portal.orrinvale.example
+                      -keyout /etc/ov/pki/portal.key -out /etc/ov/pki/portal.crt
+                    when: portal_cert.rc != 0
+
+                  - name: Portal certificate key permissions
+                    ansible.builtin.file:
+                      path: /etc/ov/pki/portal.key
+                      mode: "0600"
+          EOF
+          ansible-playbook site.yml --tags cert

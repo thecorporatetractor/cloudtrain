@@ -1,0 +1,935 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-ci-pipeline-lint-test
+  title: Gate the automation repository with a CI pipeline
+  domain: automation
+  frameworks:
+  - linuxplus:automation-scripting
+  difficulty: hard
+  estimatedMinutes: 35
+  tags:
+  - ansible
+  - ci
+  - lint
+  - molecule
+  - git
+  version: 1
+spec:
+  description: |
+    The claims automation repository **`git@ov-git:claims-automation.git`** (a role `audit_agent` with a Molecule
+    scenario, a site playbook and an inventory) has no automated checks. A small pipeline runner on the control node
+    watches every branch of the repository; whenever a branch tip changes it checks the commit out and executes the
+    steps of **`.ov-ci.yml`** at the top of the repository:
+
+    ```yaml
+    steps:
+      - name: <step name>
+        run: <shell command, run from the repository root>
+    ```
+
+    Steps run in order and the run stops at the first failing step. Results appear in `/var/ci/runs` (the command
+    `ov-ci-runs` lists them; the runner checks the branch tips every few seconds, so wait for a run to finish before
+    you push again).
+
+    On a new branch **`ci`**, add a pipeline that runs, in this order, the playbook syntax check of `site.yml`,
+    `ansible-lint` and the role's Molecule scenario. Then show that the gate works: push a commit that contains a lint
+    error (for example a task without a name) so the run fails at the lint step, and push the fix afterwards so the next
+    run passes all three steps. Leave `main` unchanged.
+  objectives:
+  - Express a test pipeline as a file in the repository
+  - Chain syntax check, lint and Molecule
+  - Prove a gate by pushing a failure and its fix
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    interval:
+      type: int
+      min: 10
+      max: 90
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-git
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-test-el1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-git:eth1
+    - a: ov-ctl:eth2
+      b: ov-test-el1:eth1
+  setup:
+  - 'on': ov-git
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-git) a=40 ;; ov-test-el1) a=71 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-git)
+          id git >/dev/null 2>&1 || useradd -m -d /srv/git -s /bin/bash -c "Git service" git
+          echo 'git:Ov-boot-{{bootpw}}' | chpasswd
+          install -d -o git -g git /srv/git ;;
+      esac
+
+      case $(hostname) in
+        ov-test-el1)
+          [ -f /run/ov-audit-agent.pid ] && kill "$(cat /run/ov-audit-agent.pid)" 2>/dev/null || true
+          rm -f /run/ov-audit-agent.pid /etc/ov/audit-agent.conf /usr/local/sbin/ov-audit-agent ;;
+      esac
+  - 'on': ov-test-el1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-git=10.70.0.40 ov-test-el1=10.70.0.71
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-git ov-test-el1
+      ct-ansible pushkey git Ov-boot-{{bootpw}} ov-git
+      ct-ansible run /home/learner ssh ovauto@ov-git "sudo -n usermod -p '*' git"
+  - 'on': ov-git
+    run: |
+      set -eu
+      cd /srv/git
+      runuser -u git -- sh -eu <<'EOS'
+      if [ ! -d /srv/git/claims-automation.git ]; then
+        git init -q --bare -b main /srv/git/claims-automation.git
+        t=$(mktemp -d); git -C $t init -q -b main
+        printf '# Orrin and Vale: claims-automation\n' > $t/README.md
+        mkdir -p $t/$(dirname README.md)
+        cat > $t/README.md <<'EOF'
+      # Claims automation
+
+      Playbooks and roles of the claims platform team.
+      EOF
+        mkdir -p $t/$(dirname ansible.cfg)
+        cat > $t/ansible.cfg <<'EOF'
+      [defaults]
+      inventory = inventory.yml
+      remote_user = ovauto
+      roles_path = ./roles
+      EOF
+        mkdir -p $t/$(dirname inventory.yml)
+        cat > $t/inventory.yml <<'EOF'
+      audit_nodes:
+        hosts:
+          ov-test-el1:
+      EOF
+        mkdir -p $t/$(dirname site.yml)
+        cat > $t/site.yml <<'EOF'
+      ---
+      - name: Audit agent everywhere
+        hosts: audit_nodes
+        become: true
+        roles:
+          - role: audit_agent
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/defaults/main.yml)
+        cat > $t/roles/audit_agent/defaults/main.yml <<'EOF'
+      ---
+      audit_agent_interval: {{interval}}
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/templates/audit-agent.conf.j2)
+        cat > $t/roles/audit_agent/templates/audit-agent.conf.j2 <<'EOF'
+      interval={{ audit_agent_interval }}
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/files/ov-audit-agent)
+        cat > $t/roles/audit_agent/files/ov-audit-agent <<'EOF'
+      #!/bin/sh
+      # Orrin and Vale audit agent: writes a heartbeat every few seconds
+      echo $$ > /run/ov-audit-agent.pid
+      while :; do
+        date +%s >> /var/log/ov-audit-agent.log
+        sleep 5
+      done
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/tasks/main.yml)
+        cat > $t/roles/audit_agent/tasks/main.yml <<'EOF'
+      ---
+      - name: Agent configuration directory
+        ansible.builtin.file:
+          path: /etc/ov
+          state: directory
+          mode: "0755"
+
+      - name: Agent configuration
+        ansible.builtin.template:
+          src: audit-agent.conf.j2
+          dest: /etc/ov/audit-agent.conf
+          owner: root
+          group: root
+          mode: "0644"
+
+      - name: Agent program
+        ansible.builtin.copy:
+          src: ov-audit-agent
+          dest: /usr/local/sbin/ov-audit-agent
+          owner: root
+          group: root
+          mode: "0755"
+
+      - name: Start the agent
+        ansible.builtin.shell: setsid nohup /usr/local/sbin/ov-audit-agent >/dev/null 2>&1 </dev/null &
+        args:
+          creates: /run/ov-audit-agent.pid
+
+      - name: Wait for the agent to register
+        ansible.builtin.wait_for:
+          path: /run/ov-audit-agent.pid
+          timeout: 15
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/meta/main.yml)
+        cat > $t/roles/audit_agent/meta/main.yml <<'EOF'
+      galaxy_info:
+        namespace: orrinvale
+        role_name: audit_agent
+        author: Orrin and Vale platform team
+        description: Audit agent for branch and claims hosts
+        license: GPL-3.0-or-later
+        min_ansible_version: "2.14"
+        platforms:
+          - name: EL
+            versions: [all]
+      dependencies: []
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/molecule/default/molecule.yml)
+        cat > $t/roles/audit_agent/molecule/default/molecule.yml <<'EOF'
+      ---
+      driver:
+        name: default
+        options:
+          managed: false
+      platforms:
+        - name: ov-test-el1
+          groups: [audit_nodes]
+      provisioner:
+        name: ansible
+        inventory:
+          group_vars:
+            all:
+              ansible_user: ovauto
+      verifier:
+        name: ansible
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/molecule/default/converge.yml)
+        cat > $t/roles/audit_agent/molecule/default/converge.yml <<'EOF'
+      ---
+      - name: Converge
+        hosts: audit_nodes
+        become: true
+        tasks:
+          - name: Apply the audit agent role
+            ansible.builtin.include_role:
+              name: orrinvale.audit_agent
+      EOF
+        mkdir -p $t/$(dirname roles/audit_agent/molecule/default/verify.yml)
+        cat > $t/roles/audit_agent/molecule/default/verify.yml <<'EOF'
+      ---
+      - name: Verify
+        hosts: audit_nodes
+        become: true
+        gather_facts: false
+        tasks:
+          - name: Agent configuration
+            ansible.builtin.stat:
+              path: /etc/ov/audit-agent.conf
+            register: audit_agent_conf
+
+          - name: Agent process id
+            ansible.builtin.slurp:
+              src: /run/ov-audit-agent.pid
+            register: audit_agent_pid
+            failed_when: false
+
+          - name: Agent liveness
+            ansible.builtin.command: kill -0 {{ audit_agent_pid.content | default('eA==') | b64decode | trim }}
+            register: audit_agent_alive
+            changed_when: false
+            failed_when: false
+
+          - name: The configuration is owned by root and the agent runs
+            ansible.builtin.assert:
+              that:
+                - audit_agent_conf.stat.exists
+                - audit_agent_conf.stat.pw_name == 'root'
+                - audit_agent_alive.rc == 0
+      EOF
+        git -C $t add -A
+        git -C $t -c user.name='O&V platform' -c user.email=platform@orrinvale.example commit -q -m 'Initial commit'
+        git -C $t push -q /srv/git/claims-automation.git main
+        rm -rf $t
+      fi
+      EOS
+  - 'on': ov-ctl
+    timeoutSec: 120
+    run: |
+      set -eu
+      install -d /usr/local/lib/ov-ci /var/ci /var/ci/runs
+      cat > /usr/local/lib/ov-ci/runner.py <<'EOF'
+      #!/opt/ansible/bin/python3
+      """Orrin and Vale pipeline runner (lab helper): polls the Git server for branch tips and runs the
+      steps of .ov-ci.yml in a fresh checkout. One JSON record per run under /var/ci/runs."""
+      import json, os, secrets, shlex, subprocess, sys, time, shutil
+      import yaml
+
+      REPO = os.environ.get('OV_CI_REPO', 'git@ov-git:claims-automation.git')
+      BASE = os.environ.get('OV_CI_BASE', '/var/ci')
+      USER = os.environ.get('OV_CI_USER', 'learner')
+      ENV = {'HOME': '/home/learner', 'USER': 'learner', 'LOGNAME': 'learner', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+             'PATH': '/opt/ansible/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'ANSIBLE_NOCOLOR': '1', 'TERM': 'dumb',
+             # the learner's ~/.gitconfig (url.insteadOf, replace refs) must not redirect the runner's git calls
+             'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_NO_REPLACE_OBJECTS': '1'}
+      if USER == '':
+          ENV = dict(os.environ, ANSIBLE_NOCOLOR='1')
+
+
+      # lint and export run as an unprivileged account that is neither root nor the learner, so nothing the learner's
+      # steps or background processes do can reach the judged copy
+      JUDGE = 'nobody' if USER else ''
+
+
+      def run(cmd, cwd=None, timeout=300, user=None, home=None):
+          user = USER if user is None else user
+          env = dict(ENV)
+          if home:
+              env['HOME'] = home
+          argv = ['/bin/sh', '-c', cmd]
+          if user:
+              argv = ['runuser', '-u', user, '--', 'env', '-i'] + ['%s=%s' % kv for kv in env.items()] + argv
+          try:
+              p = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, text=True)
+              return p.returncode, p.stdout
+          except subprocess.TimeoutExpired as e:
+              return 124, (e.stdout or '') if isinstance(e.stdout, str) else ''
+
+
+      def tips():
+          rc, out = run('git ls-remote --heads %s' % REPO, cwd='/')
+          if rc != 0:
+              return None
+          res = {}
+          for line in out.splitlines():
+              parts = line.split()
+              if len(parts) == 2 and parts[1].startswith('refs/heads/'):
+                  res[parts[1]] = parts[0]
+          return res
+
+
+      def record(n, ref, sha, chain, steps, status, note='', lint=None):
+          rec = {'n': n, 'ref': ref, 'sha': sha, 'chain': chain, 'status': status, 'steps': steps, 'note': note,
+                 'lint': lint or {'verdict': 'none'}, 'finished': int(time.time())}
+          tmp = os.path.join(BASE, 'runs', '.%06d.tmp' % n)
+          with open(tmp, 'w') as f:
+              json.dump(rec, f)
+          os.chmod(tmp, 0o644)
+          os.rename(tmp, os.path.join(BASE, 'runs', '%06d.json' % n))
+
+
+      # The runner re-lints every commit itself, whatever the learner's pipeline says: on a copy without .git and
+      # without any lint configuration, with a configuration this runner owns. Skip tags, noqa comments and lint
+      # configuration or ignore files (including a .gitignore that hides yml files) in the commit make the verdict "tampered".
+      LINT_CFG = '/usr/local/lib/ov-ci/ansible-lint.yml'
+      LINT_SCRIPT = r"""
+      cd src || exit 4
+      if find . \( -name '.ansible-lint*' -o -name 'ansible-lint*' -o -name '.config' -o -name '.yamllint*' -o -name '.gitattributes' \) | grep -q .; then exit 3; fi
+      if grep -rIEq 'skip_ansible_lint|noqa' .; then exit 3; fi
+      # ansible-lint skips every path a .gitignore matches: a .gitignore that hides yml files, roles or the playbooks is tampering,
+      # and whatever else is left is deleted so it cannot hide anything from the judged export
+      if find . -name .gitignore -type f -exec grep -qsEi 'yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]' {} +; then exit 3; fi
+      find . -name .gitignore -delete
+      # the configuration sits next to the export: ansible-lint only lints files below the directory of its configuration
+      cp %s ../lint-config.yml || exit 4
+      exec timeout 150 ansible-lint -c ../lint-config.yml --offline -q .
+      """ % LINT_CFG
+
+
+      def export_pristine(repo, sha, judge):
+          # Export the commit exactly as pushed, before any pipeline step has run: git archive as the learner (the
+          # clone is still untouched), unpacked by the judge account into a directory the learner cannot write.
+          # The export is size-bounded and must contain every file of the commit.
+          gitenv = ' '.join('%s=%s' % (k, shlex.quote(v)) for k, v in ENV.items())
+          if USER:
+              arch = 'runuser -u %s -- env -i %s ' % (USER, gitenv)
+              untar = 'runuser -u %s -- env -i %s ' % (JUDGE, gitenv)
+          else:
+              arch = untar = ''
+          src = os.path.join(judge, 'src')
+          cmd = ('set -o pipefail 2>/dev/null; %sgit -C %s -c core.attributesFile=/dev/null archive --format=tar %s'
+                 ' | head -c 67108864 | %star -x --no-same-owner --no-same-permissions -C %s -f -'
+                 % (arch, shlex.quote(repo), shlex.quote(sha), untar, shlex.quote(src)))
+          p = subprocess.run(['/bin/bash', '-c', cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, text=True)
+          if p.returncode != 0:
+              return False
+          rc, out = run('git ls-tree -r --name-only %s | wc -l' % shlex.quote(sha), cwd=repo, timeout=30)
+          rc2, out2 = run('find . -mindepth 1 ! -type d | wc -l', cwd=src, timeout=60, user=JUDGE)
+          return rc == 0 and rc2 == 0 and out.strip().isdigit() and out.strip() == out2.strip()
+
+
+      def independent_lint(judge):
+          rc, out = run(LINT_SCRIPT, cwd=judge, timeout=200, user=JUDGE, home=judge)
+          verdict = {0: 'clean', 2: 'findings', 3: 'tampered'}.get(rc, 'error')
+          return {'verdict': verdict, 'rc': rc, 'tail': out[-600:]}
+
+
+      def step_timeout(s):
+          try:
+              return max(1, min(int(s.get('timeout', 300)), 900))
+          except Exception:
+              return 300
+
+
+      def pipeline(n, ref, sha):
+          # unguessable per-run directories: /var/ci/work and /var/ci/judge are traverse-only, so learner processes
+          # left over from earlier runs cannot list or find them
+          token = '%d-%s' % (n, secrets.token_hex(8))
+          work = os.path.join(BASE, 'work', token)
+          judge = os.path.join(BASE, 'judge', token)
+          os.makedirs(work, exist_ok=True)
+          os.makedirs(os.path.join(judge, 'src'), exist_ok=True)
+          try:
+              if USER:
+                  shutil.chown(work, USER)
+                  shutil.chown(judge, JUDGE)
+                  shutil.chown(os.path.join(judge, 'src'), JUDGE)
+              os.chmod(work, 0o700)
+              os.chmod(judge, 0o755)
+              rc, out = run('git clone -q %s repo && cd repo && git checkout -q %s && git rev-list --first-parent -50 %s' % (REPO, sha, sha), cwd=work)
+              if rc != 0:
+                  record(n, ref, sha, [], [], 'error', 'checkout failed')
+                  return
+              chain = out.split()
+              repo = os.path.join(work, 'repo')
+              if not export_pristine(repo, sha, judge):
+                  record(n, ref, sha, chain, [], 'error', 'export failed')
+                  return
+              # the learner's checkout is read as the learner, never by this root process; bounded size and time
+              rc, text = run('test -f .ov-ci.yml && test ! -L .ov-ci.yml && head -c 65536 .ov-ci.yml', cwd=repo, timeout=30)
+              if rc != 0:
+                  record(n, ref, sha, chain, [], 'no-pipeline', 'no .ov-ci.yml in this commit')
+                  return
+              try:
+                  spec = yaml.safe_load(text) or {}
+                  steps = [s for s in spec.get('steps', [])]
+                  assert steps and all(isinstance(s, dict) and 'run' in s for s in steps)
+              except Exception:
+                  record(n, ref, sha, chain, [], 'error', 'invalid .ov-ci.yml')
+                  return
+              recs, failed = [], False
+              for i, s in enumerate(steps):
+                  name = str(s.get('name', 'step%d' % (i + 1)))[:80]
+                  cmd = str(s['run'])[:2000]
+                  if failed:
+                      recs.append({'name': name, 'run': cmd, 'status': 'skipped', 'rc': None, 'tail': ''})
+                      continue
+                  t0 = time.time()
+                  rc, out = run(cmd, cwd=repo, timeout=step_timeout(s))
+                  recs.append({'name': name, 'run': cmd, 'status': 'passed' if rc == 0 else 'failed', 'rc': rc,
+                               'seconds': int(time.time() - t0), 'tail': out[-600:]})
+                  failed = rc != 0
+              lint = independent_lint(judge)
+              record(n, ref, sha, chain, recs, 'failed' if failed else 'passed', lint=lint)
+          except Exception as e:
+              try:
+                  record(n, ref, sha, [], [], 'error', 'runner error: %s' % type(e).__name__)
+              except Exception:
+                  pass
+          finally:
+              shutil.rmtree(work, ignore_errors=True)
+              shutil.rmtree(judge, ignore_errors=True)
+
+
+      def main():
+          os.makedirs(os.path.join(BASE, 'runs'), exist_ok=True)
+          for d in ('work', 'judge'):
+              os.makedirs(os.path.join(BASE, d), exist_ok=True)
+              os.chmod(os.path.join(BASE, d), 0o711)
+          seen = {}
+          n = len([f for f in os.listdir(os.path.join(BASE, 'runs')) if f.endswith('.json')])
+          first = True
+          while True:
+              t = tips()
+              if t is not None:
+                  if first:
+                      seen = dict(t)  # the starting state is not a run
+                      first = False
+                  for ref, sha in sorted(t.items()):
+                      if seen.get(ref) != sha:
+                          seen[ref] = sha
+                          n += 1
+                          try:
+                              pipeline(n, ref, sha)
+                          except Exception:
+                              pass
+              time.sleep(float(os.environ.get('OV_CI_POLL', '3')))
+
+
+      if __name__ == '__main__':
+          main()
+      EOF
+      chmod 0755 /usr/local/lib/ov-ci/runner.py
+      printf -- '---\nskip_list: []\nwarn_list: []\n' > /usr/local/lib/ov-ci/ansible-lint.yml
+      chmod 0644 /usr/local/lib/ov-ci/ansible-lint.yml
+      cat > /usr/local/bin/ov-ci-runs <<'EOF'
+      #!/bin/sh
+      # one line per pipeline run: number, branch, commit, result, steps
+      for f in /var/ci/runs/*.json; do [ -f "$f" ] || continue; jq -r '[.n, .ref, .sha[0:7], .status, ([.steps[] | "\(.name)=\(.status)"] | join(" "))] | @tsv' "$f"; done
+      EOF
+      chmod 0755 /usr/local/bin/ov-ci-runs
+      pgrep -f /usr/local/lib/ov-ci/runner.py >/dev/null || setsid nohup /usr/local/lib/ov-ci/runner.py >/var/log/ov-ci-runner.log 2>&1 </dev/null &
+      sleep 6
+  checks:
+  - id: pipeline-file
+    description: Branch ci on the Git server carries a pipeline file that runs the syntax check, ansible-lint and the Molecule scenario
+    type: shell
+    'on': ov-git
+    skills:
+    - automation.quality.ci
+    - automation.devworkflow.git
+    weight: 2
+    command: |
+      g="runuser -u git -- git --git-dir=/srv/git/claims-automation.git"
+      $g rev-parse -q --verify refs/heads/ci >/dev/null || { echo no-branch; exit 0; }
+      f=$($g show ci:.ov-ci.yml 2>/dev/null) || { echo no-pipeline-file; exit 0; }
+      r=""
+      printf '%s' "$f" | grep -q -- '--syntax-check' || r="$r syntax-check"
+      printf '%s' "$f" | grep -q 'ansible-lint' || r="$r ansible-lint"
+      printf '%s' "$f" | grep -q 'molecule' || r="$r molecule"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: main-untouched
+    description: The main branch on the server still has only its first commit
+    type: shell
+    'on': ov-git
+    skills:
+    - automation.devworkflow.git
+    command: |
+      n=$(runuser -u git -- git --git-dir=/srv/git/claims-automation.git rev-list --count main 2>/dev/null)
+      [ "$n" = 1 ] && echo main-intact || echo "main-commits=$n"
+    expect:
+      match: exact
+      value: main-intact
+  - id: failed-lint-run
+    description: The run history shows a failed run of branch ci whose syntax check passed and whose lint step failed
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.ci
+    weight: 3
+    command: |
+      /opt/ansible/bin/python3 -I - failed <<'EOF'
+      import json, glob, sys, os, re, shlex
+      runs = [json.load(open(f)) for f in sorted(glob.glob('/var/ci/runs/*.json'))]
+      ci = [r for r in runs if r['ref'] == 'refs/heads/ci']
+      LINT_FLAGS = {'--strict', '-v', '-vv', '-q', '--nocolor', '--offline', '-p', '--parseable'}
+
+
+      def segments(cmd):
+          # simple commands joined by && only: no pipes, ;, ||, background, redirects or substitutions
+          if re.search(r'[|;<>`$(){}&\\\n]', cmd.replace('&&', '')):
+              return None
+          try:
+              return [shlex.split(seg) for seg in cmd.split('&&')]
+          except ValueError:
+              return None
+
+
+      def is_step(cmd, key):
+          segs = segments(cmd)
+          if not segs:
+              return False
+          hits = 0
+          for w in segs:
+              if not w:
+                  return False
+              if w[0] == 'cd' and len(w) == 2:
+                  continue
+              # only the bare tool names or their /opt/ansible/bin absolute paths: any other
+              # path (a learner-made script named molecule) is not the real tool
+              if '/' in w[0] and os.path.dirname(w[0]) != '/opt/ansible/bin':
+                  return False
+              b = os.path.basename(w[0])
+              if key == 'syntax' and b == 'ansible-playbook' and '--syntax-check' in w and 'site.yml' in w:
+                  hits += 1
+              elif key == 'molecule' and b == 'molecule' and len(w) >= 2 and w[1] == 'test':
+                  hits += 1
+              elif key == 'lint' and b == 'ansible-lint':
+                  args, i = w[1:], 0
+                  while i < len(args):
+                      a = args[i]
+                      if a == '--profile' and i + 1 < len(args):
+                          i += 2
+                          continue
+                      if a in LINT_FLAGS or not a.startswith('-'):
+                          i += 1
+                          continue
+                      return False
+                  hits += 1
+              else:
+                  return False
+          return hits == 1
+
+
+      def st(r, key):
+          return [s for s in r['steps'] if is_step(s['run'], key) and s.get('rc') not in (126, 127)]
+
+
+      def verdict(r):
+          return (r.get('lint') or {}).get('verdict')
+
+
+      want = sys.argv[1]
+      if want == 'failed':
+          for r in ci:
+              lint = st(r, 'lint'); syn = st(r, 'syntax')
+              if r['status'] == 'failed' and verdict(r) == 'findings' and lint and lint[0]['status'] == 'failed' and syn and syn[0]['status'] == 'passed':
+                  print('ok'); raise SystemExit
+          print('no-failed-lint-run' if ci else 'no-runs-on-ci')
+      else:
+          for i, r in enumerate(ci):
+              lint = st(r, 'lint'); syn = st(r, 'syntax'); mol = st(r, 'molecule')
+              if r['status'] != 'passed' or verdict(r) != 'clean' or not (lint and syn and mol) or any(s['status'] != 'passed' for s in r['steps']):
+                  continue
+              for f in ci[:i]:
+                  if f['status'] == 'failed' and verdict(f) == 'findings' and f['sha'] in r['chain'] and f['sha'] != r['sha']:
+                      print('ok'); raise SystemExit
+          print('no-green-run-after-a-failure')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: green-after-fix
+    description: A later run of branch ci passed all three steps and builds on the commit of the failed run
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.ci
+    weight: 3
+    command: |
+      /opt/ansible/bin/python3 -I - green <<'EOF'
+      import json, glob, sys, os, re, shlex
+      runs = [json.load(open(f)) for f in sorted(glob.glob('/var/ci/runs/*.json'))]
+      ci = [r for r in runs if r['ref'] == 'refs/heads/ci']
+      LINT_FLAGS = {'--strict', '-v', '-vv', '-q', '--nocolor', '--offline', '-p', '--parseable'}
+
+
+      def segments(cmd):
+          # simple commands joined by && only: no pipes, ;, ||, background, redirects or substitutions
+          if re.search(r'[|;<>`$(){}&\\\n]', cmd.replace('&&', '')):
+              return None
+          try:
+              return [shlex.split(seg) for seg in cmd.split('&&')]
+          except ValueError:
+              return None
+
+
+      def is_step(cmd, key):
+          segs = segments(cmd)
+          if not segs:
+              return False
+          hits = 0
+          for w in segs:
+              if not w:
+                  return False
+              if w[0] == 'cd' and len(w) == 2:
+                  continue
+              # only the bare tool names or their /opt/ansible/bin absolute paths: any other
+              # path (a learner-made script named molecule) is not the real tool
+              if '/' in w[0] and os.path.dirname(w[0]) != '/opt/ansible/bin':
+                  return False
+              b = os.path.basename(w[0])
+              if key == 'syntax' and b == 'ansible-playbook' and '--syntax-check' in w and 'site.yml' in w:
+                  hits += 1
+              elif key == 'molecule' and b == 'molecule' and len(w) >= 2 and w[1] == 'test':
+                  hits += 1
+              elif key == 'lint' and b == 'ansible-lint':
+                  args, i = w[1:], 0
+                  while i < len(args):
+                      a = args[i]
+                      if a == '--profile' and i + 1 < len(args):
+                          i += 2
+                          continue
+                      if a in LINT_FLAGS or not a.startswith('-'):
+                          i += 1
+                          continue
+                      return False
+                  hits += 1
+              else:
+                  return False
+          return hits == 1
+
+
+      def st(r, key):
+          return [s for s in r['steps'] if is_step(s['run'], key) and s.get('rc') not in (126, 127)]
+
+
+      def verdict(r):
+          return (r.get('lint') or {}).get('verdict')
+
+
+      want = sys.argv[1]
+      if want == 'failed':
+          for r in ci:
+              lint = st(r, 'lint'); syn = st(r, 'syntax')
+              if r['status'] == 'failed' and verdict(r) == 'findings' and lint and lint[0]['status'] == 'failed' and syn and syn[0]['status'] == 'passed':
+                  print('ok'); raise SystemExit
+          print('no-failed-lint-run' if ci else 'no-runs-on-ci')
+      else:
+          for i, r in enumerate(ci):
+              lint = st(r, 'lint'); syn = st(r, 'syntax'); mol = st(r, 'molecule')
+              if r['status'] != 'passed' or verdict(r) != 'clean' or not (lint and syn and mol) or any(s['status'] != 'passed' for s in r['steps']):
+                  continue
+              for f in ci[:i]:
+                  if f['status'] == 'failed' and verdict(f) == 'findings' and f['sha'] in r['chain'] and f['sha'] != r['sha']:
+                      print('ok'); raise SystemExit
+          print('no-green-run-after-a-failure')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Pipeline commands
+    body: The three commands are `ansible-playbook --syntax-check site.yml`, `ansible-lint` and `cd roles/audit_agent && molecule test`.
+    cost: 1
+  - title: Waiting for the runner
+    body: Run `ov-ci-runs` after each push until the new run shows a result. A run with Molecule takes about a minute; a failing lint step ends the run earlier.
+    cost: 1
+  misconceptions:
+  - id: no-lint-step
+    description: Builds a pipeline with only the syntax check and the Molecule scenario.
+    feedback: The pipeline must run ansible-lint; without it a lint error never makes a run fail.
+    expectFail:
+    - failed-lint-run
+    - pipeline-file
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 660
+      run: |
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c ci
+        wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+        cat > .ov-ci.yml <<'EOF'
+        steps:
+          - name: syntax
+            run: ansible-playbook --syntax-check site.yml
+          - name: molecule
+            run: cd roles/audit_agent && molecule test
+            timeout: 420
+        EOF
+        cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+        - ansible.builtin.shell: echo audit agent ready
+        EOF
+        git add -A
+        git commit -q -m 'Pipeline without lint'
+        git push -q -u origin ci
+        wait_runs 1
+  - id: lint-error-never-pushed
+    description: Keeps the code clean from the start, so there is never a failing run.
+    feedback: Push a commit with a lint error first so the history shows the pipeline stopping it, then fix it.
+    expectFail:
+    - failed-lint-run
+    - green-after-fix
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 660
+      run: |
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c ci
+        wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+        cat > .ov-ci.yml <<'EOF'
+        steps:
+          - name: syntax
+            run: ansible-playbook --syntax-check site.yml
+          - name: lint
+            run: ansible-lint
+          - name: molecule
+            run: cd roles/audit_agent && molecule test
+            timeout: 420
+        EOF
+        git add -A
+        git commit -q -m 'Add pipeline'
+        git push -q -u origin ci
+        wait_runs 1
+  - id: hide-with-gitignore
+    description: Fixes the red lint run by adding a .gitignore that hides the role and the playbook from ansible-lint, plus a clean dummy playbook.
+    feedback: The runner re-lints every commit itself and treats a .gitignore that hides yml files as tampering; the error has to be fixed in the task.
+    expectFail:
+    - green-after-fix
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 780
+      run: |
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c ci
+        wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+        cat > .ov-ci.yml <<'EOF'
+        steps:
+          - name: syntax
+            run: ansible-playbook --syntax-check site.yml
+          - name: lint
+            run: ansible-lint
+          - name: molecule
+            run: cd roles/audit_agent && molecule test
+            timeout: 420
+        EOF
+        cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+        - ansible.builtin.shell: echo audit agent ready
+        EOF
+        git add -A
+        git commit -q -m 'Add pipeline (and a sloppy task)'
+        git push -q -u origin ci
+        wait_runs 1
+        printf 'roles/\nsite.yml\n' > .gitignore
+        printf -- '---\n- name: Dummy\n  hosts: localhost\n  gather_facts: false\n  tasks:\n    - name: Nothing\n      ansible.builtin.debug:\n        msg: ok\n' > dummy.yml
+        git add -A
+        git commit -q -m 'Hide the finding'
+        git push -q origin ci
+        wait_runs 2
+  - id: wrong-pipeline-name
+    description: Saves the pipeline as ov-ci.yml without the leading dot.
+    feedback: The runner only reads .ov-ci.yml at the top of the repository.
+    expectFail:
+    - pipeline-file
+    - failed-lint-run
+    - green-after-fix
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 660
+      run: |
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c ci
+        wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+        cat > ov-ci.yml <<'EOF'
+        steps:
+          - name: syntax
+            run: ansible-playbook --syntax-check site.yml
+          - name: lint
+            run: ansible-lint
+          - name: molecule
+            run: cd roles/audit_agent && molecule test
+            timeout: 420
+        EOF
+        cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+        - ansible.builtin.shell: echo audit agent ready
+        EOF
+        git add -A
+        git commit -q -m 'Add pipeline'
+        git push -q -u origin ci
+        wait_runs 1
+  solution:
+    explanation: |
+      The pipeline file `.ov-ci.yml` lists three steps: `ansible-playbook --syntax-check site.yml`, `ansible-lint` and
+      `molecule test` in the role directory. Pushing it together with a task that has no name and uses `shell` makes the lint
+      step fail (the run history shows the syntax check green, lint red, Molecule skipped). A second commit removes the task;
+      the next run passes all three steps. `main` is never touched. The run history is in `/var/ci/runs` (`ov-ci-runs`).
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 900
+      run: |
+        set -e
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c ci
+        wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+        cat > .ov-ci.yml <<'EOF'
+        steps:
+          - name: syntax
+            run: ansible-playbook --syntax-check site.yml
+          - name: lint
+            run: ansible-lint
+          - name: molecule
+            run: cd roles/audit_agent && molecule test
+            timeout: 420
+        EOF
+        cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+        - ansible.builtin.shell: echo audit agent ready
+        EOF
+        git add -A
+        git commit -q -m 'Add pipeline (and a sloppy task)'
+        git push -q -u origin ci
+        wait_runs 1
+        python3 - <<'PY'
+        import re
+        p='roles/audit_agent/tasks/main.yml'
+        s=open(p).read()
+        s=s[:s.index('\n- ansible.builtin.shell: echo audit agent ready')]+'\n'
+        open(p,'w').write(s.rstrip('\n')+'\n')
+        PY
+        git commit -qam 'Remove the unnamed task'
+        git push -q origin ci
+        wait_runs 2
+    alternatives:
+    - id: basic-profile
+      description: Runs ansible-lint with the basic profile and removes the sloppy task with sed.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q -c ci
+          wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+          cat > .ov-ci.yml <<'EOF'
+          steps:
+            - name: syntax
+              run: ansible-playbook --syntax-check site.yml
+            - name: lint
+              run: ansible-lint --profile basic
+            - name: molecule
+              run: cd roles/audit_agent && molecule test
+              timeout: 420
+          EOF
+          cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+          - ansible.builtin.shell: echo audit agent ready
+          EOF
+          git add -A
+          git commit -q -m 'Add pipeline with the basic profile'
+          git push -q -u origin ci
+          wait_runs 1
+          head -n -2 roles/audit_agent/tasks/main.yml > /tmp/tasks.new && cat /tmp/tasks.new > roles/audit_agent/tasks/main.yml
+          git commit -qam 'Drop the unnamed task'
+          git push -q origin ci
+          wait_runs 2

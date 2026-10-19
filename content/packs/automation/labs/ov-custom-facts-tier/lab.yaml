@@ -1,0 +1,574 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-custom-facts-tier
+  title: Publish service tier as a custom fact
+  domain: automation
+  frameworks:
+  - ex294-aligned:core-components
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - ansible
+  - facts
+  - conditionals
+  version: 1
+spec:
+  description: |
+    Every Orrin and Vale host has a support tier and an owner team, recorded as the host variables
+    `support_tier` and `owner_team` in **`/home/learner/claims-automation/host_vars/`** (do not edit them).
+    Operations wants the same data on the hosts themselves.
+
+    Write **`/home/learner/claims-automation/facts.yml`** so that
+
+    - every host publishes a local fact file **`/etc/ansible/facts.d/ov.fact`** and Ansible then reports
+      `ansible_local.ov.tier` and `ansible_local.ov.team`, and
+    - a follow-up play installs the paging agent (supplied as `files/ov-pager-agent`) as
+      **`/usr/local/bin/ov-pager-agent`** (mode 0755), together with **`/etc/ov/pager/agent.conf`**
+      containing the line `team=<owner team>`, **only on hosts whose tier is `gold`**. Other hosts must
+      not get either file.
+
+    Run the playbook; the grader runs it again and expects no changes.
+  objectives:
+  - Write a custom fact under facts.d
+  - Read ansible_local in a later play
+  - Install software conditionally on a fact
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    teamweb:
+      type: choice
+      values:
+      - portal
+      - intake
+      - edge
+    tierweb2:
+      type: choice
+      values:
+      - silver
+      - bronze
+    tierquote:
+      type: choice
+      values:
+      - silver
+      - bronze
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-quote-api1
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth3
+      b: ov-db-1:eth1
+    - a: ov-ctl:eth4
+      b: ov-quote-api1:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-claims-web1) t=gold;       m={{teamweb}} ;;
+        ov-claims-web2) t={{tierweb2}}; m={{teamweb}} ;;
+        ov-db-1)        t=gold;       m=data ;;
+        ov-quote-api1)  t={{tierquote}}; m=quoting ;;
+      esac
+      printf '%s %s\n' "$t" "$m" > /var/tmp/.ct-expect-tier
+      rm -rf /etc/ansible/facts.d /usr/local/bin/ov-pager-agent /etc/ov/pager
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-db-1
+    run: *ov-node
+  - 'on': ov-quote-api1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+          claims_db:
+            hosts:
+              ov-db-1:
+      quoting:
+        hosts:
+          ov-quote-api1:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      install -d -o learner -g learner $p/host_vars $p/files
+      cat > $p/host_vars/ov-claims-web1.yml <<'EOF'
+      support_tier: gold
+      owner_team: {{teamweb}}
+      EOF
+      cat > $p/host_vars/ov-claims-web2.yml <<'EOF'
+      support_tier: {{tierweb2}}
+      owner_team: {{teamweb}}
+      EOF
+      cat > $p/host_vars/ov-db-1.yml <<'EOF'
+      support_tier: gold
+      owner_team: data
+      EOF
+      cat > $p/host_vars/ov-quote-api1.yml <<'EOF'
+      support_tier: {{tierquote}}
+      owner_team: quoting
+      EOF
+      cat > $p/files/ov-pager-agent <<'EOF'
+      #!/bin/sh
+      # Orrin and Vale paging agent (gold tier hosts only)
+      exec logger -t ov-pager "agent heartbeat for $(hostname)"
+      EOF
+      chown -R learner:learner $p
+      cat $p/host_vars/*.yml $p/files/ov-pager-agent | sha256sum > /var/tmp/.ct-facts.sum
+  checks:
+  - id: fact-claimsweb1
+    description: ov-claims-web1 publishes its tier and team as a local fact
+    type: shell
+    'on': ov-claims-web1
+    skills: &a227
+    - automation.data.facts
+    weight: 2
+    command: &chk_fact-n |
+      read tier team < /var/tmp/.ct-expect-tier
+      f=/etc/ansible/facts.d/ov.fact
+      [ -f "$f" ] || { echo no-fact; exit 0; }
+      if [ -x "$f" ]; then out=$("$f" 2>/dev/null); else out=$(cat "$f"); fi
+      printf '%s' "$out" | python3 -c '
+      import json, sys
+      t, m = sys.argv[1], sys.argv[2]
+      try:
+          d = json.load(sys.stdin)
+      except Exception:
+          print("not-json"); raise SystemExit
+      r = []
+      if d.get("tier") != t: r.append("tier")
+      if d.get("team") != m: r.append("team")
+      print(" ".join(r) or "ok")' "$tier" "$team"
+    expect:
+      match: exact
+      value: ok
+  - id: fact-claimsweb2
+    description: ov-claims-web2 publishes its tier and team as a local fact
+    type: shell
+    'on': ov-claims-web2
+    skills: *a227
+    weight: 2
+    command: *chk_fact-n
+    expect:
+      match: exact
+      value: ok
+  - id: fact-db1
+    description: ov-db-1 publishes its tier and team as a local fact
+    type: shell
+    'on': ov-db-1
+    skills: *a227
+    weight: 2
+    command: *chk_fact-n
+    expect:
+      match: exact
+      value: ok
+  - id: fact-quoteapi1
+    description: ov-quote-api1 publishes its tier and team as a local fact
+    type: shell
+    'on': ov-quote-api1
+    skills: *a227
+    weight: 2
+    command: *chk_fact-n
+    expect:
+      match: exact
+      value: ok
+  - id: agent-claimsweb1
+    description: ov-claims-web1 has the paging agent exactly when its tier is gold
+    type: shell
+    'on': ov-claims-web1
+    skills: &a307
+    - automation.control-flow.conditionals
+    - automation.data.facts
+    weight: 2
+    command: &chk_agent-n |
+      read tier team < /var/tmp/.ct-expect-tier
+      a=/usr/local/bin/ov-pager-agent; c=/etc/ov/pager/agent.conf
+      if [ "$tier" = gold ]; then
+        [ -x $a ] || { echo no-agent; exit 0; }
+        [ "$(stat -c %a $a)" = 755 ] || { echo agent-mode; exit 0; }
+        grep -qx "team=$team" $c 2>/dev/null && echo ok || echo no-config
+      else
+        [ ! -e $a ] && [ ! -e $c ] && echo ok || echo agent-present
+      fi
+    expect:
+      match: exact
+      value: ok
+  - id: agent-claimsweb2
+    description: ov-claims-web2 has the paging agent exactly when its tier is gold
+    type: shell
+    'on': ov-claims-web2
+    skills: *a307
+    weight: 2
+    command: *chk_agent-n
+    expect:
+      match: exact
+      value: ok
+  - id: agent-db1
+    description: ov-db-1 has the paging agent exactly when its tier is gold
+    type: shell
+    'on': ov-db-1
+    skills: *a307
+    weight: 2
+    command: *chk_agent-n
+    expect:
+      match: exact
+      value: ok
+  - id: agent-quoteapi1
+    description: ov-quote-api1 has the paging agent exactly when its tier is gold
+    type: shell
+    'on': ov-quote-api1
+    skills: *a307
+    weight: 2
+    command: *chk_agent-n
+    expect:
+      match: exact
+      value: ok
+  - id: facts-rerun
+    description: facts.yml runs again without changes and the supplied data is unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.facts
+    weight: 1
+    timeoutSec: 240
+    command: |
+      cd /home/learner/claims-automation
+      [ "$(cat host_vars/*.yml files/ov-pager-agent | sha256sum)" = "$(cat /var/tmp/.ct-facts.sum)" ] || { echo data-edited; exit 0; }
+      ct-ansible recap /home/learner/claims-automation facts.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Custom facts
+    body: Files in `/etc/ansible/facts.d/` ending in `.fact` are read by fact gathering; the file name before `.fact` becomes the key under `ansible_local`. A JSON document (or an executable that prints one) gives a flat structure.
+    cost: 1
+  - title: When are facts read?
+    body: Fact gathering runs once at the start of a play. After you create a fact in a play, the same play does not see it; run the setup module again or use a second play.
+    cost: 2
+  misconceptions:
+  - id: fact-as-ini
+    description: Writes the fact file as an INI file, so the values sit one level deeper than expected.
+    feedback: The values must be reachable as ansible_local.ov.tier and ansible_local.ov.team; an INI section adds a level, so use a flat JSON document.
+    expectFail:
+    - fact-claimsweb1
+    - fact-claimsweb2
+    - fact-db1
+    - fact-quoteapi1
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > facts.yml <<'EOF'
+        - name: Publish the support tier as a local fact
+          hosts: all
+          become: true
+          tasks:
+            - name: Facts directory
+              ansible.builtin.file:
+                path: /etc/ansible/facts.d
+                state: directory
+                mode: "0755"
+            - name: Support tier fact
+              ansible.builtin.copy:
+                dest: /etc/ansible/facts.d/ov.fact
+                content: "[general]\ntier={{ support_tier }}\nteam={{ owner_team }}\n"
+                mode: "0644"
+
+        - name: Paging agent on gold hosts
+          hosts: all
+          become: true
+          gather_facts: true
+          tasks:
+            - name: Paging agent and its configuration
+              when: ansible_local.ov.general.tier == 'gold'
+              block:
+                - name: Agent program
+                  ansible.builtin.copy:
+                    src: files/ov-pager-agent
+                    dest: /usr/local/bin/ov-pager-agent
+                    mode: "0755"
+                - name: Agent directory
+                  ansible.builtin.file:
+                    path: /etc/ov/pager
+                    state: directory
+                    mode: "0755"
+                - name: Agent configuration
+                  ansible.builtin.copy:
+                    dest: /etc/ov/pager/agent.conf
+                    content: "team={{ ansible_local.ov.general.team }}\n"
+                    mode: "0644"
+        EOF
+        ansible-playbook facts.yml
+        ansible-playbook facts.yml
+  - id: stale-facts
+    description: Writes the fact and tests it in the same play, but facts were gathered before the fact file existed.
+    feedback: Facts are collected once at the start of a play; gather them again (a new play or the setup module) after you install a custom fact.
+    expectFail:
+    - agent-claimsweb1
+    - agent-db1
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > facts.yml <<'EOF'
+        - name: Publish the support tier as a local fact
+          hosts: all
+          become: true
+          tasks:
+            - name: Facts directory
+              ansible.builtin.file:
+                path: /etc/ansible/facts.d
+                state: directory
+                mode: "0755"
+            - name: Support tier fact
+              ansible.builtin.copy:
+                dest: /etc/ansible/facts.d/ov.fact
+                content: "{{ {'tier': support_tier, 'team': owner_team} | to_nice_json }}\n"
+                mode: "0644"
+            - name: Agent program
+              ansible.builtin.copy:
+                src: files/ov-pager-agent
+                dest: /usr/local/bin/ov-pager-agent
+                mode: "0755"
+              when: ansible_local.ov.tier | default('none') == 'gold'
+            - name: Agent directory
+              ansible.builtin.file:
+                path: /etc/ov/pager
+                state: directory
+                mode: "0755"
+              when: ansible_local.ov.tier | default('none') == 'gold'
+            - name: Agent configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/pager/agent.conf
+                content: "team={{ owner_team }}\n"
+                mode: "0644"
+              when: ansible_local.ov.tier | default('none') == 'gold'
+        EOF
+        ansible-playbook facts.yml
+  - id: agent-everywhere
+    description: Installs the paging agent on every host regardless of tier.
+    feedback: Only gold hosts get the paging agent; silver and bronze hosts must not have it.
+    expectFail:
+    - agent-claimsweb2
+    - agent-quoteapi1
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > facts.yml <<'EOF'
+        - name: Publish the support tier as a local fact
+          hosts: all
+          become: true
+          tasks:
+            - name: Facts directory
+              ansible.builtin.file:
+                path: /etc/ansible/facts.d
+                state: directory
+                mode: "0755"
+            - name: Support tier fact
+              ansible.builtin.copy:
+                dest: /etc/ansible/facts.d/ov.fact
+                content: "{{ {'tier': support_tier, 'team': owner_team} | to_nice_json }}\n"
+                mode: "0644"
+
+        - name: Paging agent on gold hosts
+          hosts: all
+          become: true
+          gather_facts: true
+          tasks:
+            - name: Paging agent and its configuration
+              block:
+                - name: Agent program
+                  ansible.builtin.copy:
+                    src: files/ov-pager-agent
+                    dest: /usr/local/bin/ov-pager-agent
+                    mode: "0755"
+                - name: Agent directory
+                  ansible.builtin.file:
+                    path: /etc/ov/pager
+                    state: directory
+                    mode: "0755"
+                - name: Agent configuration
+                  ansible.builtin.copy:
+                    dest: /etc/ov/pager/agent.conf
+                    content: "team={{ ansible_local.ov.team }}\n"
+                    mode: "0644"
+        EOF
+        ansible-playbook facts.yml
+  solution:
+    explanation: |
+      The first play writes `/etc/ansible/facts.d/ov.fact` as a flat JSON document built from the host variables
+      `support_tier` and `owner_team`. Facts are only read at the start of a play, so the second play (which
+      gathers facts again and finds `ansible_local.ov`) installs the agent program and its configuration on hosts
+      whose fact says `gold`. Both plays are idempotent.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        cat > facts.yml <<'EOF'
+        - name: Publish the support tier as a local fact
+          hosts: all
+          become: true
+          tasks:
+            - name: Facts directory
+              ansible.builtin.file:
+                path: /etc/ansible/facts.d
+                state: directory
+                mode: "0755"
+            - name: Support tier fact
+              ansible.builtin.copy:
+                dest: /etc/ansible/facts.d/ov.fact
+                content: "{{ {'tier': support_tier, 'team': owner_team} | to_nice_json }}\n"
+                mode: "0644"
+
+        - name: Paging agent on gold hosts
+          hosts: all
+          become: true
+          gather_facts: true
+          tasks:
+            - name: Paging agent and its configuration
+              when: ansible_local.ov.tier == 'gold'
+              block:
+                - name: Agent program
+                  ansible.builtin.copy:
+                    src: files/ov-pager-agent
+                    dest: /usr/local/bin/ov-pager-agent
+                    mode: "0755"
+                - name: Agent directory
+                  ansible.builtin.file:
+                    path: /etc/ov/pager
+                    state: directory
+                    mode: "0755"
+                - name: Agent configuration
+                  ansible.builtin.copy:
+                    dest: /etc/ov/pager/agent.conf
+                    content: "team={{ ansible_local.ov.team }}\n"
+                    mode: "0644"
+        EOF
+        ansible-playbook facts.yml
+    alternatives:
+    - id: executable-fact-and-setup
+      description: An executable fact script and an inline setup call instead of a second gathering play.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > facts.yml <<'EOF'
+          - name: Publish the support tier as an executable fact
+            hosts: all
+            become: true
+            tasks:
+              - name: Facts directory
+                ansible.builtin.file:
+                  path: /etc/ansible/facts.d
+                  state: directory
+                  mode: "0755"
+              - name: Support tier fact script
+                ansible.builtin.copy:
+                  dest: /etc/ansible/facts.d/ov.fact
+                  content: |
+                    #!/bin/sh
+                    echo '{"tier": "{{ support_tier }}", "team": "{{ owner_team }}"}'
+                  mode: "0755"
+              - name: Reload local facts
+                ansible.builtin.setup:
+                  filter: ansible_local
+
+          - name: Paging agent on gold hosts
+            hosts: all
+            become: true
+            tasks:
+              - name: Agent program
+                ansible.builtin.copy:
+                  src: files/ov-pager-agent
+                  dest: /usr/local/bin/ov-pager-agent
+                  mode: "0755"
+                when: ansible_local.ov.tier == 'gold'
+              - name: Agent directory
+                ansible.builtin.file:
+                  path: /etc/ov/pager
+                  state: directory
+                  mode: "0755"
+                when: ansible_local.ov.tier == 'gold'
+              - name: Agent configuration
+                ansible.builtin.copy:
+                  dest: /etc/ov/pager/agent.conf
+                  content: "team={{ ansible_local.ov.team }}\n"
+                  mode: "0644"
+                when: ansible_local.ov.tier == 'gold'
+          EOF
+          ansible-playbook facts.yml

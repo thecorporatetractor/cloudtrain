@@ -1,0 +1,540 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-dynamic-inventory-cmdb
+  title: Build the inventory from the configuration database
+  domain: automation
+  frameworks:
+  - ex374-aligned:dynamic-inventory
+  - ex374-aligned:git-vars
+  difficulty: hard
+  estimatedMinutes: 35
+  tags:
+  - ansible
+  - inventory
+  - dynamic
+  - cmdb
+  - connection-vars
+  version: 1
+spec:
+  description: |
+    Orrin and Vale's CMDB serves its hosts as JSON: `http://ov-cmdb:{{cmdbport}}/api/hosts.json` lists, for every host,
+    its `name`, `site`, `role`, `ip` and `ssh_port`.
+
+    In **`/home/learner/inventory-cmdb`** the configured inventory is the (empty) directory `inventory/`. Put an
+    inventory source there that asks the CMDB when Ansible loads it and produces
+
+    - the groups **`site_<site>`** and **`role_<role>`** with their hosts, and
+    - for every host, **`ansible_host`** (the `ip`) and **`ansible_port`** (the `ssh_port`) as connection variables.
+
+    The CMDB changes over time, so the inventory must not contain a copy of its data. Then write
+    **`leeds-banner.yml`** that writes the line `Leeds office {{tok}}` to `/etc/ov/site-banner` on the hosts of
+    site leeds **only**, and run it. The grader runs it again and expects no changes.
+  objectives:
+  - Turn a CMDB export into a dynamic inventory
+  - Carry connection overrides (address and port) as host variables
+  - Target one site with a generated group
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    cmdbport:
+      type: int
+      min: 8090
+      max: 8099
+    altport:
+      type: int
+      min: 2200
+      max: 2299
+    tok:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-quote-api1
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-cmdb
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth3
+      b: ov-db-1:eth1
+    - a: ov-ctl:eth4
+      b: ov-quote-api1:eth1
+    - a: ov-ctl:eth5
+      b: ov-cmdb:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;; ov-cmdb) a=41 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      mkdir -p /etc/ov
+      rm -f /etc/ov/site-banner
+      case $(hostname) in
+        ov-cmdb)
+          install -d /srv/cmdb/api
+          cat > /srv/cmdb/api/hosts.json <<'EOF'
+      {"source": "orrinvale-cmdb", "hosts": [
+        {"name": "ov-claims-web1", "site": "leeds", "role": "web", "ip": "10.70.0.11", "ssh_port": 22},
+        {"name": "ov-claims-web2", "site": "lon",   "role": "web", "ip": "10.70.0.12", "ssh_port": 22},
+        {"name": "ov-db-1",        "site": "leeds", "role": "db",  "ip": "10.70.0.21", "ssh_port": {{altport}}},
+        {"name": "ov-quote-api1",  "site": "lon",   "role": "api", "ip": "10.70.0.31", "ssh_port": 22}
+      ]}
+      EOF
+          if ! nc -z 127.0.0.1 {{cmdbport}} 2>/dev/null; then
+            setsid nohup python3 -m http.server {{cmdbport}} --bind 0.0.0.0 --directory /srv/cmdb >/var/log/ov-cmdb.log 2>&1 </dev/null &
+            sleep 1
+          fi ;;
+      esac
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-db-1
+    run: *ov-node
+  - 'on': ov-quote-api1
+    run: *ov-node
+  - 'on': ov-cmdb
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31 ov-cmdb=10.70.0.41
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1 ov-cmdb
+  - 'on': ov-db-1
+    run: |
+      set -eu
+      kill $(pgrep -x sshd) 2>/dev/null || true
+      sleep 1
+      mkdir -p /run/sshd
+      /usr/sbin/sshd -p {{altport}}
+  - 'on': ov-ctl
+    timeoutSec: 120
+    run: |
+      set -eu
+      p=/home/learner/inventory-cmdb
+      install -d -o learner -g learner $p $p/inventory
+      printf '[defaults]\ninventory = inventory\nremote_user = ovauto\n' > $p/ansible.cfg
+      ip=10.70.0.21
+      for n in ov-db-1 $ip; do
+        ssh-keyscan -T 5 -p {{altport}} $ip 2>/dev/null | grep -v '^#' | awk -v n="[$n]:{{altport}}" '{ $1 = n; print }' >> /etc/ssh/ssh_known_hosts
+      done
+      chown -R learner:learner $p
+  checks:
+  - id: cmdb-groups
+    description: The inventory builds site_* and role_* groups and per-host address and port overrides from the CMDB data
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.inventory.dynamic
+    - automation.inventory.connection-vars
+    weight: 3
+    timeoutSec: 120
+    command: |
+      /opt/ansible/bin/python3 -I - <<'EOF'
+      import json, subprocess
+      def inv():
+          out = subprocess.run(['ct-ansible', 'run', '/home/learner/inventory-cmdb', 'ansible-inventory', '--list'], capture_output=True, text=True).stdout
+          return json.loads(out)
+      try:
+          i = inv()
+      except Exception:
+          print('inventory-does-not-load'); raise SystemExit
+      want = {'site_leeds': {'ov-claims-web1', 'ov-db-1'}, 'site_lon': {'ov-claims-web2', 'ov-quote-api1'},
+              'role_web': {'ov-claims-web1', 'ov-claims-web2'}, 'role_db': {'ov-db-1'}, 'role_api': {'ov-quote-api1'}}
+      bad = []
+      for g, hs in want.items():
+          if set(i.get(g, {}).get('hosts', [])) != hs:
+              bad.append(g)
+      hv = i.get('_meta', {}).get('hostvars', {})
+      ips = {'ov-claims-web1': '10.70.0.11', 'ov-claims-web2': '10.70.0.12', 'ov-db-1': '10.70.0.21', 'ov-quote-api1': '10.70.0.31'}
+      for h, ip in ips.items():
+          v = hv.get(h, {})
+          if v.get('ansible_host') != ip:
+              bad.append(h + ':ansible_host')
+          port = {{altport}} if h == 'ov-db-1' else 22
+          if int(v.get('ansible_port', 22)) != port:
+              bad.append(h + ':ansible_port')
+      print(' '.join(bad) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: cmdb-is-live
+    description: The inventory reads the CMDB when it is asked (a change in the CMDB shows up without editing the inventory)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.inventory.dynamic
+    weight: 2
+    timeoutSec: 120
+    command: |
+      patch() { ct-ansible run /home/learner ssh ovauto@ov-cmdb "$1" >/dev/null 2>&1; }
+      restore() { patch "sudo -n sh -c 'cp /var/tmp/hosts.orig /srv/cmdb/api/hosts.json && rm -f /var/tmp/hosts.orig'"; }
+      trap restore EXIT
+      patch "sudo -n sh -c '[ -f /var/tmp/hosts.orig ] || cp /srv/cmdb/api/hosts.json /var/tmp/hosts.orig'; sudo -n sed -i 's/\"role\": \"api\"/\"role\": \"api2\"/' /srv/cmdb/api/hosts.json"
+      g=$(ct-ansible run /home/learner/inventory-cmdb ansible-inventory --list 2>/dev/null | /opt/ansible/bin/python3 -I -c "
+      import json, sys
+      try:
+          i = json.load(sys.stdin)
+      except Exception:
+          print('error'); raise SystemExit
+      print('moved' if i.get('role_api2', {}).get('hosts') == ['ov-quote-api1'] and 'role_api' not in i else 'static')")
+      restore
+      [ "$g" = moved ] && echo ok || echo inventory-ignores-cmdb-changes
+    expect:
+      match: exact
+      value: ok
+  - id: banner-claimsweb1
+    description: ov-claims-web1 has the Leeds banner exactly when it belongs to site leeds
+    type: shell
+    'on': ov-claims-web1
+    skills: &a307
+    - automation.inventory.connection-vars
+    weight: 1
+    command: &chk_banner-n |
+      f=/etc/ov/site-banner
+      exp=$(hostname)
+      case $exp in ov-claims-web1|ov-db-1) want=1 ;; *) want=0 ;; esac
+      if [ $want = 1 ]; then [ "$(cat $f 2>/dev/null)" = "Leeds office {{tok}}" ] && echo ok || echo missing-banner; else [ ! -e $f ] && echo ok || echo banner-where-it-should-not-be; fi
+    expect:
+      match: exact
+      value: ok
+  - id: banner-claimsweb2
+    description: ov-claims-web2 has the Leeds banner exactly when it belongs to site leeds
+    type: shell
+    'on': ov-claims-web2
+    skills: *a307
+    weight: 1
+    command: *chk_banner-n
+    expect:
+      match: exact
+      value: ok
+  - id: banner-db1
+    description: ov-db-1 has the Leeds banner exactly when it belongs to site leeds
+    type: shell
+    'on': ov-db-1
+    skills: *a307
+    weight: 1
+    command: *chk_banner-n
+    expect:
+      match: exact
+      value: ok
+  - id: banner-quoteapi1
+    description: ov-quote-api1 has the Leeds banner exactly when it belongs to site leeds
+    type: shell
+    'on': ov-quote-api1
+    skills: *a307
+    weight: 1
+    command: *chk_banner-n
+    expect:
+      match: exact
+      value: ok
+  - id: leeds-rerun
+    description: leeds-banner.yml runs again without changes (it reaches the Leeds hosts through the CMDB-built inventory)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.inventory.dynamic
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/inventory-cmdb leeds-banner.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Dynamic inventory script
+    body: 'An executable file in the inventory directory is called with `--list` and must print JSON: groups as `{"name": {"hosts": [...]}}` and host variables under `_meta.hostvars`. `ansible-inventory --list` shows what Ansible makes of it.'
+    cost: 1
+  - title: Connection variables
+    body: '`ansible_host` and `ansible_port` change how Ansible connects without changing the inventory name of the host.'
+    cost: 1
+  misconceptions:
+  - id: copied-data
+    description: Hard-codes the host list in the inventory script instead of asking the CMDB.
+    feedback: The inventory has to come from the CMDB at run time, otherwise it goes stale the first time the CMDB changes.
+    expectFail:
+    - cmdb-is-live
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/inventory-cmdb
+        cat > inventory/cmdb.py <<'EOF'
+        #!/usr/bin/env python3
+        import json
+        inv = {"_meta": {"hostvars": {
+          "ov-claims-web1": {"ansible_host": "10.70.0.11"}, "ov-claims-web2": {"ansible_host": "10.70.0.12"},
+          "ov-db-1": {"ansible_host": "10.70.0.21", "ansible_port": {{altport}}}, "ov-quote-api1": {"ansible_host": "10.70.0.31"}}},
+          "site_leeds": {"hosts": ["ov-claims-web1", "ov-db-1"]}, "site_lon": {"hosts": ["ov-claims-web2", "ov-quote-api1"]},
+          "role_web": {"hosts": ["ov-claims-web1", "ov-claims-web2"]}, "role_db": {"hosts": ["ov-db-1"]}, "role_api": {"hosts": ["ov-quote-api1"]}}
+        print(json.dumps(inv))
+        EOF
+        chmod 0755 inventory/cmdb.py
+        cat > leeds-banner.yml <<'EOF'
+        - name: Leeds office banner
+          hosts: site_leeds
+          become: true
+          tasks:
+            - name: Site banner
+              ansible.builtin.copy:
+                dest: /etc/ov/site-banner
+                content: "Leeds office {{tok}}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook leeds-banner.yml
+  - id: forgot-port
+    description: Sets ansible_host but ignores the SSH port from the CMDB.
+    feedback: One host listens on a non-standard SSH port; carry the ssh_port field over as ansible_port.
+    expectFail:
+    - cmdb-groups
+    - banner-db1
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/inventory-cmdb
+        cat > inventory/cmdb.py <<'EOF'
+        #!/usr/bin/env python3
+        """Dynamic inventory from the Orrin and Vale CMDB."""
+        import json
+        import sys
+        import urllib.request
+
+        URL = "http://ov-cmdb:{{cmdbport}}/api/hosts.json"
+
+
+        def build():
+            with urllib.request.urlopen(URL, timeout=10) as resp:
+                data = json.load(resp)
+            inv = {"_meta": {"hostvars": {}}}
+            for h in data["hosts"]:
+                for group in ("site_" + h["site"], "role_" + h["role"]):
+                    inv.setdefault(group, {"hosts": []})["hosts"].append(h["name"])
+                inv["_meta"]["hostvars"][h["name"]] = {"ansible_host": h["ip"]}
+            return inv
+
+
+        if __name__ == "__main__":
+            if len(sys.argv) > 1 and sys.argv[1] == "--host":
+                print(json.dumps({}))
+            else:
+                print(json.dumps(build()))
+        EOF
+        chmod 0755 inventory/cmdb.py
+        cat > leeds-banner.yml <<'EOF'
+        - name: Leeds office banner
+          hosts: site_leeds
+          become: true
+          tasks:
+            - name: Site banner
+              ansible.builtin.copy:
+                dest: /etc/ov/site-banner
+                content: "Leeds office {{tok}}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook leeds-banner.yml || true
+  - id: play-on-everything
+    description: Runs the banner play on all hosts instead of only site_leeds.
+    feedback: Only the Leeds office hosts may be touched; target the site_leeds group.
+    expectFail:
+    - banner-claimsweb2
+    - banner-quoteapi1
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/inventory-cmdb
+        cat > inventory/cmdb.py <<'EOF'
+        #!/usr/bin/env python3
+        """Dynamic inventory from the Orrin and Vale CMDB."""
+        import json
+        import sys
+        import urllib.request
+
+        URL = "http://ov-cmdb:{{cmdbport}}/api/hosts.json"
+
+
+        def build():
+            with urllib.request.urlopen(URL, timeout=10) as resp:
+                data = json.load(resp)
+            inv = {"_meta": {"hostvars": {}}}
+            for h in data["hosts"]:
+                for group in ("site_" + h["site"], "role_" + h["role"]):
+                    inv.setdefault(group, {"hosts": []})["hosts"].append(h["name"])
+                inv["_meta"]["hostvars"][h["name"]] = {"ansible_host": h["ip"], "ansible_port": h["ssh_port"]}
+            return inv
+
+
+        if __name__ == "__main__":
+            if len(sys.argv) > 1 and sys.argv[1] == "--host":
+                print(json.dumps({}))
+            else:
+                print(json.dumps(build()))
+        EOF
+        chmod 0755 inventory/cmdb.py
+        cat > leeds-banner.yml <<'EOF'
+        - name: Leeds office banner
+          hosts: all
+          become: true
+          tasks:
+            - name: Site banner
+              ansible.builtin.copy:
+                dest: /etc/ov/site-banner
+                content: "Leeds office {{tok}}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook leeds-banner.yml
+  solution:
+    explanation: |
+      An executable inventory script in the inventory directory is run with `--list` by Ansible. It fetches
+      `http://ov-cmdb:<port>/api/hosts.json`, builds the groups `site_<site>` and `role_<role>`, and returns the CMDB's
+      `ip` as `ansible_host` and `ssh_port` as `ansible_port` in `_meta.hostvars` (the database host listens on a
+      non-standard SSH port). The play then targets the group `site_leeds` only, so the Lon hosts are never touched.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/inventory-cmdb
+        cat > inventory/cmdb.py <<'EOF'
+        #!/usr/bin/env python3
+        """Dynamic inventory from the Orrin and Vale CMDB."""
+        import json
+        import sys
+        import urllib.request
+
+        URL = "http://ov-cmdb:{{cmdbport}}/api/hosts.json"
+
+
+        def build():
+            with urllib.request.urlopen(URL, timeout=10) as resp:
+                data = json.load(resp)
+            inv = {"_meta": {"hostvars": {}}}
+            for h in data["hosts"]:
+                for group in ("site_" + h["site"], "role_" + h["role"]):
+                    inv.setdefault(group, {"hosts": []})["hosts"].append(h["name"])
+                inv["_meta"]["hostvars"][h["name"]] = {"ansible_host": h["ip"], "ansible_port": h["ssh_port"]}
+            return inv
+
+
+        if __name__ == "__main__":
+            if len(sys.argv) > 1 and sys.argv[1] == "--host":
+                print(json.dumps({}))
+            else:
+                print(json.dumps(build()))
+        EOF
+        chmod 0755 inventory/cmdb.py
+        cat > leeds-banner.yml <<'EOF'
+        - name: Leeds office banner
+          hosts: site_leeds
+          become: true
+          tasks:
+            - name: Site banner
+              ansible.builtin.copy:
+                dest: /etc/ov/site-banner
+                content: "Leeds office {{tok}}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook leeds-banner.yml
+    alternatives:
+    - id: argparse-script
+      description: A script with argparse handling both --list and --host.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/inventory-cmdb
+          cat > inventory/cmdb.py <<'EOF'
+          #!/usr/bin/env python3
+          import argparse
+          import json
+          import urllib.request
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("--list", action="store_true")
+          parser.add_argument("--host")
+          args = parser.parse_args()
+
+          hosts = json.load(urllib.request.urlopen("http://ov-cmdb:{{cmdbport}}/api/hosts.json", timeout=10))["hosts"]
+          groups = {}
+          hostvars = {}
+          for item in hosts:
+              groups.setdefault("site_%s" % item["site"], []).append(item["name"])
+              groups.setdefault("role_%s" % item["role"], []).append(item["name"])
+              hostvars[item["name"]] = {"ansible_host": item["ip"], "ansible_port": item["ssh_port"]}
+          if args.host:
+              print(json.dumps(hostvars.get(args.host, {})))
+          else:
+              out = {name: {"hosts": members} for name, members in groups.items()}
+              out["_meta"] = {"hostvars": hostvars}
+              print(json.dumps(out))
+          EOF
+          chmod 0755 inventory/cmdb.py
+          cat > leeds-banner.yml <<'EOF'
+          - name: Leeds office banner
+            hosts: site_leeds
+            become: true
+            tasks:
+              - name: Site banner
+                ansible.builtin.copy:
+                  dest: /etc/ov/site-banner
+                  content: "Leeds office {{tok}}\n"
+                  mode: "0644"
+          EOF
+          ansible-playbook leeds-banner.yml
