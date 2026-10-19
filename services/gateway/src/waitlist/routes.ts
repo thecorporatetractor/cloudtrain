@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import type { SiteConfig, WaitlistEntry, WaitlistResponse } from '@cloudtrain/api-types';
 import type { Principal } from '../auth.js';
 import { authorize } from '../authz.js';
@@ -33,6 +33,9 @@ export function waitlistCsv(entries: WaitlistEntry[]): string {
   const rows = entries.map((e) => [e.email, e.organisation, e.role, e.interest, e.consentAt, e.createdAt].map(csvCell).join(','));
   return [CSV_HEADER, ...rows].join('\r\n') + '\r\n';
 }
+
+const sendCsv = (reply: FastifyReply, list: { entries: WaitlistEntry[] }) =>
+  reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', 'attachment; filename="waitlist.csv"').send(waitlistCsv(list.entries));
 
 export function registerWaitlistRoutes(app: FastifyInstance, deps: WaitlistDeps): void {
   const cfg = deps.site.waitlist;
@@ -71,8 +74,5 @@ export function registerWaitlistRoutes(app: FastifyInstance, deps: WaitlistDeps)
   const limitOf = (q: { limit?: string }) => Math.min(MAX_EXPORT, Math.max(1, Number.parseInt(q.limit ?? '', 10) || MAX_EXPORT));
 
   app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist', admin, async (req) => entriesFor(req));
-  app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist.csv', admin, async (req, reply) => {
-    const { entries } = await entriesFor(req);
-    return reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', 'attachment; filename="waitlist.csv"').send(waitlistCsv(entries));
-  });
+  app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist.csv', admin, async (req, reply) => sendCsv(reply, await entriesFor(req)));
 }
