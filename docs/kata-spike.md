@@ -24,12 +24,12 @@ reproduce steps are in section 9.
 | 1. Can Kata run in a separate kind cluster (`ct-kata`) on ct-testvm? | **Yes.** kata-deploy 4.2.0 (chart, DaemonSet mode) installed in 192 s. Cloud Hypervisor (Go and runtime-rs), QEMU (Go and runtime-rs) and Dragonball start pods. Firecracker does not, because it needs the devmapper snapshotter, a host change that was not made. Two kind-only fixes inside the node container were needed (section 1.3). |
 | Nested or emulated `/dev/kvm`? | **Nested, hardware-assisted.** r7i.8xlarge is a virtual Nitro instance (`systemd-detect-virt` = `amazon`). `kvm_intel nested=Y`, and VMX has `ept`, `unrestricted_guest` and `shadow_vmcs`. KubeVirt runs with `useEmulation: false` (libvirt `domain type='kvm'`), and the Kata VMMs need `/dev/kvm` (no TCG). |
 | Start latency vs runc vs KubeVirt | Pod Ready: runc **6.9 s**, Kata **7.7-9.9 s** (+0.8 to +3.0 s, depending on the hypervisor). With systemd as PID 1, "systemd running" is reached in runc **6.9 s**, Kata clh **10.1 s**, and an `ubuntu-vm` VMI **39.8 s** (to the cloud-init marker; VMI Ready 13.4 s). |
-| Memory overhead per sandbox | Idle busybox: **175 MiB** (clh runtime-rs) to **215 MiB** (QEMU Go). Idle systemd image: **250-260 MiB**. `ubuntu-vm` VMI: **500 MiB**. runc: **1-17 MiB**. |
+| Memory overhead per sandbox | Idle busybox: **175 MiB** (clh runtime-rs) to **215 MiB** (QEMU Go). Idle systemd image: **237-260 MiB**. `ubuntu-vm` VMI: **500 MiB**. runc: **1-17 MiB**. |
 | Density in 16 GiB | At the idle footprint: **~64** systemd Kata sandboxes vs **~32** VMIs. At the scheduler reservation of the lab as written: **14** Kata pods (1 GiB limit + 130 Mi overhead) vs **9** VMIs (1815 Mi request each). |
 | 2. Does systemd work in Kata? | **Yes, with one fix in the image.** systemd as PID 1 boots to `running` with no failed units. Without the fix, every `kubectl exec` fails with `EBUSY` (cgroup v2 "no internal processes"). The fix: the entrypoint creates an empty leaf cgroup `init`, which kata-agent uses for exec processes (kata PR 10845). |
 | Does Multus/Kube-OVN secondary networking attach? | **Yes.** A Multus NAD of type kube-ovn attaches `net1` with the OVN port's MAC, and the guest gets MTU 1400. 1400-byte frames with DF pass both ways. Primary placement with `ovn.kubernetes.io/logical_switch` (the orchestrator's primary mode) also works. Tested with clh and QEMU runtime-rs. |
-| Does `labctl verify` pass with `runtimeClassName` set? | VERIFY_ANSWER |
-| Lab kernel features | **The stock Kata guest kernel is not enough** for tier B: it has no dummy, GRE, bonding, WireGuard, 802.1Q, netem or md. A lab guest kernel (the same 6.18.35 with Kata's config plus about 40 options, built in 5 minutes) passes every probe. On managed Kata (AKS, GKE) the guest kernel cannot be replaced. |
+| Does `labctl verify` pass with `runtimeClassName` set? | **Yes.** The full verifier cycle passed for `systemd-service-lifecycle` with `tr-pis-01` as a deb-sys pod on `kata-clh-runtime-rs` (lab kernel): 2 seeds, 3 mutations and 1 alternative, all clean. Sessions were Ready in **25-45 s**, against 55-60 s for the same lab on KubeVirt in the same cluster. The first run failed because setup raced systemd's boot. A readiness probe on systemd nodes fixed it (section 4.5). |
+| Lab kernel features | **The stock Kata guest kernel is not enough** for tier B: it has no dummy, GRE, bonding, WireGuard, 802.1Q, netem or md. A lab guest kernel (the same 6.18.35 with Kata's config plus about 40 options, built in 5 minutes) passes every probe. On managed Kata (AKS, GKE) the guest kernel is the provider's, and neither documents a way to replace it. |
 | 3. Orchestrator change | Sketch in section 6. A prototype is included: `--tier-runtime-classes` (default off), RuntimeClass detection at startup, a catalog `systemd: true` flag (privileged only inside a sandbox) and Helm `orchestrator.tierRuntimeClasses`. |
 
 **Recommendation:** adopt Kata for tier B on self-managed clusters (vCenter,
@@ -307,9 +307,42 @@ same tc-redirect and are expected to work but should be confirmed.
 The run used the prototype orchestrator deployed to `ct-kata` (`TIER_RUNTIME_CLASSES=B=kata-clh`,
 `CATALOG_OVERLAY=kata-spike/catalog-kata.yaml`). At startup the manager logged
 `tier sandboxes {"enabled": "B=kata-clh"}`, so detection found the RuntimeClass
-and the Kata nodes. Both variants were verified in the same run:
+and the Kata nodes.
 
-VERIFY_RESULT
+**Run 1** (11:44Z, `B=kata-clh`, both variants, [`results/verify-run1.log`](kata-spike/results/verify-run1.log)).
+The VM variant passed all 6 runs (Ready 55-60 s). Every Kata run failed before
+grading:
+
+```
+session not ready: phase Failed: action 0 on tr-pis-01 exited 1: System has not been booted
+with systemd as init system (PID 1). Can't operate. | Failed to connect to bus: Host is down
+```
+
+The pod is Ready as soon as its container starts, and the orchestrator runs
+setup on Ready, which is before systemd has created `/run/systemd/system`.
+The VM variant does not hit this. Fix in the prototype: systemd nodes get a readiness probe
+(`systemctl is-system-running` = running or degraded, period 1 s). The probe
+is an exec, so it also depends on the `init` leaf (4.2).
+
+**Run 2** (12:01Z, `B=kata-clh-runtime-rs`, readiness probe, [`results/verify-run2.log`](kata-spike/results/verify-run2.log),
+[JSON report](kata-spike/results/verify-systemd-service-lifecycle-kata.json)):
+
+| Lab | Run | Seed | Ready | Before | After | Teardown | Result |
+|---|---|---|---|---|---|---|---|
+| systemd-service-lifecycle-kata | base:seed-1 | 1 | 25 s | 0 (0/4) | 100 (4/4) | clean | ok |
+| systemd-service-lifecycle-kata | base:seed-2 | 2 | 25 s | 0 (0/4) | 100 (4/4) | clean | ok |
+| systemd-service-lifecycle-kata | mutation:started-not-enabled | 1 | 40 s | 0 (0/4) | 78 (3/4) | clean | ok |
+| systemd-service-lifecycle-kata | mutation:disabled-not-masked | 1 | 25 s | 0 (0/4) | 67 (3/4) | clean | ok |
+| systemd-service-lifecycle-kata | mutation:masked-still-running | 1 | 25 s | 0 (0/4) | 78 (3/4) | clean | ok |
+| systemd-service-lifecycle-kata | alternative:separate-commands | 1 | 45 s | 0 (0/4) | 100 (4/4) | clean | ok |
+| systemd-service-lifecycle (VM, run 1) | all 6 runs | 1/2 | 55-60 s | 0 (0/4) | as expected | clean | ok |
+
+The grades are identical to the VM variant, run for run. "Ready" is the whole
+session (jumphost entry node + tr-pis-01 + setup) under host load ~50.
+Learner ssh from the jumphost to a container node (`ssh tr-pis-01`) is not
+graded by this lab and was not tested. Today the orchestrator injects keys
+only into VMs (cloud-init), so a tier-B pod image needs the same key wiring
+(next steps).
 
 ## 5. Feature matrix for tier B
 
@@ -352,6 +385,8 @@ orchestrator:
 - A container node whose image has `tier: B` gets
   `pod.spec.runtimeClassName`. The existing global `--runtime-class` stays as
   the default for every other image.
+- Images marked `systemd: true` get a readiness probe on
+  `systemctl is-system-running`, so setup never runs before boot finishes.
 - Images marked `systemd: true` run **privileged only when a sandbox
   RuntimeClass applies**. Without one, the node fails with `ErrUnsupported`
   instead of becoming privileged on the host kernel. That is the safety
@@ -423,7 +458,7 @@ Everything is off unless `--tier-runtime-classes` is set.
 
 | File | Change |
 |---|---|
-| `internal/drivers/sandbox.go` (+ test) | `ParseTierRuntimeClasses`, `DetectTierRuntimeClasses` (RuntimeClass exists and matches a schedulable node), `applySandbox` (sets `runtimeClassName` per image tier; `systemd: true` images become privileged only inside a sandbox, otherwise `ErrUnsupported`; annotation `labs.cloudtrain.dev/sandbox`) |
+| `internal/drivers/sandbox.go` (+ test) | `ParseTierRuntimeClasses`, `DetectTierRuntimeClasses` (RuntimeClass exists and matches a schedulable node), `applySandbox` (sets `runtimeClassName` per image tier; `systemd: true` images become privileged only inside a sandbox, otherwise `ErrUnsupported`, and get a systemd readiness probe; annotation `labs.cloudtrain.dev/sandbox`) |
 | `internal/drivers/catalog.go` | `systemd` field on catalog images; `tier` documented as functional with the flag |
 | `internal/drivers/container.go`, `runtime.go` | `TierRuntimeClasses` option, `applySandbox` in `Provision` |
 | `cmd/manager/main.go` | `--tier-runtime-classes`, startup detection and log |
@@ -459,7 +494,9 @@ Next steps, in order:
 
 1. **Images:** build `deb-sys:24.04` and `el-sys:10` properly (from the
    mirror snapshot, `ct-sysinit` entrypoint, catalog `tier: B, systemd:
-   true`), in CI (no KVM needed). Check that el-sys with systemd 257 (cgroup v1
+   true`), in CI (no KVM needed). Wire learner and admin ssh keys into
+   container nodes the way cloud-init does for VMs, so `ssh <node>` from the
+   jumphost works. Check that el-sys with systemd 257 (cgroup v1
    removed) behaves the same.
 2. **Lab guest kernel:** a `tools/images/kata-kernel` build (Kata's config +
    the fragment from section 4.3), published as an OCI artifact. Add a
@@ -495,7 +532,7 @@ tools/slots/run.sh vm -- helm install kata-deploy oci://ghcr.io/kata-containers/
 ./lat.sh / ./vmlat.sh / ./mem.sh / ./probe.sh / ./multus.sh / ./dind.sh
 tools/slots/run.sh build -- ./build-kernel.sh                     # lab guest kernel
 SESSION_SELECTOR=labs.cloudtrain.dev/verify=true LOAD_LAB_IMAGES=0 CATALOG_OVERLAY=catalog-kata.yaml \
-  TIER_RUNTIME_CLASSES=B=kata-clh tools/slots/run.sh build -- deploy/scripts/orchestrator-deploy.sh
+  TIER_RUNTIME_CLASSES=B=kata-clh-runtime-rs tools/slots/run.sh build -- deploy/scripts/orchestrator-deploy.sh
 tools/slots/run.sh vm -- bin/labctl verify --context kind-ct-kata --catalog catalog.yaml,catalog-kata.yaml <labs>
 kind delete cluster --name ct-kata                                # done at the end of the spike
 ```

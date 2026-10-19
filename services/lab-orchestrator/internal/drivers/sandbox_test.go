@@ -80,6 +80,9 @@ func TestApplySandbox(t *testing.T) {
 			if podHasPrivileged(pod) != tc.wantPriv {
 				t.Fatalf("privileged = %v, want %v", podHasPrivileged(pod), tc.wantPriv)
 			}
+			if hasProbe := pod.Spec.Containers[0].ReadinessProbe != nil; hasProbe != tc.wantPriv {
+				t.Fatalf("systemd readiness probe = %v, want %v", hasProbe, tc.wantPriv)
+			}
 		})
 	}
 }

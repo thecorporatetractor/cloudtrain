@@ -133,7 +133,23 @@ func (d *ContainerDriver) applySandbox(ref NodeRef, pod *corev1.Pod) error {
 				c.SecurityContext = &corev1.SecurityContext{}
 			}
 			c.SecurityContext.Privileged = ptr.To(true)
+			// Ready = systemd finished booting, so setup never races it
+			// ("System has not been booted with systemd as init system").
+			c.ReadinessProbe = systemdReadiness()
 		}
 	}
 	return nil
+}
+
+// systemdReadiness is the readiness probe of systemd nodes: the system
+// reached running (or degraded: some unit failed, which labs may cause).
+func systemdReadiness() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
+			"sh", "-c", `s=$(systemctl is-system-running 2>/dev/null); [ "$s" = running ] || [ "$s" = degraded ]`,
+		}}},
+		PeriodSeconds:    1,
+		TimeoutSeconds:   5,
+		FailureThreshold: 3,
+	}
 }
