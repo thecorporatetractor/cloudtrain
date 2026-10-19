@@ -5,6 +5,7 @@
 #                                    then the exam runs; repeat every CYCLE_SLEEP seconds (systemd unit)
 #   ct-batch.sh once [id,...]        one cycle (optionally only these lab ids; they are re-run even if passed);
 #                                    while the loop runs, the ids are queued for it instead (state/requeue)
+#   ct-batch.sh images <target,...>  rebuild those images now (build slot), load them into kind and requeue their labs
 #   ct-batch.sh summary              print the summary table
 #   ct-batch.sh list                 built labs: slot, run/skip, image readiness (no side effects)
 #
@@ -63,8 +64,170 @@ deploy_manager() {
   platform_hash > "$RES/state/manager.hash"
 }
 
+# ---------------------------------------------------------------------------- image refresh
+# When a sync changes image inputs (tools/images, tools/mirrors, deploy/versions.env, deploy/images), only the
+# affected images are rebuilt through the build slot and loaded into kind, then the labs that use them are
+# requeued. The queue (state/images/pending) and the failure backoff live in files, so they survive the loop's
+# re-exec and a reboot. A failed build is retried after IMG_FAIL_BASE seconds, doubling per failure up to
+# IMG_FAIL_MAX, and dropped after IMG_MAX_TRIES (`ct-batch.sh images <target>` retries by hand), so a broken
+# build cannot loop. AUTO_IMAGE_REFRESH=0 only records the changed inputs in state/images-stale.txt.
+# The repo sync is deferred while a refresh runs, so the builds see one revision.
+AUTO_IMAGE_REFRESH=${AUTO_IMAGE_REFRESH:-1}
+IMG_FAIL_BASE=${IMG_FAIL_BASE:-900}
+IMG_FAIL_MAX=${IMG_FAIL_MAX:-21600}
+IMG_MAX_TRIES=${IMG_MAX_TRIES:-5}
+IMG_BUILD_TIMEOUT=${IMG_BUILD_TIMEOUT:-3h}
+IMG_REQUEUE=${IMG_REQUEUE:-1}
+IMG_MIN_FREE_GB=${IMG_MIN_FREE_GB:-100}   # free GB on the Docker root before a build starts (kubelet disk-pressure eviction is near 85% used)
+IMGD=$RES/state/images
+VM_IMAGES="kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm"
+IMG_ORDER="workloads jumphost linux-pod frr nettools netsvc ansible-ctl iac-ws-terraform iac-ws-tofu kql-ws oci-registry kubeadm-node kubeadm-full kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm mirror"
+
+image_targets() { # stdin: changed repo paths; prints the affected image targets (words, in any order)
+  local p
+  while read -r p; do
+    case $p in
+      tools/images/jumphost/* | tools/images/build-jumphost.sh) echo jumphost ;;
+      tools/images/linux-pod/* | tools/images/build-linux-pod.sh) echo linux-pod ;;
+      tools/images/netdev/frr/*) echo frr ;;
+      tools/images/netdev/nettools/*) echo nettools ;;
+      tools/images/netdev/netsvc/*) echo netsvc ;;
+      tools/images/netdev/build.sh) echo frr nettools netsvc ;;
+      tools/images/ansible/* | tools/images/build-ansible-ctl.sh) echo ansible-ctl ;;
+      tools/mirrors/lock/ansible.lock | tools/mirrors/ansible-collections.yml) echo ansible-ctl mirror ;;
+      tools/images/iac/* | tools/images/build-iac-ws.sh) echo iac-ws-terraform iac-ws-tofu ;;
+      tools/images/kql-ws/* | tools/images/build-kql-ws.sh) echo kql-ws ;;
+      tools/images/oci-registry/* | tools/images/build-oci-registry.sh) echo oci-registry ;;
+      tools/images/lock/workloads.lock) echo workloads ;;
+      tools/images/lock/addons.lock | tools/images/lock/buildah-images.lock | tools/images/kubeadm-addons/* | tools/images/scripts/guest-kubeadm-addons.sh) echo kubeadm-full ;;
+      tools/images/lock/kubernetes-*.lock | tools/images/lock/calico.lock | tools/images/scripts/guest-kubeadm.sh) echo kubeadm-node kubeadm-upgrade ;;
+      tools/images/scripts/guest-etcd-host.sh) echo etcd-host ;;
+      tools/images/scripts/guest-el-vm.sh) echo el-vm ;;
+      tools/images/scripts/guest-ubuntu-vm.sh) echo ubuntu-vm ;;
+      tools/images/scripts/guest-docker-vm.sh | tools/images/docker-vm/* | tools/images/lock/docker-vm.lock) echo docker-vm ;;
+      tools/mirrors/lock/el10.lock | tools/mirrors/packages-el10.txt) echo el-vm mirror ;;
+      tools/mirrors/lock/noble.lock | tools/mirrors/packages-noble.txt) echo ubuntu-vm mirror ;;
+      tools/mirrors/* | deploy/scripts/mirrors-up.sh) echo mirror ;;
+      tools/images/build.sh | tools/images/scripts/guest-common.sh | tools/images/scripts/customize.sh | tools/images/builder/*) echo "$VM_IMAGES" ;;
+    esac
+  done
+}
+# Build inputs that mention a deploy/versions.env variable changed between two revisions.
+versions_env_files() { # versions_env_files <old> <new>
+  local v
+  git -C "$REPO" diff -U0 "$1" "$2" -- deploy/versions.env | sed -nE 's/^[+-]([A-Z][A-Z0-9_]*)=.*/\1/p' | sort -u |
+    while read -r v; do git -C "$REPO" grep -lw -- "$v" -- tools/images deploy/scripts ':!tools/images/vm-images.yaml'; done | sort -u
+}
+target_cmd() { # the build+load command of a target, run from $REPO (the scripts load into kind: LOAD_INTO_KIND=1)
+  case $1 in
+    workloads) echo 'bash tools/images/load.sh workloads' ;;
+    jumphost) echo 'bash tools/images/build-jumphost.sh' ;;
+    linux-pod) echo 'bash tools/images/build-linux-pod.sh' ;;
+    frr | nettools | netsvc) echo "bash tools/images/netdev/build.sh $1" ;;
+    ansible-ctl) echo 'bash tools/images/build-ansible-ctl.sh' ;;
+    iac-ws-terraform) echo 'bash tools/images/build-iac-ws.sh terraform' ;;
+    iac-ws-tofu) echo 'bash tools/images/build-iac-ws.sh tofu' ;;
+    kql-ws) echo 'bash tools/images/build-kql-ws.sh' ;;
+    oci-registry) echo 'bash tools/images/build-oci-registry.sh' ;;
+    kubeadm-node) echo 'bash tools/images/build.sh kubeadm-node && bash tools/images/build.sh kubeadm-full' ;;
+    kubeadm-full | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm) echo "bash tools/images/build.sh $1" ;;
+    mirror) echo 'bash deploy/scripts/mirrors-up.sh' ;;
+    *) return 1 ;;
+  esac
+}
+target_rx() { # regex over catalog image names: the refs (and so the labs) a target feeds
+  case $1 in
+    jumphost) echo '^cloudtrain/jumphost:' ;;
+    linux-pod) echo '^cloudtrain/(el|deb)-lab:' ;;
+    frr | nettools | netsvc | ansible-ctl | kql-ws | oci-registry | etcd-host | el-vm | ubuntu-vm | docker-vm) echo "^cloudtrain/$1:" ;;
+    iac-ws-terraform | iac-ws-tofu) echo '^cloudtrain/iac-ws:' ;;
+    kubeadm-node) echo '^cloudtrain/kubeadm-node:v[0-9.]+(-full)?$' ;;
+    kubeadm-full) echo '^cloudtrain/kubeadm-node:.*-full$' ;;
+    kubeadm-upgrade) echo '^cloudtrain/kubeadm-node:.*-upgrade$' ;;
+    mirror) echo '^cloudtrain/(el-lab|deb-lab|el-vm|ubuntu-vm):' ;;
+  esac
+}
+pending_add() { # pending_add <target>...
+  mkdir -p "$IMGD"
+  (flock 7; local t; for t; do grep -qxF -- "$t" "$IMGD/pending" 2>/dev/null || echo "$t" >> "$IMGD/pending"; done) 7>"$IMGD/pending.lock"
+}
+pending_drop() { (flock 7; [[ -f $IMGD/pending ]] && { grep -vxF -- "$1" "$IMGD/pending" > "$IMGD/pending.new" || true; mv "$IMGD/pending.new" "$IMGD/pending"; }) 7>"$IMGD/pending.lock"; }
+refresh_running() { mkdir -p "$IMGD"; ! (flock -n 7) 7>"$IMGD/refresh.flock"; }
+labs_using() { # labs_using <target>...: ids of built labs whose curriculum images resolve to those targets' catalog images
+  local t rx refs="" id dir slot lrefs r
+  for t; do
+    rx=$(target_rx "$t"); [[ -n $rx ]] || continue
+    refs+=" $(RX=$rx yq -r '.images | to_entries[] | select(.value.image | test(strenv(RX))) | .key' "$REPO/deploy/images/catalog.yaml" | tr '\n' ' ')"
+  done
+  while IFS=$'\t' read -r id dir slot lrefs; do
+    for r in ${lrefs//,/ }; do [[ " $refs " == *" $r "* ]] && { echo "$id"; break; }; done
+  done < <(lab_list) | paste -sd, -
+}
+docker_free_gb() { df -BG --output=avail "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)" 2>/dev/null | tail -1 | tr -dc 0-9; }
+# Enough disk for a build? Prunes unused build cache older than 24h first; the check is not a failure (no backoff step).
+disk_ok() {
+  local f; f=$(docker_free_gb); f=${f:-0}
+  (( f >= IMG_MIN_FREE_GB )) && return 0
+  docker builder prune -f --filter until=24h >/dev/null 2>&1; docker image prune -f >/dev/null 2>&1
+  f=$(docker_free_gb); f=${f:-0}
+  (( f >= IMG_MIN_FREE_GB )) || { log "image refresh: only ${f}G free on the Docker root (need ${IMG_MIN_FREE_GB}G); build deferred"; return 1; }
+}
+# Builds every pending target that is due (one at a time, each in the build slot). Runs detached from the
+# loop (`images-run`), holds state/images/refresh.flock, and requeues the labs of what it rebuilt.
+image_refresh_run() {
+  mkdir -p "$IMGD"; exec 8>"$IMGD/refresh.flock"; flock -n 8 || return 0
+  local t cmd rev n next delay rc built=() ids
+  rev=$(git -C "$REPO" rev-parse HEAD)
+  for t in $IMG_ORDER; do
+    grep -qxF -- "$t" "$IMGD/pending" 2>/dev/null || continue
+    n=0; next=0; [[ -f $IMGD/fail.$t ]] && read -r n next < "$IMGD/fail.$t"
+    (( $(date +%s) >= next )) || continue
+    cmd=$(target_cmd "$t") || { log "image refresh: unknown target $t; dropped"; pending_drop "$t"; continue; }
+    disk_ok || { echo "$n $(( $(date +%s) + IMG_FAIL_BASE ))" > "$IMGD/fail.$t"; continue; }
+    log "image refresh: $t at ${rev:0:9}$( ((n)) && echo " (retry $n)")"
+    (cd "$REPO" && DOCKERIO_MIRROR=${DOCKERIO_MIRROR:-mirror.gcr.io} GUESTFS_KVM=${GUESTFS_KVM:-1} LOAD_INTO_KIND=1 OCI_IMAGE_REVISION=$rev \
+       tools/slots/run.sh build -- timeout -k 2m "$IMG_BUILD_TIMEOUT" bash -c "$cmd") >"$IMGD/$t.log" 2>&1 9>&- 8>&-
+    rc=$?
+    docker builder prune -f --filter until=30m >/dev/null 2>&1; docker image prune -f >/dev/null 2>&1   # this build's cache and dangling layers
+    if (( rc == 0 )); then
+      pending_drop "$t"; rm -f "$IMGD/fail.$t"; built+=("$t")
+      printf '%s %s %s\n' "$(date -u +%FT%TZ)" "${rev:0:9}" "$t" >> "$RES/state/images-built.txt"
+      log "image refresh: $t built and loaded"
+    else
+      n=$((n + 1))
+      if (( n >= IMG_MAX_TRIES )); then
+        pending_drop "$t"; rm -f "$IMGD/fail.$t"
+        log "image refresh: $t failed $n times (state/images/$t.log); giving up until its inputs change or: ct-batch.sh images $t"
+      else
+        delay=$(( IMG_FAIL_BASE << (n - 1) )); (( delay > IMG_FAIL_MAX )) && delay=$IMG_FAIL_MAX
+        echo "$n $(( $(date +%s) + delay ))" > "$IMGD/fail.$t"
+        log "image refresh: $t failed (rc $rc, $n of $IMG_MAX_TRIES; state/images/$t.log); retry in ${delay}s"
+      fi
+    fi
+  done
+  if (( IMG_REQUEUE && ${#built[@]} )); then
+    ids=$(labs_using "${built[@]}")
+    [[ -n $ids ]] && { requeue_add "$ids"; log "image refresh: requeued labs using ${built[*]}: $ids"; }
+  fi
+  return 0
+}
+image_refresh_kick() { # start a detached refresh when something is pending and none runs
+  [[ $AUTO_IMAGE_REFRESH == 1 && -s $IMGD/pending ]] || return 0
+  refresh_running && return 0
+  setsid -f bash "$(readlink -f "$0")" images-run 9>&- >>"$LOG" 2>&1
+}
+image_refresh_manual() { # image_refresh_manual <target,...>
+  local t
+  for t in ${1//,/ }; do
+    target_cmd "$t" >/dev/null || { echo "unknown image target: $t (one of: $IMG_ORDER)" >&2; return 2; }
+    pending_add "$t"; rm -f "$IMGD/fail.$t"
+  done
+  image_refresh_run
+}
+
 sync_repo() {
   local old new
+  refresh_running && { log "image refresh running; repo sync deferred"; return 0; }
   old=$(git -C "$REPO" rev-parse HEAD)
   git -C "$REPO" fetch -q origin main || { log "git fetch failed; staying on ${old:0:9}"; return 0; }
   git -C "$REPO" reset -q --hard origin/main
@@ -76,7 +239,16 @@ sync_repo() {
       >>"$RES/state/build.log" 2>&1 || { log "labctl build failed (state/build.log)"; return 1; }
     local imgs
     imgs=$(git -C "$REPO" diff --name-only "$old" "$new" -- tools/images tools/mirrors deploy/versions.env deploy/images | head -50)
-    [[ -n $imgs ]] && { printf '%s %s..%s\n%s\n' "$(date -u +%FT%TZ)" "${old:0:9}" "${new:0:9}" "$imgs" >> "$RES/state/images-stale.txt"; log "image inputs changed (state/images-stale.txt); images are NOT rebuilt automatically"; }
+    if [[ -n $imgs ]]; then
+      printf '%s %s..%s\n%s\n' "$(date -u +%FT%TZ)" "${old:0:9}" "${new:0:9}" "$imgs" >> "$RES/state/images-stale.txt"
+      if [[ $AUTO_IMAGE_REFRESH == 1 ]]; then
+        local tg
+        tg=$( { git -C "$REPO" diff --name-only "$old" "$new" -- tools/images tools/mirrors deploy/scripts/mirrors-up.sh; versions_env_files "$old" "$new"; } |
+              image_targets | tr ' ' '\n' | sort -u | grep . || true)
+        if [[ -n $tg ]]; then pending_add $tg; log "image inputs changed; queued image refresh: $(echo $tg)"
+        else log "image inputs changed; no image affected (state/images-stale.txt)"; fi
+      else log "image inputs changed (state/images-stale.txt); AUTO_IMAGE_REFRESH=0: images are NOT rebuilt"; fi
+    fi
   fi
   [[ $(cat "$RES/state/manager.hash" 2>/dev/null) == "$(platform_hash)" ]] && $K -n "$ORCH_NS" get deploy lab-orchestrator >/dev/null 2>&1 || deploy_manager
 }
@@ -240,6 +412,7 @@ cycle() { # cycle [ids]
   [[ -n $only ]] && force=1
   cluster_up || return 1
   sync_repo || return 1
+  image_refresh_kick
   cleanup_stale
   load_catalog; IMG_OK=()
   while IFS=$'\t' read -r id dir slot refs; do
@@ -355,9 +528,11 @@ case ${1:-loop} in
           requeue_add "$2"; log "the loop holds the runner lock; queued for it: $2"; exit 0
         fi
         cycle "${2:-}"; summary >/dev/null ;;
+  images) [[ -n ${2:-} ]] || { echo "usage: $0 images <target,...>" >&2; exit 2; }; image_refresh_manual "$2" ;;
+  images-run) image_refresh_run ;;
   summary) summary ;;
   list) load_catalog; while IFS=$'\t' read -r id dir slot refs; do
           w=$(needs_run "$id" "$dir" 0 && echo run || echo skip); m=$(images_ready "$refs") && m=ready
           printf '%s\t%s\t%s\t%s\n' "$id" "$slot" "$w" "$m"; done < <(lab_list) ;;
-  *) echo "usage: $0 loop | once [id,...] | summary | list" >&2; exit 2 ;;
+  *) echo "usage: $0 loop | once [id,...] | images <target,...> | summary | list" >&2; exit 2 ;;
 esac

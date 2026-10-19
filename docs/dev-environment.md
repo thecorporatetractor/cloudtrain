@@ -787,6 +787,14 @@ failure when either changed, and a run cut by a stop or reboot simply runs again
 the volume under `/srv/ct-work/results/`: `status.json` (one line, every minute),
 `summary.tsv`, `labs/<id>.json` (status, failing step, timing, log tail), `logs/<id>.log`,
 `reports/<id>.json` (labctl's report), `exams/<exam>-<mode>.json`, `runner.log`.
+When a sync changes image inputs (`tools/images`, `tools/mirrors`, `deploy/versions.env`, `deploy/images`), the
+runner records the files in `state/images-stale.txt`, maps them to the affected images (a changed `versions.env` variable
+counts for every build input that mentions it) and, with `AUTO_IMAGE_REFRESH=1` (the default in
+`runner.env`), rebuilds only those through the build slot (`state/images/pending`, logs in
+`state/images/<target>.log`, one detached `images-run` at a time), loads them into the kind nodes and requeues the
+labs that use them. The repo sync waits while a refresh runs. A failed build backs off (`IMG_FAIL_BASE` 900 s doubling
+to `IMG_FAIL_MAX`) and is dropped after `IMG_MAX_TRIES` (5) failures; A build waits (deferred, not counted as a failure) until `IMG_MIN_FREE_GB` (100) are free on the Docker root, after pruning old build cache, and prunes its own cache afterwards. `ct-batch.sh images kql-ws,jumphost` rebuilds
+named images by hand (targets: see `IMG_ORDER` in the script).
 `ct-batch.sh list` shows what the next cycle would run; `ct-batch.sh once id,...` re-runs
 labs. While the loop runs (it holds the runner lock), `once id,...` appends the ids to
 `state/requeue` instead and exits; the loop starts them, forced, while it dispatches, and wakes

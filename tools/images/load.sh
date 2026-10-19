@@ -4,7 +4,7 @@
 # Usage: load.sh [name...]     default: all
 #   kubeadm-node | kubeadm-upgrade | etcd-host   containerDisks -> nodes that run VMs
 #   jumphost, linux-pod-el, linux-pod-deb, linux-pod-el-sys, linux-pod-deb-sys, mirror,
-#   iac-ws-terraform, iac-ws-tofu, ansible-ctl, kql-ws -> every node
+#   iac-ws-terraform, iac-ws-tofu, ansible-ctl, kql-ws, oci-registry -> every node
 #   el-vm | ubuntu-vm | docker-vm                containerDisks -> nodes that run VMs
 #   workloads                                    lab workload images (tools/images/lock/
 #                                                workloads.lock) -> every node, for
@@ -91,6 +91,8 @@ for t in "${targets[@]}"; do
                      load_docker_image "$ANSIBLE_CTL_IMAGE" $ALL_NODES ;;
     kql-ws)          # shellcheck disable=SC2086
                      load_docker_image "$KQL_WS_IMAGE" $ALL_NODES ;;
-    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | docker-vm | mirror | iac-ws-terraform | iac-ws-tofu | ansible-ctl | kql-ws)" ;;
+    oci-registry)    # shellcheck disable=SC2086
+                     load_docker_image "$(yq -r '.images["oci-registry:3"].image' "$REPO_ROOT/deploy/images/catalog.yaml")" $ALL_NODES ;;
+    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | docker-vm | mirror | iac-ws-terraform | iac-ws-tofu | ansible-ctl | kql-ws | oci-registry)" ;;
   esac
 done
