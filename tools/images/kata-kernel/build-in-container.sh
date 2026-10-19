@@ -4,6 +4,9 @@
 set -euo pipefail
 : "${V:?}" "${RELEASE:?}" "${BASE:?}" "${REV:?}" "${UBUNTU_APT_SNAPSHOT:?}" "${OWNER:?}"
 export DEBIAN_FRONTEND=noninteractive
+# snapshot.ubuntu.com is HTTPS: CA certificates first (they do not end up in the kernel).
+apt-get -o Acquire::ForceIPv4=true -qq update
+apt-get -o Acquire::ForceIPv4=true -qq install -y --no-install-recommends ca-certificates >/dev/null
 apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any -qq update --snapshot "$UBUNTU_APT_SNAPSHOT"
 apt-get -o Acquire::ForceIPv4=true -qq install -y --no-install-recommends --snapshot "$UBUNTU_APT_SNAPSHOT" \
   gcc make libc6-dev bc bison flex libelf-dev libssl-dev cpio python3 perl xz-utils >/dev/null

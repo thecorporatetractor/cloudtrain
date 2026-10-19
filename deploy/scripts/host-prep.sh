@@ -4,6 +4,8 @@
 # the kind node image (pinned by digest, ships kmod), so nothing is fetched at runtime.
 #   openvswitch, geneve : Kube-OVN datapath (OVS kernel module + geneve tunnels)
 #   vhost_net, tun      : KubeVirt virtio-net (creates /dev/vhost-net)
+#   vhost_vsock         : KIND_PROFILE=kata only: the Kata agent talks to the shim over vsock
+#                         (creates /dev/vhost-vsock); not loaded for the other profiles
 # Must run BEFORE `kind create cluster`: privileged containers only see device
 # nodes that existed when they were created.
 source "$(dirname "$0")/lib.sh"
@@ -11,6 +13,8 @@ source "$(dirname "$0")/lib.sh"
 [[ -c /dev/kvm ]] || die "/dev/kvm not present: enable nested virtualization (WSL2: nestedVirtualization=true in .wslconfig)"
 
 modules=(openvswitch geneve vhost_net tun vxlan br_netfilter ip_tables)
+devices=(/dev/kvm /dev/vhost-net /dev/net/tun)
+if ((KATA_PROFILE)); then modules+=(vhost_vsock); devices+=(/dev/vhost-vsock); fi
 missing=()
 for m in "${modules[@]}"; do
   grep -qE "^${m} " /proc/modules || [[ -d /sys/module/$m ]] || missing+=("$m")
@@ -33,10 +37,10 @@ if ((${#missing[@]})); then
     || die "modprobe failed; on WSL2 check that /lib/modules/$(uname -r) exists"
 fi
 
-for d in /dev/kvm /dev/vhost-net /dev/net/tun; do
+for d in "${devices[@]}"; do
   [[ -c $d ]] || die "$d missing after module load"
 done
-log "host ready: kvm, vhost-net, tun, openvswitch, geneve"
+log "host ready: kvm, vhost-net, tun, openvswitch, geneve$( ((KATA_PROFILE)) && echo ', vhost-vsock')"
 
 # Modules lab content needs (tunnels, IPsec, VLANs, bonds, tc, NAT; lab-kernel-modules.txt).
 # Not fatal: the platform runs without them, only the labs that use them fail (e.g.

@@ -91,13 +91,14 @@ test). It should be the same as the `docker stop` case plus host-prep reloading 
 
 ### Cluster profiles (`KIND_PROFILE`)
 
-`task dev:up` builds one of three cluster flavours ([any-kubernetes.md](any-kubernetes.md)):
+`task dev:up` builds one of four cluster flavours ([any-kubernetes.md](any-kubernetes.md)):
 
 | Profile | Cluster | Primary CNI | Kube-OVN | Orchestrator |
 |---|---|---|---|---|
 | `kubeovn-primary` (default) | `cloudtrain-dev` | Kube-OVN | primary | `--network-mode=primary` |
 | `managed-cni` | `cloudtrain-mcni` | Cilium (`deploy/cilium/values.yaml`), stands in for a managed cloud's CNI | non-primary behind Multus (`deploy/kube-ovn/values-secondary.yaml`) | `--network-mode=secondary` |
 | `managed-cni-calico` | `cloudtrain-calico` | Calico VXLAN (`deploy/calico/kind.sed` over the pinned upstream `calico-vxlan.yaml`, `CALICO_VERSION`), a second managed-CNI stand-in | non-primary behind Multus, as `managed-cni` | `--network-mode=secondary` |
+| `kata` | `cloudtrain-kata` | Kube-OVN, as the default, plus Kata Containers for tier-B sandboxes (below) | primary | `--tier-runtime-classes B=kata-clh-runtime-rs` |
 
 ```bash
 task dev:up KIND_PROFILE=managed-cni              # control plane + 2 workers (deploy/kind/cluster-managed-cni.yaml)
@@ -105,12 +106,55 @@ task orchestrator:deploy KIND_PROFILE=managed-cni # adds --network-mode=secondar
 task lab:verify KIND_PROFILE=managed-cni -- <lab dir>
 task dev:down KIND_PROFILE=managed-cni            # deletes only cloudtrain-mcni
 # the same commands with KIND_PROFILE=managed-cni-calico use cluster cloudtrain-calico
+# and with KIND_PROFILE=kata cluster cloudtrain-kata
 ```
 
-`CT_CLUSTER_NAME` overrides the cluster name of either profile (the remote verify VM
+`CT_CLUSTER_NAME` overrides the cluster name of any profile (the remote verify VM
 uses it with `KIND_CONFIG=tools/verify-vm/kind-managed-cni.yaml` for a throwaway
 cluster next to the batch runner's). The profiles are separate clusters, so a
-`managed-cni*` cluster never touches `cloudtrain-dev`.
+`managed-cni*` or `kata` cluster never touches `cloudtrain-dev`.
+
+#### `KIND_PROFILE=kata`: tier-B sandboxes
+
+Opt-in, for tier-B work ([kata-spike.md](kata-spike.md)); nothing changes for the other
+profiles or the orchestrator's default. Needs a host with nested KVM (`/dev/kvm`) and the
+`vhost_vsock` module, which `host-prep.sh` loads for this profile only, before the node
+containers start (WSL2 kernels may lack it). `dev-up.sh` then runs
+`deploy/scripts/kata-up.sh` as its last step:
+
+1. **kind node fixes** (redone by every `dev:up`, since a node container restart loses
+   them): `/dev/shm` remounted at `KATA_NODE_SHM` (default 16G; a kind node has 64 MiB and
+   QEMU backs guest RAM with `/dev/shm` files), and `dbus` installed from the Debian
+   snapshot the node image was built from (`KATA_NODE_DEBIAN_SNAPSHOT`) and started: the
+   runtime-rs shims move the VMM into the pod's systemd scope over D-Bus.
+2. **kata-deploy** `KATA_DEPLOY_VERSION` (chart `.tgz` sha256-pinned, image by digest),
+   Cloud Hypervisor on runtime-rs only (`deploy/kata/values.yaml`). It creates the
+   RuntimeClass `kata-clh-runtime-rs` (nodeSelector `katacontainers.io/kata-runtime=true`).
+3. **Lab guest kernel** (`tools/images/kata-kernel`, release `<version>-ct<rev>`, e.g.
+   `6.18.35-ct1`) copied to `/opt/kata/share/kata-containers/vmlinux-<release>` on every Kata
+   node and selected by the drop-in `config.d/90-lab-kernel.toml` of `clh-runtime-rs`. The
+   kernel is `KATA_LAB_KERNEL_FILE`, else a local build (`task image:build:kata-kernel`), else
+   the published artifact `ghcr.io/thecorporatetractor/cloudtrain/kata-lab-kernel:<release>`
+   (oras), checked against `KATA_LAB_KERNEL_SHA256` or, while that is unpinned, its cosign
+   signature from the `kata-kernel` workflow. `KATA_LAB_KERNEL=stock` keeps Kata's kernel.
+4. A probe pod in `kata-clh-runtime-rs` must boot the lab kernel and create a bond.
+
+```bash
+task image:build:linux-pod FAMILY=deb-sys        # tier-B systemd image (el-sys too)
+task dev:up KIND_PROFILE=kata                    # cluster cloudtrain-kata
+task orchestrator:deploy KIND_PROFILE=kata       # --tier-runtime-classes B=kata-clh-runtime-rs
+tools/kata/lab-variant.sh content/packs/linux/labs/netem-impaired-link /tmp/kata-labs
+task lab:verify KIND_PROFILE=kata -- --parallel 1 /tmp/kata-labs/netem-impaired-link-kata
+labctl preflight --context kind-cloudtrain-kata --tier-runtime-classes B=kata-clh-runtime-rs \
+  --probe --systemd-image cloudtrain/deb-sys:24.04
+```
+
+`TIER_RUNTIME_CLASSES=` (empty) deploys the orchestrator without the flag, the default
+behaviour: tier-B container nodes then run on runc and `systemd: true` images are refused.
+`tools/kata/lab-variant.sh` writes a lab's Kata variant: its `ubuntu-vm`/`el-vm` nodes
+become `deb-sys`/`el-sys` pods, nothing else changes; labs with extra disks or reboots stay
+on KubeVirt. On the verify VM the profile runs next to the batch runner's cluster with
+`CT_CLUSTER_NAME` and its own `KUBECONFIG` (see [kata-spike.md](kata-spike.md), section 9).
 
 ### Storage on kind
 
@@ -613,7 +657,13 @@ Status and measurements: `docs/handoffs/foundations.md`.
   the host), and the pod is annotated `labs.cloudtrain.dev/learner-sudo: "true"`. Prefer
   tier-A (`userNamespace`) images for such labs; operators can refuse them entirely with
   the manager flag `--allow-learner-sudo=false` (sessions fail with a clear message).
-- **Tier B, Kata**: deferred (download size); tier-B labs run as tier-C VMs locally.
+- **Tier B, Kata** (`el-sys:10`, `deb-sys:24.04`, `task image:build:linux-pod FAMILY=deb-sys`):
+  the tier-A image plus systemd as PID 1 (`tools/images/linux-pod/sys/ct-sysinit`: the
+  `init` leaf cgroup that keeps `kubectl exec` working, loop and device-mapper nodes), sshd,
+  chrony, nftables, LVM/mdadm, kmod and the lab kernel's `modules.builtin`; learner has
+  passwordless sudo. Catalog `systemd: true`: they run privileged only inside a Kata sandbox
+  (`--tier-runtime-classes`, `KIND_PROFILE=kata`); without one the session fails. Today's
+  tier-B labs still run as tier-C VMs; `KIND_PROFILE=kata` verifies their Kata variants.
 - **Tier C, VMs** (`el-vm:10`, `ubuntu-vm:24.04`, `task image:build:el-vm|ubuntu-vm`). The
   mirror snapshot is baked in as the only, local repo (`/opt/cloudtrain/repo/<el10|noble>`),
   because lab VPCs have no route to cluster services. Extra blank disks: topology

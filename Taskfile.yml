@@ -17,14 +17,14 @@ tasks:
     cmds: [bash deploy/scripts/install-tools.sh]
 
   dev:up:
-    desc: "Create/converge the kind cluster 'cloudtrain-dev' with Kube-OVN, Multus, KubeVirt (KVM), CDI; KIND_PROFILE=managed-cni: cluster 'cloudtrain-mcni' with Cilium primary and Kube-OVN non-primary; KIND_PROFILE=managed-cni-calico: cluster 'cloudtrain-calico', Calico VXLAN primary"
+    desc: "Create/converge the kind cluster 'cloudtrain-dev' with Kube-OVN, Multus, KubeVirt (KVM), CDI; KIND_PROFILE=managed-cni: cluster 'cloudtrain-mcni' with Cilium primary and Kube-OVN non-primary; KIND_PROFILE=managed-cni-calico: cluster 'cloudtrain-calico', Calico VXLAN primary; KIND_PROFILE=kata: cluster 'cloudtrain-kata', Kube-OVN primary plus Kata (tier-B sandboxes, lab guest kernel)"
     deps: [tools]
     env:
       KIND_PROFILE: '{{.KIND_PROFILE | default "kubeovn-primary"}}'
     cmds: [bash deploy/scripts/dev-up.sh]
 
   dev:down:
-    desc: Delete the kind cluster 'cloudtrain-dev' (KIND_PROFILE=managed-cni - 'cloudtrain-mcni', managed-cni-calico - 'cloudtrain-calico'; leaves every other cluster/container alone)
+    desc: Delete the kind cluster 'cloudtrain-dev' (KIND_PROFILE=managed-cni - 'cloudtrain-mcni', managed-cni-calico - 'cloudtrain-calico', kata - 'cloudtrain-kata'; leaves every other cluster/container alone)
     env:
       KIND_PROFILE: '{{.KIND_PROFILE | default "kubeovn-primary"}}'
     cmds: [bash deploy/scripts/dev-down.sh]
@@ -64,8 +64,12 @@ tasks:
     cmds: [bash tools/images/build-jumphost.sh]
 
   image:build:linux-pod:
-    desc: 'Tier-A learner pods cloudtrain/el-lab:10 + cloudtrain/deb-lab:24.04 (catalog el-lab:10, deb-lab:24.04); FAMILY=el|deb for one'
+    desc: 'Tier-A learner pods cloudtrain/el-lab:10 + cloudtrain/deb-lab:24.04 (catalog el-lab:10, deb-lab:24.04); FAMILY=el|deb for one, FAMILY=el-sys|deb-sys for the tier-B systemd images (Kata only)'
     cmds: ['bash tools/images/build-linux-pod.sh {{.FAMILY}}']
+
+  image:build:kata-kernel:
+    desc: 'Kata lab guest kernel (tools/images/kata-kernel, KATA_LAB_KERNEL_* in versions.env; build slot), for KIND_PROFILE=kata without the published artifact'
+    cmds: [tools/slots/run.sh build -- bash tools/images/kata-kernel/build.sh]
 
   image:build:el-vm:
     desc: 'containerDisk cloudtrain/el-vm:10 (catalog el-vm:10): AlmaLinux 10 + local dnf repo, SELinux enforcing, firewalld (build slot)'
@@ -229,7 +233,7 @@ tasks:
     cmds: [bash tools/charts/test.sh]
 
   orchestrator:deploy:
-    desc: 'Build the lab-orchestrator image and deploy CRDs, RBAC and the manager into cloudtrain-dev (CATALOG_OVERLAY=<file> merges a local catalog overlay; KIND_PROFILE=managed-cni / managed-cni-calico deploy into cloudtrain-mcni / cloudtrain-calico with --network-mode=secondary)'
+    desc: 'Build the lab-orchestrator image and deploy CRDs, RBAC and the manager into cloudtrain-dev (CATALOG_OVERLAY=<file> merges a local catalog overlay; KIND_PROFILE=managed-cni / managed-cni-calico deploy into cloudtrain-mcni / cloudtrain-calico with --network-mode=secondary; KIND_PROFILE=kata into cloudtrain-kata with --tier-runtime-classes B=kata-clh-runtime-rs, TIER_RUNTIME_CLASSES= turns it off)'
     env:
       KIND_PROFILE: '{{.KIND_PROFILE | default "kubeovn-primary"}}'
     cmds: [bash deploy/scripts/orchestrator-deploy.sh]
@@ -238,7 +242,7 @@ tasks:
     desc: 'Run the verifier cycle against the live cluster: task lab:verify -- [--only <lab-id>] [--parallel N] [--keep] <lab dir>...'
     dir: services/lab-orchestrator
     cmds:
-      - go run ./cmd/labctl verify --context kind-{{if eq (.KIND_PROFILE | default "") "managed-cni"}}cloudtrain-mcni{{else if eq (.KIND_PROFILE | default "") "managed-cni-calico"}}cloudtrain-calico{{else}}{{.CLUSTER_NAME}}{{end}} --repo-root {{.ROOT_DIR}} {{.CLI_ARGS}}
+      - go run ./cmd/labctl verify --context kind-{{if eq (.KIND_PROFILE | default "") "managed-cni"}}cloudtrain-mcni{{else if eq (.KIND_PROFILE | default "") "managed-cni-calico"}}cloudtrain-calico{{else if eq (.KIND_PROFILE | default "") "kata"}}cloudtrain-kata{{else}}{{.CLUSTER_NAME}}{{end}} --repo-root {{.ROOT_DIR}} {{.CLI_ARGS}}
 
   curriculum:render:
     desc: 'Regenerate docs/curriculum.md from content/curriculum.yaml'

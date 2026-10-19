@@ -5,7 +5,7 @@
 //	labctl verify [--context C] [--parallel N] [--only ID] [--keep] <lab dir|lab.yaml>...
 //	labctl exam compile|draw|run [flags] <exam-id>
 //	labctl catalog check|publishable|overlay [flags]
-//	labctl preflight [--context C] [--network-mode auto|primary|secondary] [--probe]
+//	labctl preflight [--context C] [--network-mode auto|primary|secondary] [--probe] [--tier-runtime-classes B=<rc>] [--systemd-image <img>]
 package main
 
 import (
@@ -33,7 +33,7 @@ Usage:
   labctl verify [flags] <lab>...      run the verifier cycle on a live cluster (see docs/k8s-readiness.md)
   labctl exam compile|draw|run ...    exam simulations (see 'labctl exam help')
   labctl catalog check|publishable|overlay ...  image catalog release tooling (see 'labctl catalog help')
-  labctl preflight [flags]            check a cluster can run labs (network section; see docs/any-kubernetes.md)
+  labctl preflight [flags]            check a cluster can run labs (network and sandbox sections; see docs/any-kubernetes.md)
 
 Run 'labctl <command> -h' for command flags.
 `

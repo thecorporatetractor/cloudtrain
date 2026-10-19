@@ -4,7 +4,8 @@
 # KIND_PROFILE (lib.sh): kubeovn-primary (default, cluster cloudtrain-dev) or
 # managed-cni (cluster cloudtrain-mcni: Cilium primary, Kube-OVN non-primary
 # behind Multus, emulating a managed cloud cluster; docs/any-kubernetes.md) or
-# managed-cni-calico (cluster cloudtrain-calico: the same with Calico VXLAN primary).
+# managed-cni-calico (cluster cloudtrain-calico: the same with Calico VXLAN primary) or
+# kata (cluster cloudtrain-kata: kubeovn-primary plus Kata for tier-B sandboxes, step 7).
 # Host overrides (default: the reference machine's files):
 #   KIND_CONFIG=<file>            kind cluster config, used only when the cluster is created
 #   KUBE_OVN_EXTRA_VALUES=<file>  extra Helm values merged over deploy/kube-ovn/values.yaml
@@ -48,13 +49,15 @@ else
     --config "${KIND_CONFIG:-$DEFAULT_KIND_CONFIG}" --wait 0s
   if [[ -n $prev_ctx ]]; then kubectl config use-context "$prev_ctx" >/dev/null; fi
 fi
-# Every node must have the KVM/virtio-net device nodes as character devices.
+# Every node must have the KVM/virtio-net (and for Kata the vsock) device nodes as character devices.
+DEV_TEST='test -c /dev/kvm && test -c /dev/vhost-net && test -c /dev/net/tun'
+((KATA_PROFILE)) && DEV_TEST+=' && test -c /dev/vhost-vsock'
 for node in $(docker ps --filter "$NODE_FILTER" --format '{{.Names}}'); do
-  if ! docker exec "$node" sh -c 'test -c /dev/kvm && test -c /dev/vhost-net && test -c /dev/net/tun'; then
-    warn "$node lacks /dev/kvm, /dev/vhost-net or /dev/net/tun as char devices (started before host-prep?); restarting it"
+  if ! docker exec "$node" sh -c "$DEV_TEST"; then
+    warn "$node lacks /dev/kvm, /dev/vhost-net, /dev/net/tun$( ((KATA_PROFILE)) && echo ' or /dev/vhost-vsock') as char devices (started before host-prep?); restarting it"
     docker restart "$node" >/dev/null
-    docker exec "$node" sh -c 'test -c /dev/kvm && test -c /dev/vhost-net && test -c /dev/net/tun' \
-      || die "$node still lacks KVM/vhost-net/tun devices after restart"
+    docker exec "$node" sh -c "$DEV_TEST" \
+      || die "$node still lacks the KVM/vhost-net/tun$( ((KATA_PROFILE)) && echo '/vhost-vsock') devices after restart"
   fi
 done
 # On hosts with DMI (EC2, most bare metal; WSL has none) kind bind-mounts files over
@@ -176,5 +179,8 @@ wait_for "CDI Available" 600 k wait cdi/cdi --for=condition=Available --timeout=
 
 # --- 6. Prove KVM (not emulation) with a throwaway VMI -----------------------
 "$REPO_ROOT/deploy/scripts/verify-kvm.sh"
+
+# --- 7. Kata Containers (KIND_PROFILE=kata: tier-B sandboxes) ----------------
+if ((KATA_PROFILE)); then "$REPO_ROOT/deploy/scripts/kata-up.sh"; fi
 
 log "dev:up complete in $((SECONDS - T0))s. Context: $KUBECONTEXT"

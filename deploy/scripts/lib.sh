@@ -19,18 +19,26 @@ export PATH="$HOME/.local/bin:$PATH"
 #     Its own cluster (default name cloudtrain-mcni), so it never touches cloudtrain-dev.
 #   managed-cni-calico: as managed-cni with Calico (VXLAN, deploy/calico/) as the primary CNI.
 #     Cluster cloudtrain-calico.
-# CT_CLUSTER_NAME overrides the cluster name of either profile.
+#   kata: kubeovn-primary plus Kata Containers (Cloud Hypervisor on runtime-rs, the lab guest
+#     kernel) for tier-B sandboxes (deploy/scripts/kata-up.sh, docs/kata-spike.md). Cluster
+#     cloudtrain-kata; the orchestrator gets --tier-runtime-classes B=$KATA_RUNTIME_CLASS.
+# CT_CLUSTER_NAME overrides the cluster name of any profile.
 export KIND_PROFILE=${KIND_PROFILE:-kubeovn-primary}
 case $KIND_PROFILE in
   kubeovn-primary) ;;
   managed-cni) CLUSTER_NAME=cloudtrain-mcni ;;
   managed-cni-calico) CLUSTER_NAME=cloudtrain-calico ;;
-  *) printf 'unknown KIND_PROFILE %s (kubeovn-primary, managed-cni or managed-cni-calico)\n' "$KIND_PROFILE" >&2; exit 2 ;;
+  kata) CLUSTER_NAME=cloudtrain-kata ;;
+  *) printf 'unknown KIND_PROFILE %s (kubeovn-primary, managed-cni, managed-cni-calico or kata)\n' "$KIND_PROFILE" >&2; exit 2 ;;
 esac
 # Profiles where another CNI owns eth0 and Kube-OVN is secondary behind Multus.
 SECONDARY_PROFILE=0
 case $KIND_PROFILE in managed-cni | managed-cni-calico) SECONDARY_PROFILE=1 ;; esac
 export SECONDARY_PROFILE
+# Profiles with Kata Containers (vhost_vsock on the host, kata-up.sh).
+KATA_PROFILE=0
+[[ $KIND_PROFILE == kata ]] && KATA_PROFILE=1
+export KATA_PROFILE
 export CLUSTER_NAME=${CT_CLUSTER_NAME:-$CLUSTER_NAME}
 export KUBECONTEXT="kind-${CLUSTER_NAME}"
 

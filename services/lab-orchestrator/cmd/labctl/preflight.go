@@ -17,8 +17,9 @@ package main
 //     management segment: the Multus default network in secondary mode),
 //     isolation from the API service, and the kernel modules on those nodes.
 //
-// Every check reports PASS, WARN or FAIL with a fix; any FAIL exits 1. Other
-// sections (KVM, storage, Pod Security, registry) are added next to it.
+// The sandbox section (preflight_sandbox.go) checks the Kata RuntimeClasses for
+// tier B. Every check reports PASS, WARN or FAIL with a fix; any FAIL exits 1.
+// Other sections (KVM, storage, Pod Security, registry) are added next to them.
 
 import (
 	"bufio"
@@ -101,6 +102,10 @@ type preflightOpts struct {
 	modulesFile string
 	mtu         int
 	timeout     time.Duration
+	// tiers is the manager's --tier-runtime-classes (sandbox section).
+	tiers map[string]string
+	// systemdImage, with probe: a tier-B systemd image to boot in each sandbox.
+	systemdImage string
 }
 
 func cmdPreflight(args []string, stdout, stderr io.Writer) int {
@@ -114,8 +119,15 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 	repoRoot := fl.String("repo-root", "", "repository root, for deploy/scripts/lab-kernel-modules.txt (default: found from the working directory)")
 	mtu := fl.Int("lab-mtu", network.DefaultLinkMTU, "the orchestrator's --lab-mtu (the segment MTU the probe sets and expects)")
 	timeout := fl.Duration("timeout", 5*time.Minute, "probe timeout")
+	tierRC := fl.String("tier-runtime-classes", "", "the orchestrator's --tier-runtime-classes to check (e.g. B=kata-clh-runtime-rs); empty: report the Kata RuntimeClasses only")
+	systemdImage := fl.String("systemd-image", "", "with --probe: a tier-B systemd image (e.g. cloudtrain/deb-sys:24.04, on the nodes) to boot in each sandbox RuntimeClass and exec into")
 	asJSON := fl.Bool("json", false, "print the report as JSON")
 	if err := fl.Parse(args); err != nil {
+		return 2
+	}
+	tiers, err := drivers.ParseTierRuntimeClasses(*tierRC)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		return 2
 	}
 	if *mode != "auto" {
@@ -134,7 +146,7 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	o := preflightOpts{mode: *mode, probe: *probe, toolsImage: *toolsImage, mtu: *mtu, timeout: *timeout,
-		modulesFile: filepath.Join(root, "deploy", "scripts", "lab-kernel-modules.txt")}
+		modulesFile: filepath.Join(root, "deploy", "scripts", "lab-kernel-modules.txt"), tiers: tiers, systemdImage: *systemdImage}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+2*time.Minute)
 	defer cancel()
 	rep, err := runNetworkPreflight(ctx, cfg, o, stderr)
@@ -158,9 +170,9 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 func printPreflight(w io.Writer, rep *pfReport) {
 	fmt.Fprintf(w, "preflight %s (network mode %s)\n", rep.Section, rep.Mode)
 	for _, c := range rep.Checks {
-		fmt.Fprintf(w, "%-4s  %-28s %s\n", c.Status, c.Name, c.Message)
+		fmt.Fprintf(w, "%-4s  %-34s %s\n", c.Status, c.Name, c.Message)
 		if c.Fix != "" && c.Status != pfPass {
-			fmt.Fprintf(w, "      %-28s fix: %s\n", "", c.Fix)
+			fmt.Fprintf(w, "      %-34s fix: %s\n", "", c.Fix)
 		}
 	}
 }
@@ -207,12 +219,12 @@ func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts,
 	if err != nil {
 		return nil, err
 	}
-	rep := &pfReport{Section: "network"}
+	rep := &pfReport{Section: "network, sandbox"}
 	mode := evaluateNetwork(cl, o.mode, rep)
 	rep.Mode = string(mode)
+	var ex drivers.PodExecutor
 	if o.probe {
-		ex, err := drivers.NewRESTPodExecutor(cfg)
-		if err != nil {
+		if ex, err = drivers.NewRESTPodExecutor(cfg); err != nil {
 			return nil, err
 		}
 		p := &netProbe{c: c, ex: ex, o: o, mode: mode, log: logOut}
@@ -220,6 +232,11 @@ func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts,
 	} else {
 		rep.add("probe", pfWarn, "not run: MTU, 1400-byte frames, isolation and kernel modules unchecked", "re-run with --probe")
 	}
+	runSandboxPreflight(ctx, c, ex, o, cl.Nodes, rep, func(format string, args ...any) {
+		if logOut != nil {
+			fmt.Fprintf(logOut, "preflight: "+format+"\n", args...)
+		}
+	})
 	return rep, nil
 }
 

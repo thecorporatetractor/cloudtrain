@@ -18,6 +18,7 @@ TOOLS=(
   "helm|3.22.0|https://get.helm.sh/helm-v3.22.0-linux-amd64.tar.gz|1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb|linux-amd64/helm"
   "hadolint|2.15.1|$GH/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64|c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507|"
   "kube-linter|0.8.3|$GH/stackrox/kube-linter/releases/download/v0.8.3/kube-linter-linux.tar.gz|1a6d8419b11971372971fdbc22682b684ebfb7cf1c39591662d1b6ca736c41df|kube-linter"
+  "oras|1.3.4|$GH/oras-project/oras/releases/download/v1.3.4/oras_1.3.4_linux_amd64.tar.gz|f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454|oras"
   "osv-scanner|2.7.0|$GH/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64|160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b|"
   "shellcheck|0.11.0|$GH/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz|8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198|shellcheck-v0.11.0/shellcheck"
   "syft|1.54.1|$GH/anchore/syft/releases/download/v1.54.1/syft_1.54.1_linux_amd64.tar.gz|c069905b391cc4c20a5ba65ad5c10be2a7ba074f8ea6ad203e24d14e303dad47|syft"
