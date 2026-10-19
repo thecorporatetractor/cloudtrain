@@ -185,6 +185,8 @@ spec:
       # ansible-lint drops every path a .gitignore matches, so the judged copy has no ignore file or lint configuration at any depth
       N sh -c 'find . -type l -delete; rm -rf .git .config; find . \( -name ".gitignore" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name ".yamllint*" \) -delete'
       if [ "$(N sh -c 'grep -rIlE "skip_ansible_lint|noqa" . | head -1')" != "" ]; then clean; echo silenced; exit 0; fi
+      # ansible-lint only reads *.yml/*.yaml, so tasks hidden in other files or pulled in through include/import would escape it
+      if [ -n "$(N sh -c 'find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1')" ]; then clean; echo hidden-tasks; exit 0; fi
       out=$(N timeout 150 /opt/ansible/bin/ansible-lint -c $cfg --profile production -q --offline 2>&1); rc=$?
       n=$(printf '%s\n' "$out" | grep -c ':[0-9]')
       clean
@@ -206,6 +208,7 @@ spec:
         if [ -n "$(find . /home/learner/.config/yamllint \( -name ".yamllint*" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name config -path "*yamllint*" -o -path "*/.config/*" \) 2>/dev/null | head -1)" ]; then echo silenced; exit 0; fi
         if timeout 30 grep -rIqsEi --include=.gitignore "yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]" . ; then echo silenced; exit 0; fi
         if timeout 30 grep -rIqsE --exclude-dir=.git "skip_ansible_lint|noqa|skip_list|warn_list|skip_tasks|exclude_paths|enable_list" . ; then echo silenced; exit 0; fi
+        if [ -n "$(find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1)" ]; then echo silenced; exit 0; fi
         echo clean')
       [ "$r" = clean ] || { echo silenced; exit 0; }
       [ "$(ct-ansible run /home/learner/branch-automation cat roles/branch_gateway/defaults/main.yml roles/branch_gateway/templates/gateway.conf.j2 site.yml | sha256sum)" = "$(cat /var/tmp/.ct-lint.sum)" ] && echo ok || echo supplied-files-changed

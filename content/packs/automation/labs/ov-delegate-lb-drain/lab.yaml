@@ -32,7 +32,7 @@ spec:
 
     The sampler records from the start of the session. If a try goes wrong (or you restart the application by hand),
     put every node back with `ansible claims_web -b -m shell -a 'echo r1 > /etc/ov/claims-release && /usr/local/sbin/ov-claims-ctl restart'`,
-    wait until all four are healthy, then clear the records with `ov-lb-reset` on the control node and run again.
+    wait until all four are healthy, then clear the records with `ov-lb-reset` on the control node and run again. The records that are judged start at the last reset and must contain all four nodes switching from `r1` to `r{{rel}}`, so reset while every node is back on `r1`, before the run you want judged.
   objectives:
   - Delegate tasks to the load balancer
   - Update nodes one at a time with serial
@@ -120,6 +120,7 @@ spec:
       #!/usr/bin/python3
       import http.server
       import os
+      import socket
       import socketserver
       import time
 
@@ -136,6 +137,7 @@ spec:
               body = ("claims-web %s\n" % RELEASE).encode() if warm else b"warming up\n"
               self.send_response(200 if warm else 503)
               self.send_header("Content-Length", str(len(body)))
+              self.send_header("X-Node", socket.gethostname())
               self.end_headers()
               self.wfile.write(body)
 
@@ -264,8 +266,11 @@ spec:
       ) &
       (
         while :; do
-          c=$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' http://10.70.0.50:8080/ 2>/dev/null)
-          echo "$(date +%s) $c" >> $R
+          out=$(curl -s -i --max-time 2 http://10.70.0.50:8080/ 2>/dev/null | tr -d '\r')
+          c=$(printf '%s\n' "$out" | awk 'NR==1 {print $2}'); c=${c:-000}
+          node=$(printf '%s\n' "$out" | awk -F': ' 'tolower($1)=="x-node" {print $2}')
+          rel=$(printf '%s\n' "$out" | awk '/^claims-web / {print $2}')
+          echo "$(date +%s) $c ${rel:--} ${node:--}" >> $R
           sleep 0.2
         done
       ) &
@@ -345,6 +350,10 @@ spec:
     - automation.advanced.rolling
     weight: 3
     command: |
+      # The judged window (since the last ov-lb-reset) must contain the whole rollout: every one of the four nodes answered
+      # with r1 first and with r{{rel}} later. A window that was reset after the nodes had switched cannot be judged.
+      sw=$(awk '$2 == 200 && $4 != "-" { if ($3 == "r1") old[$4] = 1; if ($3 == "r{{rel}}" && old[$4]) sw[$4] = 1 } END { n = 0; for (k in sw) n++; print n }' /var/lib/ov-lb/requests.log)
+      [ "$sw" = 4 ] || { echo "window-misses-rollout=$sw/4"; exit 0; }
       awk '{ if (NR == 1 || $2 < min) min = $2; if ($2 == 3) three++; n++ } END { if (n < 20) print "sampler-short"; else if (min < 3) print "min=" min; else if (!three) print "no-drain-seen"; else print "ok" }' /var/lib/ov-lb/healthy.log
     expect:
       match: exact
@@ -357,6 +366,10 @@ spec:
     - automation.advanced.delegation
     weight: 3
     command: |
+      # The judged window (since the last ov-lb-reset) must contain the whole rollout: every one of the four nodes answered
+      # with r1 first and with r{{rel}} later. A window that was reset after the nodes had switched cannot be judged.
+      sw=$(awk '$2 == 200 && $4 != "-" { if ($3 == "r1") old[$4] = 1; if ($3 == "r{{rel}}" && old[$4]) sw[$4] = 1 } END { n = 0; for (k in sw) n++; print n }' /var/lib/ov-lb/requests.log)
+      [ "$sw" = 4 ] || { echo "window-misses-rollout=$sw/4"; exit 0; }
       n=$(wc -l < /var/lib/ov-lb/requests.log)
       bad=$(awk '$2 != 200' /var/lib/ov-lb/requests.log | wc -l)
       [ "$n" -ge 50 ] || { echo "sampler-short"; exit 0; }

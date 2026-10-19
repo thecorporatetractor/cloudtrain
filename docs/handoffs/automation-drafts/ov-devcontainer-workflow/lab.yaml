@@ -189,6 +189,8 @@ spec:
       ct-ansible run $t/repo timeout 60 tar --exclude=./.git -cf - . | N timeout 60 tar -x --no-same-owner --no-same-permissions -f - || { clean; echo copy-failed; exit 0; }
       N sh -c 'find . -type l -delete; rm -rf .git .ansible-lint .ansible-lint.yml .ansible-lint.yaml .ansible-lint-ignore .config .yamllint .yamllint.yml .yamllint.yaml; find . \( -name ".gitignore" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name ".yamllint*" \) -delete'
       if [ -n "$(N sh -c 'timeout 30 grep -rIlE "skip_ansible_lint|noqa" . | head -1')" ]; then clean; echo lint-silenced; exit 0; fi
+      # ansible-lint only reads *.yml/*.yaml, so tasks pulled in through include/import from another file would escape it
+      if [ -n "$(N sh -c 'timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1')" ]; then clean; echo lint-silenced; exit 0; fi
       out=$(N timeout 150 /opt/ansible/bin/ansible-lint -c $cfg --offline -p --nocolor provision.yml 2>&1); rc=$?
       clean
       [ $rc = 0 ] && echo clean || echo lint-findings
@@ -209,6 +211,7 @@ spec:
       if [ -n "$(ct-ansible run $t/repo sh -c 'find . -path ./.git -prune -o \( -name ".ansible-lint*" -o -name "ansible-lint*" -o -path "*/.config/*" -o -name .config \) -print | head -1')" ]; then r=silenced
       elif ct-ansible run $t/repo timeout 30 grep -rIqsEi --exclude-dir=.git --include=.gitignore 'yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]' . ; then r=silenced
       elif ct-ansible run / test -e /home/learner/.config/yamllint; then r=silenced
+      elif [ -n "$(ct-ansible run $t/repo sh -c 'timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1')" ]; then r=silenced
       elif ct-ansible run $t/repo timeout 30 grep -rIqsE --exclude-dir=.git 'skip_ansible_lint|noqa|skip_list|warn_list|skip_tasks|exclude_paths|enable_list' .; then r=silenced; else r=ok; fi
       ct-ansible run $t/repo test -f provision.yml || r=no-playbook
       ct-ansible run / rm -rf $t; echo $r

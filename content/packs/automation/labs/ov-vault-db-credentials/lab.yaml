@@ -136,6 +136,33 @@ spec:
       v=$(L ansible ov-db-1 -c local -m ansible.builtin.debug -a var=vault_db_password 2>/dev/null | sed -n 's/.*"vault_db_password": "\(.*\)".*/\1/p')
       [ "$v" = "Ov-db-{{dbpw}}" ] || { echo wrong-value; exit 0; }
       L grep -rIqs 'Ov-db-{{dbpw}}' . && { echo plaintext-in-project; exit 0; }
+      # The value must come from a vault blob labelled prod: group_vars is copied (as the learner) into a directory owned by
+      # nobody and decrypted there with the known vault password, and the variable has to be defined by such a file
+      j=$(mktemp -d); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j' EXIT
+      L tar -cf - group_vars 2>/dev/null | (cd $j && runuser -u nobody -- tar -x --no-same-owner --no-same-permissions -f - 2>/dev/null)
+      (cd $j && runuser -u nobody -- find . -type l -delete)
+      w=$(cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 timeout 40 /opt/ansible/bin/python3 -I - <<'EOS'
+      import os
+      from ansible.parsing.dataloader import DataLoader
+      from ansible.parsing.vault import VaultSecret
+      loader = DataLoader()
+      loader.set_vault_secrets([('prod', VaultSecret(b'Ov-vault-{{vaultpw}}'))])
+      found = False
+      for root, _, files in os.walk('group_vars'):
+          for f in files:
+              path = os.path.join(root, f)
+              try:
+                  if os.path.getsize(path) > 262144 or 'ANSIBLE_VAULT;1.2;AES256;prod' not in open(path).read():
+                      continue
+                  data = loader.load_from_file(path)
+                  if isinstance(data, dict) and str(data.get('vault_db_password')) == 'Ov-db-{{dbpw}}':
+                      found = True
+              except Exception:
+                  pass
+      print('ok' if found else 'not-from-vault')
+      EOS
+      )
+      [ "$w" = ok ] || { echo not-from-vault; exit 0; }
       echo ok
     expect:
       match: exact

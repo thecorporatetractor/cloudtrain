@@ -267,11 +267,14 @@ spec:
       # reads learner-controlled files: run as the learner, with a time limit
       L() { ct-ansible run /home/learner/branch-automation timeout 30 "$@"; }
       L sha256sum -c --quiet /var/tmp/.ct-rolling.sum >/dev/null 2>&1 || { echo supplied-files-changed; exit 0; }
-      L /opt/ansible/bin/python3 -I - <<'EOF'
-      import os, yaml
+      # the playbook is read as the learner (bounded) into a copy; the verdict is computed by an unprivileged account
+      snap=$(mktemp); trap 'rm -f "$snap"' EXIT; chmod 0644 "$snap"
+      L timeout 10 head -c 262145 branch-upgrade.yml > "$snap" 2>/dev/null
+      runuser -u nobody -- env -i HOME=/nonexistent PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 timeout 30 /opt/ansible/bin/python3 -I - "$snap" <<'EOF'
+      import os, sys, yaml
       try:
-          if os.path.getsize('/home/learner/branch-automation/branch-upgrade.yml') > 262144: raise ValueError('large')
-          plays = yaml.safe_load(open('/home/learner/branch-automation/branch-upgrade.yml'))
+          if os.path.getsize(sys.argv[1]) > 262144: raise ValueError('large')
+          plays = yaml.safe_load(open(sys.argv[1]))
           assert isinstance(plays, list) and all(isinstance(q, dict) for q in plays)
       except Exception:
           print('no-playbook'); raise SystemExit

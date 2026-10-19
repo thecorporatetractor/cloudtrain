@@ -155,8 +155,13 @@ spec:
     timeoutSec: 300
     command: |
       /opt/ansible/bin/python3 -I - <<'EOF'
-      import atexit, json, signal, subprocess
+      import atexit, json, os, random, signal, subprocess
       H = 'ov-branch-lon-gw'
+      # per-attempt names and devices, so a module cannot special-case fixed values
+      sfx = os.urandom(3).hex()
+      T = 'lon-t' + sfx
+      C = 'lon-c' + sfx
+      U1, U2, U3 = ['lpd://10.70.9.%d' % n for n in random.sample(range(100, 250), 3)]
       D = '/home/learner/printer-modules'
       def run(*a):
           try:
@@ -191,30 +196,30 @@ spec:
       d = run('ansible-doc', 'orrinvale.claims.ov_print_queue')
       if d.returncode != 0 or 'queue' not in d.stdout:
           fail('no-documentation')
-      r = adhoc({'queue': 'lon-test', 'device': 'lpd://10.70.9.200'})
-      if not r or r.get('changed') is not True or 'lon-test' not in r.get('queues', []):
+      r = adhoc({'queue': T, 'device': U1})
+      if not r or r.get('changed') is not True or T not in r.get('queues', []):
           fail('add-not-changed')
-      if 'lon-test=lpd://10.70.9.200\n' not in fileq():
+      if T + '=' + U1 + '\n' not in fileq():
           fail('add-not-written')
-      r = adhoc({'queue': 'lon-test', 'device': 'lpd://10.70.9.200'})
+      r = adhoc({'queue': T, 'device': U1})
       if not r or r.get('changed') is not False:
           fail('add-not-idempotent')
       before = fileq()
-      r = adhoc({'queue': 'lon-check', 'device': 'lpd://10.70.9.201'}, check=True)
-      if not r or r.get('changed') is not True or 'lon-check' not in r.get('queues', []):
+      r = adhoc({'queue': C, 'device': U2}, check=True)
+      if not r or r.get('changed') is not True or C not in r.get('queues', []):
           fail('check-mode-result')
       if fileq() != before:
           fail('check-mode-wrote')
-      r = adhoc({'queue': 'lon-test', 'state': 'absent'}, check=True)
+      r = adhoc({'queue': T, 'state': 'absent'}, check=True)
       if not r or r.get('changed') is not True or fileq() != before:
           fail('check-mode-remove')
-      r = adhoc({'queue': 'lon-test', 'device': 'lpd://10.70.9.202'})
-      if not r or r.get('changed') is not True or 'lon-test=lpd://10.70.9.202\n' not in fileq():
+      r = adhoc({'queue': T, 'device': U3})
+      if not r or r.get('changed') is not True or T + '=' + U3 + '\n' not in fileq():
           fail('update-not-applied')
-      r = adhoc({'queue': 'lon-test', 'state': 'absent'})
-      if not r or r.get('changed') is not True or 'lon-test' in r.get('queues', []):
+      r = adhoc({'queue': T, 'state': 'absent'})
+      if not r or r.get('changed') is not True or T in r.get('queues', []):
           fail('remove-not-changed')
-      r = adhoc({'queue': 'lon-test', 'state': 'absent'})
+      r = adhoc({'queue': T, 'state': 'absent'})
       if not r or r.get('changed') is not False:
           fail('remove-not-idempotent')
       restore()

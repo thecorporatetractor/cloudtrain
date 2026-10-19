@@ -430,7 +430,7 @@ Adaptations and blockers:
 - ov-delegate-lb-drain: needs haproxy from the el10 mirror in an el-lab pod (own setup step, 600 s; ov-lb1 has cpu 0.5 / 512 MiB); if it does not install, move to VMs.
 - ov-tags-partial-runs: removes the preinstalled tree package (no mirror dependency); the certificate uses openssl, not community.crypto (no python cryptography in the pods).
 
-Verify queue: 22 pod labs on the remote batch runner (labctl verify, two seeds, mutations, alternatives) plus 1 blocked (ov-devcontainer-workflow, which stays in the learner course ae-workflow and its path module like the other blocked learning labs, so it is listed there but cannot be started until code-server and the web proxy exist).
+Verify queue: 22 pod labs on the remote batch runner (labctl verify, two seeds, mutations, alternatives) plus 1 blocked (ov-devcontainer-workflow: status proposed, not in any course or path module and not counted as built; its terminal-only stand-in is kept as a draft in docs/handoffs/automation-drafts/ov-devcontainer-workflow/lab.yaml, outside the pack, until code-server and the web proxy exist).
 
 ## Open questions (user)
 

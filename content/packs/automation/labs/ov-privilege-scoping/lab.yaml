@@ -205,11 +205,15 @@ spec:
     weight: 3
     timeoutSec: 60
     command: |
-      cd /home/learner/claims-automation
-      ct-ansible run /home/learner/claims-automation /opt/ansible/bin/python3 -I - <<'EOF'
+      # The project is copied (as the learner) into a directory owned by nobody and judged there by that account, so no
+      # learner process can touch the verdict.
+      j=$(mktemp -d); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 "$@"); }
+      ct-ansible run /home/learner/claims-automation timeout 30 tar --exclude=./.git -cf - . 2>/dev/null | N timeout 30 tar -x --no-same-owner --no-same-permissions -f - 2>/dev/null
+      N find . -type l -delete
+      N timeout 55 /opt/ansible/bin/python3 -I - <<'EOF'
       import os, re, json, subprocess, yaml
       bad = set()
-      priv = 0
       BOOL = {'true': True, 'yes': True, 'on': True, '1': True, 'false': False, 'no': False, 'off': False, '0': False}
       ESC = re.compile(r'^(ansible_)?(become|sudo|su)(_\w+)?$')
       OKKEYS = ('become', 'become_user', 'become_method')
@@ -283,12 +287,33 @@ spec:
                   yield t, b
 
 
-      def isdir(t):
-          return any(isinstance(v, dict) and str(v.get('state')) == 'directory' for v in t.values())
+      kinds = set()
+      wb = [False]
+      PKG = {'dnf', 'dnf5', 'yum', 'package'}
+      CONF = {'copy', 'template', 'lineinfile', 'blockinfile'}
+
+
+      def allowed(t):
+          # allowlist: a task may escalate only if it is one of the three privileged tasks (as root)
+          if str(t.get('become_user', 'root')) != 'root':
+              return None
+          for k, v in t.items():
+              m = str(k).split('.')[-1]
+              if m not in PKG | CONF | {'file'}:
+                  continue
+              if isinstance(v, str):
+                  v = dict(x.split('=', 1) for x in v.split() if '=' in x)
+              if not isinstance(v, dict):
+                  return None
+              if m in PKG:
+                  return 'pkg'
+              if m == 'file':
+                  return 'dir' if str(v.get('path', v.get('dest', ''))).rstrip('/') == '/var/reports' and str(v.get('state')) == 'directory' else None
+              return 'conf' if str(v.get('dest', v.get('path', ''))) == '/etc/ov/report.conf' else None
+          return None
 
 
       def check(path, depth):
-          global priv
           if depth > 4:
               bad.add('import-depth')
               return
@@ -314,16 +339,23 @@ spec:
               for k in ('pre_tasks', 'tasks', 'post_tasks', 'handlers'):
                   every += p.get(k) or []
               for t, b in walk(every, base):
-                  text = yaml.safe_dump(t)
-                  if '/var/reports/' in text and not isdir(t) and b:
-                      bad.add('report-escalates')
-                  if ('package' in text or 'dnf' in text or '/etc/ov/report.conf' in text) and b:
-                      priv += 1
+                  text = yaml.safe_dump(t, width=10 ** 6)
+                  if 'written_by' in text:
+                      if re.search(r'written_by=\s*\{\{[^}]*ansible_(user_id|user|facts)', text):
+                          wb[0] = True
+                  if b:
+                      kind = allowed(t)
+                      if kind:
+                          kinds.add(kind)
+                      else:
+                          bad.add('extra-escalation')
 
 
       check('report.yml', 0)
-      if not priv and not bad:
-          bad.add('nothing-escalates')
+      if kinds != {'pkg', 'conf', 'dir'} and not bad:
+          bad.add('privileged-tasks-missing')
+      if not wb[0] and not bad:
+          bad.add('written_by-not-from-ansible_user_id')
       print(' '.join(sorted(bad)) or 'ok')
       EOF
     expect:

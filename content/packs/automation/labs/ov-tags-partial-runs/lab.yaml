@@ -204,12 +204,14 @@ spec:
     weight: 2
     command: |
       cd /home/learner/claims-automation
-      all=$(ct-ansible run . ansible-playbook site.yml --list-tasks 2>/dev/null | grep -c '^      .*TAGS:')
-      sel=$(ct-ansible run . ansible-playbook site.yml --list-tasks --tags cert 2>/dev/null | grep '^      .*TAGS:')
-      n=$(printf '%s\n' "$sel" | grep -c '^      .*TAGS:')
-      [ "$all" = 5 ] || { echo "tasks=$all"; exit 0; }
-      printf '%s\n' "$sel" | grep -qiE 'legacy|banner' && { echo "non-cert-tasks-selected"; exit 0; }
-      [ "$n" = 3 ] && echo cert-only || echo "selected=$n"
+      # the task names are compared with the ones setup wrote: nothing renamed, removed or added
+      names() { sed -n 's/^      \(.*\)\tTAGS:.*/\1/p' | sort; }
+      all=$(ct-ansible run . ansible-playbook site.yml --list-tasks 2>/dev/null | names)
+      sel=$(ct-ansible run . ansible-playbook site.yml --list-tasks --tags cert 2>/dev/null | names)
+      want_all=$(printf '%s\n' 'Retire the legacy tree utility' 'Portal banner' 'Portal certificate expiry' 'Portal certificate renewal' 'Portal certificate key permissions' | sort)
+      want_sel=$(printf '%s\n' 'Portal certificate expiry' 'Portal certificate renewal' 'Portal certificate key permissions' | sort)
+      [ "$all" = "$want_all" ] || { echo "tasks-changed"; exit 0; }
+      [ "$sel" = "$want_sel" ] && echo cert-only || echo "selected=$(printf '%s\n' "$sel" | grep -c .)"
     expect:
       match: exact
       value: cert-only
