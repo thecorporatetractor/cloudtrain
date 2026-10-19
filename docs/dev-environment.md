@@ -164,6 +164,17 @@ sets CDI scratch space to `standard` (`DEV_STORAGE_CLASS=` empty uses the defaul
 To try another class: `STORAGE_CLASS=<name> task dev:orchestrator`. The manager's startup
 preflight logs a warning when no default class exists. Details: [storage.md](storage.md).
 
+### Pinned lab images
+
+Lab images loaded into kind (`cloudtrain/*`) exist only on the nodes (`imagePullPolicy:
+IfNotPresent`, nothing to pull), so kubelet image garbage collection deleting one at
+about 76% disk breaks every lab that uses it. `load_image` (`deploy/scripts/lib.sh`, used by
+`tools/images/load.sh`, `orchestrator-deploy.sh` and the other loaders) therefore labels each
+image `io.cri-containerd.pinned=pinned` on every node through `pin_image`, which containerd's
+CRI excludes from GC; it is idempotent and only warns on failure. The kind configs also
+raise the kubelet `imageGCHighThresholdPercent`/`imageGCLowThresholdPercent` to 90/85;
+existing clusters pick that up only on recreate (the pin works on them already, re-run a load).
+
 ## What `lab:demo` builds
 
 ```

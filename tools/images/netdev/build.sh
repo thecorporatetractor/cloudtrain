@@ -14,6 +14,8 @@ for t in "${targets[@]}"; do
   docker build -q -t "$tag" "$DIR/$t" >/dev/null || die "build $tag failed"
   log "built $tag"
   if [[ "${LOAD_INTO_KIND:-1}" == 1 ]] && cluster_exists; then
-    kind load docker-image --name "$CLUSTER_NAME" "$tag" >/dev/null && log "loaded $tag into $CLUSTER_NAME"
+    # load_image (lib.sh) loads where missing and pins the image against kubelet image GC.
+    # shellcheck disable=SC2046
+    load_image "$tag" $(kind get nodes --name "$CLUSTER_NAME") && log "loaded $tag into $CLUSTER_NAME"
   fi
 done

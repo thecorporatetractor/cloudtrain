@@ -11,6 +11,8 @@
 #                                                `mode: virtual` labs whose Pods run on
 #                                                the host nodes
 #
+# Loaded images are pinned (io.cri-containerd.pinned) on every node so kubelet image GC
+# cannot delete them; see pin_image in deploy/scripts/lib.sh.
 # Idempotent: an image already on a node with the same digest is skipped.
 # IMAGE_SOURCE=ghcr pulls the images CI publishes from GHCR instead of the local Docker
 # store (lib.sh, docs/deploy.md); the default, local, is unchanged.
