@@ -35,8 +35,11 @@ const (
 	// AnnotationBooted on a VM records the VMI (boot) whose liveness was
 	// confirmed after a restart of a VM with a persistent disk.
 	AnnotationBooted = "labs.cloudtrain.dev/booted"
-	// DefaultVMDiskSize fits the 10 GiB golden images plus filesystem overhead.
-	DefaultVMDiskSize = "11Gi"
+	// DefaultVMDiskSize is the persistent root disk of a containerDisk whose
+	// catalog entry has no diskSize: a 10 GiB image (virtual size) plus CDI's
+	// filesystem overhead (6 %) and headroom. Larger images set diskSize (at
+	// least virtual size x 1.15; tools/images/build.sh enforces it).
+	DefaultVMDiskSize = "12Gi"
 )
 
 // VMDiskOptions selects how VM root disks are backed.

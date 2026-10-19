@@ -39,11 +39,14 @@ images:
     publishable: true
   # kubeadm nodes: `/opt/cloudtrain/bin/cni-install <podCIDR>` installs Calico (enforces
   # NetworkPolicy) from the sha256-recorded /opt/cloudtrain/manifests/calico.yaml; all
-  # control-plane, Calico and workload images preloaded; curl installed. No users or
-  # keys baked in (the runtime injects them through cloud-init).
+  # control-plane, Calico and workload images preloaded; curl and buildah installed
+  # (root storage /var/lib/containers, RUN on the host network, short names -> docker.io;
+  # empty: labs seed it from containerd with `ctr images export` + `buildah pull
+  # oci-archive:`). No users or keys baked in (the runtime injects them through cloud-init).
   kubeadm:1.37:
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.37.1
+    diskSize: 12Gi                     # persistent root disk: 10 GiB virtual size x 1.15
     kubernetesVersion: v1.37.1
     publishable: true
     publishName: kubeadm-node-v1.37
@@ -55,6 +58,7 @@ images:
   kubeadm:1.36:
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.36-upgrade
+    diskSize: 12Gi                     # persistent root disk: 10 GiB virtual size x 1.15
     kubernetesVersion: v1.36.5
     stagedUpgrades: [v1.37.1]
     publishable: true
@@ -99,24 +103,33 @@ images:
   # [--pool a-b]` with metrics-server, gateway-api, traefik (IngressClass + GatewayClass
   # "traefik", :80/:443, NodePorts 30080/30443), metallb (L2, pool default
   # 192.168.100.200-220), local-path (default StorageClass), falco; aliases ingress,
-  # gateway, lb, storage, all. Images preloaded (lock/addons.lock). CKS material always
+  # gateway, lb, storage, all (all = everything but falco and csi-hostpath); csi-hostpath =
+  # CSI hostpath driver hostpath.csi.k8s.io with volume expansion, StorageClass
+  # csi-hostpath. Images preloaded (lock/addons.lock). CKS material always
   # present: gVisor runsc registered with containerd as handler `runsc` (labs create the
   # RuntimeClass), kube-bench + cfg, AppArmor sample profiles and audit policies in
-  # /opt/cloudtrain/security. No Trivy DB (size; see docs/dev-environment.md).
+  # /opt/cloudtrain/security. Supply chain: Trivy with a dated offline DB (TRIVY_DB_DATE;
+  # `trivy image --image-src containerd` reads namespace k8s.io, buildah images come in
+  # through podman.socket), cosign, buildah base images registry.quillmoor.example/mirror/
+  # golang:1.25 and .../base/static-nonroot:2026.10, signed fixture /opt/qm-signing
+  # (parcel-api-{blue,green,amber} layouts, release.pub; only green verifies) with
+  # registry.quillmoor.example/parcel/api:{blue,green,amber} in containerd.
   kubeadm:1.37-full:
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.37.1-full
+    diskSize: 19Gi                     # persistent root disk: 16 GiB virtual size x 1.15
     kubernetesVersion: v1.37.1
     tier: K
-    addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco]
+    addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco, csi-hostpath]
     publishable: true
     publishName: kubeadm-node-v1.37-full
   kubeadm:1.37-sec:                    # same image, the curriculum's CKS ref
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.37.1-full
+    diskSize: 19Gi                     # persistent root disk: 16 GiB virtual size x 1.15
     kubernetesVersion: v1.37.1
     tier: K
-    addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco]
+    addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco, csi-hostpath]
     publishable: true
     publishName: kubeadm-node-v1.37-full
   # linux (foundations stream) ------------------------------------------------
@@ -197,6 +210,7 @@ images:
   docker-vm:29:
     kind: containerDisk
     image: cloudtrain/docker-vm:29
+    diskSize: 14Gi                     # persistent root disk: 12 GiB virtual size x 1.15
     tier: C
     publishable: true
   # automation (automation-content stream) -------------------------------------

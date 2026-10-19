@@ -191,3 +191,32 @@ func TestPullSecretsOnPodsAndVMs(t *testing.T) {
 		t.Fatal("no secret configured: want none")
 	}
 }
+
+func TestParseCatalogDiskSize(t *testing.T) {
+	for _, tc := range []struct {
+		yaml string
+		ok   bool
+	}{
+		{"images:\n  a:\n    kind: containerDisk\n    image: x/a:1\n    diskSize: 14Gi\n", true},
+		{"images:\n  a:\n    kind: containerDisk\n    image: x/a:1\n    diskSize: lots\n", false},
+		{"images:\n  a:\n    kind: containerDisk\n    image: x/a:1\n    diskSize: \"0\"\n", false},
+		{"images:\n  a:\n    kind: container\n    image: x/a:1\n    diskSize: 14Gi\n", false},
+	} {
+		if _, err := ParseCatalog([]byte(tc.yaml)); (err == nil) != tc.ok {
+			t.Errorf("ParseCatalog(%q): err=%v, want ok=%v", tc.yaml, err, tc.ok)
+		}
+	}
+}
+
+// The shared catalog sizes the persistent disks of images larger than 10 GiB.
+func TestRepoCatalogDiskSizes(t *testing.T) {
+	c, err := LoadCatalog("../../../../deploy/images/catalog.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ref, want := range map[string]string{"kubeadm:1.37": "12Gi", "kubeadm:1.37-full": "19Gi", "kubeadm:1.37-sec": "19Gi", "docker-vm:29": "14Gi"} {
+		if got := c.Images[ref].DiskSize; got != want {
+			t.Errorf("%s diskSize = %q, want %s (virtual size x 1.15)", ref, got, want)
+		}
+	}
+}

@@ -250,7 +250,7 @@ pins disagree.
 
 | Catalog ref | Image | Contents | Build |
 |---|---|---|---|
-| `kubeadm:1.37` | `cloudtrain/kubeadm-node:v1.37.1` (containerDisk) | kubeadm/kubelet/kubectl 1.37.1 held, containerd, control-plane + Calico + workload images, curl | `task image:build:kubeadm-node` |
+| `kubeadm:1.37` | `cloudtrain/kubeadm-node:v1.37.1` (containerDisk) | kubeadm/kubelet/kubectl 1.37.1 held, containerd, control-plane + Calico + workload images, curl, buildah | `task image:build:kubeadm-node` |
 | `kubeadm:1.36` | `cloudtrain/kubeadm-node:v1.36-upgrade` (containerDisk) | v1.36.5 installed and held; v1.37.1 staged offline (see below) | `task image:build:kubeadm-upgrade` |
 | `etcd-host:3.6` | `cloudtrain/etcd-host:3.6` (containerDisk) | etcd v3.6.15 + etcdctl/etcdutl in `/usr/local/bin`, `etcd.service` with mutual TLS | `task image:build:etcd-host` |
 | `jumphost:1` | `cloudtrain/jumphost:1` (container) | kubectl v1.37.1, helm v4.3.0, etcdctl/etcdutl, yq, jq, ssh, vim/nano, tmux, user `learner` (uid 1000), `k` alias with completion, prompt with the kube context | `task image:build:jumphost` |
@@ -293,6 +293,16 @@ user `etcd`, and an enabled `etcd.service` (single member, client and peer mutua
 the TLS flags. The etcd-snapshot-restore lab replaces the unit and PKI with its own
 (`provision-etcd.sh` tears them down first); `task image:test` runs that lab's provision
 script and solution on the image.
+
+**Persistent root disks.** With `--vm-disks persistent` (the manager default) every VM root disk is a CDI
+DataVolume imported from the containerDisk. Its size is the catalog `diskSize`, or
+`DefaultVMDiskSize` (12Gi, for the 10 GiB images) when the entry has none. CDI keeps 6 % for
+filesystem overhead, so a disk smaller than the image's virtual size plus that fails the import
+with "A larger PVC is required". The catalog therefore sizes disks at virtual size x 1.15: 12Gi
+for the kubeadm:1.37 and 1.36 images, 19Gi for kubeadm:1.37-full/-sec (16 GiB: the Trivy DB, the
+Go base image and a Trivy export of a buildah image do not fit the free space of a 12 GiB root
+when the VM boots from the ephemeral containerDisk) and 14Gi for docker-vm:29 (12 GiB).
+`build.sh` refuses to build an image whose catalog `diskSize` is below that.
 
 All VM images share the same conventions: Ubuntu cloud image with cloud-init and sshd,
 **no users or keys baked in** (the runtime injects `learner` with passwordless sudo,
@@ -615,6 +625,32 @@ Status and measurements: `docs/handoffs/foundations.md`.
 - **kubeadm extras** (`kubeadm:1.37-full` = `kubeadm:1.37-sec`, `build.sh kubeadm-full`,
   layered on kubeadm:1.37): `/opt/cloudtrain/bin/addons-install <list> [--wait] [--pool a-b]`
   after `kubeadm init` + `cni-install`; see the catalog comment for the add-on list.
+  Supply-chain tools (all Apache-2.0, licence texts in `/usr/share/doc/<tool>`):
+  - **buildah** is in every kubeadm image (Ubuntu archive at `UBUNTU_APT_SNAPSHOT`), root
+    storage `/var/lib/containers/storage`, separate from containerd: images move between them
+    as OCI archives (`buildah push ... oci-archive:` / `ctr -n k8s.io images import`). RUN steps
+    use the host network, so buildah writes no CNI config next to Calico's.
+  - **-full/-sec** add podman (only for `podman.socket`, which is how Trivy reads buildah's
+    storage), cosign `COSIGN_VERSION`, Trivy `TRIVY_VERSION` with its DB, the base images of
+    `tools/images/kubeadm-addons/buildah-images.txt` in buildah's storage (by digest,
+    `lock/buildah-images.lock`), and the signing fixture of `kubeadm-addons/signing/`.
+  - **Trivy offline DB.** `/usr/local/bin/trivy` is a wrapper that only sets defaults: cache
+    and DB `/var/lib/trivy` (other users get their own cache linked to the same DB), no DB,
+    Java DB, checks or VEX update, `--offline-scan`, no version check or telemetry, containerd
+    namespace `k8s.io`, podman socket `/run/podman/podman.sock`. The DB is the
+    `ghcr.io/aquasecurity/trivy-db:2` artifact pinned by manifest digest (`TRIVY_DB_REF`,
+    dated `TRIVY_DB_DATE`, both in `/etc/cloudtrain-release`); build.sh checks the manifest
+    and layer sha256. About 135 MB compressed, 1.6 GB unpacked. It is never updated on a node.
+    To refresh it, run `tools/images/kubeadm-addons/trivy-db-pin.sh`, paste the two lines into
+    `versions.env`, rebuild kubeadm-full and re-verify the Trivy labs: the checks scan
+    against the same DB, but xks-scan-pick-image's setup needs 1 to 3 of its 4 images with
+    a CRITICAL finding (DB 2026-10-18: httpd:2.4 only).
+  - **Signing fixture** (`/opt/qm-signing`): three builds of `registry.quillmoor.example/parcel/api`
+    (`blue`, `green`, `amber`) as OCI layouts in `cosign save` format and in containerd. Only
+    `green` is signed with the key in `release.pub`, `amber` with a throwaway key and `blue`
+    not at all, so `cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog
+    --local-image <layout>` passes for green only, offline. The private keys exist only during
+    the build.
 
 ## Remote verify VM
 

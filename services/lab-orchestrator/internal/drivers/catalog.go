@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 )
 
@@ -26,7 +27,9 @@ type CatalogImage struct {
 	// informational, families match by ref (see DeviceFamily).
 	Netdev string `json:"netdev,omitempty"`
 	// DiskSize of a persistent root disk imported from a containerDisk
-	// (default DefaultVMDiskSize); at least the image's virtual size.
+	// (default DefaultVMDiskSize); at least the image's virtual size plus
+	// CDI's filesystem overhead, else the import fails with "A larger PVC is
+	// required" (the catalog uses virtual size x 1.15, checked by build.sh).
 	DiskSize string `json:"diskSize,omitempty"`
 	// EtcdVersion and KubectlVersion are informational (written by tools/images).
 	EtcdVersion    string `json:"etcdVersion,omitempty"`
@@ -93,6 +96,15 @@ func ParseCatalog(data []byte) (*ImageCatalog, error) {
 		}
 		if img.Kind != ImageKindContainer && img.Kind != ImageKindContainerDisk {
 			return nil, fmt.Errorf("image catalog: %s has unknown kind %q", ref, img.Kind)
+		}
+		if img.DiskSize != "" {
+			q, err := resource.ParseQuantity(img.DiskSize)
+			if err != nil || q.Sign() <= 0 {
+				return nil, fmt.Errorf("image catalog: %s has invalid diskSize %q", ref, img.DiskSize)
+			}
+			if img.Kind != ImageKindContainerDisk {
+				return nil, fmt.Errorf("image catalog: %s: diskSize applies to containerDisk images only", ref)
+			}
 		}
 	}
 	return c, nil

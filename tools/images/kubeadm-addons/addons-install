@@ -15,12 +15,15 @@
 #                   192.168.100.200-192.168.100.220, in the lab VPC subnet)
 #   local-path      local-path-provisioner, StorageClass "local-path" (default class)
 #   falco           Falco DaemonSet (modern eBPF), alerts in `kubectl -n falco logs ds/falco`
+#   csi-hostpath    CSI hostpath driver hostpath.csi.k8s.io (volume expansion, capacity
+#                   tracking; single node: volumes live on the node running the plugin),
+#                   StorageClass "csi-hostpath" (allowVolumeExpansion, not the default)
 # Aliases: ingress, gateway -> traefik; lb -> metallb; storage -> local-path; all = every
-# add-on except falco. Idempotent (kubectl apply).
+# add-on except falco and csi-hostpath. Idempotent (kubectl apply).
 set -euo pipefail
 ROOT=/opt/cloudtrain/addons
 export KUBECONFIG=${KUBECONFIG:-/etc/kubernetes/admin.conf}
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 list=$1; shift
 wait=0; pool=192.168.100.200-192.168.100.220
@@ -75,6 +78,12 @@ if ((wait)); then
       metallb)        kubectl -n metallb-system rollout status ds/speaker --timeout=300s ;;
       local-path)     kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout=300s ;;
       falco)          kubectl -n falco rollout status ds/falco --timeout=300s ;;
+      csi-hostpath)   kubectl -n kube-system rollout status sts/csi-hostpathplugin --timeout=300s
+                      # registered with the kubelet (CSINode) before anyone provisions
+                      for _ in $(seq 60); do
+                        kubectl get csinode -o jsonpath='{.items[*].spec.drivers[*].name}' | grep -qw hostpath.csi.k8s.io && break
+                        sleep 2
+                      done ;;
     esac
   done
 fi

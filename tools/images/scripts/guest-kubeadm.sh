@@ -3,6 +3,8 @@
 # node: containerd (systemd cgroups), kubeadm/kubelet/kubectl pinned + held, kernel
 # prerequisites, and every control-plane, CNI and lab workload image already in
 # containerd's k8s.io store, so `kubeadm init/join` and the labs' Pods need no registry.
+# buildah (Ubuntu archive) builds images on the node; its storage is separate from
+# containerd's (labs move images across with OCI archives and `ctr images import`).
 #
 # With STAGED_K8S_VERSION set (upgrade image) the node also carries that release
 # OFFLINE: flat signed apt repos /opt/k8s-apt/<minor>/ for the installed and the staged
@@ -12,7 +14,23 @@
 source /opt/cloudtrain/build/guest-common.sh
 
 grow_root
-base_setup conntrack socat ethtool ipset ebtables apt-utils
+base_setup conntrack socat ethtool ipset ebtables apt-utils buildah
+# buildah on a Kubernetes node: RUN steps use the host network (no CNI config of its own
+# next to the cluster's in /etc/cni/net.d, no extra bridge), the runtime is containerd.io's
+# runc, and short names (FROM busybox:1.37) resolve to docker.io like Docker and containerd
+# do; with no internet, only images already in buildah's storage are found.
+install -d /etc/containers/containers.conf.d /etc/containers/registries.conf.d
+cat > /etc/containers/containers.conf.d/50-cloudtrain.conf <<'EOF'
+[containers]
+netns = "host"
+
+[network]
+network_config_dir = "/etc/containers/networks"
+EOF
+cat > /etc/containers/registries.conf.d/50-cloudtrain.conf <<'EOF'
+unqualified-search-registries = ["docker.io"]
+short-name-mode = "permissive"
+EOF
 
 install -m 0755 -d /etc/apt/keyrings
 fetch_key https://download.docker.com/linux/ubuntu/gpg "$DOCKER_APT_KEY_FPR" /etc/apt/keyrings/docker.gpg
@@ -36,6 +54,7 @@ KV=$(pkg_version kubeadm "$K8S_VERSION")
 apt-get install -y "containerd.io=${CONTAINERD_VERSION}" "kubelet=$KV" "kubeadm=$KV" "kubectl=$KV" \
   "cri-tools=${K8S_CRI_TOOLS_VERSION}" "kubernetes-cni=${KUBERNETES_CNI_VERSION}"
 apt-mark hold kubelet kubeadm kubectl containerd.io cri-tools kubernetes-cni
+command -v runc >/dev/null  # buildah's OCI runtime (shipped by containerd.io)
 
 # --- staged upgrade target: offline, signed, flat apt repos -------------------------
 # /opt/k8s-apt/<minor>/ mirrors https://pkgs.k8s.io/core:/stable:/<minor>/deb/ for the
@@ -171,6 +190,7 @@ write_release \
   "CALICO_VERSION=${CALICO_VERSION}" \
   "POD_CIDR=${LAB_POD_CIDR}" \
   "CONTAINERD_VERSION=$(containerd --version | awk '{print $3}')" \
-  "CONTAINERD_PACKAGE=${CONTAINERD_VERSION}"
+  "CONTAINERD_PACKAGE=${CONTAINERD_VERSION}" \
+  "BUILDAH_VERSION=$(buildah --version | awk '{print $3}')"
 
 generalize
