@@ -81,7 +81,9 @@ spec:
           cat other-leaf.crt other-ca.crt > other-chain.crt
           chown -R learner:learner "$s"
           N="runuser -u learner -- env HOME=/home/learner notation"
-          $N key add other-source-signer "$s/other-leaf.key" "$s/other-chain.crt"
+          install -d -o learner -g learner /home/learner/.config/notation
+          printf '{"keys":[{"name":"other-source-signer","keyPath":"%s","certPath":"%s"}]}\n' "$s/other-leaf.key" "$s/other-chain.crt" > /home/learner/.config/notation/signingkeys.json
+          chown learner:learner /home/learner/.config/notation/signingkeys.json
           dother=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/other-source/manifests/1.0 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           $N sign --signature-format cose --key other-source-signer --insecure-registry "localhost:5000/other-source@$dother"
         else
@@ -123,7 +125,7 @@ spec:
       expect: {match: exact, value: rejected}
   hints:
     - title: A signing certificate needs its own key
-      body: "Create a leaf key and CSR with `openssl req -new -newkey rsa:2048 -nodes`, then have `copperleaf-ca.key` sign it with `openssl x509 -req -CA ... -CAkey ... -extfile leaf.ext`. Concatenate leaf then CA into a chain file and register it with `notation key add <name> <key> <chain>`; `notation sign --key <name>` then uses it."
+      body: "Create a leaf key and CSR with `openssl req -new -newkey rsa:2048 -nodes`, then have `copperleaf-ca.key` sign it with `openssl x509 -req -CA ... -CAkey ... -extfile leaf.ext`. Concatenate leaf then CA into a chain file and register it by adding an entry (`name`, `keyPath`, `certPath` with absolute paths; no `default` field) to the `keys` list in `~/.config/notation/signingkeys.json` (`notation key list` shows it; `notation key add` only handles plugin keys); `notation sign --key <name>` then uses it."
       cost: 1
     - title: Trust store vs trust policy
       body: "The CA certificate goes into Notation's trust store (`notation cert add --type ca --store copperleaf copperleaf-ca.crt`); the trust policy names that store in `trustStores` as `ca:copperleaf`. Load the policy with `notation policy import trustpolicy.json`; `notation verify` has no policy-file flag."
@@ -172,7 +174,8 @@ spec:
           openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/C=US/ST=CA/O=copperleaf/CN=copperleaf release signer" 2>/dev/null
           openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
           cat leaf.crt copperleaf-ca.crt > chain.crt
-          notation key add copperleaf-release leaf.key chain.crt
+          mkdir -p ~/.config/notation
+          printf '{"keys":[{"name":"copperleaf-release","keyPath":"%s","certPath":"%s"}]}\n' "$PWD/leaf.key" "$PWD/chain.crt" > ~/.config/notation/signingkeys.json
           d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/subtitle/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/subtitle@$d"
           notation cert add -t ca -s copperleaf copperleaf-ca.crt
@@ -195,7 +198,8 @@ spec:
               openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/C=US/ST=CA/O=copperleaf/CN=copperleaf release signer" 2>/dev/null
               openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
               cat leaf.crt copperleaf-ca.crt > chain.crt
-              notation key add copperleaf-release leaf.key chain.crt
+              mkdir -p ~/.config/notation
+          printf '{"keys":[{"name":"copperleaf-release","keyPath":"%s","certPath":"%s"}]}\n' "$PWD/leaf.key" "$PWD/chain.crt" > ~/.config/notation/signingkeys.json
               d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/subtitle/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
               notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/subtitle@$d"
               notation verify --insecure-registry localhost:5000/subtitle:{{rel}}
