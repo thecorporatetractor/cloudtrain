@@ -1,0 +1,216 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: quadlet-container-service
+  title: Run a rootless container as a boot-time service
+  domain: linux
+  frameworks:
+  - rhcsa-aligned:containers
+  difficulty: hard
+  estimatedMinutes: 25
+  tags:
+  - containers
+  - podman
+  - quadlet
+  - rootless
+  - systemd
+  version: 1
+spec:
+  description: |
+    On **`tr-quad-01`** (`ssh tr-quad-01`; you have `sudo`) the user **`pis`** owns the image
+    **`registry.tallowmere.test/pis-board:1`** in its **rootless** podman storage (no registry is reachable:
+    use `Pull=never`). The container serves a status page on port 8080.
+
+    Run it as a service of user `pis` so that it starts at boot **without anybody logging in**:
+
+    - define it as a **Quadlet** unit named `pis-board` in `pis`'s `~/.config/containers/systemd/`,
+      publishing host port **{{port}}** to 8080, installed for `default.target`;
+    - enable **lingering** for `pis`;
+    - start it now: `curl http://127.0.0.1:{{port}}/` must answer.
+
+    The grading is reboot-graded: persistence is checked from configuration (linger, the unit and its
+    install section) until verify can reboot hosts.
+  objectives:
+  - Write a Quadlet .container file for a rootless user
+  - Enable lingering so user services start at boot
+  params:
+    port:
+      type: choice
+      values:
+      - '9090'
+      - '9191'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-quad-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-quad-01
+    timeoutSec: 600
+    run: |
+      set -eu
+      id pis >/dev/null 2>&1 || useradd -m pis
+      grep -q '^pis:' /etc/subuid || usermod --add-subuids 200000-265535 --add-subgids 200000-265535 pis
+      rpm -q podman netavark passt >/dev/null 2>&1 || dnf -y -q install podman netavark passt >/dev/null
+      U=$(id -u pis)
+      loginctl enable-linger pis
+      sleep 3
+      export XDG_RUNTIME_DIR=/run/user/$U
+      RUN="runuser -u pis -- env XDG_RUNTIME_DIR=/run/user/$U HOME=/home/pis"
+      systemctl --user -M pis@ stop pis-board.service >/dev/null 2>&1 || true
+      rm -f /home/pis/.config/containers/systemd/pis-board.container
+      if ! (cd /home/pis && $RUN podman image exists registry.tallowmere.test/pis-board:1); then
+      rm -rf /tmp/r; mkdir -p /tmp/r
+      dnf -y -q --installroot=/tmp/r --releasever=10 --setopt=install_weak_deps=0 install python3 coreutils-single almalinux-release >/dev/null
+      [ -e /tmp/r/etc/os-release ] || cp /etc/os-release /tmp/r/etc/os-release
+      mkdir -p /tmp/r/usr/local/bin
+      cat > /tmp/r/usr/local/bin/pisboard <<'EOPY'
+      #!/usr/bin/python3
+      import http.server
+      class H(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              self.send_response(200); self.end_headers(); self.wfile.write(b"pis-board-ok\n")
+          def log_message(self, *a): pass
+      http.server.HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+      EOPY
+      chmod 0755 /tmp/r/usr/local/bin/pisboard
+      tar -C /tmp/r -c . | (cd /home/pis && $RUN podman import --change 'CMD ["/usr/local/bin/pisboard"]' - registry.tallowmere.test/pis-board:1 >/dev/null)
+      rm -rf /tmp/r
+      fi
+      (cd /home/pis && $RUN podman image exists registry.tallowmere.test/pis-board:1)
+      loginctl disable-linger pis
+      sleep 2
+  checks:
+  - id: linger
+    description: Lingering is enabled for pis
+    type: shell
+    'on': tr-quad-01
+    skills: &id001
+    - linux.internals.container-services
+    weight: 1.5
+    command: |
+      loginctl show-user pis -p Linger 2>/dev/null || echo Linger=unknown
+    expect:
+      match: exact
+      value: Linger=yes
+  - id: unit-file
+    description: A pis-board Quadlet file exists in the pis user directory with an install section
+    type: shell
+    'on': tr-quad-01
+    skills: *id001
+    weight: 2
+    command: |
+      f=/home/pis/.config/containers/systemd/pis-board.container
+      [ -f $f ] && grep -q '^Image=registry.tallowmere.test/pis-board:1' $f && grep -q '^WantedBy=default.target' $f && echo ok || echo missing
+    expect:
+      match: exact
+      value: ok
+  - id: generated-unit
+    description: Quadlet generated a user unit that is active
+    type: shell
+    'on': tr-quad-01
+    skills: *id001
+    weight: 2
+    command: |
+      U=$(id -u pis); [ -d /run/user/$U ] || { echo no-user-manager; exit; }
+      sudo_u="runuser -u pis -- env XDG_RUNTIME_DIR=/run/user/$U"
+      $sudo_u systemctl --user is-active pis-board.service 2>/dev/null || true
+    expect:
+      match: exact
+      value: active
+  - id: rootless
+    description: The container runs rootless as pis
+    type: shell
+    'on': tr-quad-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      U=$(id -u pis); [ -d /run/user/$U ] || { echo none; exit; }
+      n=$(cd /home/pis && runuser -u pis -- env XDG_RUNTIME_DIR=/run/user/$U podman ps -q 2>/dev/null | wc -l)
+      echo "containers=$n; root=$(podman ps -q 2>/dev/null | wc -l)"
+    expect:
+      match: exact
+      value: containers=1; root=0
+  - id: serves
+    description: The status page answers
+    type: shell
+    'on': tr-quad-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      curl -fs --max-time 5 http://127.0.0.1:{{port}}/ 2>/dev/null | head -1 || echo down
+    expect:
+      match: exact
+      value: pis-board-ok
+  hints:
+  - title: As the user
+    body: Use sudo -u pis env XDG_RUNTIME_DIR=/run/user/$(id -u pis) systemctl --user ... or systemctl
+      --user -M pis@ ...
+    cost: 0
+  - title: Quadlet sections
+    body: '[Container] Image=, PublishPort=, Pull=never; [Service] Restart=; [Install] WantedBy=default.target'
+    cost: 1
+  misconceptions:
+  - id: no-linger
+    description: Starts the user manager by hand but never enables lingering.
+    feedback: 'Without linger the user manager (and the container) only exists while pis is logged in:
+      loginctl enable-linger pis.'
+    expectFail:
+    - linger
+    mutation:
+      'on': tr-quad-01
+      as: learner
+      timeoutSec: 150
+      run: |
+        U=$(id -u pis); P=/home/pis/.config/containers/systemd; RUN="sudo -u pis env XDG_RUNTIME_DIR=/run/user/$U"
+           sudo systemctl start user@$U.service; sleep 2
+           $RUN mkdir -p $P
+           T='[Service]\nRestart=always\n[Install]\nWantedBy=default.target\n'
+           printf '[Container]\nImage=registry.tallowmere.test/pis-board:1\nPublishPort={{port}}:8080\nPull=never\n%b' "$T" | sudo -u pis tee $P/pis-board.container >/dev/null
+           $RUN systemctl --user daemon-reload; $RUN systemctl --user start pis-board.service; sleep 5
+  - id: no-install
+    description: Writes the Quadlet file without an [Install] section.
+    feedback: Without WantedBy=default.target the unit is not started when the user manager starts at
+      boot.
+    expectFail:
+    - unit-file
+    mutation:
+      'on': tr-quad-01
+      as: learner
+      timeoutSec: 150
+      run: |
+        U=$(id -u pis); P=/home/pis/.config/containers/systemd; RUN="sudo -u pis env XDG_RUNTIME_DIR=/run/user/$U"
+           sudo loginctl enable-linger pis; sleep 3
+           $RUN mkdir -p $P
+           T='[Service]\nRestart=always\n'
+           printf '[Container]\nImage=registry.tallowmere.test/pis-board:1\nPublishPort={{port}}:8080\nPull=never\n%b' "$T" | sudo -u pis tee $P/pis-board.container >/dev/null
+           $RUN systemctl --user daemon-reload; $RUN systemctl --user start pis-board.service; sleep 5
+  solution:
+    explanation: |
+      A .container file in ~/.config/containers/systemd is turned into a user service by the Quadlet
+      generator on daemon-reload; the [Install] section makes it part of default.target, and
+      loginctl enable-linger starts the user manager at boot so that target is reached without a login.
+    steps:
+    - 'on': tr-quad-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        U=$(id -u pis); P=/home/pis/.config/containers/systemd; RUN="sudo -u pis env XDG_RUNTIME_DIR=/run/user/$U"
+         sudo loginctl enable-linger pis; sleep 3
+         $RUN mkdir -p $P
+         T='[Service]\nRestart=always\n[Install]\nWantedBy=default.target\n'
+         printf '[Container]\nImage=registry.tallowmere.test/pis-board:1\nPublishPort={{port}}:8080\nPull=never\n%b' "$T" | sudo -u pis tee $P/pis-board.container >/dev/null
+         $RUN systemctl --user daemon-reload; $RUN systemctl --user start pis-board.service; sleep 5
+         curl -s http://127.0.0.1:{{port}}/

@@ -1,0 +1,194 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: node-exporter-alert
+  title: Export host and custom metrics and write a disk-usage alert rule
+  domain: linux
+  frameworks:
+  - linuxplus:troubleshooting
+  difficulty: medium
+  estimatedMinutes: 25
+  tags:
+  - observability
+  - prometheus
+  - node-exporter
+  - textfile
+  - alerting
+  version: 1
+spec:
+  description: |
+    On **`tr-metrics-01`** (`ssh tr-metrics-01`; you have `sudo`) the monitoring team wants host metrics and the
+    age of the last depot sync.
+
+    1. Run **`prometheus-node-exporter`** as an enabled service listening on port **9100** with the
+       **textfile collector** reading `/var/lib/prometheus/node-exporter` (Ubuntu keeps its options in
+       `/etc/default/prometheus-node-exporter`).
+    2. Publish the metric **`depot_sync_age_seconds`** (a gauge: seconds since `/srv/depot/last-sync` was
+       modified) as `/var/lib/prometheus/node-exporter/depot.prom`, written by a script
+       `/usr/local/bin/tr-sync-age`; run the script once now.
+    3. Write the Prometheus alert rule file **`/etc/prometheus/rules/depot.yml`** with an alert
+       **`DiskAlmostFull`** that fires when a filesystem is **more than {{pct}} % used**
+       (`node_filesystem_*` metrics; ignore tmpfs).
+  objectives:
+  - Enable the textfile collector and publish a custom gauge
+  - Write a Prometheus alert rule from node_filesystem metrics
+  params:
+    pct:
+      type: choice
+      values:
+      - '90'
+      - '85'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-metrics-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-metrics-01
+    timeoutSec: 300
+    run: |
+      set -eu
+      command -v prometheus-node-exporter >/dev/null || apt-get -y -qq install prometheus-node-exporter >/dev/null 2>&1 || true
+      command -v prometheus-node-exporter >/dev/null || { echo "prometheus-node-exporter is not installed (image gap)" >&2; exit 1; }
+      systemctl stop prometheus-node-exporter.service >/dev/null 2>&1 || true
+      printf 'ARGS=""\n' > /etc/default/prometheus-node-exporter
+      rm -f /var/lib/prometheus/node-exporter/*.prom /usr/local/bin/tr-sync-age /etc/prometheus/rules/depot.yml
+      mkdir -p /srv/depot /var/lib/prometheus/node-exporter
+      touch -d '2 hours ago' /srv/depot/last-sync
+      systemctl enable --now prometheus-node-exporter.service >/dev/null 2>&1
+      command -v curl >/dev/null || apt-get -y -qq install curl >/dev/null
+  checks:
+  - id: exporter
+    description: The exporter is enabled, active and answers on 9100
+    type: shell
+    'on': tr-metrics-01
+    skills: &id001
+    - linux.observability.host-metrics
+    weight: 1.5
+    command: |
+      systemctl is-enabled prometheus-node-exporter.service >/dev/null 2>&1 && curl -fs --max-time 5 http://127.0.0.1:9100/metrics 2>/dev/null | grep -q "^node_filesystem_size_bytes" && echo up || echo down
+    expect:
+      match: exact
+      value: up
+  - id: custom-metric
+    description: depot_sync_age_seconds is exported with the right age
+    type: shell
+    'on': tr-metrics-01
+    skills: *id001
+    weight: 2.5
+    command: |
+      v=$(curl -fs --max-time 5 http://127.0.0.1:9100/metrics 2>/dev/null | awk '$1=="depot_sync_age_seconds"{print $2}')
+      age=$(( $(date +%s) - $(stat -c %Y /srv/depot/last-sync) ))
+      awk -v v="${v:-x}" -v a="$age" 'BEGIN{ if (v !~ /^[0-9.e+]+$/) print "missing"; else print (v+0 > a-600 && v+0 < a+600) ? "ok" : "v=" v " age=" a }'
+    expect:
+      match: exact
+      value: ok
+  - id: script
+    description: The metric comes from tr-sync-age
+    type: shell
+    'on': tr-metrics-01
+    skills: *id001
+    weight: 1
+    command: |
+      [ -x /usr/local/bin/tr-sync-age ] && /usr/local/bin/tr-sync-age >/dev/null 2>&1; grep -q "^depot_sync_age_seconds" /var/lib/prometheus/node-exporter/depot.prom 2>/dev/null && echo ok || echo no
+    expect:
+      match: exact
+      value: ok
+  - id: rule
+    description: DiskAlmostFull fires above {{pct}} % used and stays quiet below
+    type: shell
+    'on': tr-metrics-01
+    skills: *id001
+    weight: 3
+    command: |
+      python3 - <<'EOPY'
+      import re, yaml
+      try:
+          d = yaml.safe_load(open("/etc/prometheus/rules/depot.yml"))
+          rules = [r for g in d["groups"] for r in g["rules"] if r.get("alert") == "DiskAlmostFull"]
+          expr = str(rules[0]["expr"])
+      except Exception:
+          print("no-rule"); raise SystemExit
+      def ev(used):
+          e = re.sub(r"node_filesystem_(size|avail|free)_bytes(\{[^}]*\})?", lambda m: "1000.0" if m.group(1) == "size" else str(1000.0 * (100 - used) / 100), expr)
+          e = e.replace("\n", " ")
+          return bool(eval(e, {"__builtins__": {}}, {}))
+      try:
+          print("ok" if ev({{pct}} + 3) and not ev({{pct}} - 3) else "wrong-threshold")
+      except Exception as x:
+          print("unparsed")
+      EOPY
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Textfile collector
+    body: Add --collector.textfile.directory=DIR to ARGS in /etc/default/prometheus-node-exporter and
+      restart the service.
+    cost: 0
+  - title: Metric format
+    body: 'A .prom file holds lines like: # TYPE name gauge, then name VALUE.'
+    cost: 1
+  misconceptions:
+  - id: no-textfile
+    description: Starts the exporter without the textfile directory argument.
+    feedback: The textfile collector needs --collector.textfile.directory=/var/lib/prometheus/node-exporter
+      in ARGS.
+    expectFail:
+    - custom-metric
+    mutation:
+      'on': tr-metrics-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf '#!/bin/sh\necho "# TYPE depot_sync_age_seconds gauge"\necho "depot_sync_age_seconds $(( $(date +%%s) - $(stat -c %%Y /srv/depot/last-sync) ))"\n' | sudo tee /usr/local/bin/tr-sync-age >/dev/null
+        sudo chmod 0755 /usr/local/bin/tr-sync-age; sudo sh -c '/usr/local/bin/tr-sync-age > /var/lib/prometheus/node-exporter/depot.prom'
+        sudo mkdir -p /etc/prometheus/rules
+        printf 'groups:\n- name: depot\n  rules:\n  - alert: DiskAlmostFull\n    expr: (1 - node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"}) * 100 > {{pct}}\n    for: 5m\n' | sudo tee /etc/prometheus/rules/depot.yml >/dev/null
+  - id: inverted-rule
+    description: Alerts when the free space is above the threshold.
+    feedback: Compute the used percentage (100 - available/size*100) and compare it with {{pct}}, or alert
+      on available below the remainder.
+    expectFail:
+    - rule
+    mutation:
+      'on': tr-metrics-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        printf 'ARGS="--collector.textfile.directory=/var/lib/prometheus/node-exporter"\n' | sudo tee /etc/default/prometheus-node-exporter >/dev/null
+        sudo systemctl restart prometheus-node-exporter.service
+        printf '#!/bin/sh\necho "# TYPE depot_sync_age_seconds gauge"\necho "depot_sync_age_seconds $(( $(date +%%s) - $(stat -c %%Y /srv/depot/last-sync) ))"\n' | sudo tee /usr/local/bin/tr-sync-age >/dev/null
+        sudo chmod 0755 /usr/local/bin/tr-sync-age; sudo sh -c '/usr/local/bin/tr-sync-age > /var/lib/prometheus/node-exporter/depot.prom'; sleep 2
+        sudo mkdir -p /etc/prometheus/rules
+        printf 'groups:\n- name: depot\n  rules:\n  - alert: DiskAlmostFull\n    expr: node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"} * 100 > {{pct}}\n    for: 5m\n' | sudo tee /etc/prometheus/rules/depot.yml >/dev/null
+  solution:
+    explanation: |
+      The Debian package reads ARGS from /etc/default/prometheus-node-exporter; the textfile collector serves every
+      *.prom file in its directory. The alert expression is the used percentage, 100 - avail/size*100, compared
+      with the threshold, over non-tmpfs filesystems.
+    steps:
+    - 'on': tr-metrics-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        printf 'ARGS="--collector.textfile.directory=/var/lib/prometheus/node-exporter"\n' | sudo tee /etc/default/prometheus-node-exporter >/dev/null
+        sudo systemctl restart prometheus-node-exporter.service
+        printf '#!/bin/sh\necho "# TYPE depot_sync_age_seconds gauge"\necho "depot_sync_age_seconds $(( $(date +%%s) - $(stat -c %%Y /srv/depot/last-sync) ))"\n' | sudo tee /usr/local/bin/tr-sync-age >/dev/null
+        sudo chmod 0755 /usr/local/bin/tr-sync-age
+        sudo sh -c '/usr/local/bin/tr-sync-age > /var/lib/prometheus/node-exporter/depot.prom'; sleep 2
+        sudo mkdir -p /etc/prometheus/rules
+        printf 'groups:\n- name: depot\n  rules:\n  - alert: DiskAlmostFull\n    expr: (1 - node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"}) * 100 > {{pct}}\n    for: 5m\n' | sudo tee /etc/prometheus/rules/depot.yml >/dev/null
+        curl -s http://127.0.0.1:9100/metrics | grep depot_sync

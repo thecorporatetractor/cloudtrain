@@ -1,0 +1,212 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: capabilities-drop-service
+  title: Run the platform board with one capability and a syscall filter
+  domain: linux
+  frameworks:
+  - linuxplus:services-users
+  difficulty: hard
+  estimatedMinutes: 20
+  tags:
+  - internals
+  - capabilities
+  - seccomp
+  - systemd
+  - security
+  version: 1
+spec:
+  description: |
+    `tr-board.service` on **`tr-cap-01`** (`ssh tr-cap-01`; you have `sudo`) serves the platform
+    display on **port 80**. It currently runs as **root** with every capability, and the
+    security review asks for a rebuild of its unit (`/etc/systemd/system/tr-board.service`):
+
+    - run as the existing unprivileged user **`{{svc}}`**;
+    - keep exactly one capability, **`CAP_NET_BIND_SERVICE`**, as ambient and in the bounding set,
+      so that the daemon still binds port 80;
+    - add a seccomp syscall filter (`@system-service`).
+
+    The daemon must still answer on `http://127.0.0.1/`. Verify the result in `/proc/<pid>/status`
+    (`CapEff`, `CapBnd`, `Seccomp`) and decode with `capsh --decode`.
+  objectives:
+  - Grant a single capability to an unprivileged service
+  - Verify capabilities and seccomp from /proc
+  params:
+    svc:
+      type: choice
+      values:
+      - board
+      - boardsvc
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-cap-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-cap-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      id {{svc}} >/dev/null 2>&1 || useradd -r -M -s /sbin/nologin {{svc}}
+      cat > /usr/local/bin/tr-board <<'EOPY'
+      #!/usr/bin/python3
+      import http.server
+      class H(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              self.send_response(200); self.end_headers(); self.wfile.write(b"board-ok\n")
+          def log_message(self, *a): pass
+      http.server.HTTPServer(("0.0.0.0", 80), H).serve_forever()
+      EOPY
+      chmod 0755 /usr/local/bin/tr-board
+      systemctl disable --now tr-board.service >/dev/null 2>&1 || true
+      printf '[Unit]\nDescription=Platform board\nStartLimitIntervalSec=0\n[Service]\nExecStart=/usr/local/bin/tr-board\nRestart=on-failure\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-board.service
+      systemctl daemon-reload
+      systemctl enable --now tr-board.service >/dev/null 2>&1
+      sleep 2; curl -fs http://127.0.0.1/ | grep -q board-ok
+  checks:
+  - id: serves
+    description: The board answers on port 80
+    type: shell
+    'on': tr-cap-01
+    skills: &id001
+    - linux.internals.capabilities-seccomp
+    weight: 1.5
+    command: |
+      curl -fs --max-time 5 http://127.0.0.1/ 2>/dev/null | head -1 || echo down
+    expect:
+      match: exact
+      value: board-ok
+  - id: runs-as
+    description: The daemon runs as {{svc}}
+    type: shell
+    'on': tr-cap-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      echo "user=$(systemctl show -P User tr-board.service)"
+    expect:
+      match: exact
+      value: user={{svc}}
+  - id: caps
+    description: Effective and bounding capabilities are only CAP_NET_BIND_SERVICE
+    type: shell
+    'on': tr-cap-01
+    skills: *id001
+    weight: 2
+    command: |
+      p=$(systemctl show -P MainPID tr-board.service); [ "$p" -gt 0 ] || { echo none; exit; }
+      echo "eff=$(awk '/^CapEff/{print $2}' /proc/$p/status) bnd=$(awk '/^CapBnd/{print $2}' /proc/$p/status)"
+    expect:
+      match: exact
+      value: eff=0000000000000400 bnd=0000000000000400
+  - id: seccomp
+    description: A seccomp filter is active
+    type: shell
+    'on': tr-cap-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      p=$(systemctl show -P MainPID tr-board.service); [ "$p" -gt 0 ] || { echo none; exit; }
+      echo "seccomp=$(awk '/^Seccomp:/{print $2}' /proc/$p/status)"
+    expect:
+      match: exact
+      value: seccomp=2
+  - id: unit-persistent
+    description: The settings are in the enabled unit file
+    type: shell
+    'on': tr-cap-01
+    skills: *id001
+    weight: 1
+    command: |
+      systemctl is-enabled tr-board.service >/dev/null 2>&1 && systemctl show -P User tr-board.service | grep -qx {{svc}} && systemctl show -P SystemCallFilter tr-board.service | grep -q . && echo persistent || echo no
+    expect:
+      match: exact
+      value: persistent
+  hints:
+  - title: Which capability
+    body: capsh --print lists names; the one for ports below 1024 is CAP_NET_BIND_SERVICE (bit 10).
+    cost: 0
+  - title: Directives
+    body: User=, AmbientCapabilities=, CapabilityBoundingSet=, SystemCallFilter= in the [Service] section.
+    cost: 1
+  misconceptions:
+  - id: no-cap
+    description: Runs as the unprivileged user without ambient capabilities.
+    feedback: An unprivileged user cannot bind port 80 unless CAP_NET_BIND_SERVICE is granted as an ambient
+      capability.
+    expectFail:
+    - serves
+    - caps
+    - seccomp
+    - unit-persistent
+    mutation:
+      'on': tr-cap-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        X='User={{svc}}'
+        printf '[Unit]\nDescription=Platform board\nStartLimitIntervalSec=0\n[Service]\n%b\nExecStart=/usr/local/bin/tr-board\nRestart=on-failure\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n' "$X" | sudo tee /etc/systemd/system/tr-board.service >/dev/null; sudo systemctl daemon-reload; sudo systemctl restart tr-board.service; sleep 2
+  - id: ambient-only
+    description: Adds the ambient capability but leaves the bounding set and syscalls open.
+    feedback: AmbientCapabilities alone does not shrink the bounding set; add CapabilityBoundingSet and
+      SystemCallFilter.
+    expectFail:
+    - caps
+    - seccomp
+    - unit-persistent
+    mutation:
+      'on': tr-cap-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        X='User={{svc}}\nAmbientCapabilities=CAP_NET_BIND_SERVICE'
+        printf '[Unit]\nDescription=Platform board\nStartLimitIntervalSec=0\n[Service]\n%b\nExecStart=/usr/local/bin/tr-board\nRestart=on-failure\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n' "$X" | sudo tee /etc/systemd/system/tr-board.service >/dev/null; sudo systemctl daemon-reload; sudo systemctl restart tr-board.service; sleep 2
+  - id: still-root
+    description: Keeps root and only adds the bounding set and filter.
+    feedback: 'The daemon should not run as root: set User=.'
+    expectFail:
+    - runs-as
+    - unit-persistent
+    mutation:
+      'on': tr-cap-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        X='CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nSystemCallFilter=@system-service'
+        printf '[Unit]\nDescription=Platform board\nStartLimitIntervalSec=0\n[Service]\n%b\nExecStart=/usr/local/bin/tr-board\nRestart=on-failure\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n' "$X" | sudo tee /etc/systemd/system/tr-board.service >/dev/null; sudo systemctl daemon-reload; sudo systemctl restart tr-board.service; sleep 2
+  solution:
+    explanation: |
+      User= drops root; AmbientCapabilities= gives the non-root process CAP_NET_BIND_SERVICE and
+      CapabilityBoundingSet= removes everything else; SystemCallFilter=@system-service installs a seccomp
+      filter. /proc/PID/status shows CapEff/CapBnd 0x400 (bit 10) and Seccomp 2.
+    steps:
+    - 'on': tr-cap-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        printf '[Unit]\nDescription=Platform board\nStartLimitIntervalSec=0\n[Service]\nUser={{svc}}\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nSystemCallFilter=@system-service\nExecStart=/usr/local/bin/tr-board\nRestart=on-failure\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/tr-board.service >/dev/null
+        sudo systemctl daemon-reload; sudo systemctl restart tr-board.service; sleep 2
+        p=$(systemctl show -P MainPID tr-board.service); grep -E 'Cap(Eff|Bnd)|Seccomp' /proc/$p/status; capsh --decode=$(awk '/^CapEff/{print $2}' /proc/$p/status)
+    alternatives:
+    - id: dropin
+      description: Leave the original unit and add a drop-in override.
+      steps:
+      - 'on': tr-cap-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo mkdir -p /etc/systemd/system/tr-board.service.d
+          printf '[Service]\nUser={{svc}}\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nSystemCallFilter=@system-service\n' | sudo tee /etc/systemd/system/tr-board.service.d/harden.conf >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl restart tr-board.service; sleep 2

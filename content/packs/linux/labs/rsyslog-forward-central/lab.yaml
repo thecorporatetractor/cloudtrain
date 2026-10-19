@@ -1,0 +1,208 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: rsyslog-forward-central
+  title: Forward authentication logs to a central rsyslog server
+  domain: linux
+  frameworks:
+  - lpic1:essential-services
+  - linuxplus:security
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - logging
+  - rsyslog
+  - forwarding
+  - syslog
+  version: 1
+spec:
+  description: |
+    Authentication messages must be collected centrally. The log server is **`tr-log-1`** (`ssh tr-log-1`)
+    and the application host is **`tr-app-1`** (`ssh tr-app-1`); you have `sudo` on both.
+
+    - On **`tr-log-1`** receive syslog over **TCP port 514** and store messages of the **`auth` and `authpriv`**
+      facilities that arrive from the network in **`/var/log/remote/<sending hostname>/auth.log`** (one directory per
+      host name in the message, using a template). Other facilities must not end up in those files.
+    - On **`tr-app-1`** forward `auth` and `authpriv` messages to `tr-log-1` over TCP port 514.
+
+    The grader sends test messages claiming to come from three different hosts straight to the server's port
+    (design choice: simulated hosts instead of three VMs) and logs one message through the client with
+    `logger -p authpriv.notice` (tag `{{tag}}`).
+  objectives:
+  - Configure an rsyslog TCP receiver with a per-host dynamic file template
+  - Forward selected facilities to a central server
+  params:
+    tag:
+      type: choice
+      values:
+      - alpha
+      - bravo
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-log-1
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+    - name: tr-app-1
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-log-1
+    timeoutSec: 240
+    run: |
+      set -eu
+      V=/var/lib/cloudtrain; install -d -m 0700 $V
+      dpkg -s rsyslog >/dev/null 2>&1 || apt-get install -y -q rsyslog >/dev/null
+      rm -f /etc/rsyslog.d/*remote*.conf /etc/rsyslog.d/*central*.conf
+      rm -rf /var/log/remote; systemctl enable --now rsyslog >/dev/null 2>&1; systemctl restart rsyslog
+
+      cat > /var/lib/cloudtrain/send.py <<'EOPY'
+      import socket, sys
+      host, pri, msg = sys.argv[1:4]
+      s = socket.create_connection(("127.0.0.1", 514), timeout=5)
+      s.sendall(("<%s>1 2026-10-19T10:00:00Z %s app 1 - - %s\n" % (pri, host, msg)).encode())
+      s.close()
+      EOPY
+  - 'on': tr-app-1
+    timeoutSec: 240
+    run: |
+      set -eu
+      dpkg -s rsyslog >/dev/null 2>&1 || apt-get install -y -q rsyslog >/dev/null
+      rm -f /etc/rsyslog.d/*forward*.conf /etc/rsyslog.d/*central*.conf
+      systemctl enable --now rsyslog >/dev/null 2>&1; systemctl restart rsyslog
+  checks:
+  - id: srv-listen
+    description: tr-log-1 listens on TCP 514 with rsyslog
+    type: shell
+    'on': tr-log-1
+    skills: &id001
+    - linux.observability.rsyslog
+    weight: 1.5
+    command: |
+      systemctl is-active rsyslog >/dev/null && ss -H -ltnp | grep -q ":514 .*rsyslogd" && echo listening || echo not-listening
+    expect:
+      match: exact
+      value: listening
+  - id: srv-sim
+    description: Three simulated hosts get their own auth.log and nothing else is stored there
+    type: shell
+    'on': tr-log-1
+    skills: *id001
+    weight: 3
+    timeoutSec: 60
+    command: |
+      V=/var/lib/cloudtrain; rm -rf /var/log/remote/tr-sim-*; n=0
+      for h in tr-sim-a tr-sim-b tr-sim-c; do
+        python3 $V/send.py $h 86 "auth-probe-$h" 2>/dev/null; python3 $V/send.py $h 30 "daemon-probe-$h" 2>/dev/null
+      done; sleep 4
+      for h in tr-sim-a tr-sim-b tr-sim-c; do
+        f=/var/log/remote/$h/auth.log
+        grep -q "auth-probe-$h" $f 2>/dev/null && ! grep -q "daemon-probe" $f 2>/dev/null && n=$((n+1))
+      done; echo "hosts=$n/3"
+    expect:
+      match: exact
+      value: hosts=3/3
+  - id: cli-forward
+    description: tr-app-1 has a valid TCP forwarding rule to tr-log-1 (and sends the test message)
+    type: shell
+    'on': tr-app-1
+    skills: *id001
+    weight: 1.5
+    timeoutSec: 30
+    command: |
+      rsyslogd -N1 >/dev/null 2>&1 || { echo invalid; exit; }
+      c=$(cat /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null | grep -v '^[[:space:]]*#')
+      if echo "$c" | grep -q 'tr-log-1' && echo "$c" | grep -Eq '@@tr-log-1|protocol="tcp"' && echo "$c" | grep -Eq 'auth'; then r=forwarding; else r=not-forwarding; fi
+      logger -p authpriv.notice -t tr-fwd "fwdprobe-{{tag}}"; echo $r
+    expect:
+      match: exact
+      value: forwarding
+  - id: cli-arrives
+    description: A message logged on tr-app-1 arrived under its own host directory
+    type: shell
+    'on': tr-log-1
+    skills: *id001
+    weight: 2.5
+    timeoutSec: 60
+    command: |
+      for i in $(seq 1 25); do grep -rq "fwdprobe-{{tag}}" /var/log/remote/tr-app-1/auth.log 2>/dev/null && { echo arrived; exit; }; sleep 1; done; echo missing
+    expect:
+      match: exact
+      value: arrived
+  hints:
+  - title: Receiver
+    body: module(load="imtcp") input(type="imtcp" port="514"), a template with %HOSTNAME%, and an omfile
+      action with dynaFile.
+    cost: 0
+  - title: Sender
+    body: 'In a file in /etc/rsyslog.d: auth,authpriv.* action(type="omfwd" target="tr-log-1" port="514"
+      protocol="tcp")'
+    cost: 1
+  misconceptions:
+  - id: flat-file
+    description: Stores everything in one file instead of a file per host.
+    feedback: The template must contain %HOSTNAME% so that each sender gets its own directory.
+    expectFail:
+    - srv-sim
+    - cli-forward
+    - cli-arrives
+    mutation:
+      'on': tr-log-1
+      as: learner
+      timeoutSec: 120
+      run: |
+        printf 'module(load="imtcp")\ninput(type="imtcp" port="514")\ntemplate(name="RemoteAuth" type="string" string="/var/log/remote/auth.log")\nif ($inputname == "imtcp" and ($syslogfacility-text == "auth" or $syslogfacility-text == "authpriv")) then {\n  action(type="omfile" dynaFile="RemoteAuth" dirCreateMode="0755" fileCreateMode="0640")\n  stop\n}\n' | sudo tee /etc/rsyslog.d/10-remote.conf >/dev/null
+        sudo systemctl restart rsyslog; sleep 2
+        sudo mkdir -p /var/log/remote
+  - id: udp-forward
+    description: Forwards over UDP while the server listens on TCP only.
+    feedback: 'imtcp only accepts TCP: use @@ or protocol="tcp" on the client.'
+    expectFail:
+    - srv-listen
+    - srv-sim
+    - cli-forward
+    - cli-arrives
+    mutation:
+      'on': tr-app-1
+      as: learner
+      timeoutSec: 120
+      run: |
+        printf 'auth,authpriv.* @tr-log-1:514\n' | sudo tee /etc/rsyslog.d/20-forward.conf >/dev/null
+        sudo systemctl restart rsyslog; sleep 2
+  solution:
+    explanation: |
+      imtcp listens on TCP 514; a template with %HOSTNAME% and a dynaFile action write each sender into its own
+      directory, and the inputname/facility filter keeps non-auth messages out. The client uses an omfwd action with
+      protocol tcp to the log server.
+    steps:
+    - 'on': tr-log-1
+      as: learner
+      timeoutSec: 180
+      run: |
+        printf 'module(load="imtcp")\ninput(type="imtcp" port="514")\ntemplate(name="RemoteAuth" type="string" string="/var/log/remote/%%HOSTNAME%%/auth.log")\nif ($inputname == "imtcp" and ($syslogfacility-text == "auth" or $syslogfacility-text == "authpriv")) then {\n  action(type="omfile" dynaFile="RemoteAuth" dirCreateMode="0755" fileCreateMode="0640")\n  stop\n}\n' | sudo tee /etc/rsyslog.d/10-remote.conf >/dev/null
+        sudo systemctl restart rsyslog; sleep 2
+        ss -ltn | grep 514
+    - 'on': tr-app-1
+      as: learner
+      timeoutSec: 180
+      run: |
+        printf 'auth,authpriv.* action(type="omfwd" target="tr-log-1" port="514" protocol="tcp")\n' | sudo tee /etc/rsyslog.d/20-forward.conf >/dev/null
+        sudo systemctl restart rsyslog; sleep 2
+        logger -p authpriv.notice -t tr-test hello

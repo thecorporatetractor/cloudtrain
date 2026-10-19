@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: unit-sandboxing-score
+  title: Sandbox a service until its exposure score drops below the limit
+  domain: linux
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 25
+  tags:
+  - systemd
+  - sandboxing
+  - security
+  - systemd-analyze
+  version: 1
+spec:
+  description: |
+    `tr-pis.service` on **`tr-sbx-01`** (`ssh tr-sbx-01`; you have `sudo`) serves the passenger
+    information pages on **port 8081** and keeps a hit counter in `/var/lib/tr-pis/hits`. It runs as root
+    with no restrictions and `systemd-analyze security tr-pis.service` rates it **UNSAFE**.
+
+    Without changing its `ExecStart`, add sandboxing directives (a drop-in under
+    `/etc/systemd/system/tr-pis.service.d/` is the clean way) until the overall exposure level is
+    **below {{limit}}**. The service must stay active, still answer on `http://127.0.0.1:8081/` and still
+    update its hit counter (find out which path it has to be allowed to write).
+  objectives:
+  - Read systemd-analyze security output
+  - Add sandboxing directives without breaking a service
+  params:
+    limit:
+      type: choice
+      values:
+      - '4.0'
+      - '3.0'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-sbx-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-sbx-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      apt-get -y -qq install curl >/dev/null 2>&1 || true
+      mkdir -p /srv/pis /var/lib/tr-pis /var/lib/cloudtrain
+      echo 'pis-ok' > /srv/pis/index.html
+      echo 0 > /var/lib/tr-pis/hits
+      cat > /usr/local/bin/tr-pis <<'EOPY'
+      #!/usr/bin/python3
+      import http.server
+      class H(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              try:
+                  try:
+                      n = int(open("/var/lib/tr-pis/hits").read() or 0)
+                  except FileNotFoundError:
+                      n = 0
+                  open("/var/lib/tr-pis/hits", "w").write(str(n + 1))
+                  body = open("/srv/pis/index.html", "rb").read()
+              except Exception:
+                  self.send_response(500); self.end_headers(); self.wfile.write(b"error\n"); return
+              self.send_response(200); self.end_headers(); self.wfile.write(body)
+          def log_message(self, *a): pass
+      http.server.HTTPServer(("127.0.0.1", 8081), H).serve_forever()
+      EOPY
+      chmod 0755 /usr/local/bin/tr-pis
+      systemctl stop tr-pis.service >/dev/null 2>&1 || true
+      rm -rf /etc/systemd/system/tr-pis.service.d
+      printf '[Unit]\nDescription=Passenger information pages\n[Service]\nExecStart=/usr/local/bin/tr-pis\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-pis.service
+      chown -R root:root /var/lib/tr-pis; chmod 0755 /var/lib/tr-pis
+      systemctl daemon-reload; systemctl enable --now tr-pis.service >/dev/null 2>&1
+      sleep 2; curl -fs http://127.0.0.1:8081/ | grep -q pis-ok
+  checks:
+  - id: score
+    description: The exposure level is below {{limit}}
+    type: shell
+    'on': tr-sbx-01
+    skills: &id001
+    - linux.systemd.unit-sandboxing
+    weight: 3
+    timeoutSec: 40
+    command: |
+      s=$(systemd-analyze security tr-pis.service --no-pager 2>/dev/null | sed -n 's/.*Overall exposure level for tr-pis.service: \([0-9.]*\).*/\1/p' | head -1)
+      [ -n "$s" ] || { echo no-score; exit; }
+      awk -v s="$s" -v l="{{limit}}" 'BEGIN{print (s < l) ? "below-limit" : "score=" s}'
+    expect:
+      match: exact
+      value: below-limit
+  - id: serves
+    description: The service is active and answers
+    type: shell
+    'on': tr-sbx-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      o=$(curl -fs --max-time 5 http://127.0.0.1:8081/ 2>/dev/null) && [ "$(systemctl is-active tr-pis.service)" = active ] && echo "$o" || echo down
+    expect:
+      match: exact
+      value: pis-ok
+  - id: state-writable
+    description: The hit counter still increases
+    type: shell
+    'on': tr-sbx-01
+    skills: *id001
+    weight: 2
+    command: |
+      a=$(cat /var/lib/tr-pis/hits 2>/dev/null || echo x); curl -fs --max-time 5 http://127.0.0.1:8081/ >/dev/null 2>&1; sleep 1; b=$(cat /var/lib/tr-pis/hits 2>/dev/null || echo y)
+      [ "$a" != x ] && [ "$b" = "$((a + 1))" ] && echo counting || echo "hits=$a/$b"
+    expect:
+      match: exact
+      value: counting
+  - id: exec-unchanged
+    description: ExecStart is untouched and the unit is enabled
+    type: shell
+    'on': tr-sbx-01
+    skills: *id001
+    weight: 1
+    command: |
+      systemctl show -P ExecStart tr-pis.service | grep -q 'path=/usr/local/bin/tr-pis ;' && systemctl is-enabled tr-pis.service >/dev/null 2>&1 && echo unchanged || echo changed
+    expect:
+      match: exact
+      value: unchanged
+  hints:
+  - title: Find what is exposed
+    body: systemd-analyze security tr-pis.service lists every directive with its weight; the largest items
+      are a good start.
+    cost: 0
+  - title: State path
+    body: 'The app writes /var/lib/tr-pis/hits: StateDirectory=tr-pis creates and allows it, even with
+      ProtectSystem=strict.'
+    cost: 1
+  misconceptions:
+  - id: token-effort
+    description: Adds only NoNewPrivileges and PrivateTmp.
+    feedback: Two directives barely move the score; combine filesystem, kernel, namespace, capability
+      and syscall restrictions (see systemd-analyze security tr-pis.service).
+    expectFail:
+    - score
+    mutation:
+      'on': tr-sbx-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo mkdir -p /etc/systemd/system/tr-pis.service.d
+        printf '[Service]\nNoNewPrivileges=yes\nPrivateTmp=yes\n' | sudo tee /etc/systemd/system/tr-pis.service.d/sbx.conf >/dev/null
+        sudo systemctl daemon-reload; sudo systemctl restart tr-pis.service; sleep 2
+  - id: strict-no-state
+    description: Sets ProtectSystem=strict and forgets the state directory.
+    feedback: With ProtectSystem=strict the whole file system is read-only for the service; allow its
+      state path with StateDirectory=tr-pis or ReadWritePaths=.
+    expectFail:
+    - serves
+    - state-writable
+    mutation:
+      'on': tr-sbx-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        sudo mkdir -p /etc/systemd/system/tr-pis.service.d
+        printf '\n[Service]\nDynamicUser=yes\nNoNewPrivileges=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectControlGroups=yes\nProtectClock=yes\nProtectHostname=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictAddressFamilies=AF_INET AF_INET6\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nCapabilityBoundingSet=\nSystemCallArchitectures=native\nSystemCallFilter=@system-service\nSystemCallFilter=~@privileged @resources\nUMask=0077\nRemoveIPC=yes\n' | sudo tee /etc/systemd/system/tr-pis.service.d/sbx.conf >/dev/null
+        sudo systemctl daemon-reload; sudo systemctl restart tr-pis.service; sleep 2
+  solution:
+    explanation: |
+      A drop-in with DynamicUser, a state directory, ProtectSystem=strict, kernel/namespace/capability
+      restrictions and a syscall filter brings the exposure score well under 4. StateDirectory keeps
+      /var/lib/tr-pis writable (and owned by the dynamic user) while everything else is read-only.
+    steps:
+    - 'on': tr-sbx-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo mkdir -p /etc/systemd/system/tr-pis.service.d
+        printf '\n[Service]\nDynamicUser=yes\nStateDirectory=tr-pis\nNoNewPrivileges=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectControlGroups=yes\nProtectClock=yes\nProtectHostname=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictAddressFamilies=AF_INET AF_INET6\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nCapabilityBoundingSet=\nSystemCallArchitectures=native\nSystemCallFilter=@system-service\nSystemCallFilter=~@privileged @resources\nUMask=0077\nRemoveIPC=yes\n' | sudo tee /etc/systemd/system/tr-pis.service.d/sbx.conf >/dev/null
+        sudo systemctl daemon-reload; sudo systemctl restart tr-pis.service; sleep 2
+        systemd-analyze security tr-pis.service --no-pager | tail -3; curl -s http://127.0.0.1:8081/

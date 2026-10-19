@@ -1,0 +1,186 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: attack-surface-cleanup
+  title: Reduce a signalling host to its approved listening services
+  domain: linux
+  frameworks:
+  - cks:system-hardening
+  - linuxplus:security
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - security
+  - hardening
+  - ss
+  - services
+  - attack-surface
+  version: 1
+spec:
+  description: |
+    The signalling host **`tr-sig-01`** (`ssh tr-sig-01`; you have `sudo`) must expose only what is on its
+    approved list, `/etc/tr-baseline/approved-services.txt`: **SSH (22)** and the **signalling API (8443)**.
+    Someone installed and started other network services. Find every service that listens on a
+    non-loopback address and is not approved, and remove or disable it so that it stays gone after a reboot.
+    Do not touch the approved services, and do not rely on a firewall to hide a listening service.
+  objectives:
+  - List listening sockets and their owning services
+  - Remove unapproved services persistently
+  params:
+    web:
+      type: choice
+      values:
+      - apache2
+      - nginx
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-sig-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-sig-01
+    timeoutSec: 300
+    run: |
+      set -eu
+      mkdir -p /etc/tr-baseline
+      printf '22/tcp sshd\n8443/tcp tr-sigapi\n' > /etc/tr-baseline/approved-services.txt
+      dpkg -s {{web}} >/dev/null 2>&1 || apt-get install -y -q {{web}} vsftpd >/dev/null
+      dpkg -s vsftpd >/dev/null 2>&1 || apt-get install -y -q vsftpd >/dev/null
+      for s in tr-sigapi tr-debug-shell; do
+        cat > /usr/local/bin/$s <<EOS
+      #!/usr/bin/python3
+      import socket, time
+      s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      s.bind(("0.0.0.0", $( [ $s = tr-sigapi ] && echo 8443 || echo 9999 ))); s.listen(5)
+      while True:
+          c, _ = s.accept(); c.sendall(b"$s\n"); c.close()
+      EOS
+        chmod 0755 /usr/local/bin/$s
+        printf '[Unit]\nDescription=%s\n[Service]\nExecStart=/usr/local/bin/%s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' $s $s > /etc/systemd/system/$s.service
+      done
+      systemctl daemon-reload
+      systemctl unmask {{web}} vsftpd >/dev/null 2>&1 || true
+      systemctl enable --now tr-sigapi.service tr-debug-shell.service {{web}}.service vsftpd.service >/dev/null 2>&1
+      sleep 3
+      ss -H -ltn | grep -q ':8443 ' && ss -H -ltn | grep -q ':9999 '
+  checks:
+  - id: surface
+    description: Only the approved ports listen on non-loopback addresses
+    type: shell
+    'on': tr-sig-01
+    skills: &id001
+    - linux.security.attack-surface
+    weight: 3
+    command: |
+      ss -H -ltn | awk '{a=$4; if (a ~ /^127\./ || a ~ /^\[::1\]/) next; n=split(a, p, ":"); print p[n]}' | sort -un | paste -sd' '
+    expect:
+      match: exact
+      value: 22 8443
+  - id: approved-up
+    description: The approved services are still running
+    type: shell
+    'on': tr-sig-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      n=0; ss -H -ltn | grep -q ":22 " && n=$((n+1)); ss -H -ltn | grep -q ":8443 " && n=$((n+1)); systemctl is-active tr-sigapi.service >/dev/null && n=$((n+1)); echo "up=$n/3"
+    expect:
+      match: exact
+      value: up=3/3
+  - id: persistent
+    description: The unapproved services cannot start at boot
+    type: shell
+    'on': tr-sig-01
+    skills: *id001
+    weight: 2.5
+    command: |
+      bad=0; for u in tr-debug-shell.service {{web}}.service vsftpd.service; do
+        st=$(systemctl is-enabled $u 2>/dev/null || true); case "$st" in enabled|enabled-runtime|alias|static|indirect)
+          if [ "$st" = static ] || [ "$st" = indirect ]; then :; else bad=$((bad+1)); fi;; esac
+      done; echo "enabled=$bad"
+    expect:
+      match: exact
+      value: enabled=0
+  - id: no-firewall-trick
+    description: The ports are closed by stopping services, not by a firewall
+    type: shell
+    'on': tr-sig-01
+    skills: *id001
+    weight: 1
+    command: |
+      if ufw status 2>/dev/null | grep -q "Status: active" || nft list ruleset 2>/dev/null | grep -Eq "dport (21|80|9999)"; then echo firewall; else echo none; fi
+    expect:
+      match: exact
+      value: none
+  hints:
+  - title: Listeners
+    body: ss -ltnp lists listening TCP sockets with the owning process; systemctl status PID shows the
+      unit.
+    cost: 0
+  - title: Boot
+    body: systemctl is-enabled UNIT; disable --now stops and removes the boot link.
+    cost: 1
+  misconceptions:
+  - id: stop-only
+    description: Stops the services but leaves them enabled.
+    feedback: Stopping lasts until the next boot; disable (or mask/remove) the units too.
+    expectFail:
+    - persistent
+    mutation:
+      'on': tr-sig-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo systemctl stop tr-debug-shell.service {{web}}.service vsftpd.service
+  - id: firewall-hide
+    description: Blocks the ports with ufw and leaves the services running.
+    feedback: 'A firewall hides a listener, it does not remove it: the services still listen and start
+      at boot.'
+    expectFail:
+    - surface
+    - persistent
+    - no-firewall-trick
+    mutation:
+      'on': tr-sig-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        sudo ufw allow 22/tcp >/dev/null; sudo ufw allow 8443/tcp >/dev/null
+        sudo ufw deny 21/tcp >/dev/null; sudo ufw deny 80/tcp >/dev/null; sudo ufw deny 9999/tcp >/dev/null
+        sudo ufw --force enable >/dev/null
+  solution:
+    explanation: |
+      ss -ltnp shows the listeners and their processes; systemctl disable --now (or masking, or removing the package) takes them
+      out of the boot sequence. Only 22 and 8443 stay.
+    steps:
+    - 'on': tr-sig-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo ss -ltnp
+        sudo systemctl disable --now tr-debug-shell.service {{web}}.service vsftpd.service
+        sudo systemctl mask vsftpd.service
+        sudo ss -ltn
+    alternatives:
+    - id: purge
+      description: Remove the packages and the rogue unit instead of disabling them.
+      steps:
+      - 'on': tr-sig-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo systemctl disable --now tr-debug-shell.service
+          sudo rm -f /etc/systemd/system/tr-debug-shell.service /usr/local/bin/tr-debug-shell; sudo systemctl daemon-reload
+          sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y -q {{web}} vsftpd >/dev/null

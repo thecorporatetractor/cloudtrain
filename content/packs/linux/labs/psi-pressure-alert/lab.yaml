@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: psi-pressure-alert
+  title: Use pressure stall data to find the stalled slice and set an alert threshold
+  domain: linux
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 20
+  tags:
+  - performance
+  - psi
+  - cgroups
+  - monitoring
+  version: 1
+spec:
+  description: |
+    `tr-psi-01` (`ssh tr-psi-01`; you have `sudo`) runs several slices and the monitoring team wants a
+    pressure-based alert instead of load average. Read the pressure stall information while the current load
+    runs (`/proc/pressure/*` for the system, `cpu.pressure`, `memory.pressure` and `io.pressure` below
+    `/sys/fs/cgroup/<slice>`), find the slice whose tasks are stalled, then write
+    **`/etc/tr-monitor/psi.conf`** with:
+
+    ```
+    slice=<the stalled slice, for example tr-web.slice>
+    resource=<cpu|memory|io>
+    some_avg10_threshold=<a percentage>
+    ```
+    The threshold must be at least **5** and must be one that would have fired for the stalled slice
+    (below its current `some avg60`) while staying silent for the idle `tr-web.slice`.
+  objectives:
+  - Read system and per-cgroup pressure stall information
+  - Pick an alert threshold from observed pressure
+  params:
+    cul:
+      type: choice
+      values:
+      - tr-reports
+      - tr-exports
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-psi-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-psi-01
+    timeoutSec: 240
+    run: |
+      set -eu
+      for u in {{cul}}-job tr-web-idle; do systemctl stop $u.service >/dev/null 2>&1 || true; done
+      install -d /etc/tr-monitor; rm -f /etc/tr-monitor/psi.conf
+      printf '# slice=\n# resource=\n# some_avg10_threshold=\n' > /etc/tr-monitor/psi.conf.sample
+      cat > /usr/local/bin/tr-spin <<'EOS'
+      #!/bin/bash
+      for i in $(seq 1 6); do ( while :; do :; done ) & done
+      wait
+      EOS
+      printf '#!/bin/sh\nexec sleep 100000\n' > /usr/local/bin/tr-web-idle
+      chmod 0755 /usr/local/bin/tr-spin /usr/local/bin/tr-web-idle
+      printf '[Unit]\nDescription=Report crunch\n[Service]\nSlice={{cul}}.slice\nNice=10\nExecStart=/usr/local/bin/tr-spin\n' > /etc/systemd/system/{{cul}}-job.service
+      printf '[Unit]\nDescription=Web idle\n[Service]\nSlice=tr-web.slice\nExecStart=/usr/local/bin/tr-web-idle\n' > /etc/systemd/system/tr-web-idle.service
+      systemctl daemon-reload
+      systemctl start {{cul}}-job.service tr-web-idle.service
+      sleep 75
+  checks:
+  - id: stalled-slice
+    description: The stalled slice is named correctly
+    type: shell
+    'on': tr-psi-01
+    skills: &id001
+    - linux.performance.psi
+    weight: 2
+    timeoutSec: 30
+    command: |
+      got=$(sed -n 's/^slice=//p' /etc/tr-monitor/psi.conf 2>/dev/null | head -1)
+      best=$(for s in /sys/fs/cgroup/tr-*.slice; do v=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' $s/cpu.pressure 2>/dev/null); echo "${v:-0} $(basename $s)"; done | sort -rn | head -1 | awk '{print $2}')
+      [ "$got" = "$best" ] && echo ok || echo "got=$got best=$best"
+    expect:
+      match: exact
+      value: ok
+  - id: resource
+    description: The stalled resource is cpu
+    type: shell
+    'on': tr-psi-01
+    skills: *id001
+    weight: 1
+    command: |
+      sed -n "s/^resource=//p" /etc/tr-monitor/psi.conf 2>/dev/null | head -1
+    expect:
+      match: exact
+      value: cpu
+  - id: threshold
+    description: The threshold fires for the stalled slice and not for the idle one
+    type: shell
+    'on': tr-psi-01
+    skills: *id001
+    weight: 2.5
+    command: |
+      t=$(sed -n 's/^some_avg10_threshold=//p' /etc/tr-monitor/psi.conf 2>/dev/null | head -1)
+      cul=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' /sys/fs/cgroup/{{cul}}.slice/cpu.pressure)
+      idle=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' /sys/fs/cgroup/tr-web.slice/cpu.pressure)
+      awk -v t="${t:-x}" -v c="$cul" -v i="$idle" 'BEGIN{ if (t !~ /^[0-9.]+$/) print "not-a-number"; else print (t+0 >= 5 && t+0 < c+0 && t+0 > i+0) ? "ok" : "t=" t " culprit=" c " idle=" i }'
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Where
+    body: cat /proc/pressure/cpu for the host and cat /sys/fs/cgroup/SLICE/cpu.pressure for a slice; some
+      and full lines carry avg10, avg60 and avg300.
+    cost: 0
+  misconceptions:
+  - id: wrong-slice
+    description: Blames the idle web slice.
+    feedback: The stalled slice is the one whose own cpu.pressure shows stall time; tr-web.slice has tasks
+      that are asleep.
+    expectFail:
+    - stalled-slice
+    mutation:
+      'on': tr-psi-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo install -d /etc/tr-monitor
+        printf 'slice=tr-web.slice\nresource=cpu\nsome_avg10_threshold=20\n' | sudo tee /etc/tr-monitor/psi.conf >/dev/null
+  - id: zero-threshold
+    description: Sets a threshold of 1, which would also fire on noise.
+    feedback: Choose a value between the quiet baseline and the observed stall (at least 5).
+    expectFail:
+    - threshold
+    mutation:
+      'on': tr-psi-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo install -d /etc/tr-monitor
+        printf 'slice={{cul}}.slice\nresource=cpu\nsome_avg10_threshold=1\n' | sudo tee /etc/tr-monitor/psi.conf >/dev/null
+  - id: io-resource
+    description: Reads io.pressure and reports io.
+    feedback: CPU spinners stall in cpu.pressure; io.pressure and memory.pressure stay near 0.
+    expectFail:
+    - resource
+    mutation:
+      'on': tr-psi-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        sudo install -d /etc/tr-monitor
+        printf 'slice={{cul}}.slice\nresource=io\nsome_avg10_threshold=20\n' | sudo tee /etc/tr-monitor/psi.conf >/dev/null
+  solution:
+    explanation: |
+      Pressure stall information reports the share of time tasks were stalled waiting for a resource. The six CPU
+      spinners in one slice leave its cpu.pressure high (some avg60 in the tens) while the idle slice stays at 0, so
+      any threshold between the two (and at least 5) is right.
+    steps:
+    - 'on': tr-psi-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory
+        for s in /sys/fs/cgroup/tr-*.slice; do echo $s; cat $s/cpu.pressure; done
+        sudo install -d /etc/tr-monitor
+        printf 'slice={{cul}}.slice\nresource=cpu\nsome_avg10_threshold=20\n' | sudo tee /etc/tr-monitor/psi.conf >/dev/null
