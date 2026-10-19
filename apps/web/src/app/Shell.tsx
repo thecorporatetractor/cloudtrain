@@ -13,7 +13,7 @@ import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 import { canAccess } from './access';
 import { AuthGate, isHybridPath, isPublicPath, isSitePath } from './auth';
-import { BrandMark, useBrandName } from '@/components/brand';
+import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { SiteLayout } from '@/site/SiteLayout';
 import { CommandPalette } from './CommandPalette';
 import { PersonaSwitcher } from './PersonaSwitcher';
@@ -157,7 +157,7 @@ function ShellInner() {
             </button>
             <Link to="/" className="brand" aria-label={`${brand} home`}>
               <BrandMark />
-              <span className="brand-name">{brand}</span>
+              <BrandName />
             </Link>
             <button type="button" className="topbar-btn" style={{ marginLeft: 'auto' }} onClick={() => shell.setPaletteOpen(true)} aria-label="Search and commands">
               <Search size={17} />
@@ -216,7 +216,7 @@ function NavPanel({ mode, inDrawer, inWorkspace, pathname, sections, principal, 
       <div className="nav-brand">
         <Link to="/" className="brand" aria-label={`${brand} home`}>
           <BrandMark />
-          {mode === 'full' && <span className="brand-name">{brand}</span>}
+          {mode === 'full' && <BrandName />}
         </Link>
         {inDrawer ? (
           <DialogPrimitive.Close asChild>

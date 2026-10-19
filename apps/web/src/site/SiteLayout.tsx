@@ -5,7 +5,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useMe } from '@/api/client';
 import { useSite } from '@/api/public';
 import type { SiteConfig } from '@/api/types';
-import { BrandMark, useBrandName } from '@/components/brand';
+import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Dropdown, Tooltip } from '@/components/ui';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
@@ -103,7 +103,7 @@ function SiteHeader() {
       <div className="site-container site-header-inner">
         <Link to="/" className="brand site-brand" aria-label={`${brand} home`}>
           <BrandMark />
-          <span className="brand-name">{brand}</span>
+          <BrandName />
         </Link>
         <nav className="site-nav" aria-label="Website">
           {nav.map((n) => (
@@ -198,7 +198,7 @@ function SiteFooter() {
           <div className="stack" style={{ gap: 10 }}>
             <span className="brand" style={{ padding: 0 }}>
               <BrandMark />
-              <span className="brand-name">{brand}</span>
+              <BrandName />
             </span>
             <p className="small muted" style={{ maxWidth: 320 }}>
               {site?.brand.tagline}

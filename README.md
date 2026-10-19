@@ -1,4 +1,11 @@
-<h1 align="center">CloudTrain</h1>
+<p align="center">
+  <a href="https://github.com/thecorporatetractor/cloudtrain">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="apps/web/public/brand/cloudtrain-horizontal-white.svg">
+      <img alt="CloudTrain" src="apps/web/public/brand/cloudtrain-horizontal.svg" width="380">
+    </picture>
+  </a>
+</p>
 
 <p align="center">
   <b>Hands-on infrastructure training on real systems, graded automatically, with timed exam simulations.</b><br>
