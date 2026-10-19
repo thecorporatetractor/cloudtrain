@@ -17,7 +17,7 @@ spec:
 
     | side | interface on the gateway | network | test client |
     |---|---|---|---|
-    | management | `eth0` | the lab management network (your ssh session) | - |
+    | management | the NIC with the default route (`ip route`) | the lab management network (your ssh session) | - |
     | ticket office ("ops") | `fw-ops` | 10.71.1.0/24 | namespace `ops` (10.71.1.2) |
     | public | `fw-pub` | 10.71.2.0/24 | namespace `pax` (10.71.2.2) |
 
@@ -26,7 +26,7 @@ spec:
 
     - uses a table in the `inet` family with an `input` chain **policy drop**;
     - accepts **established and related** traffic and everything on the loopback;
-    - accepts everything from the **management interface `eth0`** (do not cut off your own
+    - accepts everything from the **management interface** (the NIC that carries the default route) (do not cut off your own
       session and the platform);
     - accepts **SSH (TCP 22) only from the ops subnet 10.71.1.0/24**;
     - accepts **HTTPS (TCP 443) from anywhere** (the gateway serves it on 443);
@@ -65,7 +65,9 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
-        [ "$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" = eth0 ] || { echo "this lab expects the management NIC to be eth0 (default route is on $(ip -4 route show default | head -1))" >&2; exit 1; }
+        # remember the management NIC (eth0 or a predictable name such as enp1s0)
+        ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' > /var/lib/tr-mgmt-if
+        grep -q . /var/lib/tr-mgmt-if
         for u in tr-gw-443 tr-gw-8081 tr-pax-9000; do systemctl stop $u.service 2>/dev/null || true; done
         systemctl disable --now nftables.service >/dev/null 2>&1 || true
         nft flush ruleset
@@ -169,12 +171,12 @@ spec:
         curl -4 -s -m 6 http://10.71.2.2:9000/ || echo none
       expect: {match: exact, value: "pax-{{token}}"}
     - id: management-kept
-      description: The running ruleset accepts everything arriving on eth0
+      description: The running ruleset accepts everything arriving on the management interface
       type: shell
       on: tr-net-01
       skills: [linux.net.firewall]
       weight: 1
-      command: nft list ruleset 2>/dev/null | grep -Eq 'iif(name)? +"?eth0"? +accept' && echo kept || echo missing
+      command: m=$(cat /var/lib/tr-mgmt-if 2>/dev/null); [ -n "$m" ] && nft list ruleset 2>/dev/null | grep -Eq "iif(name)? +\"?$m\"? +accept" && echo kept || echo missing
       expect: {match: exact, value: kept}
     - id: persistent
       description: The saved configuration loads cleanly and enables the nftables service
@@ -194,7 +196,7 @@ spec:
       expect: {match: exact, value: persistent}
   hints:
     - title: Skeleton
-      body: "One table inet with an input chain: type filter hook input priority 0; policy drop; Put the accepts first (ct state, iif lo, iifname eth0, then the services) and the log statement last so only dropped packets reach it."
+      body: "One table inet with an input chain: type filter hook input priority 0; policy drop; Put the accepts first (ct state, iif lo, iifname <management NIC>, then the services) and the log statement last so only dropped packets reach it."
       cost: 0
     - title: Log with a limit
       command: 'limit rate 5/minute log prefix "tr-drop: "'
@@ -202,18 +204,18 @@ spec:
       cost: 1
     - title: Check before you load
       command: sudo nft -c -f /etc/nftables.conf
-      body: "-c only checks the syntax. Keep your ssh session open until you have confirmed that eth0 is accepted, then enable the service so the file is loaded at boot."
+      body: "-c only checks the syntax. Keep your ssh session open until you have confirmed that the management interface is accepted, then enable the service so the file is loaded at boot."
       cost: 1
   misconceptions:
     - id: ssh-open-to-all
       description: Opens SSH to everybody instead of only the ops subnet.
-      feedback: "The brief limits SSH to 10.71.1.0/24 (plus management on eth0). Add ip saddr 10.71.1.0/24 to the rule."
+      feedback: "The brief limits SSH to 10.71.1.0/24 (plus the management interface). Add ip saddr 10.71.1.0/24 to the rule."
       expectFail: [pub-ssh-blocked]
       mutation:
         on: tr-net-01
         as: learner
         run: |
-          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          M=$(cat /var/lib/tr-mgmt-if); cat <<EOF | sudo tee /etc/nftables.conf >/dev/null
           #!/usr/sbin/nft -f
           flush ruleset
           table inet filter {
@@ -221,7 +223,7 @@ spec:
               type filter hook input priority 0; policy drop;
               ct state established,related accept
               iif lo accept
-              iifname "eth0" accept
+              iifname "$M" accept
               tcp dport 22 accept
               tcp dport 443 accept
               limit rate {{rate}} log prefix "tr-drop: "
@@ -238,14 +240,14 @@ spec:
         on: tr-net-01
         as: learner
         run: |
-          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          M=$(cat /var/lib/tr-mgmt-if); cat <<EOF | sudo tee /etc/nftables.conf >/dev/null
           #!/usr/sbin/nft -f
           flush ruleset
           table inet filter {
             chain input {
               type filter hook input priority 0; policy drop;
               iif lo accept
-              iifname "eth0" accept
+              iifname "$M" accept
               ip saddr 10.71.1.0/24 tcp dport 22 accept
               tcp dport 443 accept
               limit rate {{rate}} log prefix "tr-drop: "
@@ -262,7 +264,7 @@ spec:
         on: tr-net-01
         as: learner
         run: |
-          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          M=$(cat /var/lib/tr-mgmt-if); cat <<EOF | sudo tee /etc/nftables.conf >/dev/null
           #!/usr/sbin/nft -f
           flush ruleset
           table inet filter {
@@ -270,7 +272,7 @@ spec:
               type filter hook input priority 0; policy drop;
               ct state established,related accept
               iif lo accept
-              iifname "eth0" accept
+              iifname "$M" accept
               ip saddr 10.71.1.0/24 tcp dport 22 accept
               tcp dport 443 accept
               log prefix "tr-drop: "
@@ -286,7 +288,7 @@ spec:
         as: learner
         run: |
           set -e
-          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          M=$(cat /var/lib/tr-mgmt-if); cat <<EOF | sudo tee /etc/nftables.conf >/dev/null
           #!/usr/sbin/nft -f
           flush ruleset
           table inet filter {
@@ -294,7 +296,7 @@ spec:
               type filter hook input priority 0; policy drop;
               ct state established,related accept
               iif lo accept
-              iifname "eth0" accept
+              iifname "$M" accept
               ip saddr 10.71.1.0/24 tcp dport 22 accept
               tcp dport 443 accept
               limit rate {{rate}} log prefix "tr-drop: "
@@ -320,13 +322,13 @@ spec:
             run: |
               set -e
               sudo mkdir -p /etc/nftables.d
-              cat <<'EOF' | sudo tee /etc/nftables.d/gateway.nft >/dev/null
+              M=$(cat /var/lib/tr-mgmt-if); cat <<EOF | sudo tee /etc/nftables.d/gateway.nft >/dev/null
               table inet gateway {
                 chain input {
                   type filter hook input priority 0; policy drop;
                   ct state established,related accept
                   iif lo accept
-                  iifname "eth0" accept
+                  iifname "$M" accept
                   ip saddr 10.71.1.0/24 tcp dport 22 accept
                   tcp dport 443 accept
                   limit rate {{rate}} log prefix "tr-drop: "
