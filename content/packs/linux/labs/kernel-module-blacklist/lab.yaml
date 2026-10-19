@@ -1,0 +1,156 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kernel-module-blacklist
+  title: Load a module with options at boot and block another from ever loading
+  domain: linux
+  frameworks: [lpic1:system-architecture, linuxplus:system-management, lpic2:kernel]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [kernel, modules, modprobe, boot]
+  version: 1
+spec:
+  description: |
+    The test bench **`tr-mod-01`** (`ssh tr-mod-01`; you have `sudo`) simulates trackside
+    network interfaces with the kernel's **`dummy`** module, and must never touch floppy
+    hardware.
+
+    On `tr-mod-01`:
+
+    - load **`dummy`** with the option **`numdummies={{n}}`** **now** and at **every boot**
+      (so the bench has {{n}} dummy interfaces);
+    - make it impossible for the **`floppy`** module to load, even when something runs
+      `modprobe floppy` explicitly.
+
+    Do not reboot. Persistence is graded from the configuration files until a reboot step
+    is available.
+  objectives:
+    - Pass options to a module and load it at boot
+    - Block a module with a modprobe install override rather than a bare blacklist
+  params:
+    n:
+      type: choice
+      values: ["3", "4", "5"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-mod-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-mod-01
+      run: |
+        set -eu
+        modinfo dummy >/dev/null
+        for l in $(ip -o link show type dummy | awk -F': ' '{print $2}'); do ip link del "$l" 2>/dev/null || true; done
+        modprobe -r dummy 2>/dev/null || true
+        rm -f /etc/modules-load.d/dummy.conf /etc/modprobe.d/dummy.conf /etc/modprobe.d/floppy.conf
+  checks:
+    - id: loaded-now
+      description: dummy is loaded and the bench has {{n}} dummy interfaces
+      type: shell
+      on: tr-mod-01
+      skills: [linux.kernel.modules]
+      weight: 1.5
+      command: |
+        lsmod | awk '$1 == "dummy" {f = 1} END {exit !f}' || { echo not-loaded; exit 0; }
+        ip -o link show type dummy | wc -l
+      expect: {match: exact, value: "{{n}}"}
+    - id: at-boot
+      description: dummy is listed for loading at boot
+      type: shell
+      on: tr-mod-01
+      skills: [linux.kernel.modules]
+      weight: 1
+      command: cat /etc/modules-load.d/*.conf /usr/lib/modules-load.d/*.conf /run/modules-load.d/*.conf 2>/dev/null | sed 's/#.*//' | awk '{print $1}' | grep -qx dummy && echo listed || echo missing
+      expect: {match: exact, value: listed}
+    - id: option
+      description: The module configuration sets numdummies={{n}}
+      type: shell
+      on: tr-mod-01
+      skills: [linux.kernel.modules]
+      weight: 1.5
+      command: |
+        v=$(modprobe -c 2>/dev/null | awk '$1 == "options" && $2 == "dummy" {for (i = 3; i <= NF; i++) if ($i ~ /^numdummies=/) {split($i, a, "="); v = a[2]}} END {print v}')
+        echo "${v:-unset}"
+      expect: {match: exact, value: "{{n}}"}
+    - id: floppy-blocked
+      description: An explicit modprobe floppy would run /bin/false instead of loading the module
+      type: shell
+      on: tr-mod-01
+      skills: [linux.kernel.modules]
+      weight: 2
+      command: |
+        modprobe -n -v floppy 2>&1 | grep -qE '^install /bin/(false|true)' && echo blocked || echo loadable
+      expect: {match: exact, value: blocked}
+    - id: floppy-absent
+      description: The floppy module is not loaded
+      type: shell
+      on: tr-mod-01
+      skills: [linux.kernel.modules]
+      weight: 0.5
+      command: |
+        lsmod | awk '$1 == "floppy" {f = 1} END {print f ? "loaded" : "absent"}'
+      expect: {match: exact, value: absent}
+  hints:
+    - title: Boot-time loading and options
+      body: "/etc/modules-load.d/*.conf lists modules for systemd-modules-load; /etc/modprobe.d/*.conf holds options lines. modprobe -c shows the merged configuration."
+      cost: 1
+    - title: Blacklist is not a block
+      body: "A blacklist line only stops alias-based autoloading. 'install floppy /bin/false' makes even an explicit modprobe fail."
+      cost: 2
+  misconceptions:
+    - id: modprobe-only
+      description: Loads the module with the option by hand only.
+      feedback: "modprobe lasts until reboot; list the module in /etc/modules-load.d and put the option in /etc/modprobe.d."
+      expectFail: [at-boot, option]
+      mutation:
+        on: tr-mod-01
+        as: learner
+        run: |
+          sudo modprobe dummy numdummies={{n}}
+          echo 'install floppy /bin/false' | sudo tee /etc/modprobe.d/floppy.conf >/dev/null
+    - id: blacklist-only
+      description: Uses a bare blacklist line for floppy.
+      feedback: "blacklist only prevents automatic loading by alias; modprobe floppy still loads it. Add an install override."
+      expectFail: [floppy-blocked]
+      mutation:
+        on: tr-mod-01
+        as: learner
+        run: |
+          echo dummy | sudo tee /etc/modules-load.d/dummy.conf >/dev/null
+          echo 'options dummy numdummies={{n}}' | sudo tee /etc/modprobe.d/dummy.conf >/dev/null
+          echo 'blacklist floppy' | sudo tee /etc/modprobe.d/floppy.conf >/dev/null
+          sudo modprobe dummy
+  solution:
+    explanation: |
+      modules-load.d makes systemd-modules-load load dummy at boot, and the options line
+      in modprobe.d supplies numdummies every time it loads. 'install floppy /bin/false'
+      replaces the load action itself, so explicit and automatic loads both fail.
+    steps:
+      - on: tr-mod-01
+        as: learner
+        run: |
+          set -e
+          echo dummy | sudo tee /etc/modules-load.d/dummy.conf >/dev/null
+          echo 'options dummy numdummies={{n}}' | sudo tee /etc/modprobe.d/dummy.conf >/dev/null
+          printf 'blacklist floppy\ninstall floppy /bin/false\n' | sudo tee /etc/modprobe.d/floppy.conf >/dev/null
+          sudo modprobe dummy
+          modprobe -n -v floppy || true
+    alternatives:
+      - id: single-file
+        description: Put everything in one modprobe.d file and load the module through systemd-modules-load.
+        steps:
+          - on: tr-mod-01
+            as: learner
+            run: |
+              set -e
+              printf 'options dummy numdummies={{n}}\ninstall floppy /bin/true\n' | sudo tee /etc/modprobe.d/tr-bench.conf >/dev/null
+              echo dummy | sudo tee /etc/modules-load.d/tr-bench.conf >/dev/null
+              sudo systemctl restart systemd-modules-load

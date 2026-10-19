@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: recover-root-password
+  title: Regain root access on a host with an unknown password
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems, lfcs:operations-deployment]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [boot, recovery, root-password, selinux]
+  version: 1
+spec:
+  description: |
+    Nobody knows the root password of depot host **`depot-ctl-3`** (`ssh depot-ctl-3`;
+    you have `sudo` through your own account). The ticket says the new root password is
+    **`{{pw}}`**.
+
+    Make that the root password and leave the host in a state that is correct **after
+    the next reboot**:
+
+    - root's password is exactly **`{{pw}}`** and the account is not locked;
+    - **`/etc/shadow` has its proper SELinux label** (`shadow_t`), or a full relabel is
+      scheduled for the next boot;
+    - no other account's password changes.
+
+    On a real host with no working login you would interrupt the boot at the console
+    (`rd.break` on the kernel line, `mount -o remount,rw /sysroot`, `chroot /sysroot`,
+    `passwd`, `touch /.autorelabel`). Here you can reach the host over ssh, so you grade
+    the end state of that procedure.
+  objectives:
+    - Reset the root password and keep SELinux labels correct
+    - Know the console recovery procedure and its relabel step
+  params:
+    pw:
+      type: choice
+      values: ["Tr-Reset-4471", "Tr-Reset-9302", "Tr-Reset-6158"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-ctl-3
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-ctl-3
+      timeoutSec: 60
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/pwmatch.py <<'EOPY'
+        import ctypes, sys
+        lib = None
+        for n in ("libcrypt.so.2", "libcrypt.so.1", "libcrypt.so"):
+            try:
+                lib = ctypes.CDLL(n)
+                break
+            except OSError:
+                pass
+        user, pw = sys.argv[1], sys.argv[2]
+        h = ""
+        for l in open("/etc/shadow"):
+            f = l.split(":")
+            if f[0] == user:
+                h = f[1]
+        lib.crypt.restype = ctypes.c_char_p
+        lib.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        r = lib.crypt(pw.encode(), h.encode()) if h.startswith("$") else None
+        print("match" if r and r.decode() == h else "differs")
+        EOPY
+        usermod -p "$(openssl passwd -6 "$(head -c 24 /dev/urandom | base64)")" root
+        rm -f /.autorelabel
+        restorecon /etc/shadow
+        awk -F: '$1 != "root" {print $1 ":" $2}' /etc/shadow | sha256sum | cut -d' ' -f1 > /var/lib/cloudtrain/others.sha
+  checks:
+    - id: root-password
+      description: The root password is the one from the ticket
+      type: shell
+      on: depot-ctl-3
+      skills: [linux.boot.recovery]
+      weight: 2
+      command: python3 /var/lib/cloudtrain/pwmatch.py root '{{pw}}'
+      expect: {match: exact, value: match}
+    - id: root-unlocked
+      description: The root account is usable (not locked, not empty)
+      type: shell
+      on: depot-ctl-3
+      skills: [linux.boot.recovery]
+      weight: 1
+      command: passwd -S root | awk '{print $2}'
+      expect: {match: exact, value: PS}
+    - id: shadow-label
+      description: /etc/shadow is labelled shadow_t or a relabel is scheduled
+      type: shell
+      on: depot-ctl-3
+      skills: [linux.boot.recovery]
+      weight: 2
+      command: |
+        t=$(stat -c %C /etc/shadow | cut -d: -f3)
+        if [ "$t" = shadow_t ]; then echo labelled
+        elif [ -e /.autorelabel ]; then echo relabel-scheduled
+        else echo "wrong:$t"; fi
+      expect: {match: regex, value: "^(labelled|relabel-scheduled)$"}
+    - id: others-untouched
+      description: No other account's password was changed
+      type: shell
+      on: depot-ctl-3
+      skills: [linux.boot.recovery]
+      weight: 1
+      command: |
+        n=$(awk -F: '$1 != "root" {print $1 ":" $2}' /etc/shadow | sha256sum | cut -d' ' -f1)
+        [ "$n" = "$(cat /var/lib/cloudtrain/others.sha)" ] && echo untouched || echo changed
+      expect: {match: exact, value: untouched}
+  hints:
+    - title: Start from the ssh session
+      body: "You already have sudo, so chpasswd or passwd --stdin sets a root password without any console work. The point is the end state: password, lock state and label."
+      cost: 1
+    - title: The SELinux step
+      command: ls -Z /etc/shadow
+      body: "Files edited from a rescue chroot while SELinux is not loaded get the wrong label. restorecon -v /etc/shadow fixes one file; touch /.autorelabel relabels everything at the next boot."
+      cost: 2
+  misconceptions:
+    - id: wrong-password
+      description: Sets a password that is not the one from the ticket.
+      feedback: "Use the exact password from the ticket."
+      expectFail: [root-password]
+      mutation:
+        on: depot-ctl-3
+        as: learner
+        run: echo 'root:Tr-Wrong-0000' | sudo chpasswd
+    - id: label-broken
+      description: Sets the password but leaves /etc/shadow with a wrong label and no relabel scheduled.
+      feedback: "From a recovery chroot, /etc/shadow needs restorecon or /.autorelabel, otherwise logins can fail with SELinux enforcing."
+      expectFail: [shadow-label]
+      mutation:
+        on: depot-ctl-3
+        as: learner
+        run: |
+          echo 'root:{{pw}}' | sudo chpasswd
+          sudo chcon -t etc_t /etc/shadow
+          sudo rm -f /.autorelabel
+    - id: locked
+      description: Sets the password and then locks the account.
+      feedback: "passwd -l prefixes the hash with ! and locks the account; root must stay usable."
+      expectFail: [root-password, root-unlocked]
+      mutation:
+        on: depot-ctl-3
+        as: learner
+        run: |
+          echo 'root:{{pw}}' | sudo chpasswd
+          sudo passwd -l root
+  solution:
+    explanation: |
+      chpasswd (or passwd --stdin) writes the new hash; restorecon -v /etc/shadow, or
+      touch /.autorelabel for a full relabel, mirrors the last step of the console
+      procedure (rd.break, remount rw, chroot /sysroot, passwd, touch /.autorelabel).
+    steps:
+      - on: depot-ctl-3
+        as: learner
+        run: |
+          set -e
+          echo 'root:{{pw}}' | sudo chpasswd
+          sudo restorecon -v /etc/shadow
+          sudo touch /.autorelabel
+          sudo passwd -S root
+    alternatives:
+      - id: passwd-stdin
+        description: Use passwd --stdin and restorecon only (no full relabel).
+        steps:
+          - on: depot-ctl-3
+            as: learner
+            run: |
+              set -e
+              echo '{{pw}}' | sudo passwd --stdin root
+              sudo restorecon -v /etc/shadow

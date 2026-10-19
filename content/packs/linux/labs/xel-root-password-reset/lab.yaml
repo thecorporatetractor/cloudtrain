@@ -1,0 +1,143 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-root-password-reset
+  title: Reset the root password of node 2
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, boot, recovery, root-password]
+  version: 1
+spec:
+  description: |
+    **Host:** node 2, `tr-el-02` (`ssh tr-el-02`, then `sudo -i`)
+
+    The root password of node 2 is unknown. Set it to **`{{pw}}`**. The account must
+    stay usable, and the change must be safe for the next boot with SELinux enforcing
+    (`/etc/shadow` correctly labelled, or a relabel scheduled).
+
+    The console procedure for a host with no working login is the boot-time route
+    (`rd.break`); the end state is what is graded.
+  objectives:
+    - Reset the root password and keep SELinux labels correct
+  params:
+    pw:
+      type: choice
+      values: ["Tr-Node2-5180", "Tr-Node2-7743"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-02
+      timeoutSec: 60
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/xel-pwmatch.py <<'EOPY'
+        import ctypes, sys
+        lib = None
+        for n in ("libcrypt.so.2", "libcrypt.so.1", "libcrypt.so"):
+            try:
+                lib = ctypes.CDLL(n)
+                break
+            except OSError:
+                pass
+        user, pw = sys.argv[1], sys.argv[2]
+        h = ""
+        for l in open("/etc/shadow"):
+            f = l.split(":")
+            if f[0] == user:
+                h = f[1]
+        lib.crypt.restype = ctypes.c_char_p
+        lib.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        r = lib.crypt(pw.encode(), h.encode()) if h.startswith("$") else None
+        print("match" if r and r.decode() == h else "differs")
+        EOPY
+        usermod -p "$(openssl passwd -6 "$(head -c 24 /dev/urandom | base64)")" root
+        rm -f /.autorelabel
+        restorecon /etc/shadow
+  checks:
+    - id: root-password
+      description: The root password is the requested one
+      type: shell
+      on: tr-el-02
+      skills: [linux.boot.recovery]
+      weight: 2
+      command: python3 /var/lib/cloudtrain/xel-pwmatch.py root '{{pw}}'
+      expect: {match: exact, value: match}
+    - id: root-unlocked
+      description: The root account is usable
+      type: shell
+      on: tr-el-02
+      skills: [linux.boot.recovery]
+      weight: 1
+      command: passwd -S root | awk '{print $2}'
+      expect: {match: exact, value: PS}
+    - id: shadow-label
+      description: /etc/shadow is labelled shadow_t or a relabel is scheduled
+      type: shell
+      on: tr-el-02
+      skills: [linux.boot.recovery]
+      weight: 1.5
+      command: |
+        t=$(stat -c %C /etc/shadow | cut -d: -f3)
+        if [ "$t" = shadow_t ]; then echo labelled
+        elif [ -e /.autorelabel ]; then echo relabel-scheduled
+        else echo "wrong:$t"; fi
+      expect: {match: regex, value: "^(labelled|relabel-scheduled)$"}
+  misconceptions:
+    - id: label-broken
+      description: Sets the password but leaves /etc/shadow mislabelled with no relabel scheduled.
+      feedback: "Files changed from a rescue chroot need restorecon or /.autorelabel."
+      expectFail: [shadow-label]
+      mutation:
+        on: tr-el-02
+        as: learner
+        run: |
+          echo 'root:{{pw}}' | sudo chpasswd
+          sudo chcon -t etc_t /etc/shadow
+          sudo rm -f /.autorelabel
+    - id: locked
+      description: Sets the password and then locks the account.
+      feedback: "A locked root account has a hash starting with !; it cannot log in."
+      expectFail: [root-password, root-unlocked]
+      mutation:
+        on: tr-el-02
+        as: learner
+        run: |
+          echo 'root:{{pw}}' | sudo chpasswd
+          sudo passwd -l root
+  solution:
+    explanation: chpasswd sets the hash; restorecon -v /etc/shadow (or touch /.autorelabel) matches the last step of the rd.break procedure.
+    steps:
+      - on: tr-el-02
+        as: learner
+        run: |
+          set -e
+          echo 'root:{{pw}}' | sudo chpasswd
+          sudo restorecon -v /etc/shadow
+          sudo touch /.autorelabel
+    alternatives:
+      - id: passwd-stdin
+        description: passwd --stdin with restorecon.
+        steps:
+          - on: tr-el-02
+            as: learner
+            run: |
+              echo '{{pw}}' | sudo passwd --stdin root
+              sudo restorecon -v /etc/shadow

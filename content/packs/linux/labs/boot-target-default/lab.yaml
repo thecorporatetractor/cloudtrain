@@ -1,0 +1,154 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: boot-target-default
+  title: Make the timetable server boot to a text target and leave no rescue override
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems, lpic1:system-architecture]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [boot, systemd, targets, grub]
+  version: 1
+spec:
+  description: |
+    The timetable server **`tr-tt-01`** (`ssh tr-tt-01`; you have `sudo`) is a headless
+    machine, yet after last week's maintenance it is set to start a graphical session.
+    The engineer who tested a rescue boot may have left a kernel argument behind.
+
+    Make `tr-tt-01`:
+
+    - boot into **`multi-user.target`** by default;
+    - carry **no persistent `systemd.unit=` kernel argument** in any boot entry or in the
+      default command line used for future kernels.
+
+    Do not reboot. Booting once into `rescue.target` (by editing the entry at the boot
+    menu, which is not persistent) is part of the real procedure; it cannot be graded
+    over ssh here.
+  objectives:
+    - Read and set the default systemd target
+    - Tell a persistent kernel argument from a one-off boot menu edit
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tt-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-tt-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        systemctl set-default graphical.target
+        grubby --update-kernel=ALL --args="systemd.unit=rescue.target"
+        [ -f /etc/kernel/cmdline ] || sed 's/BOOT_IMAGE=[^ ]* *//' /proc/cmdline > /etc/kernel/cmdline
+        grep -q 'systemd\.unit=' /etc/kernel/cmdline || sed -i 's/ *$/ systemd.unit=rescue.target/' /etc/kernel/cmdline
+  checks:
+    - id: default
+      description: The default target is multi-user.target
+      type: shell
+      on: tr-tt-01
+      skills: [linux.systemd.targets]
+      weight: 2
+      command: systemctl get-default
+      expect: {match: exact, value: multi-user.target}
+    - id: entries-clean
+      description: No boot entry carries a systemd.unit= argument
+      type: shell
+      on: tr-tt-01
+      skills: [linux.systemd.targets]
+      weight: 1.5
+      command: |
+        n=$(grubby --info=ALL 2>/dev/null | grep '^args=' | grep -c 'systemd\.unit=' || true)
+        echo "entries-with-unit=$n"
+      expect: {match: exact, value: "entries-with-unit=0"}
+    - id: cmdline-clean
+      description: The default command line for future kernels has no systemd.unit= either
+      type: shell
+      on: tr-tt-01
+      skills: [linux.systemd.targets]
+      weight: 1
+      command: |
+        n=$( { cat /etc/kernel/cmdline 2>/dev/null; grep '^GRUB_CMDLINE_LINUX' /etc/default/grub 2>/dev/null; } | grep -c 'systemd\.unit=' || true)
+        echo "defaults-with-unit=$n"
+      expect: {match: exact, value: "defaults-with-unit=0"}
+    - id: boot-entries-intact
+      description: At least one boot entry still exists with its other arguments
+      type: shell
+      on: tr-tt-01
+      skills: [linux.systemd.targets]
+      weight: 0.5
+      command: |
+        grubby --info=ALL 2>/dev/null | grep '^args=' | grep -c 'root=' | awk '{print ($1 > 0 ? "intact" : "damaged")}'
+      expect: {match: exact, value: intact}
+  hints:
+    - title: Where the default lives
+      command: systemctl get-default
+      body: "The default target is the symlink /etc/systemd/system/default.target. systemctl set-default changes it; systemctl isolate only changes the running system."
+      cost: 0
+    - title: Look at the kernel command line
+      command: sudo grubby --info=ALL | grep ^args
+      body: "A systemd.unit= argument on a boot entry overrides the default target on every boot. Remove it from every entry with grubby --update-kernel=ALL --remove-args."
+      cost: 2
+    - title: Future kernels
+      body: "New kernels copy /etc/kernel/cmdline (and the defaults in /etc/default/grub). Edit those too, otherwise the argument returns with the next kernel."
+      cost: 2
+  misconceptions:
+    - id: isolate-only
+      description: Isolates multi-user.target on the running system but never changes the default.
+      feedback: "systemctl isolate changes the current state only; systemctl set-default changes what boots."
+      expectFail: [default, entries-clean, cmdline-clean]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: sudo systemctl isolate multi-user.target
+    - id: default-only
+      description: Sets the default target but leaves the systemd.unit=rescue.target kernel argument in place.
+      feedback: "The kernel command line wins over default.target; remove systemd.unit= from every entry and from /etc/kernel/cmdline."
+      expectFail: [entries-clean, cmdline-clean]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: sudo systemctl set-default multi-user.target
+    - id: entries-only
+      description: Removes the argument from the current entries but not from the default command line.
+      feedback: "The next installed kernel copies /etc/kernel/cmdline; clean it too."
+      expectFail: [cmdline-clean]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          sudo systemctl set-default multi-user.target
+          sudo grubby --update-kernel=ALL --remove-args="systemd.unit"
+  solution:
+    explanation: |
+      systemctl set-default points default.target at multi-user.target. grubby
+      --remove-args drops the systemd.unit override from every boot entry, and the same
+      word is removed from /etc/kernel/cmdline so new kernels do not bring it back.
+      The one-off rescue boot is an edit of the entry at the boot menu (append
+      systemd.unit=rescue.target, Ctrl-X); it is not persistent and cannot be graded over ssh.
+    steps:
+      - on: tr-tt-01
+        as: learner
+        run: |
+          set -e
+          sudo systemctl set-default multi-user.target
+          sudo grubby --update-kernel=ALL --remove-args="systemd.unit"
+          sudo sed -i 's/ *systemd\.unit=[^ ]*//' /etc/kernel/cmdline
+          systemctl get-default
+    alternatives:
+      - id: symlink
+        description: Re-point default.target by hand and edit the BLS entries directly.
+        steps:
+          - on: tr-tt-01
+            as: learner
+            run: |
+              set -e
+              sudo ln -sf /usr/lib/systemd/system/multi-user.target /etc/systemd/system/default.target
+              sudo sed -i 's/ *systemd\.unit=[^ ]*//' /boot/loader/entries/*.conf
+              sudo sed -i 's/ *systemd\.unit=[^ ]*//' /etc/kernel/cmdline

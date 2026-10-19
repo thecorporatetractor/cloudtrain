@@ -1,0 +1,199 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: libvirt-golden-template
+  title: Turn a configured VM into a reusable template
+  domain: linux
+  frameworks: [lpic1:install-packages]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [virtualization, templates, cloud-init, machine-id]
+  version: 1
+spec:
+  description: |
+    The depot VM **`tr-tpl-01`** (`ssh tr-tpl-01`; you have `sudo`) has been configured as the
+    standard depot server: the package **`{{pkg}}`** is installed and
+    **`/etc/tr-depot/agent.conf`** holds the depot defaults. It is going to be the **golden
+    template** for new depots. Every clone from it must boot with its own identity.
+
+    Prepare `tr-tpl-01` as a template, **keeping** the package, the configuration file and
+    cloud-init enabled (cloud-init regenerates the identity on the clone's first boot):
+
+    - `/etc/machine-id` is **empty** (the file exists, size 0);
+    - there are **no SSH host keys** in `/etc/ssh` (`ssh_host_*`);
+    - cloud-init's instance state is cleaned (`cloud-init clean`), including its logs;
+    - the depot logs under **`/var/log/tr-depot/`** are **truncated to zero length** (keep the
+      files);
+    - nothing is shut down: you are working over ssh. After the SSH host keys are removed,
+      your current session and new connections to the already running daemon keep working;
+      do not restart sshd.
+
+    Cloning two copies from the template and checking that their identities differ needs
+    libvirt and nested virtualisation, which this environment does not provide yet; that
+    proof is not part of the grading.
+  objectives:
+    - Remove the machine-specific identity (machine-id, SSH host keys, cloud-init state, logs) from a VM
+    - Know which settings must survive in a golden image
+  params:
+    pkg:
+      type: choice
+      values: [tmux, rsync]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tpl-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-tpl-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        export DEBIAN_FRONTEND=noninteractive
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null 2>&1 || true
+        dpkg -s {{pkg}} >/dev/null 2>&1 || apt-get install -y -q {{pkg}} >/dev/null
+        mkdir -p /etc/tr-depot /var/log/tr-depot
+        printf 'site=template\nrole=depot\n' > /etc/tr-depot/agent.conf
+        for i in $(seq 1 40); do echo "$(date -u +%FT%TZ) agent heartbeat $i from $(cat /etc/machine-id)" ; done > /var/log/tr-depot/agent.log
+        echo "$(date -u +%FT%TZ) boot report" > /var/log/tr-depot/boot.log
+        [ -s /etc/machine-id ] || systemd-machine-id-setup
+        ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || ssh-keygen -A >/dev/null
+        systemctl enable cloud-init >/dev/null 2>&1 || true
+  checks:
+    - id: machine-id
+      description: /etc/machine-id exists and is empty
+      type: shell
+      on: tr-tpl-01
+      skills: [linux.virt.guest-templates]
+      weight: 2
+      command: |
+        if [ -f /etc/machine-id ] && [ ! -s /etc/machine-id ]; then echo empty; elif [ -f /etc/machine-id ]; then echo "still-set"; else echo missing-file; fi
+      expect: {match: exact, value: empty}
+    - id: host-keys
+      description: No SSH host keys are left
+      type: shell
+      on: tr-tpl-01
+      skills: [linux.virt.guest-templates]
+      weight: 2
+      command: |
+        n=$(ls /etc/ssh/ssh_host_* 2>/dev/null | wc -l)
+        echo "host-key-files=$n"
+      expect: {match: exact, value: "host-key-files=0"}
+    - id: cloud-init-clean
+      description: cloud-init instance state and logs are cleaned
+      type: shell
+      on: tr-tpl-01
+      skills: [linux.virt.guest-templates]
+      weight: 2
+      command: |
+        i=$(ls /var/lib/cloud/instances 2>/dev/null | wc -l)
+        l=$(for f in /var/log/cloud-init.log /var/log/cloud-init-output.log; do [ -s "$f" ] && echo x; done | wc -l)
+        echo "instances=$i logs=$l"
+      expect: {match: exact, value: "instances=0 logs=0"}
+    - id: depot-logs
+      description: The depot logs exist and are empty
+      type: shell
+      on: tr-tpl-01
+      skills: [linux.virt.guest-templates]
+      weight: 1.5
+      command: |
+        for f in agent boot; do [ -e /var/log/tr-depot/$f.log ] || { echo "missing-$f"; exit 0; }; done
+        n=$(find /var/log/tr-depot -type f -size +0 | wc -l)
+        echo "nonempty=$n"
+      expect: {match: exact, value: "nonempty=0"}
+    - id: kept
+      description: The package, the depot configuration and cloud-init are still in place
+      type: shell
+      on: tr-tpl-01
+      skills: [linux.virt.guest-templates]
+      weight: 1.5
+      command: |
+        p=$(dpkg-query -W -f='${db:Status-Status}' {{pkg}} 2>/dev/null)
+        c=$(grep -cx 'role=depot' /etc/tr-depot/agent.conf 2>/dev/null || true)
+        e=$(systemctl is-enabled cloud-init 2>/dev/null || echo off)
+        s=$([ -s /etc/ssh/sshd_config ] && echo sshd-config || echo no-sshd-config)
+        echo "$p conf=$c $e $s"
+      expect: {match: exact, value: "installed conf=1 enabled sshd-config"}
+  hints:
+    - title: What identifies a machine
+      body: "machine-id (systemd, DBUS, DHCP client IDs), the SSH host keys, cloud-init's instance directory, and logs that name the old host. A clone that keeps them looks like the original."
+      cost: 1
+    - title: Empty, not deleted
+      command: sudo truncate -s 0 /etc/machine-id
+      body: "An empty /etc/machine-id makes systemd generate a new id at the next boot; a missing file is treated differently. Also truncate the logs and run cloud-init clean --logs."
+      cost: 2
+  misconceptions:
+    - id: deleted-machine-id
+      description: Deletes /etc/machine-id instead of emptying it.
+      feedback: "Leave an empty file: an empty /etc/machine-id marks the machine as uninitialised and systemd writes a fresh id at boot."
+      expectFail: [machine-id]
+      mutation:
+        on: tr-tpl-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo rm -f /etc/machine-id
+          sudo sh -c 'rm -f /etc/ssh/ssh_host_*'
+          sudo cloud-init clean --logs
+          sudo find /var/log/tr-depot -type f -exec truncate -s 0 {} +
+    - id: keys-left
+      description: Empties the machine-id but leaves SSH host keys and cloud-init state.
+      feedback: "Clones would share the template's SSH host keys, and cloud-init would think it already ran."
+      expectFail: [host-keys, cloud-init-clean]
+      mutation:
+        on: tr-tpl-01
+        as: learner
+        run: |
+          sudo truncate -s 0 /etc/machine-id
+          sudo find /var/log/tr-depot -type f -exec truncate -s 0 {} +
+    - id: logs-removed-files
+      description: Removes the depot log files instead of truncating them.
+      feedback: "The agent expects its log files to exist; truncate them."
+      expectFail: [depot-logs]
+      mutation:
+        on: tr-tpl-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo truncate -s 0 /etc/machine-id
+          sudo sh -c 'rm -f /etc/ssh/ssh_host_*'
+          sudo cloud-init clean --logs
+          sudo rm -f /var/log/tr-depot/*.log
+  solution:
+    explanation: |
+      Empty (not delete) /etc/machine-id, remove the SSH host keys, run cloud-init clean
+      --logs so it treats the clone's first boot as a new instance, and truncate the depot
+      logs. Package, configuration and the cloud-init service stay. The clone proof needs
+      libvirt and nested virtualisation (not available yet).
+    steps:
+      - on: tr-tpl-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo truncate -s 0 /etc/machine-id
+          sudo sh -c 'rm -f /etc/ssh/ssh_host_*'
+          sudo cloud-init clean --logs
+          sudo find /var/log/tr-depot -type f -exec truncate -s 0 {} +
+          ls -l /etc/machine-id
+    alternatives:
+      - id: logs-cleaned-with-truncate-and-journal
+        description: Use a shell redirection to empty each log and vacuum the journal too.
+        steps:
+          - on: tr-tpl-01
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo sh -c ': > /etc/machine-id'
+              sudo sh -c 'rm -f /etc/ssh/ssh_host_*'
+              sudo cloud-init clean --logs --seed
+              for f in /var/log/tr-depot/*.log; do sudo sh -c ": > $f"; done
+              sudo journalctl --rotate >/dev/null 2>&1 || true

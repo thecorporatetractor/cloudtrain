@@ -1,0 +1,235 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-ldap-user-login
+  title: Allow a directory user to log in
+  domain: linux
+  frameworks: [lfcs:users-groups]
+  difficulty: hard
+  estimatedMinutes: 12
+  tags: [exam, ldap, sssd, pam]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    A directory server runs on `tr-ops-01` itself at `ldap://127.0.0.1`
+    (base `dc=tallowmere,dc=example`, users in `ou=people`). The directory user
+    **`crew{{n}}`** must be able to log in on this host with the directory password, and
+    its home directory **`/home/crew{{n}}`** must be created automatically at first login.
+
+    Use SSSD for the identity and authentication lookups. The directory has no TLS.
+  objectives:
+    - Configure SSSD against an LDAP server and create home directories at login
+  params:
+    n:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        export DEBIAN_FRONTEND=noninteractive
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null 2>&1 || true
+        echo 'Dir-Pass-{{n}}' > $V/xlf-ldap.pw
+        id xlf-caller >/dev/null 2>&1 || useradd -m xlf-caller
+        apt-get install -y -q sssd sssd-ldap libpam-sss libnss-sss ldap-utils >/dev/null 2>&1 || echo "BLOCKED: sssd packages missing" > $V/xlf-ldap-missing
+        rm -f /etc/sssd/sssd.conf; rm -rf /home/crew{{n}}
+        if ! dpkg -s slapd >/dev/null 2>&1; then
+          for kv in 'slapd/password1 password lab-admin-pw' 'slapd/password2 password lab-admin-pw' 'slapd/domain string tallowmere.example' 'shared/organization string Tallowmere Rail' 'slapd/no_configuration boolean false'; do
+            echo "slapd $kv" | debconf-set-selections
+          done
+          apt-get install -y -q slapd >/dev/null 2>&1 || { echo "BLOCKED: slapd is not in the package mirror (image gap)" > $V/xlf-ldap-missing; exit 0; }
+        fi
+        systemctl enable --now slapd >/dev/null 2>&1 || true
+        for i in $(seq 20); do ldapsearch -x -H ldap://127.0.0.1 -b dc=tallowmere,dc=example -s base >/dev/null 2>&1 && break; sleep 1; done
+        ldapsearch -x -H ldap://127.0.0.1 -b ou=people,dc=tallowmere,dc=example -s base >/dev/null 2>&1 || ldapadd -x -D cn=admin,dc=tallowmere,dc=example -w lab-admin-pw >/dev/null <<EOL
+        dn: ou=people,dc=tallowmere,dc=example
+        objectClass: organizationalUnit
+        ou: people
+        EOL
+        h=$(slappasswd -s 'Dir-Pass-{{n}}')
+        ldapadd -x -D cn=admin,dc=tallowmere,dc=example -w lab-admin-pw >/dev/null 2>&1 <<EOL || true
+        dn: uid=crew{{n}},ou=people,dc=tallowmere,dc=example
+        objectClass: inetOrgPerson
+        objectClass: posixAccount
+        objectClass: shadowAccount
+        uid: crew{{n}}
+        cn: Crew {{n}}
+        sn: Member{{n}}
+        uidNumber: 6{{n}}0
+        gidNumber: 6{{n}}0
+        homeDirectory: /home/crew{{n}}
+        loginShell: /bin/bash
+        userPassword: $h
+        EOL
+        cat > $V/xlf-tryauth.py <<'EOPY'
+        import os, pty, pwd, select, sys, time
+        user, pw, caller = sys.argv[1:4]
+        pid, fd = pty.fork()
+        if pid == 0:
+            p = pwd.getpwnam(caller)
+            os.setgroups([]); os.setgid(p.pw_gid); os.setuid(p.pw_uid)
+            os.environ["HOME"] = p.pw_dir
+            os.execv("/usr/bin/su", ["su", "-", user, "-c", "true"])
+        buf = b""; sent = False; end = time.time() + 20
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    d = os.read(fd, 1024)
+                except OSError:
+                    d = b""
+                if d:
+                    buf += d
+                    if not sent and b"assword" in buf:
+                        os.write(fd, (pw + "\n").encode()); sent = True
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                sys.exit(0 if os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 else 1)
+        os.kill(pid, 9); os.waitpid(pid, 0); sys.exit(2)
+        EOPY
+        chmod 0600 $V/xlf-tryauth.py
+  checks:
+    - id: sssd-conf
+      description: sssd.conf defines an LDAP domain for the directory, root-owned mode 0600
+      type: shell
+      on: tr-ops-01
+      skills: [linux.identity.sssd-pam]
+      weight: 1.5
+      command: |
+        python3 - <<'PY'
+        import configparser, os
+        f = "/etc/sssd/sssd.conf"
+        try:
+            st = os.stat(f)
+        except OSError:
+            print("no-file"); raise SystemExit
+        if st.st_uid != 0 or (st.st_mode & 0o777) != 0o600:
+            print("perms"); raise SystemExit
+        c = configparser.RawConfigParser(strict=False)
+        c.read(f)
+        ok = False
+        for d in [x.strip() for x in c.get("sssd", "domains", fallback="").split(",") if x.strip()]:
+            s = "domain/" + d
+            if c.has_section(s) and c.get(s, "id_provider", fallback="") == "ldap" and ("127.0.0.1" in c.get(s, "ldap_uri", fallback="") or "localhost" in c.get(s, "ldap_uri", fallback="")) and c.get(s, "ldap_search_base", fallback="").lower().replace(" ", "") == "dc=tallowmere,dc=example":
+                ok = True
+        print("ok" if ok else "wrong-domain")
+        PY
+      expect: {match: exact, value: ok}
+    - id: mkhomedir-pam
+      description: PAM creates home directories (pam_mkhomedir in the session stack)
+      type: shell
+      on: tr-ops-01
+      skills: [linux.identity.sssd-pam]
+      weight: 1
+      command: grep -qE '^session.*pam_mkhomedir' /etc/pam.d/common-session && echo enabled || echo missing
+      expect: {match: exact, value: enabled}
+    - id: sssd-service
+      description: sssd is running and enabled, and NSS uses it
+      type: shell
+      on: tr-ops-01
+      skills: [linux.identity.sssd-pam]
+      weight: 1
+      command: |
+        n=$(grep -E '^passwd:' /etc/nsswitch.conf | grep -qw sss && echo nss-sss || echo nss-files)
+        echo "$(systemctl is-active sssd) $(systemctl is-enabled sssd) $n"
+      expect: {match: exact, value: "active enabled nss-sss"}
+    - id: resolves
+      description: crew{{n}} resolves with the directory UID
+      type: shell
+      on: tr-ops-01
+      skills: [linux.identity.sssd-pam]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        getent passwd crew{{n}} | cut -d: -f3
+      expect: {match: exact, value: "6{{n}}0"}
+    - id: login-home
+      description: A login as crew{{n}} with the directory password works and creates the home
+      type: shell
+      on: tr-ops-01
+      skills: [linux.identity.sssd-pam]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        rm -rf /home/crew{{n}}
+        python3 /var/lib/cloudtrain/xlf-tryauth.py crew{{n}} "$(cat /var/lib/cloudtrain/xlf-ldap.pw)" xlf-caller >/dev/null 2>&1 && l=login-ok || l=login-failed
+        echo "$l $(stat -c %U /home/crew{{n}} 2>/dev/null || echo no-home)"
+      expect: {match: exact, value: "login-ok crew{{n}}"}
+  misconceptions:
+    - id: no-mkhomedir
+      description: Configures SSSD but not home directory creation.
+      feedback: "pam_mkhomedir must be enabled (pam-auth-update --enable mkhomedir), otherwise the first login finds no home."
+      expectFail: [mkhomedir-pam, login-home]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf '[sssd]\nservices = nss, pam\ndomains = tr\n\n[domain/tr]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://127.0.0.1\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 600 /etc/sssd/sssd.conf
+          sudo sed -i 's/^passwd:.*/passwd: files systemd sss/; s/^group:.*/group: files systemd sss/' /etc/nsswitch.conf
+          sudo systemctl enable --now sssd
+    - id: no-nss
+      description: Leaves sss out of nsswitch.conf.
+      feedback: "The libnss-sss entry must appear on the passwd and group lines of /etc/nsswitch.conf."
+      expectFail: [sssd-service, resolves, login-home]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf '[sssd]\nservices = nss, pam\ndomains = tr\n\n[domain/tr]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://127.0.0.1\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 600 /etc/sssd/sssd.conf
+          sudo sed -i 's/ sss//g' /etc/nsswitch.conf
+          sudo pam-auth-update --enable mkhomedir
+          sudo systemctl enable --now sssd
+  solution:
+    explanation: |
+      BLOCKED this round: slapd is not in the lab mirror, so the live checks need the image
+      gap closed. The configuration is an sssd.conf LDAP domain, sss in nsswitch.conf,
+      pam_mkhomedir enabled, and the sssd service started.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          printf '[sssd]\nservices = nss, pam\ndomains = tr\n\n[domain/tr]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://127.0.0.1\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 600 /etc/sssd/sssd.conf
+          grep -E '^passwd:.*\bsss\b' /etc/nsswitch.conf >/dev/null || sudo sed -i 's/^passwd:.*/passwd: files systemd sss/; s/^group:.*/group: files systemd sss/' /etc/nsswitch.conf
+          sudo pam-auth-update --enable mkhomedir
+          sudo systemctl enable --now sssd
+          sudo systemctl restart sssd
+          sleep 3
+          getent passwd crew{{n}}
+    alternatives:
+      - id: nsswitch-sss-first
+        description: Put sss before files and add the pam_mkhomedir line to common-session by hand.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              printf '[sssd]\nservices = nss, pam\ndomains = tr\n\n[domain/tr]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://localhost\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+              sudo chmod 600 /etc/sssd/sssd.conf
+              sudo sed -i 's/^passwd:.*/passwd: files sss systemd/; s/^group:.*/group: files sss systemd/' /etc/nsswitch.conf
+              grep -q pam_mkhomedir /etc/pam.d/common-session || echo 'session optional pam_mkhomedir.so skel=/etc/skel umask=0077' | sudo tee -a /etc/pam.d/common-session >/dev/null
+              sudo systemctl enable --now sssd
