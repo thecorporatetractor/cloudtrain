@@ -147,7 +147,7 @@ func LoadCatalog(paths ...string) (*ImageCatalog, error) {
 		return nil, fmt.Errorf("image catalog: no catalog file given")
 	}
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		b, err := os.ReadFile(filepath.Clean(f))
 		if err != nil {
 			return nil, err
 		}

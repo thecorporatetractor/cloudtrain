@@ -98,7 +98,7 @@ func TemplateName(id string, version int32) string {
 
 // CompileFile reads and compiles a lab.yaml.
 func CompileFile(path string, opts Options) (*labsv1.LabTemplate, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}

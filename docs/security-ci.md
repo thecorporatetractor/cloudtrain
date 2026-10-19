@@ -165,6 +165,27 @@ YAML anchor) rather than a matrix. GitHub appends matrix values to a literal job
 (`analyze (go) (go, manual)`), and a matrix job skipped by `if:` reports under its
 unexpanded name, so either way the required check would never resolve.
 
+### Rule: every required check must always report
+
+A required check that is never created blocks the merge forever, and rulesets cannot be
+told to ignore it. So for every name in the list above:
+
+- The workflow that owns it triggers on every pull request: no `paths:` or `paths-ignore:`
+  under `on.pull_request`, no `branches:` filter that excludes the PR's base.
+- The job is created on every run. Path awareness lives inside the workflow, in the
+  `changes` job and a job-level `if:` (`!cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.<group> == 'true')`).
+  A job skipped by its own `if:` still reports under its literal `name:` and counts as
+  passing; a job that is not created, or a workflow that does not trigger, does not.
+- The job has a literal `name:` and no `strategy.matrix`, and its `needs:` chain never
+  skips it for a reason other than its own `if:`.
+- `changes` fails open: when it fails, every gated job runs.
+
+When you add a required check, add the workflow with an unfiltered `pull_request` trigger
+and the gated-job pattern above. When you path-filter a workflow at the trigger level
+(`images`, `iac`, `sbom`, `charts`), it must not be in the ruleset. Audit with
+`gh api repos/thecorporatetractor/cloudtrain/rulesets/<id>` (`required_status_checks`)
+against `grep -n "paths" .github/workflows/*.yml`.
+
 Some checks block when they run but must **not** be required:
 - `images`, `iac` and `sbom` are path-filtered on PRs at the workflow level, and a
   required check that never runs blocks the merge forever.

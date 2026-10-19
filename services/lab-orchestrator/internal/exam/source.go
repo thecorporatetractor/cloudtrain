@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
@@ -87,7 +88,7 @@ type ScoreConfig struct {
 // an `exams` list) and validates each against the curriculum exam schema.
 // YAML anchors and aliases (used for shared rules) are resolved.
 func LoadFile(path string) ([]Definition, []byte, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return nil, nil, err
 	}

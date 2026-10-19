@@ -77,9 +77,20 @@ async function checkMappings(tx: Tx, maps: SsoGroupMapping[] | undefined): Promi
 }
 
 async function discover(url: string): Promise<{ issuer: string; authorization_endpoint: string; token_endpoint: string; jwks_uri: string; userinfo_endpoint?: string; end_session_endpoint?: string }> {
+  // The URL comes from an org admin: allow only http(s) without credentials, refuse
+  // link-local/metadata addresses, and never follow redirects (SSRF hardening).
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw badRequest('The discovery URL is not a valid URL', { discoveryUrl: 'invalid' });
+  }
+  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || u.username || u.password || /^(169\.254\.|\[?fe80:|metadata\.google\.internal$)/i.test(u.hostname)) {
+    throw badRequest('The discovery URL must be an http(s) URL without credentials, not a link-local address', { discoveryUrl: 'invalid' });
+  }
   let r: Response;
   try {
-    r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    r = await fetch(u, { redirect: 'error', signal: AbortSignal.timeout(8000) });
   } catch (e) {
     throw badRequest(`Could not reach the discovery URL: ${(e as Error).message}`, { discoveryUrl: 'unreachable' });
   }

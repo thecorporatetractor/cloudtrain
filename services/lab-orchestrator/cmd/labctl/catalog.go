@@ -58,7 +58,7 @@ func loadCatalogFlag(v string) (*drivers.ImageCatalog, error) {
 // workflowImages lists the image names of the images workflow's build matrix
 // (the literal matrix.include[].name of any job: the publish matrix).
 func workflowImages(file string) ([]string, error) {
-	b, err := os.ReadFile(file)
+	b, err := os.ReadFile(filepath.Clean(file))
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +179,7 @@ func readDigests(dir string) (map[string]string, error) {
 		if e.IsDir() {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		b, err := os.ReadFile(filepath.Clean(filepath.Join(dir, e.Name())))
 		if err != nil {
 			return nil, err
 		}

@@ -205,7 +205,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	reports := v.verifyAll(ctx, labs)
 
-	if err := os.MkdirAll(o.outDir, 0o755); err != nil {
+	if err := os.MkdirAll(o.outDir, 0o750); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -213,7 +213,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	for _, r := range reports {
 		b, _ := json.MarshalIndent(r, "", "  ")
 		p := filepath.Join(o.outDir, r.Lab+".json")
-		if err := os.WriteFile(p, append(b, '\n'), 0o644); err != nil {
+		if err := os.WriteFile(p, append(b, '\n'), 0o600); err != nil {
 			fmt.Fprintln(stderr, err)
 		}
 		if !r.OK {
