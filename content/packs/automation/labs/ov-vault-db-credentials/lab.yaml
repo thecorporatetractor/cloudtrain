@@ -144,7 +144,14 @@ spec:
       L grep -rqs 'ANSIBLE_VAULT;1.2;AES256;prod' group_vars || { echo no-prod-vault; exit 0; }
       v=$(L ansible ov-db-1 -c local -m ansible.builtin.debug -a var=vault_db_password 2>/dev/null | sed -n 's/.*"vault_db_password": "\(.*\)".*/\1/p')
       [ "$v" = "Ov-db-{{dbpw}}" ] || { echo wrong-value; exit 0; }
-      L grep -rIqs 'Ov-db-{{dbpw}}' . && { echo plaintext-in-project; exit 0; }
+      # a search for something that must be absent runs on a copy (read as the learner into a root-owned archive and
+      # searched by nobody): a learner process that is stopped or cut short cannot turn it into a pass
+      sj=$(mktemp -d); sa=$(mktemp); chmod 0755 $sj; chown nobody $sj
+      ( ulimit -f 131072; ct-ansible run /home/learner/policy-db timeout 60 tar --exclude=./.git -cf - . > $sa 2>/dev/null ) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $sa 2>/dev/null) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- find . -type l -delete)
+      (cd $sj && runuser -u nobody -- grep -rIqs 'Ov-db-{{dbpw}}' .) && { rm -rf $sj $sa; echo plaintext-in-project; exit 0; }
+      rm -rf $sj $sa
       # The value must come from a vault blob labelled prod: group_vars is copied (as the learner) into a directory owned by
       # nobody and decrypted there with the known vault password, and the variable has to be defined by such a file
       j=$(mktemp -d); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j' EXIT
@@ -201,7 +208,14 @@ spec:
       L() { ct-ansible run /home/learner/policy-db timeout 60 "$@"; }
       [ "$(L head -c 256 $f)" = "Ov-vault-{{vaultpw}}" ] || { echo password-file-changed; exit 0; }
       [ "$(L stat -c %a $f)" = 600 ] || { echo mode; exit 0; }
-      L grep -rIqs 'Ov-vault-{{vaultpw}}' /home/learner/policy-db && { echo password-in-project; exit 0; }
+      # a search for something that must be absent runs on a copy (read as the learner into a root-owned archive and
+      # searched by nobody): a learner process that is stopped or cut short cannot turn it into a pass
+      sj=$(mktemp -d); sa=$(mktemp); chmod 0755 $sj; chown nobody $sj
+      ( ulimit -f 131072; ct-ansible run /home/learner/policy-db timeout 60 tar --exclude=./.git -cf - . > $sa 2>/dev/null ) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $sa 2>/dev/null) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- find . -type l -delete)
+      (cd $sj && runuser -u nobody -- grep -rIqs 'Ov-vault-{{vaultpw}}' .) && { rm -rf $sj $sa; echo password-in-project; exit 0; }
+      rm -rf $sj $sa
       cfg=$(L ansible-config dump --only-changed 2>/dev/null)
       printf '%s\n' "$cfg" | grep -q 'DEFAULT_VAULT_IDENTITY_LIST' || printf '%s\n' "$cfg" | grep 'DEFAULT_VAULT_PASSWORD_FILE' | grep -q '\.ov-vault/prod' || { echo not-configured; exit 0; }
       echo ok

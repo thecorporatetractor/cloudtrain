@@ -94,7 +94,11 @@ spec:
       ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-constructed.sum >/dev/null 2>&1 || { echo static-inventory-edited; exit 0; }
       # Every source besides 01-hosts.yml must be a plain constructed-plugin file: a hand-written static group file, an ini or
       # script source, a symlink or a subdirectory would let the groups be typed in instead of derived.
-      ct-ansible run /home/learner/claims-automation timeout 30 sh -c '
+      # the inventory directory is copied as the learner into a root-owned archive and judged by nobody from that copy
+      j=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j $a' EXIT
+      ( ulimit -f 65536; ct-ansible run /home/learner/claims-automation timeout 30 tar -cf - inventory > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      (cd $j && runuser -u nobody -- timeout 30 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null) || { echo copy-failed; exit 0; }
+      cd $j && runuser -u nobody -- env -i PATH=/usr/bin:/bin LANG=C.UTF-8 timeout 30 sh -c '
         n=0
         for f in $(find inventory -mindepth 1 ! -name 01-hosts.yml 2>/dev/null | head -50); do
           [ -f "$f" ] && [ ! -L "$f" ] || { echo "static-source:$f"; exit 0; }
