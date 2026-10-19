@@ -18,7 +18,8 @@ spec:
     **`{{a4}}`** and the IPv6 address **`{{a6}}`**, apply the configuration now, and make
     sure it is the same after a reboot.
 
-    Do not touch `eth0`: its address and the default route must stay as they are.
+    Do not touch the primary interface (the one that carries the default route): its address and
+    the default route must stay as they are.
   objectives:
     - Configure a dual-stack static address on a second interface in Netplan
   params:
@@ -100,15 +101,16 @@ spec:
       command: netplan get ethernets.eth1.addresses 2>/dev/null | sed 's/^- *//' | tr -d "'\" " | sort | paste -sd,
       expect: {match: exact, value: "{{a4}},{{a6}}"}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the primary interface, not eth1
       type: shell
       on: tr-ops-01
       skills: [linux.net.persistent-config]
       weight: 0.5
       command: |
         { ip -o addr show dev eth1 | grep -qF '{{a4}}' || grep -rqsF '{{a4}}' /etc/netplan /etc/systemd/network; } || { echo not-configured; exit 0; }
-        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+        d=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        case ",$d," in ,,|*,eth1,*) echo "$d" ;; *) echo primary ;; esac
+      expect: {match: exact, value: primary}
   misconceptions:
     - id: ip-addr-only
       description: Adds the addresses with ip addr and never writes them to Netplan.
