@@ -493,32 +493,42 @@ On AKS and GKE, use the provider's sandbox after preflight. Keep KubeVirt as
 the fallback, and as the substrate for everything that needs reboots, modules
 or SELinux.
 
-Next steps, in order:
+Next steps, in order (status after Phase 1, section 10):
 
-1. **Images:** build `deb-sys:24.04` and `el-sys:10` properly (from the
-   mirror snapshot, `ct-sysinit` entrypoint, catalog `tier: B, systemd:
-   true`), in CI (no KVM needed). Wire learner and admin ssh keys into
-   container nodes the way cloud-init does for VMs, so `ssh <node>` from the
-   jumphost works. Check that el-sys with systemd 257 (cgroup v1
-   removed) behaves the same.
-2. **Lab guest kernel:** a `tools/images/kata-kernel` build (Kata's config +
-   the fragment from section 4.3), published as an OCI artifact. Add a
-   `vhost_vsock` line to `host-prep.sh` and `tools/verify-vm/install.sh`.
-3. **kind Kata profile on ct-testvm:** `KIND_PROFILE=kata` in `dev-up.sh`:
-   kata-deploy 4.2.0 clh-runtime-rs, the `/dev/shm` and dbus node fixes,
-   the kernel and drop-in. Then run `labctl verify` for tier-B labs on it nightly.
+1. **Images:** *partly done.* `deb-sys:24.04` and `el-sys:10` exist
+   (`tools/images/linux-pod/sys/`, `build-linux-pod.sh deb-sys|el-sys`, catalog
+   `tier: B, systemd: true`), layered on the tier-A images with the
+   `ct-sysinit` entrypoint; packages come from the same point in time as the
+   mirror (`UBUNTU_APT_SNAPSHOT`, the AlmaLinux point release), because `kmod`
+   is not in the mirror's list. el-sys with systemd 257 boots and takes
+   `kubectl exec` like deb-sys (preflight, section 10). **Open:** building
+   them in CI (blocked like deb-lab/el-lab on the mirror build context), and
+   wiring learner and admin ssh keys into container nodes the way cloud-init
+   does for VMs, so `ssh <node>` from the jumphost works.
+2. **Lab guest kernel:** *done.* `tools/images/kata-kernel` (Kata's config +
+   `lab.config`, reproducible: the same vmlinux sha256 on two builds and in CI),
+   published by `.github/workflows/kata-kernel.yml` as
+   `ghcr.io/thecorporatetractor/cloudtrain/kata-lab-kernel:<release>` (cosign
+   keyless, SLSA provenance). `vhost_vsock` is in `host-prep.sh` (kata profile
+   only) and `tools/verify-vm/install.sh`.
+3. **kind Kata profile on ct-testvm:** *done,* `KIND_PROFILE=kata`
+   (`deploy/scripts/kata-up.sh`). **Open:** a nightly `labctl verify` of the
+   tier-B Kata variants on it.
 4. **Upstream:** file the kata-agent exec `EBUSY` issue for systemd containers
    (runc-style fallback to the init process's cgroup), so the image workaround
-   can go.
-5. **Orchestrator:** turn the prototype into `orchestrator.sandboxes`. Add
-   the `vmFallback` rewrite (6.2), the preflight sandbox section (6.3) and
-   tier-B capacity accounting in the gateway.
+   can go. **Open, waits on the owner.**
+5. **Orchestrator:** *preflight done* (`labctl preflight` sandbox section:
+   RuntimeClasses, tier map, own kernel, lab features, guest sizing, systemd
+   exec; not yet the Multus `net1` 1400 DF probe or the ConfigMap the manager
+   would read). **Open:** `orchestrator.sandboxes`, the `vmFallback` rewrite
+   (6.2), container-node ssh keys and tier-B capacity accounting in the gateway.
 6. **Content:** re-tier the 150 tier-B labs. Reboot, module, GRUB and SELinux
    labs move to tier C. The rest get a Kata variant verified on the kata
-   profile and keep passing on the VM fallback.
+   profile and keep passing on the VM fallback. **Open;** `tools/kata/lab-variant.sh`
+   writes a lab's Kata variant for verification.
 7. **Managed:** run the preflight sandbox probe on an AKS Pod Sandboxing pool
    and a GKE microvm pool to learn which lab features their guest kernels
-   have, and fill in the [U] cells above.
+   have, and fill in the [U] cells above. **Open** (needs paid cloud runs).
 
 ## 9. Reproduce
 

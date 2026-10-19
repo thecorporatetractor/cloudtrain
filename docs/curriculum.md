@@ -2355,7 +2355,6 @@ _CloudTrain is not affiliated with or endorsed by Microsoft Corporation. SC-200 
 
 | Ref | Kind | Tier | Status | Description |
 | --- | --- | --- | --- | --- |
-| `el-sys:10` | container | B | proposed | Kata pod image with systemd as PID 1, LVM/mdadm/nftables tools, AlmaLinux 10 based |
 | `gitea:1` | container | A | proposed | In-lab Git server for Git workflow, module sources and Ansible content |
 | `ansible-node:1` | container | A | proposed | sshd managed-node pod with a sudo-enabled student user (no systemd) |
 | `awx:24` | service | C | spike | AWX controller pool (Apache-2.0; releases paused upstream), per-learner org or per-learner instance |
