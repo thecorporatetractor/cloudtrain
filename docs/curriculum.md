@@ -12,14 +12,14 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 
 | Domain | Paths | Learning labs | Exam tasks | Exams | Verified | Built | Proposed | Tier mix (all labs) | Learning hours |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kubernetes | 5 | 89 | 103 | 3 | 152 | 40 | 0 | C 1, K 112, V 79 | 25 |
+| Kubernetes | 5 | 89 | 103 | 3 | 159 | 33 | 0 | C 1, K 112, V 79 | 25 |
 | Linux administration | 11 | 160 | 119 | 3 | 154 | 58 | 67 | A 83, B 71, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 67 | 68 | 0 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 40 | 26 | 31 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 33 | 1 | 65 | 7 | 6 | N 78 | 15 |
 | Security operations | 3 | 42 | 25 | 1 | 0 | 0 | 67 | A 61, C 4, K 2 | 22 |
-| **Total** | 46 | 542 | 405 | 14 | 577 | 199 | 171 | A 236, B 150, C 239, K 114, V 124, N 84 | 183 |
+| **Total** | 46 | 542 | 405 | 14 | 584 | 192 | 171 | A 236, B 150, C 239, K 114, V 124, N 84 | 183 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 53, do 374, fix 87, hack 19, ctf 9. New skills proposed: 236.
 
@@ -127,7 +127,7 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 | `berth-planner-hpa` | Autoscale the berth planner on CPU | do | medium | 15 | K | verified | cka:workloads-scheduling | Add CPU requests and a HorizontalPodAutoscaler that keeps the berth planner between 2 and 8 replicas at 60 % average CPU, and show it scaling under the provided load generator. |
 | `quote-engine-canary` | Send a share of traffic to a canary release | do | medium | 15 | V | verified | ckad:deployment | Run quote-engine v2 next to v1 behind the same Service so roughly one request in five reaches v2, using only Deployments, labels and replica counts. |
 | `blue-green-cutover` | Cut over the customs portal blue/green | do | medium | 12 | V | verified | ckad:deployment | Stand up the green customs portal Deployment, verify it, then switch the Service selector so all traffic moves at once and blue stays scaled for rollback. |
-| `build-waybill-image` | Build and tag an image from a Containerfile | learn | medium | 15 | K | built | ckad:design-build | Fix the waybill renderer's Containerfile so it builds, tag the image for the yard registry, export it as an OCI archive and run it in qm-yard from that tag. |
+| `build-waybill-image` | Build and tag an image from a Containerfile | learn | medium | 15 | K | verified | ckad:design-build | Fix the waybill renderer's Containerfile so it builds, tag the image for the yard registry, export it as an OCI archive and run it in qm-yard from that tag. |
 | `migrate-deprecated-apis` | Migrate manifests off removed API versions | fix | medium | 15 | V | verified | ckad:observability-maintenance | The fleet team's manifests still use removed API versions and fail to apply on v1.37; convert them to the served versions and apply them cleanly. |
 | `helm-shipment-events` | Install and upgrade a chart with custom values | do | easy | 12 | V | built | cka:cluster-architecture, ckad:deployment | Install the shipment-events chart from the local repository into its own namespace with three replicas set via values, then upgrade it to the next chart version keeping those values. |
 | `kustomize-depot-overlays` | Build staging and production overlays with Kustomize | do | medium | 15 | V | verified | cka:cluster-architecture, ckad:deployment | Create staging and production overlays for the depot portal that change replicas, image tag and a ConfigMap value, and apply production with kubectl apply -k. |
@@ -169,7 +169,7 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 | `tariff-secret-audit` | Audit who read the tariff secrets | do | hard | 30 | K | built | cks:monitoring-runtime-security, cks:cluster-hardening | Write an audit policy that logs Secret reads at Metadata level, enable it on the qm-ledger API server, and identify which ServiceAccount read the tariff Secret. |
 | `registry-allowlist-vap` | Admit only images from the company registry | do | hard | 20 | V | verified | cks:supply-chain-security, ckad:environment-config-security | Write a ValidatingAdmissionPolicy and binding that rejects any Pod in labelled namespaces whose images do not come from registry.quillmoor.example, and prove a hub image is refused. |
 | `immutable-label-printers` | Make the label printers immutable at runtime | do | medium | 15 | V | verified | cks:monitoring-runtime-security | Run the label-printer containers with a read-only root filesystem, non-root user and no privilege escalation, giving only /tmp and the spool directory writable emptyDir volumes. |
-| `waybill-image-slim-scan` | Rebuild an image smaller and scan it | do | hard | 30 | K | built | cks:supply-chain-security, ckad:design-build | Rebuild the waybill image as a multi-stage, non-root image on a minimal base so it is under 40 MB, scan before and after, and record the remaining high CVEs in a report. |
+| `waybill-image-slim-scan` | Rebuild an image smaller and scan it | do | hard | 30 | K | verified | cks:supply-chain-security, ckad:design-build | Rebuild the waybill image as a multi-stage, non-root image on a minimal base so it is under 40 MB, scan before and after, and record the remaining high CVEs in a report. |
 | `seccomp-apparmor-printer` | Confine a container with seccomp and AppArmor | do | hard | 25 | K | built | cks:system-hardening | Load the provided AppArmor profile on the fleet workers and run the barcode service with it plus the RuntimeDefault seccomp profile, so its write to /etc is denied. |
 | `gvisor-runtimeclass` | Run untrusted converters in a sandboxed runtime | do | medium | 15 | K | verified | cks:microservice-vulnerabilities | Create a RuntimeClass for the gVisor handler and move the third-party document converter Deployment onto it, proving its Pods run under the sandbox kernel. |
 | `secrets-encryption-at-rest` | Encrypt Secrets at rest in etcd | do | hard | 30 | K | verified | cks:microservice-vulnerabilities | Configure an aescbc encryption provider on the qm-ledger API server, re-write all existing Secrets, and prove from etcd that the billing Secret is no longer stored in plain text. |
