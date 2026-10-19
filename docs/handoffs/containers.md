@@ -267,6 +267,43 @@ Design decisions to know when verifying:
 - Seeds are created only when absent and never satisfy the producing task: `localhost/media-api:1.0` runs as root from `/app` (seeded by ports-env, quadlet, registry-push), `localhost/static-web:latest` has no VOLUME (seeded by rootless-user).
 - PostgreSQL has no offline image: `xct-run-persistent-db` and `xct-multi-pod-api-db` use `redis:7.4-alpine` (noted in the curriculum).
 
+### docker-vm:29 rebuild with the supply-chain tools (2026-10-19)
+
+Shipped from the wishlist above: cosign v2.6.5, notation v1.3.2 and trivy v0.75.0 in
+`/usr/local/bin` (release assets, sha256 in `deploy/versions.env`), the upstream Trivy DB (schema 2,
+built 2026-10-18T18:39Z, pinned by layer digest) in `/var/lib/trivy` (`trivy --cache-dir /var/lib/trivy
+--skip-db-update`; world-readable, labs copy it), and preloaded `moby/buildkit:v0.23.2`,
+`moby/buildkit:buildx-stable-1`, `moby/buildkit:rootless` and `docker/buildkit-syft-scanner:stable-1`
+(digests in `tools/images/lock/docker-vm.lock`). Licences: all Apache-2.0, separate programs, texts in
+`/usr/share/doc/cloudtrain-supply-chain`. Size: containerDisk qcow2 1.86 GiB, image 1.8 GB -> 3.96 GB.
+The Trivy DB layer is republished upstream every few hours and old layers are not kept forever:
+refresh `TRIVY_DB_*` in `deploy/versions.env` when the pinned one disappears (the build says so).
+
+Live verify from the image-gaps clone (`labctl verify`, batch label, `--parallel 1`): ctr-cosign-sign-verify
+pass, ctr-ci-rootless-buildkit pass, ctr-scan-triage-vex pass. Lab fixes made on the way:
+`ctr-ci-rootless-buildkit` (grader runs the pipeline from `/srv/ci`, since trivy opens `./trivy.yaml`
+and failed in root's cwd; the alternative pushes with `type=image,push=true`, as buildctl has no
+`registry` exporter), `ctr-scan-triage-vex` (setup seeds `/srv/scan-db`; the solution's `sed` used `/`
+as delimiter around `copperleaf/pybase:1.1`, so the base was never bumped), `ctr-buildx-cache-export`
+(solution and alternative steps get `timeoutSec: 900`; two builders and three builds overran the
+default step timeout).
+`ctr-buildx-cache-export` with the image: alternative 4/4 and all three mutations caught; the solution
+hit the step timeout (fixed above), and its re-run plus `xcd-build-multistage-nonroot` (its
+`FROM golang:1.25-alpine` build now runs offline) were cut by the verify VM's Spot interruption at
+09:58Z and the slow cluster recovery after it; both are requeued in the batch runner.
+
+Unblocked by the image (still `built`, in the batch queue): `ctr-cosign-sign-verify`,
+`ctr-content-trust-retired`, `xpe-image-sign-verify`, `xcd-supply-sbom-sign`, `ctr-sbom-provenance`,
+`ctr-buildx-cache-export`, `ctr-ci-rootless-buildkit`, `ctr-release-pipeline-capstone`,
+`xcd-build-multistage-nonroot`, `ctr-scan-triage-vex`, `ctr-notation-sign-verify` and `ctr-signed-only-gate` (both still carry the review major on the CA's
+missing keyUsage keyCertSign). `golang:1.25-alpine` is preloaded too (`xcd-build-multistage-nonroot`). `ctr-scan-triage-vex` now
+seeds `/srv/scan-db` from `/var/lib/trivy` in setup (learner-owned copy); the findings in its story
+(fixable criticals in `copperleaf/pybase:1.0`, `CVE-2024-<cve>`) are not in the real DB, so the scan
+counts are zero before and after, and the graders do not depend on them. Still blocked:
+`ctr-scout-policy` (its baseline step uses `docker scout cves`, which is proprietary and needs a Docker
+Hub login; rewrite it for trivy to unblock). Still on the wishlist: distroless and arm64 bases with
+binfmt, the Engine 28 variant (`ctr-engine-upgrade`) and the gitea image.
+
 ### Unconfirmed until the first live run
 
 - `ctr-podman-pod-kube-play`: `podman kube play` resolving secretKeyRef and secret volumes from a secret created by playing a Secret manifest; the check accepts the plain or base64 password in the stored Secret and requires the pod to answer authenticated.

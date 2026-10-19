@@ -129,8 +129,11 @@ like a Jinja variable it uses. Covered by a compiler test and a lab-schema test.
 | ansible-navigator 26.9.0, ansible-lint 26.10.1, Molecule 26.9.0, ansible-builder 3.2.0, ansible-runner 2.4.3, yamllint, passlib, netaddr, jmespath | `requirements.in` -> `requirements.lock` (53 wheels, sha256 each, `pip --require-hashes --only-binary`; regenerate with `lock-python.sh`). Versions match the PyPI mirror where it has them; all at least 7 days old except ansible-lint, taken at the mirror's pin | GPL-3.0 / Apache-2.0 / MIT / BSD |
 | Collections ansible.posix 2.2.2, community.general 13.5.0 (+ library_inventory_filtering_v1 1.1.5), community.crypto 3.5.0, ansible.utils 6.1.1 | `collections.lock`, Galaxy artifacts with the sha256 of `tools/mirrors/lock/ansible.lock` (the build script refuses a mismatch) | GPL-3.0 |
 | sshpass, git, vim, nano, jq, tmux, rsync, iproute2 | apt snapshot | GPL / MIT |
+| ansible-rulebook 1.3.2, drools_jpy 0.4.1, jpy, aiohttp, psycopg (+ deps) | `requirements.lock` (75 wheels since 2026-10-19) | Apache-2.0 / MIT / BSD; psycopg LGPL-3.0 |
+| OpenJDK 17 JRE headless (`JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64`) | apt snapshot | GPL-2.0 with Classpath Exception, separate program |
+| Collections ansible.eda 2.13.0, containers.podman 1.21.1, fedora.linux_system_roles 2.5.0 | `collections.lock` (mirror sha256) | Apache-2.0 / GPL-3.0 / mixed (GPL, LGPL, MIT, BSD) |
 
-Size: `cloudtrain/ansible-ctl:2.21` **680 MB** uncompressed. No code-server (see questions).
+Size: `cloudtrain/ansible-ctl:2.21` **1.08 GB** uncompressed (680 MB before the rulebook and JDK). No code-server (see questions).
 
 Helpers: `ct-ansible recap|run|pushkey` (grading and setup, runs as the learner with the
 learner's login environment) and `ct-fleet-net` (root, setup only). `ansible-lint` and
@@ -293,12 +296,12 @@ Blockers per lab:
 
 | Lab | Blocker |
 |---|---|
-| ov-system-role-timesync | `fedora.linux_system_roles` not installed in `ansible-ctl:2.21` (or the Ansible mirror); setup stops with a blocked message |
-| ov-execution-environment-build | no Podman VM image with a mirrored EE base image (`localhost/ov-ee-base:1`) and registry image (`localhost/ov-registry:3`); `oci-registry:3` and `galaxy-ng:4` are pod images; the `additional_build_files` flow is untested; the base image must ship community.general |
-| ov-net-inventory-facts, ov-net-ospf-branch-config, ov-net-branch-template-role, ov-net-parse-neighbors | `frr:10` has no openssh-server, sudo, python3 or automation account (image rebuild), or a frr `network_cli` collection in the Ansible mirror |
-| ov-net-srlinux-interfaces | same `frr:10` gap; `srlinux:25` is not in the catalog, so the FRR-only VLAN fallback was written |
-| ov-net-config-backup-restore | same `frr:10` gap; the Git repo is a bare repo on ov-ctl (no gitea) |
-| ov-eda-webhook-rulebook | `ansible-rulebook`, a JDK and the `ansible.eda` collection are not in `ansible-ctl:2.21` / the collection mirror; setup stops with a blocked message; no recap check (rulebook lab, documented exception) |
+| ov-system-role-timesync | fixed in the image (2026-10-19): `fedora.linux_system_roles` 2.5.0 is in `ansible-ctl:2.21` and the Ansible mirror; the setup guard still exists and now passes. Minor still open: the uses-role scan stops at the first `include_role` |
+| ov-execution-environment-build | still blocked, see "Image gaps closed" below for the exact remaining work; the base image must ship community.general |
+| ov-net-inventory-facts, ov-net-ospf-branch-config, ov-net-branch-template-role, ov-net-parse-neighbors | fixed in the image (2026-10-19): `frr:10` now has openssh-server, sudo, shadow (useradd) and python3. The labs use the plain `ssh` connection, so no network collection is needed. Content finding: ov-net-inventory-facts alternative `template-file` reports `changed=3` on the grader's re-run |
+| ov-net-srlinux-interfaces | `frr:10` gap fixed; `srlinux:25` is still not in the catalog (the FRR-only VLAN fallback stays) |
+| ov-net-config-backup-restore | `frr:10` gap fixed; the Git repo is a bare repo on ov-ctl (no gitea) |
+| ov-eda-webhook-rulebook | fixed in the image (2026-10-19): ansible-rulebook 1.3.2 with OpenJDK 17 and `ansible.eda` 2.13.0 are in `ansible-ctl:2.21`; no recap check (rulebook lab, documented exception) |
 
 Untested assumptions to check first in the testing round: VM hostnames equal node names (not
 used by the VM labs); `community.general.seport`/`sefcontext` need `policycoreutils-python-utils`
@@ -320,17 +323,46 @@ the controller REST API with curl from ov-ctl (job status, RBAC launch denied wi
 awx.awx collection is not in the mirror; keep product names out of titles ("controller");
 backup/restore uses AWXBackup/AWXRestore resources.
 
-Full automation blocker list (all rounds-5 waves): linux_system_roles (3 labs), code-server (1),
-ansible-rulebook/JDK (1), frr sshd/collections (6), srlinux (fallback written), EE build infra
+Full automation blocker list (all rounds-5 waves; linux_system_roles, ansible-rulebook/JDK and frr
+sshd were closed by the 2026-10-19 image rebuild): code-server (1), srlinux (fallback written), EE build infra
 (1), galaxy-ng/gitea adaptations, awx/alertmanager (8, not writable), and the el10 mirror lacks
 php and comps groups (labs adapted).
+
+### Image gaps closed (2026-10-19, remote verify VM)
+
+Image changes: `frr:10` (+ openssh-server, sudo, shadow; sshd never starts by default, so routing
+labs see the same router); `ansible-ctl:2.21` (+ ansible-rulebook 1.3.2, drools_jpy 0.4.1, OpenJDK
+17 JRE headless with `JAVA_HOME`, collections ansible.eda 2.13.0, containers.podman 1.21.1,
+fedora.linux_system_roles 2.5.0). `requirements.lock` was regenerated with the old pins held as
+constraints (`lock-python.sh`; `RELOCK=1` re-resolves everything), so only the new wheels were added.
+`tools/mirrors/ansible-collections.yml` now pins every collection version, so a mirror rebuild cannot
+move what `collections.lock` bakes in. Sizes: frr 359 -> 369 MB, ansible-ctl 680 MB -> 1.08 GB.
+grype `--only-fixed --fail-on critical` passes on both; the drools jar carries jackson 2.19.2 (High,
+fixed upstream in 2.21.x; drools_jpy has no newer release).
+
+Live verify from a clone with the image changes (`labctl verify`, batch label, `--parallel 1`):
+ov-eda-webhook-rulebook pass, xan-roles-system-timesync pass, xan-roles-system-selinux pass,
+ov-net-ospf-branch-config pass, ov-net-inventory-facts solution 5/5 on both seeds and every mutation
+caught, only the `template-file` alternative fails (content, above). The two xan system-role tasks
+are back in the sim-el-automation roles pool (6 tasks for a draw of 2).
+
+ov-execution-environment-build stays blocked. What it needs, precisely: (1) an el-vm variant
+whose root Podman store holds `localhost/ov-registry:3` (registry:3 by digest) and
+`localhost/ov-ee-base:1`, pulled into containers-storage at image build time; (2) that EE base
+built from an upstream EE (for example community-ee-minimal, by digest) plus community.general
+(site.yml calls `community.general.json_query`) and an offline wheelhouse with
+`PIP_NO_INDEX=1 PIP_FIND_LINKS=...` set in the image, because ansible-builder's builder stage
+pip-installs bindep, PyYAML and packaging and the lab's `jmespath`, and lab VMs have no PyPI;
+(3) the lab's ov-ee-1 node pointing at that variant instead of `el-vm:10`. Not done in this round:
+the variant needs its own build path in `tools/images/build.sh` and a catalog ref, and the EE
+base build is untested.
 
 ## Verify queue (testing round, grouped by slot kind)
 
 - **vm slot** (el-vm:10): the 12 VM labs above. Needing reboots: ov-reboot-persistence-fix, ov-async-patching (boot-id). Also: `sim-el-automation` exam runs and per-task verify of the 19 xan + 2 xpe tasks (four VMs per session, one at a time).
 - **pod slot**: the 22 runnable labs of PR #84 (not merged; fix its 4 majors and conflicts first).
 - **netdev**, **kubeadm**, **Kata**: none.
-- **image-blocked**: the 8 wave-4 controller/alert labs (not written, awx:24 + gitea:1 + alertmanager); ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-system-role-timesync and the xan roles timesync/selinux tasks (`fedora.linux_system_roles`); ov-execution-environment-build (EE/registry images); the 6 `ov-net-*` labs (frr:10 SSH/python3/account, SR Linux image); ov-eda-webhook-rulebook (ansible-rulebook + JDK).
+- **image-blocked**: the 8 wave-4 controller/alert labs (not written, awx:24 + gitea:1 + alertmanager); ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-execution-environment-build (Podman VM variant with the registry and EE base images). Unblocked by the 2026-10-19 image rebuild: ov-system-role-timesync and the xan roles timesync/selinux tasks, the 6 `ov-net-*` labs (ov-net-srlinux-interfaces keeps its FRR-only fallback), ov-eda-webhook-rulebook.
 
 Unmerged PRs: #84 (wave 2, 23 pod labs).
 
