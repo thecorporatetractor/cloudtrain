@@ -106,7 +106,9 @@ spec:
         # downloads come from a second address, so path MTUs annex-pc learned from uploads don't help them
         ip addr replace 10.{{octet}}.1.11/24 dev eth1
         mkdir -p /var/lib/cloudtrain; echo 0 > /var/lib/cloudtrain/last-size
-        setsid ncat -l -k -p 5001 --sh-exec 'wc -c > /var/lib/cloudtrain/last-size' </dev/null >/dev/null 2>&1 &
+        # keep the largest upload seen: a stale connection from an earlier probe can finish late and must not overwrite a full upload
+        printf '%s\n' '#!/bin/sh' 'n=$(wc -c)' 'm=$(tr -dc 0-9 < /var/lib/cloudtrain/last-size 2>/dev/null)' '[ "$n" -gt "${m:-0}" ] && echo "$n" > /var/lib/cloudtrain/last-size' 'exit 0' > /usr/local/bin/ct-sink; chmod +x /usr/local/bin/ct-sink
+        setsid ncat -l -k -p 5001 --sh-exec /usr/local/bin/ct-sink </dev/null >/dev/null 2>&1 &
         setsid ncat -l -k -p 5002 --sh-exec 'echo small' </dev/null >/dev/null 2>&1 &
         # the trailing sleep keeps ncat from closing the socket before the last bytes are flushed
         setsid ncat -l -k -p 5003 --sh-exec 'head -c 262144 /dev/zero; sleep 1' </dev/null >/dev/null 2>&1 &
