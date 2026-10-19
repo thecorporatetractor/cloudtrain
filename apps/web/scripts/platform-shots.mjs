@@ -98,8 +98,8 @@ const toWaitlist = async (p) => {
 const fillWaitlist = (email) => async (p) => {
   await toWaitlist(p);
   await p.getByLabel('Work or personal email').fill(email);
-  await p.getByLabel('Organisation').fill('Quillmoor Rail');
-  await p.getByLabel('Role').selectOption('Team lead or manager');
+  await p.locator('input[name=organisation]').fill('Quillmoor Rail');
+  await p.locator('select[name=role]').selectOption('Team lead or manager');
   await p.getByLabel('An organisation or team').check();
   await p.getByLabel(/I agree that CloudTrain may store/).check();
 };
