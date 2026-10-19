@@ -105,8 +105,14 @@ spec:
       on: cl-docker-01
       skills: [containers.build.entrypoint]
       weight: 1.5
+      # The latest start counts: the engine restart and reboot before grading (and other
+      # tasks that restart dockerd) restart worker, which logs its queue line again.
+      # worker must run copperleaf/worker:2 itself (not any image that prints the line).
       command: |
-        for i in $(seq 15); do n=$(docker logs worker 2>&1 | grep -c '^worker consuming queue {{queue}}$'); [ "$n" -ge 1 ] && break; sleep 1; done; echo "$n"
+        img=$(docker image inspect copperleaf/worker:2 2>/dev/null | jq -r '.[0].Id // "none"')
+        [ "$(docker inspect worker 2>/dev/null | jq -r '.[0].Image // "missing"')" = "$img" ] || { echo 0; exit 0; }
+        for i in $(seq 15); do l=$(docker logs worker 2>&1 | tr -d '\r' | grep '^worker consuming queue ' | tail -n 1); [ -n "$l" ] && break; sleep 1; done
+        [ "$l" = 'worker consuming queue {{queue}}' ] && echo 1 || echo 0
       expect: {match: exact, value: "1"}
     - id: healthy
       description: worker reports healthy
