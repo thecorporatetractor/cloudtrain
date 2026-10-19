@@ -30,7 +30,8 @@ that still assumed sim-linux-pro was coming-soon.
   networkd drop-in fallback, iperf-throughput-baseline mtu-one-side mutation). The 23 labs are not
   on main; do not queue them for verify until it merges.
 - PR #161 (`content/linux-r5-w3-minor`): follow-up to wave 3 (#122). Exact-address hosts pin check
-  and two misconceptions in xlp-fix-dns-client, StartLimitIntervalSec=0 on the broken units
+  in xlp-fix-dns-client (its redundant nsswitch-only misconception is removed; pins-hosts and
+  no-search remain), StartLimitIntervalSec=0 on the broken units
   (xlp-fix-unit-start, xlp-fix-oom-service), tracer-running check in xpe-incident-disk-pressure,
   port verified in xlp-fix-permission-denied app-reads. Open; touches lab hashes, so those labs
   need a re-verify after it merges.
