@@ -85,6 +85,11 @@ spec:
         install -d /etc/docker
         [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
         jq '. + {labels: ["site=copperleaf-edge"]}' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        # the engine is restarted several times within a minute (setup, grading, the learner): do not trip systemd's start limit
+        install -d /etc/systemd/system/docker.service.d /etc/systemd/system/docker.socket.d
+        printf '[Unit]\nStartLimitIntervalSec=0\n' > /etc/systemd/system/docker.service.d/10-cl-lab.conf
+        printf '[Unit]\nStartLimitIntervalSec=0\n' > /etc/systemd/system/docker.socket.d/10-cl-lab.conf
+        systemctl daemon-reload
         systemctl restart docker
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         rm -f /etc/systemd/system/cl-edge-nft.service /etc/copperleaf/edge.nft
@@ -93,7 +98,7 @@ spec:
         printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 8080' 'CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]' > "$d/Dockerfile"
         docker build -q -t copperleaf/transcoder-edge:1 "$d" >/dev/null; rm -rf "$d"
         docker rm -f transcoder-edge >/dev/null 2>&1 || true
-        docker run -d --name transcoder-edge --restart unless-stopped -p {{port}}:8080 copperleaf/transcoder-edge:1 >/dev/null
+        docker run -d --init --name transcoder-edge --restart unless-stopped -p {{port}}:8080 copperleaf/transcoder-edge:1 >/dev/null
         cat > /etc/systemd/system/cl-edge-user.service <<'UNIT'
         [Unit]
         Description=Allow the transcoder edge port from the partner range only (iptables)
@@ -196,7 +201,7 @@ spec:
       command: sudo systemctl stop docker docker.socket && sudo iptables -P FORWARD ACCEPT && sudo iptables -F && sudo iptables -X && sudo iptables -t nat -F && sudo iptables -t nat -X
       cost: 2
     - title: Your own table, your own hook
-      body: "Under nftables the engine owns its tables and has no DOCKER-USER. Create a table of your own with a base chain on the `forward` hook; a drop in any base chain on that hook is final. `ct original proto-dst` matches the port before NAT."
+      body: "Under nftables the engine owns its tables and has no DOCKER-USER. Create a table of your own with a base chain on the `forward` hook; a drop in any base chain on that hook is final. `ct original proto-dst` matches the port before NAT, but replies from the container belong to the same connection: add `ct direction original` so that only packets travelling towards the container are filtered."
       command: |
         sudo nft add table inet cl_edge && sudo nft 'add chain inet cl_edge forward { type filter hook forward priority -10 ; policy accept ; }'
       cost: 2
@@ -234,7 +239,7 @@ spec:
           sudo systemctl start docker
           sudo nft add table inet cl_edge
           sudo nft 'add chain inet cl_edge forward { type filter hook forward priority -10 ; policy accept ; }'
-          sudo nft add rule inet cl_edge forward meta l4proto tcp ct original proto-dst {{port}} ip saddr != 198.51.100.0/24 drop
+          sudo nft add rule inet cl_edge forward meta l4proto tcp ct direction original ct original proto-dst {{port}} ip saddr != 198.51.100.0/24 drop
     - id: daemon-json-overwritten
       description: Replaces daemon.json with only the firewall-backend key.
       feedback: "daemon.json held other settings (the host label). Merge the key into the existing file."
@@ -275,7 +280,7 @@ spec:
           table inet cl_edge {
             chain forward {
               type filter hook forward priority -10; policy accept;
-              meta l4proto tcp ct original proto-dst {{port}} ip saddr != 198.51.100.0/24 drop
+              meta l4proto tcp ct direction original ct original proto-dst {{port}} ip saddr != 198.51.100.0/24 drop
             }
           }
           NFT
@@ -319,8 +324,8 @@ spec:
               table ip cl_edge4 {
                 chain guard {
                   type filter hook forward priority filter - 5; policy accept;
-                  meta l4proto tcp ct original proto-dst {{port}} ip saddr 198.51.100.0/24 accept
-                  meta l4proto tcp ct original proto-dst {{port}} reject with icmp type port-unreachable
+                  meta l4proto tcp ct direction original ct original proto-dst {{port}} ip saddr 198.51.100.0/24 accept
+                  meta l4proto tcp ct direction original ct original proto-dst {{port}} reject with icmp type port-unreachable
                 }
               }
               NFT
