@@ -156,7 +156,18 @@ spec:
             if "10.40.5.0/24" in d["sources"].split() and "8443/tcp" in d["ports"].split():
                 ok = True
         bad = [z for z, d in zones.items() if "8443/tcp" in d["ports"].split() and "10.40.5.0/24" not in d["sources"].split()]
-        print("persistent" if ok and not bad else "runtime-only" if not ok else "open-to-all")
+        import subprocess
+        dz = subprocess.run(["firewall-cmd", "--permanent", "--get-default-zone"], capture_output=True, text=True).stdout.strip()
+        def ssh_for(net):
+            for z, d in zones.items():
+                if net in d["sources"].split():
+                    return "ssh" in d["services"].split() or any("service name=\"ssh\"" in r or "port=\"22\"" in r for r in d["rich"])
+            return dz in zones and "ssh" in zones[dz]["services"].split()
+        ssh_ok = ssh_for("10.40.5.0/24") and ssh_for("10.40.6.0/24")
+        if ok and not bad and not ssh_ok:
+            print("ssh-lost")
+        else:
+            print("persistent" if ok and not bad else "runtime-only" if not ok else "open-to-all")
         '
       expect: {match: exact, value: persistent}
   hints:
