@@ -13,5 +13,7 @@ RUN set -eux; mkdir -p /tmp/apt-off; mv /etc/apt/sources.list.d/* /tmp/apt-off/ 
     printf '[Service]\nExecStartPre=/usr/bin/ssh-keygen -A\n' > /tmp/x; mkdir -p /etc/systemd/system/ssh.service.d; mv /tmp/x /etc/systemd/system/ssh.service.d/10-hostkeys.conf
 COPY ct-sysinit /usr/local/sbin/ct-sysinit
 STOPSIGNAL SIGRTMIN+3
+# readiness comes from the orchestrator (systemctl is-system-running probe)
+HEALTHCHECK NONE
 ENTRYPOINT ["/usr/local/sbin/ct-sysinit"]
 CMD []
