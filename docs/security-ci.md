@@ -27,7 +27,7 @@ SARIF) and/or artifacts; they are triaged there.
 | `deps.yml` | PR (path-aware), push main, daily | `dependency-review`, `govulncheck`, `osv-scanner` | dependency-review (PRs: new dependency with a high/critical advisory or a GPL/LGPL/AGPL/SSPL license); govulncheck (reachable Go vulnerabilities) | osv-scanner SARIF over `pnpm-lock.yaml` and `go.mod` |
 | `dependabot.yml` | weekly (Mon); compose monthly | n/a | n/a | version PRs: npm (pnpm), gomod (k8s group), github-actions, docker, docker-compose; minor/patch grouped; security updates grouped; 7-day cooldown |
 | `sbom.yml` | PR (dependency paths), push main, release | `source`, `dependency-submission`, `release` | none | syft SPDX + CycloneDX of the source tree (artifact); on main, submitted to the dependency graph; on release, source and per-image SBOMs attached to the release |
-| `images.yml` | PR (image paths; changed images only), push main, `v*` tags, nightly | `build + scan (<image>)`, `publish (<image>)` | the image build; no CRITICAL vulnerability with a fix (Trivy and Grype) | Trivy (vuln + secret) and Grype SARIF; SBOM artifacts. Push to main and `v*` only: GHCR push, cosign keyless signature, SLSA provenance (`attest-build-provenance`) and SBOM attestation, both pushed to the registry |
+| `images.yml` | PR (image paths; changed images only), push main, `v*` tags, nightly | `build + scan (<image>)`, `publish (<image>)` | the image build; no CRITICAL vulnerability with a fix (Trivy and Grype) | Trivy (vuln + secret) and Grype SARIF, filtered by image tier (see "Image scan policy"); full reports and SBOM artifacts. Push to main and `v*` only: GHCR push, cosign keyless signature, SLSA provenance (`attest-build-provenance`) and SBOM attestation, both pushed to the registry |
 | `iac.yml` | PR (deploy/config/images/`*.tf` paths), push main, weekly | `iac` | kube-linter and Trivy HIGH+ on the kustomize-rendered lab-orchestrator manifests (accepted operator RBAC in `.github/iac/trivyignore.yaml`) | Trivy config (repo; `content/` excluded), checkov (deploy/, rendered manifests, tools/images, .github), kube-linter over deploy/ |
 | `dast.yml` | PR (path-aware), push main, nightly, manual | `zap (gateway)`, `zap (web)` | PRs/main: ZAP passive baseline fails on High alerts or plan errors | nightly/manual `full`: spider + active scan; HTML/JSON/SARIF reports as artifacts and code scanning |
 | `scorecard.yml` | push main, weekly, branch protection change | `analysis` | none | OpenSSF Scorecard (published to the OpenSSF API for the badge, and SARIF) |
@@ -193,6 +193,41 @@ Some checks block when they run but must **not** be required:
 
 The CodeQL gate is the ruleset's "Require code scanning results" rule (CodeQL: security
 alerts High or higher, alerts Errors). The other SARIF tools are report-only.
+
+## Image scan policy
+
+Lab and workstation images bundle third-party tools on purpose (terraform, ansible,
+kubectl, jumphost tooling) and inherit unfixed distro CVEs, so unfiltered scan output
+buried the findings that matter. Every image is still built, scanned in full and gated;
+only what is uploaded to code scanning is filtered. Each image has a `tier` in the
+`images.yml` matrix.
+
+| Tier | Images | Code scanning (SARIF) | Build gate |
+|---|---|---|---|
+| platform | `lab-orchestrator`, `gateway`, `web` | Trivy and Grype, fixable HIGH and CRITICAL only (`--ignore-unfixed`, `--only-fixed`) | fails on a fixable CRITICAL (Trivy and Grype), unchanged |
+| lab | `jumphost`, `frr`, `nettools`, `netsvc`, `oci-registry`, `iac-ws-tofu`, `ansible-ctl`, `kql-ws` | Trivy only, fixable CRITICAL only. Grype is not uploaded | fails on a fixable CRITICAL (Trivy and Grype), unchanged |
+
+Why Trivy-only CRITICAL for lab images, rather than none: a fixable CRITICAL in a lab image
+is a real, actionable bump, and keeping one scanner's alert for it keeps visibility in the
+Security tab. Grype reports the same packages with the same fix data, so uploading both only
+doubles the alerts; its gate still fails the build. Uploading nothing was rejected because
+the alerts are the only place a nightly rescan surfaces a new fixable CRITICAL for an image
+that did not change.
+
+Each image has its own SARIF category (`trivy-image-<name>`, `grype-image-<name>`). A re-upload
+under a category replaces that category's alert set, so alerts that fall out of the filter
+close by themselves. When an image or category is retired (no longer uploaded) GitHub does not
+close its alerts; lab and workstation categories only are then dismissed through the API as
+"won't fix" with a comment pointing here. Platform-image and code alerts are never bulk-dismissed.
+
+### Seeing the full reports
+
+Every `build + scan (<image>)` job writes a job summary (counts by severity, all and fixable,
+plus the fixable HIGH and CRITICAL table) and uploads the artifact `scan-reports-<image>`
+(30 days): `trivy-full.json`, `trivy-full.txt`, `grype-full.json`, `grype-full.txt` with every
+finding at every severity, fixed or not. SBOMs stay in `sbom-image-<image>`. To list the open
+alerts of one image: `gh api 'repos/thecorporatetractor/cloudtrain/code-scanning/alerts?state=open&tool_name=Trivy' --paginate`
+and filter on `most_recent_instance.category`.
 
 ## Accepted risks and ignore files
 
