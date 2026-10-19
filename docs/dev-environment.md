@@ -633,7 +633,7 @@ Status and measurements: `docs/handoffs/foundations.md`.
     as OCI archives (`buildah push ... oci-archive:` / `ctr -n k8s.io images import`). RUN steps
     use the host network, so buildah writes no CNI config next to Calico's.
   - **-full/-sec** add podman (only for `podman.socket`, which is how Trivy reads buildah's
-    storage), cosign `COSIGN_VERSION`, Trivy `TRIVY_VERSION` with its DB, the base images of
+    storage), cosign `COSIGN_V3_VERSION`, Trivy `TRIVY_VERSION` with its DB, the base images of
     `tools/images/kubeadm-addons/buildah-images.txt` in buildah's storage (by digest,
     `lock/buildah-images.lock`), and the signing fixture of `kubeadm-addons/signing/`.
   - **Trivy offline DB.** `/usr/local/bin/trivy` is a wrapper that only sets defaults: cache
