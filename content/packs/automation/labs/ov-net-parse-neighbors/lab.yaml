@@ -1,0 +1,670 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-net-parse-neighbors
+  title: "Assert OSPF health from parsed router output"
+  domain: automation
+  frameworks: [ex457-aligned:control-flow]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [ansible, network, frr, ospf, parsing, assert, tier-n, blocked]
+  version: 1
+spec:
+  description: |
+    The branch routers run OSPF; the expected neighbours of each router are in `vars/expected.yml` in `/home/learner/net`
+    (router ids). Something is wrong with at least one adjacency. Observe it, do not repair it.
+
+    Write **`ospf-health.yml`** that, for every router in `branch_routers`:
+
+    - parses the output of `show ip ospf neighbor` into structured data (neighbour id and state, only the neighbours the router actually reports) and saves it as
+      `/home/learner/net/ospf/<router>.json`, even when the router is unhealthy;
+    - **fails** the play for that router, with a message naming the router and the neighbour id, if any expected neighbour
+      is missing or not in state Full.
+
+    Routers whose neighbours are all Full must pass. The grader removes the JSON files, runs the playbook itself, reads
+    each router's result from the PLAY RECAP (an ignored error is not a failure) and compares the files that run writes
+    with what the routers report.
+  objectives:
+    - "Turn command output into structured data"
+    - "Assert on parsed data and fail with a useful message"
+    - "Keep evidence even when a task fails"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    octet:
+      type: int
+      min: 20
+      max: 90
+    fault:
+      type: choice
+      values: [man, lds]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-man-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-lds-gw, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth3" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-man-gw:eth3" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-lds-gw:eth3" }
+      - { a: "ov-branch-lon-gw:eth1", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-branch-lon-gw:eth2", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      timeoutSec: 120
+      run: &ov-router |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=21 ;; ov-branch-man-gw) a=22 ;; ov-branch-lds-gw) a=23 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth3 up
+        ip addr replace 10.70.0.$a/24 dev eth3
+        for c in sshd useradd chpasswd sudo python3; do
+          command -v $c >/dev/null 2>&1 || { echo "blocked: this frr image has no $c; routers need openssh-server, sudo, python3 and an automation account (image rebuild)" >&2; exit 1; }
+        done
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-branch-man-gw, timeoutSec: 120, run: *ov-router }
+    - { on: ov-branch-lds-gw, timeoutSec: 120, run: *ov-router }
+    - on: ov-branch-lon-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        interface eth2
+         ip address 10.{{octet}}.2.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+        !
+    - on: ov-branch-man-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.2/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+        !
+    - on: ov-branch-lds-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.3/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.2.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+        !
+    - on: ov-branch-man-gw
+      run: |
+        [ "{{fault}}" = man ] && vtysh -c 'configure terminal' -c 'interface eth1' -c 'ip ospf hello-interval 20' -c 'ip ospf dead-interval 80' && echo y | vtysh -c 'clear ip ospf process' || true
+    - on: ov-branch-lds-gw
+      run: |
+        [ "{{fault}}" = lds ] && vtysh -c 'configure terminal' -c 'interface eth1' -c 'ip ospf hello-interval 20' -c 'ip ospf dead-interval 80' && echo y | vtysh -c 'clear ip ospf process' || true
+    - on: ov-branch-lon-gw
+      run: |
+        echo y | vtysh -c 'clear ip ospf process' || true
+    - on: ov-ctl
+      timeoutSec: 300
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.21 ov-branch-man-gw=10.70.0.22 ov-branch-lds-gw=10.70.0.23
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw
+        p=/home/learner/net
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        branch_routers:
+          hosts:
+            ov-branch-lon-gw:
+            ov-branch-man-gw:
+            ov-branch-lds-gw:
+          vars:
+            ansible_connection: ssh
+            ansible_network_os: frr
+            ansible_python_interpreter: /usr/bin/python3
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/vars $p/ospf
+        cat > $p/vars/expected.yml <<'EOF'
+        expected_neighbors:
+          ov-branch-lon-gw: ["10.255.{{octet}}.2", "10.255.{{octet}}.3"]
+          ov-branch-man-gw: ["10.255.{{octet}}.1"]
+          ov-branch-lds-gw: ["10.255.{{octet}}.1"]
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: parsed-lon
+      description: "The parsed neighbour data of ov-branch-lon-gw is saved as structured JSON: exactly the neighbours the router really has, each in state Full"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.parsing, automation.control-flow.error-handling]
+      weight: 1.5
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/net/ospf/ov-branch-lon-gw.json <<'PY' 2>/dev/null || echo unreadable
+        import json, re, sys
+        IP = re.compile(r'^\d+\.\d+\.\d+\.\d+$')
+        def state_of(v):
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list):
+                for x in v:
+                    r = state_of(x)
+                    if r:
+                        return r
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    if 'state' in str(k).lower() and isinstance(x, str):
+                        return x
+            return None
+        def norm(d):
+            out = {}
+            def add(i, st):
+                if isinstance(st, str):
+                    out[i] = st.split('/')[0].strip().lower()
+            def walk(v):
+                if isinstance(v, dict):
+                    ips = [k for k in v if isinstance(k, str) and IP.match(k)]
+                    if ips:
+                        for k in ips:
+                            add(k, state_of(v[k]))
+                        return
+                    ids = [x for k, x in v.items() if isinstance(x, str) and IP.match(x) and any(w in str(k).lower() for w in ('id', 'neighbo', 'router'))]
+                    st = state_of(v) if ids else None
+                    if isinstance(st, str):
+                        add(ids[0], st)
+                        return
+                    for x in v.values():
+                        walk(x)
+                elif isinstance(v, list):
+                    if len(v) == 2 and all(isinstance(x, str) for x in v) and IP.match(v[0]):
+                        add(v[0], v[1])
+                        return
+                    for x in v:
+                        walk(x)
+            walk(d)
+            return out
+        ids = {'lon': '10.255.{{octet}}.1', 'man': '10.255.{{octet}}.2', 'lds': '10.255.{{octet}}.3'}
+        adj = {'lon': ['man', 'lds'], 'man': ['lon'], 'lds': ['lon']}
+        fault = '{{fault}}'
+        me = 'lon'
+        present = sorted(ids[x] for x in adj[me] if me != fault and x != fault)
+        got = norm(json.load(open(sys.argv[1])))
+        print('ok' if sorted(got) == present and all(got[i] == 'full' for i in present) else 'wrong-content')
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: parsed-man
+      description: "The parsed neighbour data of ov-branch-man-gw is saved as structured JSON: exactly the neighbours the router really has, each in state Full"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.parsing, automation.control-flow.error-handling]
+      weight: 1.5
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/net/ospf/ov-branch-man-gw.json <<'PY' 2>/dev/null || echo unreadable
+        import json, re, sys
+        IP = re.compile(r'^\d+\.\d+\.\d+\.\d+$')
+        def state_of(v):
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list):
+                for x in v:
+                    r = state_of(x)
+                    if r:
+                        return r
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    if 'state' in str(k).lower() and isinstance(x, str):
+                        return x
+            return None
+        def norm(d):
+            out = {}
+            def add(i, st):
+                if isinstance(st, str):
+                    out[i] = st.split('/')[0].strip().lower()
+            def walk(v):
+                if isinstance(v, dict):
+                    ips = [k for k in v if isinstance(k, str) and IP.match(k)]
+                    if ips:
+                        for k in ips:
+                            add(k, state_of(v[k]))
+                        return
+                    ids = [x for k, x in v.items() if isinstance(x, str) and IP.match(x) and any(w in str(k).lower() for w in ('id', 'neighbo', 'router'))]
+                    st = state_of(v) if ids else None
+                    if isinstance(st, str):
+                        add(ids[0], st)
+                        return
+                    for x in v.values():
+                        walk(x)
+                elif isinstance(v, list):
+                    if len(v) == 2 and all(isinstance(x, str) for x in v) and IP.match(v[0]):
+                        add(v[0], v[1])
+                        return
+                    for x in v:
+                        walk(x)
+            walk(d)
+            return out
+        ids = {'lon': '10.255.{{octet}}.1', 'man': '10.255.{{octet}}.2', 'lds': '10.255.{{octet}}.3'}
+        adj = {'lon': ['man', 'lds'], 'man': ['lon'], 'lds': ['lon']}
+        fault = '{{fault}}'
+        me = 'man'
+        present = sorted(ids[x] for x in adj[me] if me != fault and x != fault)
+        got = norm(json.load(open(sys.argv[1])))
+        print('ok' if sorted(got) == present and all(got[i] == 'full' for i in present) else 'wrong-content')
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: parsed-lds
+      description: "The parsed neighbour data of ov-branch-lds-gw is saved as structured JSON: exactly the neighbours the router really has, each in state Full"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.parsing, automation.control-flow.error-handling]
+      weight: 1.5
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/net/ospf/ov-branch-lds-gw.json <<'PY' 2>/dev/null || echo unreadable
+        import json, re, sys
+        IP = re.compile(r'^\d+\.\d+\.\d+\.\d+$')
+        def state_of(v):
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list):
+                for x in v:
+                    r = state_of(x)
+                    if r:
+                        return r
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    if 'state' in str(k).lower() and isinstance(x, str):
+                        return x
+            return None
+        def norm(d):
+            out = {}
+            def add(i, st):
+                if isinstance(st, str):
+                    out[i] = st.split('/')[0].strip().lower()
+            def walk(v):
+                if isinstance(v, dict):
+                    ips = [k for k in v if isinstance(k, str) and IP.match(k)]
+                    if ips:
+                        for k in ips:
+                            add(k, state_of(v[k]))
+                        return
+                    ids = [x for k, x in v.items() if isinstance(x, str) and IP.match(x) and any(w in str(k).lower() for w in ('id', 'neighbo', 'router'))]
+                    st = state_of(v) if ids else None
+                    if isinstance(st, str):
+                        add(ids[0], st)
+                        return
+                    for x in v.values():
+                        walk(x)
+                elif isinstance(v, list):
+                    if len(v) == 2 and all(isinstance(x, str) for x in v) and IP.match(v[0]):
+                        add(v[0], v[1])
+                        return
+                    for x in v:
+                        walk(x)
+            walk(d)
+            return out
+        ids = {'lon': '10.255.{{octet}}.1', 'man': '10.255.{{octet}}.2', 'lds': '10.255.{{octet}}.3'}
+        adj = {'lon': ['man', 'lds'], 'man': ['lon'], 'lds': ['lon']}
+        fault = '{{fault}}'
+        me = 'lds'
+        present = sorted(ids[x] for x in adj[me] if me != fault and x != fault)
+        got = norm(json.load(open(sys.argv[1])))
+        print('ok' if sorted(got) == present and all(got[i] == 'full' for i in present) else 'wrong-content')
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: reported
+      description: "ospf-health.yml really fails (no ignored errors) only for the routers with a broken adjacency, names the missing neighbour, and the JSON files it writes match what the routers report"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.parsing, automation.control-flow.error-handling]
+      weight: 3
+      timeoutSec: 240
+      command: |
+        d=/home/learner/net
+        [ -f $d/ospf-health.yml ] || { echo no-playbook; exit 0; }
+        rm -f $d/ospf/ov-branch-lon-gw.json $d/ospf/ov-branch-man-gw.json $d/ospf/ov-branch-lds-gw.json
+        out=$(ct-ansible run $d env ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_RETRY_FILES_ENABLED=0 ansible-playbook ospf-health.yml 2>&1)
+        rec=$(echo "$out" | awk '/^PLAY RECAP/ { r = 1; next } r && / : /')
+        [ -n "$rec" ] || { echo no-recap; exit 0; }
+        f() { echo "$rec" | awk -v h="$1" -v k="$2" '$1 == h { for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1] == k) print kv[2] } }'; }
+        for h in ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw; do
+          [ "$(f $h unreachable)" = 0 ] || { echo "unreachable-or-missing=$h"; exit 0; }
+        done
+        [ {{fault}} = man ] && good=ov-branch-lds-gw fid=2 || good=ov-branch-man-gw fid=3
+        [ "$(f $good failed)" = 0 ] || { echo "healthy-router-failed=$good"; exit 0; }
+        for h in ov-branch-lon-gw ov-branch-{{fault}}-gw; do
+          [ "$(f $h failed)" -ge 1 ] 2>/dev/null || { echo "not-failed=$h"; exit 0; }
+          [ "$(f $h ignored)" = 0 ] || { echo "errors-ignored=$h"; exit 0; }
+        done
+        echo "$out" | grep -E '^(fatal|failed): \[ov-branch-lon-gw\]' | grep -qE "10\.255\.{{octet}}\.$fid([^0-9]|$)" || { echo neighbour-not-named=ov-branch-lon-gw; exit 0; }
+        echo "$out" | grep -E '^(fatal|failed): \[ov-branch-{{fault}}-gw\]' | grep -qE '10\.255\.{{octet}}\.1([^0-9]|$)' || { echo neighbour-not-named=ov-branch-{{fault}}-gw; exit 0; }
+        t=$(mktemp -d)
+        for h in ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw; do
+          [ -s $d/ospf/$h.json ] || { echo "not-saved=$h"; rm -rf $t; exit 0; }
+          ct-ansible run $d ssh -o BatchMode=yes ovauto@$h "sudo -n vtysh -c 'show ip ospf neighbor json'" > $t/$h.json 2>/dev/null || { echo "device-unreadable=$h"; rm -rf $t; exit 0; }
+        done
+        /opt/ansible/bin/python3 - $d/ospf $t <<'PY' 2>/dev/null || echo unreadable
+        import json, re, sys
+        IP = re.compile(r'^\d+\.\d+\.\d+\.\d+$')
+        def state_of(v):
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list):
+                for x in v:
+                    r = state_of(x)
+                    if r:
+                        return r
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    if 'state' in str(k).lower() and isinstance(x, str):
+                        return x
+            return None
+        def norm(d):
+            out = {}
+            def add(i, st):
+                if isinstance(st, str):
+                    out[i] = st.split('/')[0].strip().lower()
+            def walk(v):
+                if isinstance(v, dict):
+                    ips = [k for k in v if isinstance(k, str) and IP.match(k)]
+                    if ips:
+                        for k in ips:
+                            add(k, state_of(v[k]))
+                        return
+                    ids = [x for k, x in v.items() if isinstance(x, str) and IP.match(x) and any(w in str(k).lower() for w in ('id', 'neighbo', 'router'))]
+                    st = state_of(v) if ids else None
+                    if isinstance(st, str):
+                        add(ids[0], st)
+                        return
+                    for x in v.values():
+                        walk(x)
+                elif isinstance(v, list):
+                    if len(v) == 2 and all(isinstance(x, str) for x in v) and IP.match(v[0]):
+                        add(v[0], v[1])
+                        return
+                    for x in v:
+                        walk(x)
+            walk(d)
+            return out
+        bad = []
+        for h in ('ov-branch-lon-gw', 'ov-branch-man-gw', 'ov-branch-lds-gw'):
+            try:
+                mine = norm(json.load(open(sys.argv[1] + '/' + h + '.json')))
+            except Exception:
+                bad.append('unreadable=' + h)
+                continue
+            if mine != norm(json.load(open(sys.argv[2] + '/' + h + '.json'))):
+                bad.append('differs-from-device=' + h)
+        print(' '.join(bad) or 'ok')
+        PY
+        rm -rf $t
+      expect: { match: exact, value: "ok" }
+    - id: fault-man-intact
+      description: "The network was only observed: ov-branch-man-gw keeps its configuration"
+      type: shell
+      on: ov-branch-man-gw
+      skills: [automation.control-flow.error-handling]
+      weight: 0.5
+      command: |
+        [ "{{fault}}" = man ] && want=1 || want=0
+        have=$(vtysh -c 'show running-config' | grep -c 'ip ospf hello-interval 20')
+        [ "$have" = "$want" ] && echo intact || echo changed
+      expect: { match: exact, value: "intact" }
+    - id: fault-lds-intact
+      description: "The network was only observed: ov-branch-lds-gw keeps its configuration"
+      type: shell
+      on: ov-branch-lds-gw
+      skills: [automation.control-flow.error-handling]
+      weight: 0.5
+      command: |
+        [ "{{fault}}" = lds ] && want=1 || want=0
+        have=$(vtysh -c 'show running-config' | grep -c 'ip ospf hello-interval 20')
+        [ "$have" = "$want" ] && echo intact || echo changed
+      expect: { match: exact, value: "intact" }
+  hints:
+    - title: "Text to data"
+      body: |
+        `show ip ospf neighbor` prints a table. The `regex_findall` filter with `multiline=True` can pull the neighbour id and the state out of every row at once; `dict()` of the resulting pairs gives a lookup by neighbour id.
+      cost: 2
+    - title: "Saying which router failed"
+      body: |
+        `ansible.builtin.assert` fails the task for the host with `fail_msg`. Put `{{ inventory_hostname }}` and the neighbour id in the message; a `loop` over the host's expected neighbours reports the first one that is missing.
+      cost: 1
+    - title: "Keep the data even when it fails"
+      body: |
+        The task that saves the parsed data must come before the assertion, otherwise a failing host leaves no file behind.
+      cost: 1
+  misconceptions:
+    - id: failures-ignored
+      description: "Prints the problem but ignores the failure so the play ends green."
+      feedback: "The play must fail for a router with a missing or not-Full neighbour."
+      expectFail: [reported]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > ospf-health.yml <<'EOF'
+          - name: OSPF health
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/expected.yml
+            tasks:
+              - name: OSPF neighbours
+                ansible.builtin.command: vtysh -c 'show ip ospf neighbor'
+                register: nb
+                changed_when: false
+              - name: Parse the neighbour table
+                ansible.builtin.set_fact:
+                  ospf_state: "{{ dict(nb.stdout | regex_findall('^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+\\d+\\s+(\\w+)', multiline=True)) }}"
+              - name: Keep the structured data
+                ansible.builtin.copy:
+                  dest: /home/learner/net/ospf/{{ inventory_hostname }}.json
+                  content: "{{ ospf_state | to_nice_json }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+              - name: Every expected neighbour is Full
+                ansible.builtin.assert:
+                  that: ospf_state[item] | default('missing') == 'Full'
+                  fail_msg: "{{ inventory_hostname }}: OSPF neighbour {{ item }} is {{ ospf_state[item] | default('missing') }}"
+                loop: "{{ expected_neighbors[inventory_hostname] }}"
+                ignore_errors: true
+          EOF
+          ansible-playbook ospf-health.yml || true
+    - id: any-full-neighbour
+      description: "Passes a router as soon as any neighbour is Full."
+      feedback: "Every expected neighbour must be Full, not just one of them."
+      expectFail: [reported]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > ospf-health.yml <<'EOF'
+          - name: OSPF health
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/expected.yml
+            tasks:
+              - name: OSPF neighbours
+                ansible.builtin.command: vtysh -c 'show ip ospf neighbor'
+                register: nb
+                changed_when: false
+              - name: Parse the neighbour table
+                ansible.builtin.set_fact:
+                  ospf_state: "{{ dict(nb.stdout | regex_findall('^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+\\d+\\s+(\\w+)', multiline=True)) }}"
+              - name: Keep the structured data
+                ansible.builtin.copy:
+                  dest: /home/learner/net/ospf/{{ inventory_hostname }}.json
+                  content: "{{ ospf_state | to_nice_json }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+              - name: Every expected neighbour is Full
+                ansible.builtin.assert:
+                  that: "'Full' in nb.stdout"
+                  fail_msg: "{{ inventory_hostname }}: OSPF neighbour {{ item }} is {{ ospf_state[item] | default('missing') }}"
+                loop: "{{ expected_neighbors[inventory_hostname] }}"
+          EOF
+          ansible-playbook ospf-health.yml || true
+    - id: nothing-saved
+      description: "Asserts correctly but keeps no structured data."
+      feedback: "The parsed data must be saved per router for later reports."
+      expectFail: [parsed-lon, parsed-man, parsed-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > ospf-health.yml <<'EOF'
+          - name: OSPF health
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/expected.yml
+            tasks:
+              - name: OSPF neighbours
+                ansible.builtin.command: vtysh -c 'show ip ospf neighbor'
+                register: nb
+                changed_when: false
+              - name: Parse the neighbour table
+                ansible.builtin.set_fact:
+                  ospf_state: "{{ dict(nb.stdout | regex_findall('^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+\\d+\\s+(\\w+)', multiline=True)) }}"
+              - name: Every expected neighbour is Full
+                ansible.builtin.assert:
+                  that: ospf_state[item] | default('missing') == 'Full'
+                  fail_msg: "{{ inventory_hostname }}: OSPF neighbour {{ item }} is {{ ospf_state[item] | default('missing') }}"
+                loop: "{{ expected_neighbors[inventory_hostname] }}"
+          EOF
+          ansible-playbook ospf-health.yml || true
+  solution:
+    explanation: |
+      The play reads the neighbour table on every router, extracts neighbour id and state with `regex_findall`, keeps the
+      result as a dictionary and saves it as JSON on the control node before asserting. The assertion loops over the
+      router's expected neighbours (from the supplied variables) and fails with a message naming the router and the
+      neighbour, so exactly the routers that miss a Full adjacency fail the play. Nothing on the network is changed.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > ospf-health.yml <<'EOF'
+          - name: OSPF health
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/expected.yml
+            tasks:
+              - name: OSPF neighbours
+                ansible.builtin.command: vtysh -c 'show ip ospf neighbor'
+                register: nb
+                changed_when: false
+              - name: Parse the neighbour table
+                ansible.builtin.set_fact:
+                  ospf_state: "{{ dict(nb.stdout | regex_findall('^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+\\d+\\s+(\\w+)', multiline=True)) }}"
+              - name: Keep the structured data
+                ansible.builtin.copy:
+                  dest: /home/learner/net/ospf/{{ inventory_hostname }}.json
+                  content: "{{ ospf_state | to_nice_json }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+              - name: Every expected neighbour is Full
+                ansible.builtin.assert:
+                  that: ospf_state[item] | default('missing') == 'Full'
+                  fail_msg: "{{ inventory_hostname }}: OSPF neighbour {{ item }} is {{ ospf_state[item] | default('missing') }}"
+                loop: "{{ expected_neighbors[inventory_hostname] }}"
+          EOF
+          ansible-playbook ospf-health.yml || true
+    alternatives:
+      - id: split-columns
+        description: "Splits each table row into columns in a loop instead of using a regular expression."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/net
+              cat > ospf-health.yml <<'EOF'
+              - name: OSPF health
+                hosts: branch_routers
+                become: true
+                gather_facts: false
+                vars_files:
+                  - vars/expected.yml
+                tasks:
+                  - name: OSPF neighbours
+                    ansible.builtin.command: vtysh -c 'show ip ospf neighbor'
+                    register: nb
+                    changed_when: false
+                  - name: Start with an empty table
+                    ansible.builtin.set_fact:
+                      ospf_state: {}
+                  - name: Parse the neighbour table row by row
+                    ansible.builtin.set_fact:
+                      ospf_state: "{{ ospf_state | combine({item.split()[0]: item.split()[2].split('/')[0]}) }}"
+                    loop: "{{ nb.stdout_lines | select('match', '^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+ ') | list }}"
+                  - name: Keep the structured data
+                    ansible.builtin.copy:
+                      dest: /home/learner/net/ospf/{{ inventory_hostname }}.json
+                      content: "{{ ospf_state | to_nice_json }}\n"
+                      mode: "0644"
+                    delegate_to: localhost
+                    become: false
+                  - name: Every expected neighbour is Full
+                    ansible.builtin.assert:
+                      that: ospf_state[item] | default('missing') == 'Full'
+                      fail_msg: "{{ inventory_hostname }}: OSPF neighbour {{ item }} is {{ ospf_state[item] | default('missing') }}"
+                    loop: "{{ expected_neighbors[inventory_hostname] }}"
+              EOF
+              ansible-playbook ospf-health.yml || true

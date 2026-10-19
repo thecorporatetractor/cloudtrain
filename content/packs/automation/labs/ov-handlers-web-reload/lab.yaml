@@ -1,0 +1,448 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-handlers-web-reload
+  title: "Reload the claims web server only when its configuration changes"
+  domain: automation
+  frameworks: [ex294-aligned:core-components, ex294-aligned:plays-errors]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ansible, handlers, nginx, templates, tier-b]
+  version: 1
+spec:
+  description: |
+    The claims web nodes `ov-claims-web1` and `ov-claims-web2` run nginx. The legacy playbook
+    **`/home/learner/claims-automation/web.yml`** restarts the service on every run and drops sessions.
+    The portal must move to **port {{port}}** (the port is the variable `claims_port` in `group_vars/claims_web.yml`;
+    the template is `templates/nginx.conf.j2`).
+
+    Rework `web.yml` so that:
+
+    - the new configuration is applied by **reloading** nginx, only when the configuration actually changed;
+    - an unchanged run touches nothing, and does not restart or reload the service;
+    - a configuration that does not pass nginx's own syntax test never replaces the live file, so it can never reach the reload.
+
+    Do not run the legacy playbook before you have changed it: the grader compares nginx with the process that was
+    running when the lab started. Run your playbook; the grader runs it again.
+  objectives:
+    - "Notify a handler from a template task"
+    - "Reload instead of restarting a service"
+    - "Validate a rendered configuration before it is installed"
+  params:
+    port:
+      type: choice
+      values: [8008, 8009, 9000]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-claims-web1
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-nginx-pid ] && exit 0
+        rpm -q nginx >/dev/null 2>&1 || dnf -y -q install nginx >/dev/null
+        cat > /etc/nginx/nginx.conf <<'CONF'
+        user nginx;
+        worker_processes 1;
+        error_log /var/log/nginx/error.log;
+        pid /run/nginx.pid;
+        events {
+            worker_connections 256;
+        }
+        http {
+            access_log /var/log/nginx/access.log;
+            default_type text/plain;
+            server {
+                listen 80;
+                server_name _;
+                location / {
+                    return 200 "claims portal\n";
+                }
+            }
+        }
+        CONF
+        systemctl enable --now nginx
+        sleep 2
+        systemctl show -p MainPID --value nginx > /var/tmp/.ct-nginx-pid
+    - on: ov-claims-web2
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-nginx-pid ] && exit 0
+        rpm -q nginx >/dev/null 2>&1 || dnf -y -q install nginx >/dev/null
+        cat > /etc/nginx/nginx.conf <<'CONF'
+        user nginx;
+        worker_processes 1;
+        error_log /var/log/nginx/error.log;
+        pid /run/nginx.pid;
+        events {
+            worker_connections 256;
+        }
+        http {
+            access_log /var/log/nginx/access.log;
+            default_type text/plain;
+            server {
+                listen 80;
+                server_name _;
+                location / {
+                    return 200 "claims portal\n";
+                }
+            }
+        }
+        CONF
+        systemctl enable --now nginx
+        sleep 2
+        systemctl show -p MainPID --value nginx > /var/tmp/.ct-nginx-pid
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/templates $p/group_vars
+        cat > $p/templates/nginx.conf.j2 <<'EOF'
+        user nginx;
+        worker_processes 1;
+        error_log /var/log/nginx/error.log;
+        pid /run/nginx.pid;
+        events {
+            worker_connections 256;
+        }
+        http {
+            access_log /var/log/nginx/access.log;
+            default_type text/plain;
+            server {
+                listen {{ claims_port }};
+                server_name {{ inventory_hostname }};
+                location / {
+                    return 200 "claims portal\n";
+                }
+            }
+        }
+        EOF
+        printf 'claims_port: {{port}}\n' > $p/group_vars/claims_web.yml
+        cat > $p/web.yml <<'EOF'
+        - name: Claims web nodes
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: nginx package
+              ansible.builtin.dnf:
+                name: nginx
+                state: present
+            - name: Site configuration
+              ansible.builtin.template:
+                src: nginx.conf.j2
+                dest: /etc/nginx/nginx.conf
+                owner: root
+                group: root
+                mode: "0644"
+            - name: Restart nginx
+              ansible.builtin.service:
+                name: nginx
+                state: restarted
+                enabled: true
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: web-web1
+      description: "nginx on ov-claims-web1 serves the new port from a valid configuration and is the same process that was running when the lab started"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.control-flow.handlers, automation.modules.packages-services]
+      weight: 2
+      command: &webstate |
+        p=$(systemctl show -p MainPID --value nginx)
+        [ "$p" = "$(cat /var/tmp/.ct-nginx-pid)" ] && m=same-master || m=new-master
+        ss -ltn | grep -q ':{{port}} ' && l=listening || l=closed
+        nginx -t >/dev/null 2>&1 && c=valid || c=invalid
+        echo "$m $l $c"
+      expect: { match: exact, value: "same-master listening valid" }
+    - { id: web-web2, description: "nginx on ov-claims-web2 serves the new port from a valid configuration and is the same process that was running when the lab started", type: shell, on: ov-claims-web2, skills: [automation.control-flow.handlers, automation.modules.packages-services], weight: 2, command: *webstate, expect: { match: exact, value: "same-master listening valid" } }
+    - id: structure
+      description: "web.yml changes the site configuration through a validated template that notifies a handler, and no task restarts the service"
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.handlers, automation.modules.packages-services]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/claims-automation/web.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def mod(t):
+            for k, v in t.items():
+                n = k.split('.')[-1]
+                if n in ('template', 'copy', 'service', 'systemd', 'systemd_service', 'command', 'shell'):
+                    return n, (v if isinstance(v, dict) else {'cmd': str(v)})
+            return None, {}
+        notify = reload = validate = restart = False
+        for p in plays:
+            for t in (p.get('tasks') or []):
+                n, a = mod(t)
+                if t.get('notify'): notify = True
+                if n in ('template', 'copy') and 'nginx -t' in str(a.get('validate', '')): validate = True
+                if n in ('service', 'systemd', 'systemd_service') and a.get('state') == 'restarted': restart = True
+            for h in (p.get('handlers') or []):
+                n, a = mod(h)
+                if n in ('service', 'systemd', 'systemd_service') and a.get('state') == 'reloaded': reload = True
+                if n in ('command', 'shell') and 'reload' in str(a.get('cmd', '')) : reload = True
+        bad = [k for k, ok in (('no-notify', notify), ('no-reload-handler', reload), ('no-validate', validate), ('restart-left', not restart)) if not ok]
+        print('ok' if not bad else ','.join(bad))
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: rerun-quiet
+      description: "web.yml runs again without changes and without restarting nginx"
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.handlers, automation.modules.packages-services]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        d=/home/learner/claims-automation
+        a=$(ct-ansible run $d ssh ov-claims-web1 systemctl show -p MainPID --value nginx)
+        r=$(ct-ansible recap $d web.yml)
+        b=$(ct-ansible run $d ssh ov-claims-web1 systemctl show -p MainPID --value nginx)
+        [ "$a" = "$b" ] || { echo restarted-on-rerun; exit 0; }
+        echo "$r"
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Do not run the old playbook"
+      body: |
+        The grader compares nginx with the process that was running when the lab started. Running the legacy `web.yml` once restarts nginx on both nodes, so change the playbook before its first run.
+      cost: 1
+    - title: "Notify a handler"
+      body: |
+        `notify: Handler name` on the template task queues a handler only when that task reports a change. Handlers live in the play's `handlers:` section and run once at the end of the play.
+      cost: 1
+    - title: "Never reload a broken file"
+      body: |
+        `ansible.builtin.template` accepts `validate:` with a command that receives the rendered file as `%s`. nginx can test a complete file with `nginx -t -c`.
+      cost: 2
+  misconceptions:
+    - id: restart-handler
+      description: "Moves the restart into a handler but keeps it a restart."
+      feedback: "A restart replaces the nginx master process and drops connections; the handler must reload."
+      expectFail: [web-web1, web-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > web.yml <<'EOF'
+          - name: Claims web nodes
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: nginx package
+                ansible.builtin.dnf:
+                  name: nginx
+                  state: present
+              - name: Site configuration
+                ansible.builtin.template:
+                  src: nginx.conf.j2
+                  dest: /etc/nginx/nginx.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+                  validate: nginx -t -c %s
+                notify: Restart nginx
+              - name: nginx running and enabled
+                ansible.builtin.service:
+                  name: nginx
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Restart nginx
+                ansible.builtin.service:
+                  name: nginx
+                  state: restarted
+          EOF
+          ansible-playbook web.yml
+    - id: reload-every-run
+      description: "Reloads nginx with an ordinary task instead of a handler."
+      feedback: "A task that reloads on every run reports a change every time; notify a handler so it runs only when the configuration changed."
+      expectFail: [rerun-quiet, structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > web.yml <<'EOF'
+          - name: Claims web nodes
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: nginx package
+                ansible.builtin.dnf:
+                  name: nginx
+                  state: present
+              - name: Site configuration
+                ansible.builtin.template:
+                  src: nginx.conf.j2
+                  dest: /etc/nginx/nginx.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+                  validate: nginx -t -c %s
+              - name: nginx running and enabled
+                ansible.builtin.service:
+                  name: nginx
+                  state: started
+                  enabled: true
+
+              - name: Reload nginx
+                ansible.builtin.service:
+                  name: nginx
+                  state: reloaded
+          EOF
+          ansible-playbook web.yml
+    - id: no-validation
+      description: "Notifies a reload handler but never tests the new file first."
+      feedback: "A syntax error would reach the reload; the template task must validate the rendered file."
+      expectFail: [structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > web.yml <<'EOF'
+          - name: Claims web nodes
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: nginx package
+                ansible.builtin.dnf:
+                  name: nginx
+                  state: present
+              - name: Site configuration
+                ansible.builtin.template:
+                  src: nginx.conf.j2
+                  dest: /etc/nginx/nginx.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+                notify: Reload nginx
+              - name: nginx running and enabled
+                ansible.builtin.service:
+                  name: nginx
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Reload nginx
+                ansible.builtin.service:
+                  name: nginx
+                  state: reloaded
+          EOF
+          ansible-playbook web.yml
+  solution:
+    explanation: |
+      The template task validates the rendered file with `nginx -t -c %s` before it replaces the live
+      configuration, and `notify` queues the handler only when the file changed. The handler reloads
+      nginx (a HUP to the same master process, so no connection is dropped). On the second run nothing
+      changes, so the handler never fires.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > web.yml <<'EOF'
+          - name: Claims web nodes
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: nginx package
+                ansible.builtin.dnf:
+                  name: nginx
+                  state: present
+              - name: Site configuration
+                ansible.builtin.template:
+                  src: nginx.conf.j2
+                  dest: /etc/nginx/nginx.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+                  validate: nginx -t -c %s
+                notify: Reload nginx
+              - name: nginx running and enabled
+                ansible.builtin.service:
+                  name: nginx
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Reload nginx
+                ansible.builtin.service:
+                  name: nginx
+                  state: reloaded
+          EOF
+          ansible-playbook web.yml
+    alternatives:
+      - id: systemd-listen
+        description: "Uses the systemd module in the handler, with a listen topic that several tasks can share."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > web.yml <<'EOF'
+              - name: Claims web nodes
+                hosts: claims_web
+                become: true
+                tasks:
+                  - name: nginx package
+                    ansible.builtin.dnf:
+                      name: nginx
+                      state: present
+                  - name: Site configuration
+                    ansible.builtin.template:
+                      src: nginx.conf.j2
+                      dest: /etc/nginx/nginx.conf
+                      owner: root
+                      group: root
+                      mode: "0644"
+                      validate: nginx -t -c %s
+                    notify: reload web
+                  - name: nginx running and enabled
+                    ansible.builtin.service:
+                      name: nginx
+                      state: started
+                      enabled: true
+                handlers:
+                  - name: Reload nginx
+                    listen: reload web
+                    ansible.builtin.systemd:
+                      name: nginx
+                      state: reloaded
+              EOF
+              ansible-playbook web.yml

@@ -1,0 +1,592 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-net-config-backup-restore
+  title: "Back up router configs and restore one after a bad change"
+  domain: automation
+  frameworks: [ex457-aligned:config-backup]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [ansible, network, frr, git, backup, restore, tier-n, blocked]
+  version: 1
+spec:
+  description: |
+    Last night's backup of the branch routers is in the Git repository `/home/learner/net-configs.git` (working copy
+    `/home/learner/net/repo`, files `configs/<router>.conf`). This morning a change made on `ov-branch-lon-gw` broke
+    its OSPF adjacencies with the other branches.
+
+    - Write **`backup.yml`** in `/home/learner/net` that saves the running configuration of **every** branch router into
+      `configs/` of the working copy, commits it with a message of the form `backup YYYY-MM-DD`, and pushes the commit to
+      the central repository.
+    - Write **`restore.yml`** that puts `ov-branch-lon-gw` back to its last known good configuration and prove that its
+      OSPF adjacencies return.
+
+    Do not rewrite the repository's history. The grader reads the repository and the router's state.
+  objectives:
+    - "Back up device configurations into Git"
+    - "Choose the right backup to restore"
+    - "Restore a device configuration with a playbook"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-man-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-lds-gw, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth3" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-man-gw:eth3" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-lds-gw:eth3" }
+      - { a: "ov-branch-lon-gw:eth1", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-branch-lon-gw:eth2", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      timeoutSec: 120
+      run: &ov-router |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=21 ;; ov-branch-man-gw) a=22 ;; ov-branch-lds-gw) a=23 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth3 up
+        ip addr replace 10.70.0.$a/24 dev eth3
+        for c in sshd useradd chpasswd sudo python3; do
+          command -v $c >/dev/null 2>&1 || { echo "blocked: this frr image has no $c; routers need openssh-server, sudo, python3 and an automation account (image rebuild)" >&2; exit 1; }
+        done
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-branch-man-gw, timeoutSec: 120, run: *ov-router }
+    - { on: ov-branch-lds-gw, timeoutSec: 120, run: *ov-router }
+    - on: ov-branch-lon-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        interface eth2
+         ip address 10.{{octet}}.2.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+        !
+    - on: ov-branch-man-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.2/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+        !
+    - on: ov-branch-lds-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.3/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.2.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+        !
+    - on: ov-branch-lon-gw
+      run: |
+        vtysh -c 'configure terminal' -c 'interface eth1' -c 'ip ospf hello-interval 30' -c 'ip ospf dead-interval 120'
+        echo y | vtysh -c 'clear ip ospf process' || true
+    - on: ov-branch-man-gw
+      run: |
+        echo y | vtysh -c 'clear ip ospf process' || true
+    - on: ov-ctl
+      timeoutSec: 400
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.21 ov-branch-man-gw=10.70.0.22 ov-branch-lds-gw=10.70.0.23
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw
+        p=/home/learner/net
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        branch_routers:
+          hosts:
+            ov-branch-lon-gw:
+            ov-branch-man-gw:
+            ov-branch-lds-gw:
+          vars:
+            ansible_connection: ssh
+            ansible_network_os: frr
+            ansible_python_interpreter: /usr/bin/python3
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        repo=/home/learner/net-configs.git
+        runuser -l learner -c "git init -q --bare -b main $repo"
+        runuser -l learner -c "git clone -q $repo $p/repo"
+        runuser -l learner -c "git -C $p/repo config user.name 'Orrin and Vale automation'; git -C $p/repo config user.email 'automation@orrinvale.example'"
+        mkdir -p $p/repo/configs
+        cat > $p/repo/configs/ov-branch-lon-gw.conf <<'EOF'
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        interface eth2
+         ip address 10.{{octet}}.2.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+        !
+        EOF
+        cat > $p/repo/configs/ov-branch-man-gw.conf <<'EOF'
+        interface lo
+         ip address 10.255.{{octet}}.2/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+        !
+        EOF
+        cat > $p/repo/configs/ov-branch-lds-gw.conf <<'EOF'
+        interface lo
+         ip address 10.255.{{octet}}.3/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.2.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+        !
+        EOF
+        chown -R learner:learner $p
+        runuser -l learner -c "cd $p/repo && git add configs && git commit -q -m 'backup 2026-10-17 nightly' && git branch -M main && git push -q origin main"
+        runuser -u learner -- git --git-dir=$repo rev-parse main > /var/tmp/.ct-seed-commit
+        chown -R learner:learner $p
+  checks:
+    - id: backup-commit
+      description: "The central repository has a new dated backup commit on top of the existing history, holding a configuration file for every branch router"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.backup-facts, automation.devworkflow.git]
+      weight: 3
+      command: |
+        g() { runuser -u learner -- git --git-dir=/home/learner/net-configs.git "$@"; }
+        seed=$(cat /var/tmp/.ct-seed-commit)
+        g merge-base --is-ancestor $seed main 2>/dev/null || { echo history-rewritten; exit 0; }
+        n=$(g log --format=%s main | grep -cE '^backup [0-9]{4}-[0-9]{2}-[0-9]{2}')
+        [ "$n" -ge 2 ] || { echo no-new-backup-commit; exit 0; }
+        f=$(g ls-tree -r --name-only main | grep -cE '^configs/ov-branch-(lon|man|lds)-gw\.conf$')
+        [ "$f" = 3 ] || { echo "files=$f"; exit 0; }
+        g show main:configs/ov-branch-lon-gw.conf | grep -q 'router ospf' || { echo lon-config-empty; exit 0; }
+        echo ok
+      expect: { match: exact, value: "ok" }
+    - id: restored-lon
+      description: "ov-branch-lon-gw has both OSPF adjacencies Full again and its OSPF timers are back to the standard values"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.network.backup-facts, automation.devworkflow.git]
+      weight: 3
+      timeoutSec: 130
+      command: |
+        for i in $(seq 100); do
+          n=$(vtysh -c 'show ip ospf neighbor' 2>/dev/null | grep -c Full)
+          [ "$n" = 2 ] && break; sleep 1
+        done
+        t=$(vtysh -c 'show ip ospf interface eth1' 2>/dev/null | grep -c 'Hello 10s, Dead 40s')
+        echo "full=$n timers=$t"
+      expect: { match: exact, value: "full=2 timers=1" }
+    - id: restore-rerun
+      description: "restore.yml runs again without errors and without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.backup-facts, automation.devworkflow.git]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        ct-ansible recap /home/learner/net restore.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Getting the configuration"
+      body: |
+        `vtysh -c 'show running-config'` prints the router's configuration. Store each router's output in a file named after it under `configs/` in the working copy `/home/learner/net/repo`, then `git add`, `git commit` and `git push origin main` from there.
+      cost: 1
+    - title: "Which backup is good?"
+      body: |
+        The repository already has last night's backup. Compare it with what the broken router runs now; a backup taken after the bad change contains the bad change. `git log` and `git show <revision>:<path>` read old versions.
+      cost: 2
+    - title: "Applying a stored configuration"
+      body: |
+        `vtysh -f <file>` applies a file of FRR commands to the running configuration; values stated in the file overwrite the current ones. Copy the file to the router first.
+      cost: 1
+  misconceptions:
+    - id: restore-fresh-backup
+      description: "Takes a new backup and restores the router from it."
+      feedback: "The new backup already contains the bad change; restore from the last backup taken before it."
+      expectFail: [restored-lon]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/net
+          cat > backup.yml <<'EOF'
+          - name: Back up the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Running configuration
+                ansible.builtin.command: vtysh -c 'show running-config'
+                register: running
+                changed_when: false
+              - name: Store it in the working copy
+                ansible.builtin.copy:
+                  dest: /home/learner/net/repo/configs/{{ inventory_hostname }}.conf
+                  content: "{{ running.stdout }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          - name: Commit and push
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            tasks:
+              - name: Commit when something changed
+                ansible.builtin.shell: |
+                  git add configs
+                  if git diff --cached --quiet; then echo unchanged; else git commit -q -m "backup $(date +%F)" && echo committed; fi
+                args:
+                  chdir: /home/learner/net/repo
+                register: commit
+                changed_when: "'committed' in commit.stdout"
+              - name: Push to the central repository
+                ansible.builtin.command: git push -q origin main
+                args:
+                  chdir: /home/learner/net/repo
+                changed_when: "'committed' in commit.stdout"
+          EOF
+          cat > restore.yml <<'EOF'
+          - name: Restore ov-branch-lon-gw from a backup
+            hosts: ov-branch-lon-gw
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Pick the revision
+                ansible.builtin.command: echo main
+                args:
+                  chdir: /home/learner/net/repo
+                register: good_rev
+                delegate_to: localhost
+                become: false
+                changed_when: false
+              - name: Configuration from that revision
+                ansible.builtin.command: "git show {{ good_rev.stdout }}:configs/{{ inventory_hostname }}.conf"
+                args:
+                  chdir: /home/learner/net/repo
+                register: good_conf
+                delegate_to: localhost
+                become: false
+                changed_when: false
+              - name: Put the file on the router
+                ansible.builtin.copy:
+                  content: "{{ good_conf.stdout }}\n"
+                  dest: /etc/frr/restore.conf
+                  mode: "0640"
+                register: put
+              - name: Apply it
+                ansible.builtin.command: vtysh -f /etc/frr/restore.conf
+                when: put.changed
+          EOF
+          ansible-playbook backup.yml
+          ansible-playbook restore.yml || true
+    - id: backup-not-committed
+      description: "Fetches the configurations into the working copy but never commits them."
+      feedback: "The backup is only a backup once it is a dated commit in the repository."
+      expectFail: [backup-commit]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > backup.yml <<'EOF'
+          - name: Back up the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Running configuration
+                ansible.builtin.command: vtysh -c 'show running-config'
+                register: running
+                changed_when: false
+              - name: Store it in the working copy
+                ansible.builtin.copy:
+                  dest: /home/learner/net/repo/configs/{{ inventory_hostname }}.conf
+                  content: "{{ running.stdout }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          EOF
+          ansible-playbook backup.yml
+    - id: commit-not-pushed
+      description: "Commits the backup in the working copy but does not push it."
+      feedback: "The central repository is the backup; push the commit."
+      expectFail: [backup-commit]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > backup.yml <<'EOF'
+          - name: Back up the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Running configuration
+                ansible.builtin.command: vtysh -c 'show running-config'
+                register: running
+                changed_when: false
+              - name: Store it in the working copy
+                ansible.builtin.copy:
+                  dest: /home/learner/net/repo/configs/{{ inventory_hostname }}.conf
+                  content: "{{ running.stdout }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          - name: Commit and push
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            tasks:
+              - name: Commit when something changed
+                ansible.builtin.shell: |
+                  git add configs
+                  if git diff --cached --quiet; then echo unchanged; else git commit -q -m "backup $(date +%F)" && echo committed; fi
+                args:
+                  chdir: /home/learner/net/repo
+                register: commit
+                changed_when: "'committed' in commit.stdout"
+          EOF
+          ansible-playbook backup.yml
+  solution:
+    explanation: |
+      `backup.yml` stores every router's running configuration in the working copy, commits with a dated message only when
+      something changed, and pushes to the central bare repository. `restore.yml` reads lon's configuration from the
+      earliest backup commit, the last one taken before the bad change, copies it to the router and applies it with
+      `vtysh -f`; the timers in the file overwrite the bad ones and the adjacencies come back.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/net
+          cat > backup.yml <<'EOF'
+          - name: Back up the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Running configuration
+                ansible.builtin.command: vtysh -c 'show running-config'
+                register: running
+                changed_when: false
+              - name: Store it in the working copy
+                ansible.builtin.copy:
+                  dest: /home/learner/net/repo/configs/{{ inventory_hostname }}.conf
+                  content: "{{ running.stdout }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          - name: Commit and push
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            tasks:
+              - name: Commit when something changed
+                ansible.builtin.shell: |
+                  git add configs
+                  if git diff --cached --quiet; then echo unchanged; else git commit -q -m "backup $(date +%F)" && echo committed; fi
+                args:
+                  chdir: /home/learner/net/repo
+                register: commit
+                changed_when: "'committed' in commit.stdout"
+              - name: Push to the central repository
+                ansible.builtin.command: git push -q origin main
+                args:
+                  chdir: /home/learner/net/repo
+                changed_when: "'committed' in commit.stdout"
+          EOF
+          cat > restore.yml <<'EOF'
+          - name: Restore ov-branch-lon-gw from a backup
+            hosts: ov-branch-lon-gw
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Pick the revision
+                ansible.builtin.command: git rev-list --max-parents=0 main
+                args:
+                  chdir: /home/learner/net/repo
+                register: good_rev
+                delegate_to: localhost
+                become: false
+                changed_when: false
+              - name: Configuration from that revision
+                ansible.builtin.command: "git show {{ good_rev.stdout }}:configs/{{ inventory_hostname }}.conf"
+                args:
+                  chdir: /home/learner/net/repo
+                register: good_conf
+                delegate_to: localhost
+                become: false
+                changed_when: false
+              - name: Put the file on the router
+                ansible.builtin.copy:
+                  content: "{{ good_conf.stdout }}\n"
+                  dest: /etc/frr/restore.conf
+                  mode: "0640"
+                register: put
+              - name: Apply it
+                ansible.builtin.command: vtysh -f /etc/frr/restore.conf
+                when: put.changed
+          EOF
+          ansible-playbook backup.yml
+          ansible-playbook restore.yml
+    alternatives:
+      - id: git-module
+        description: "Checks the good revision out with the git module and copies the file from the checkout."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 400
+            run: |
+              set -e
+              cd ~/net
+              cat > backup.yml <<'EOF'
+              - name: Back up the branch routers
+                hosts: branch_routers
+                become: true
+                gather_facts: false
+                tasks:
+                  - name: Running configuration
+                    ansible.builtin.command: vtysh -c 'show running-config'
+                    register: running
+                    changed_when: false
+                  - name: Store it in the working copy
+                    ansible.builtin.copy:
+                      dest: /home/learner/net/repo/configs/{{ inventory_hostname }}.conf
+                      content: "{{ running.stdout }}\n"
+                      mode: "0644"
+                    delegate_to: localhost
+                    become: false
+              - name: Commit and push
+                hosts: localhost
+                connection: local
+                gather_facts: false
+                tasks:
+                  - name: Commit when something changed
+                    ansible.builtin.shell: |
+                      git add configs
+                      if git diff --cached --quiet; then echo unchanged; else git commit -q -m "backup $(date +%F)" && echo committed; fi
+                    args:
+                      chdir: /home/learner/net/repo
+                    register: commit
+                    changed_when: "'committed' in commit.stdout"
+                  - name: Push to the central repository
+                    ansible.builtin.command: git push -q origin main
+                    args:
+                      chdir: /home/learner/net/repo
+                    changed_when: "'committed' in commit.stdout"
+              EOF
+              cat > restore.yml <<'EOF'
+              - name: Restore ov-branch-lon-gw from the last known good backup
+                hosts: ov-branch-lon-gw
+                become: true
+                gather_facts: false
+                tasks:
+                  - name: Last known good backup
+                    ansible.builtin.command: git rev-list --max-parents=0 main
+                    args:
+                      chdir: /home/learner/net/repo
+                    register: good_rev
+                    delegate_to: localhost
+                    become: false
+                    changed_when: false
+                  - name: Check that revision out
+                    ansible.builtin.git:
+                      repo: /home/learner/net-configs.git
+                      dest: /home/learner/net/good
+                      version: "{{ good_rev.stdout }}"
+                    delegate_to: localhost
+                    become: false
+                  - name: Put the file on the router
+                    ansible.builtin.copy:
+                      src: /home/learner/net/good/configs/{{ inventory_hostname }}.conf
+                      dest: /etc/frr/restore.conf
+                      mode: "0640"
+                    register: put
+                  - name: Apply it
+                    ansible.builtin.command: vtysh -f /etc/frr/restore.conf
+                    when: put.changed
+              EOF
+              ansible-playbook backup.yml
+              ansible-playbook restore.yml

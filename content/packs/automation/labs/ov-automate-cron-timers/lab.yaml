@@ -1,0 +1,514 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-automate-cron-timers
+  title: "Schedule nightly claims exports with cron and a timer"
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, cron, systemd-timer, scheduling, tier-c]
+  version: 1
+spec:
+  description: |
+    The claims database nodes (`claims_db`: `ov-db-1` and `ov-db-2`) need two scheduled jobs. The scripts exist already:
+    `/usr/local/bin/claims-export` and `/usr/local/bin/ov-export-rotate`; the user `claimsbatch` exists too. The cron
+    service is currently stopped and disabled.
+
+    Write **`/home/learner/claims-automation/schedule.yml`** (inventory and `ansible.cfg` are in that directory) that, on
+    the `claims_db` hosts only:
+
+    - runs `/usr/local/bin/claims-export` every night at **02:15** as the user **`claimsbatch`** (a cron entry), with the
+      cron service running and enabled;
+    - rotates the export directory weekly with a **systemd timer** named `ov-export-rotate.timer` that fires on
+      **{{day}} at 03:30** and starts `ov-export-rotate.service`, whose command is
+      `/usr/local/bin/ov-export-rotate --keep {{keep}}`; the timer is enabled and active.
+
+    Both jobs must survive a reboot and must not be duplicated when the playbook runs again. Run it; the grader runs it again
+    and expects no changes.
+  objectives:
+    - "Manage cron entries idempotently"
+    - "Create and enable a systemd timer with a service unit"
+    - "Keep scheduled jobs across reboots"
+  params:
+    day:
+      type: choice
+      values: [Mon, Wed, Sun]
+    keep:
+      type: int
+      min: 4
+      max: 12
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-db-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-db-2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-db-1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-db-2, timeoutSec: 120, run: *ov-vm }
+    - { on: ov-claims-web1, timeoutSec: 120, run: *ov-vm }
+    - on: ov-db-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-cron-seeded ] && exit 0
+        rpm -q cronie >/dev/null 2>&1 || dnf -y -q install cronie >/dev/null
+        id claimsbatch >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Claims batch" claimsbatch
+        install -d -o claimsbatch -g claimsbatch /var/exports/claims
+        cat > /usr/local/bin/claims-export <<'EOS'
+        #!/bin/sh
+        mkdir -p /var/exports/claims
+        date +%F > /var/exports/claims/export-$(date +%F).csv
+        EOS
+        cat > /usr/local/bin/ov-export-rotate <<'EOS'
+        #!/bin/sh
+        keep=4
+        [ "$1" = "--keep" ] && keep=$2
+        find /var/exports/claims -name 'export-*.csv' -mtime +$((keep * 7)) -delete
+        EOS
+        chmod 0755 /usr/local/bin/claims-export /usr/local/bin/ov-export-rotate
+        systemctl disable --now crond >/dev/null 2>&1 || true
+        touch /var/tmp/.ct-cron-seeded
+    - on: ov-db-2
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-cron-seeded ] && exit 0
+        rpm -q cronie >/dev/null 2>&1 || dnf -y -q install cronie >/dev/null
+        id claimsbatch >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Claims batch" claimsbatch
+        install -d -o claimsbatch -g claimsbatch /var/exports/claims
+        cat > /usr/local/bin/claims-export <<'EOS'
+        #!/bin/sh
+        mkdir -p /var/exports/claims
+        date +%F > /var/exports/claims/export-$(date +%F).csv
+        EOS
+        cat > /usr/local/bin/ov-export-rotate <<'EOS'
+        #!/bin/sh
+        keep=4
+        [ "$1" = "--keep" ] && keep=$2
+        find /var/exports/claims -name 'export-*.csv' -mtime +$((keep * 7)) -delete
+        EOS
+        chmod 0755 /usr/local/bin/claims-export /usr/local/bin/ov-export-rotate
+        systemctl disable --now crond >/dev/null 2>&1 || true
+        touch /var/tmp/.ct-cron-seeded
+    - on: ov-claims-web1
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-cron-seeded ] && exit 0
+        rpm -q cronie >/dev/null 2>&1 || dnf -y -q install cronie >/dev/null
+        id claimsbatch >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Claims batch" claimsbatch
+        install -d -o claimsbatch -g claimsbatch /var/exports/claims
+        cat > /usr/local/bin/claims-export <<'EOS'
+        #!/bin/sh
+        mkdir -p /var/exports/claims
+        date +%F > /var/exports/claims/export-$(date +%F).csv
+        EOS
+        cat > /usr/local/bin/ov-export-rotate <<'EOS'
+        #!/bin/sh
+        keep=4
+        [ "$1" = "--keep" ] && keep=$2
+        find /var/exports/claims -name 'export-*.csv' -mtime +$((keep * 7)) -delete
+        EOS
+        chmod 0755 /usr/local/bin/claims-export /usr/local/bin/ov-export-rotate
+        systemctl disable --now crond >/dev/null 2>&1 || true
+        touch /var/tmp/.ct-cron-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+            claims_db:
+              hosts:
+                ov-db-1:
+                ov-db-2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+
+        chown -R learner:learner $p
+  checks:
+    - id: cron-db1
+      description: "ov-db-1 runs the claims export once a night at the required time as the batch user, and the cron service runs and is enabled"
+      type: shell
+      on: ov-db-1
+      skills: [automation.modules.scheduling]
+      weight: 2
+      command: &cron |
+        a=$(crontab -l -u claimsbatch 2>/dev/null | grep -Ev '^[[:space:]]*#' | grep -cE '^15[[:space:]]+2[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+/usr/local/bin/claims-export([[:space:]]|$)')
+        b=$(cat /etc/cron.d/* 2>/dev/null | grep -Ev '^[[:space:]]*#' | grep -cE '^15[[:space:]]+2[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+claimsbatch[[:space:]]+/usr/local/bin/claims-export([[:space:]]|$)')
+        echo "cron=$((a+b)) $(systemctl is-active crond) $(systemctl is-enabled crond)"
+      expect: { match: exact, value: "cron=1 active enabled" }
+    - { id: cron-db2, description: "ov-db-2 runs the claims export once a night at the required time as the batch user, and the cron service runs and is enabled", type: shell, on: ov-db-2, skills: [automation.modules.scheduling], weight: 2, command: *cron, expect: { match: exact, value: "cron=1 active enabled" } }
+    - id: timer-db1
+      description: "ov-db-1 has a weekly rotation timer on the required day and time that is enabled, active and starts the rotation service with the retention argument"
+      type: shell
+      on: ov-db-1
+      skills: [automation.modules.scheduling]
+      weight: 2
+      command: &timer |
+        t=ov-export-rotate
+        cal=$(systemctl cat $t.timer 2>/dev/null | grep -E '^OnCalendar=' | head -1)
+        ex=$(systemctl cat $t.service 2>/dev/null | grep -cE '^ExecStart=/usr/local/bin/ov-export-rotate --keep {{keep}}$')
+        case "$cal" in *{{day}}*03:30*) c=calendar-ok ;; *) c=calendar-wrong ;; esac
+        echo "$(systemctl is-enabled $t.timer 2>/dev/null) $(systemctl is-active $t.timer 2>/dev/null) $c exec=$ex"
+      expect: { match: exact, value: "enabled active calendar-ok exec=1" }
+    - { id: timer-db2, description: "ov-db-2 has a weekly rotation timer on the required day and time that is enabled, active and starts the rotation service with the retention argument", type: shell, on: ov-db-2, skills: [automation.modules.scheduling], weight: 2, command: *timer, expect: { match: exact, value: "enabled active calendar-ok exec=1" } }
+    - id: web-untouched
+      description: "ov-claims-web1 has neither the nightly export nor the rotation timer"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.scheduling]
+      command: |
+        echo "cron=$(crontab -l -u claimsbatch 2>/dev/null | grep -c claims-export) $(systemctl cat ov-export-rotate.timer >/dev/null 2>&1 && echo timer || echo no-timer)"
+      expect: { match: exact, value: "cron=0 no-timer" }
+    - id: rerun-no-changes
+      description: "schedule.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.scheduling]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation schedule.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Cron without hand-editing"
+      body: |
+        `ansible.builtin.cron` manages one entry by its `name`, so a re-run edits that entry instead of adding another. `user:` chooses whose crontab it is; `minute` and `hour` take strings.
+      cost: 1
+    - title: "The cron daemon"
+      body: |
+        Nothing runs the jobs unless the cron service is started and enabled; check it on the node before you trust the entry.
+      cost: 1
+    - title: "A timer is two units"
+      body: |
+        A `.timer` unit starts a `.service` unit of the same name. After writing unit files the systemd manager must reload (`daemon_reload`), and the timer needs `enabled: true` (starts at boot) as well as `state: started`.
+      cost: 2
+  misconceptions:
+    - id: root-crontab
+      description: "Adds the entry without naming the batch user, so it lands in root's crontab."
+      feedback: "The export must run as the claims batch user; set the user of the cron entry."
+      expectFail: [cron-db1, cron-db2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > schedule.yml <<'EOF'
+          - name: Nightly claims export and weekly rotation
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: cron service
+                ansible.builtin.service:
+                  name: crond
+                  state: started
+                  enabled: true
+              - name: Nightly export
+                ansible.builtin.cron:
+                  name: nightly claims export
+                  minute: "15"
+                  hour: "2"
+                  job: /usr/local/bin/claims-export
+              - name: Rotation service unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.service
+                  content: |
+                    [Unit]
+                    Description=Rotate the claims export directory
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/bin/ov-export-rotate --keep {{keep}}
+                notify: Reload systemd
+              - name: Rotation timer unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.timer
+                  content: |
+                    [Unit]
+                    Description=Weekly claims export rotation
+                    [Timer]
+                    OnCalendar={{day}} *-*-* 03:30:00
+                    Persistent=true
+                    [Install]
+                    WantedBy=timers.target
+                notify: Reload systemd
+              - name: Reload systemd now
+                ansible.builtin.meta: flush_handlers
+              - name: Timer started and enabled
+                ansible.builtin.systemd:
+                  name: ov-export-rotate.timer
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Reload systemd
+                ansible.builtin.systemd:
+                  daemon_reload: true
+          EOF
+          ansible-playbook schedule.yml
+    - id: appended-twice
+      description: "Appends the entry with a shell pipeline, so every run adds another copy."
+      feedback: "A shell append is not idempotent; let a module that knows the entry's name manage it."
+      expectFail: [cron-db1, cron-db2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > schedule.yml <<'EOF'
+          - name: Nightly claims export and weekly rotation
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: cron service
+                ansible.builtin.service:
+                  name: crond
+                  state: started
+                  enabled: true
+              - name: Nightly export
+                ansible.builtin.shell: (crontab -l -u claimsbatch 2>/dev/null; echo "15 2 * * * /usr/local/bin/claims-export") | crontab -u claimsbatch -
+              - name: Rotation service unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.service
+                  content: |
+                    [Unit]
+                    Description=Rotate the claims export directory
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/bin/ov-export-rotate --keep {{keep}}
+                notify: Reload systemd
+              - name: Rotation timer unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.timer
+                  content: |
+                    [Unit]
+                    Description=Weekly claims export rotation
+                    [Timer]
+                    OnCalendar={{day}} *-*-* 03:30:00
+                    Persistent=true
+                    [Install]
+                    WantedBy=timers.target
+                notify: Reload systemd
+              - name: Reload systemd now
+                ansible.builtin.meta: flush_handlers
+              - name: Timer started and enabled
+                ansible.builtin.systemd:
+                  name: ov-export-rotate.timer
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Reload systemd
+                ansible.builtin.systemd:
+                  daemon_reload: true
+          EOF
+          ansible-playbook schedule.yml
+          ansible-playbook schedule.yml
+    - id: timer-not-enabled
+      description: "Starts the timer but does not enable it."
+      feedback: "A timer that is only started is gone after a reboot; it must be enabled as well."
+      expectFail: [timer-db1, timer-db2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > schedule.yml <<'EOF'
+          - name: Nightly claims export and weekly rotation
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: cron service
+                ansible.builtin.service:
+                  name: crond
+                  state: started
+                  enabled: true
+              - name: Nightly export
+                ansible.builtin.cron:
+                  name: nightly claims export
+                  user: claimsbatch
+                  minute: "15"
+                  hour: "2"
+                  job: /usr/local/bin/claims-export
+              - name: Rotation service unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.service
+                  content: |
+                    [Unit]
+                    Description=Rotate the claims export directory
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/bin/ov-export-rotate --keep {{keep}}
+                notify: Reload systemd
+              - name: Rotation timer unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.timer
+                  content: |
+                    [Unit]
+                    Description=Weekly claims export rotation
+                    [Timer]
+                    OnCalendar={{day}} *-*-* 03:30:00
+                    Persistent=true
+                    [Install]
+                    WantedBy=timers.target
+                notify: Reload systemd
+              - name: Reload systemd now
+                ansible.builtin.meta: flush_handlers
+              - name: Timer started
+                ansible.builtin.systemd:
+                  name: ov-export-rotate.timer
+                  state: started
+            handlers:
+              - name: Reload systemd
+                ansible.builtin.systemd:
+                  daemon_reload: true
+          EOF
+          ansible-playbook schedule.yml
+  solution:
+    explanation: |
+      The cron service is started and enabled. `ansible.builtin.cron` manages the nightly entry by name in the batch
+      user's crontab, so repeated runs keep a single line. The rotation service and timer units are copied into
+      `/etc/systemd/system`, systemd reloads when they change, and the timer is started and enabled. Every module
+      compares state first, so the second run reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > schedule.yml <<'EOF'
+          - name: Nightly claims export and weekly rotation
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: cron service
+                ansible.builtin.service:
+                  name: crond
+                  state: started
+                  enabled: true
+              - name: Nightly export
+                ansible.builtin.cron:
+                  name: nightly claims export
+                  user: claimsbatch
+                  minute: "15"
+                  hour: "2"
+                  job: /usr/local/bin/claims-export
+              - name: Rotation service unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.service
+                  content: |
+                    [Unit]
+                    Description=Rotate the claims export directory
+                    [Service]
+                    Type=oneshot
+                    ExecStart=/usr/local/bin/ov-export-rotate --keep {{keep}}
+                notify: Reload systemd
+              - name: Rotation timer unit
+                ansible.builtin.copy:
+                  dest: /etc/systemd/system/ov-export-rotate.timer
+                  content: |
+                    [Unit]
+                    Description=Weekly claims export rotation
+                    [Timer]
+                    OnCalendar={{day}} *-*-* 03:30:00
+                    Persistent=true
+                    [Install]
+                    WantedBy=timers.target
+                notify: Reload systemd
+              - name: Reload systemd now
+                ansible.builtin.meta: flush_handlers
+              - name: Timer started and enabled
+                ansible.builtin.systemd:
+                  name: ov-export-rotate.timer
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Reload systemd
+                ansible.builtin.systemd:
+                  daemon_reload: true
+          EOF
+          ansible-playbook schedule.yml
+    alternatives:
+      - id: cron-d-file
+        description: "Keeps the cron entry in its own file under /etc/cron.d instead of the user's crontab."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > schedule.yml <<'EOF'
+              - name: Nightly claims export and weekly rotation
+                hosts: claims_db
+                become: true
+                tasks:
+                  - name: cron service
+                    ansible.builtin.service:
+                      name: crond
+                      state: started
+                      enabled: true
+                  - name: Nightly export
+                    ansible.builtin.cron:
+                      name: nightly claims export
+                      user: claimsbatch
+                      cron_file: ov-claims-export
+                      minute: "15"
+                      hour: "2"
+                      job: /usr/local/bin/claims-export
+                  - name: Rotation service unit
+                    ansible.builtin.copy:
+                      dest: /etc/systemd/system/ov-export-rotate.service
+                      content: |
+                        [Unit]
+                        Description=Rotate the claims export directory
+                        [Service]
+                        Type=oneshot
+                        ExecStart=/usr/local/bin/ov-export-rotate --keep {{keep}}
+                    notify: Reload systemd
+                  - name: Rotation timer unit
+                    ansible.builtin.copy:
+                      dest: /etc/systemd/system/ov-export-rotate.timer
+                      content: |
+                        [Unit]
+                        Description=Weekly claims export rotation
+                        [Timer]
+                        OnCalendar={{day}} *-*-* 03:30:00
+                        Persistent=true
+                        [Install]
+                        WantedBy=timers.target
+                    notify: Reload systemd
+                  - name: Reload systemd now
+                    ansible.builtin.meta: flush_handlers
+                  - name: Timer started and enabled
+                    ansible.builtin.systemd:
+                      name: ov-export-rotate.timer
+                      state: started
+                      enabled: true
+                handlers:
+                  - name: Reload systemd
+                    ansible.builtin.systemd:
+                      daemon_reload: true
+              EOF
+              ansible-playbook schedule.yml

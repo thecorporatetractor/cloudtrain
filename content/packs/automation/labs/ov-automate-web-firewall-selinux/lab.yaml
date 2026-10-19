@@ -1,0 +1,482 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-automate-web-firewall-selinux
+  title: "Serve the quoting API on a non-standard port with SELinux enforcing"
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [ansible, selinux, firewalld, httpd, tier-c]
+  version: 1
+spec:
+  description: |
+    The quoting API host `ov-quote-api1` (group `quoting`) has its page in `/srv/quote/index.html` but no web server.
+    Write **`/home/learner/claims-automation/quote-web.yml`** (inventory and `ansible.cfg` are in that directory) that
+    sets it up so that `httpd`:
+
+    - serves the content of `/srv/quote` on **TCP port {{port}}**, so that `http://ov-quote-api1:{{port}}/` works from
+      `ov-claims-web1`, now and **after a reboot**;
+    - runs with **SELinux enforcing**: fix the policy settings persistently rather than relaxing SELinux;
+    - has the port open in firewalld permanently and immediately, and is enabled at boot.
+
+    Do not move the content. Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Label a port and a directory for httpd in SELinux"
+    - "Open a port in firewalld permanently and immediately"
+    - "Keep a service running across reboots"
+  params:
+    port:
+      type: choice
+      values: [8082, 8083, 8087]
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-quote-api1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-quote-api1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web1, timeoutSec: 120, run: *ov-vm }
+    - on: ov-quote-api1
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-quote-seeded ] && exit 0
+        rpm -q policycoreutils-python-utils >/dev/null 2>&1 || dnf -y -q install policycoreutils-python-utils >/dev/null
+        mkdir -p /srv/quote
+        echo "<h1>Orrin and Vale quoting API</h1><p>engine {{token}}</p>" > /srv/quote/index.html
+        chcon -R -t default_t /srv/quote 2>/dev/null || true
+        setenforce 1
+        touch /var/tmp/.ct-quote-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        quoting:
+          hosts:
+            ov-quote-api1:
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+
+        chown -R learner:learner $p
+  checks:
+    - id: served
+      description: "ov-claims-web1 gets the quoting API page from the required port"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        curl -s -m 8 http://ov-quote-api1:{{port}}/ | grep -o 'engine {{token}}' || echo unreachable
+      expect: { match: exact, value: "engine {{token}}" }
+    - id: enforcing
+      description: "SELinux on ov-quote-api1 is enforcing now and in its configuration"
+      type: shell
+      on: ov-quote-api1
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      weight: 0.5
+      command: |
+        echo "$(getenforce) $(sed -n 's/^SELINUX=//p' /etc/selinux/config)"
+      expect: { match: exact, value: "Enforcing enforcing" }
+    - id: port-label
+      description: "The port is labelled for web servers in the persistent SELinux policy"
+      type: shell
+      on: ov-quote-api1
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      weight: 1
+      command: |
+        semanage port -l -C 2>/dev/null | awk '$1 == "http_port_t" && $2 == "tcp"' | grep -qw {{port}} && echo labelled || echo missing
+      expect: { match: exact, value: "labelled" }
+    - id: fcontext
+      description: "The content has a web content type that survives a relabel"
+      type: shell
+      on: ov-quote-api1
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      weight: 1
+      command: |
+        t=$(matchpathcon -n /srv/quote/index.html 2>/dev/null | cut -d: -f3); a=$(stat -c %C /srv/quote/index.html | cut -d: -f3)
+        case "$t" in httpd_sys_content_t|httpd_sys_rw_content_t|public_content_t) [ "$a" = "$t" ] && echo persistent || echo "actual=$a" ;; *) echo "policy=$t" ;; esac
+      expect: { match: exact, value: "persistent" }
+    - id: boot-state
+      description: "The port is open in the permanent firewall configuration and httpd starts at boot"
+      type: shell
+      on: ov-quote-api1
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      weight: 1
+      command: |
+        firewall-cmd --permanent --list-ports | tr ' ' '\n' | grep -qx '{{port}}/tcp' && f=open || f=closed
+        echo "$f $(systemctl is-enabled httpd 2>/dev/null)"
+      expect: { match: exact, value: "open enabled" }
+    - id: rerun-no-changes
+      description: "quote-web.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation quote-web.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Why does it not start?"
+      body: |
+        httpd may only bind ports that SELinux labels `http_port_t`. `community.general.seport` records a port label in the persistent policy; it needs `policycoreutils-python-utils`, which is installed.
+      cost: 1
+    - title: "Labels that last"
+      body: |
+        A label set with `chcon` (or `setype` on the file module) is lost at the next relabel. `community.general.sefcontext` stores a rule for a path pattern, and `restorecon` applies it; run it only when it changes something (`changed_when`).
+      cost: 1
+    - title: "Open now and after a reboot"
+      body: |
+        `ansible.posix.firewalld` needs both `permanent: true` (survives a reboot) and `immediate: true` (applies now).
+      cost: 1
+  misconceptions:
+    - id: chcon-label
+      description: "Labels the content with a one-off type change instead of a policy rule."
+      feedback: "A type set directly on the files disappears at the next relabel; record a file-context rule and restore from it."
+      expectFail: [fcontext]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > quote-web.yml <<'EOF'
+          - name: Quoting API web server
+            hosts: quoting
+            become: true
+            tasks:
+              - name: httpd package
+                ansible.builtin.dnf:
+                  name: httpd
+                  state: present
+              - name: Site configuration
+                ansible.builtin.copy:
+                  dest: /etc/httpd/conf.d/quote.conf
+                  mode: "0644"
+                  content: |
+                    Listen {{port}}
+                    <VirtualHost *:{{port}}>
+                        DocumentRoot /srv/quote
+                        <Directory /srv/quote>
+                            Require all granted
+                        </Directory>
+                    </VirtualHost>
+                notify: Restart httpd
+              - name: Web port label
+                community.general.seport:
+                  ports: "{{port}}"
+                  proto: tcp
+                  setype: http_port_t
+                  state: present
+              - name: Content label
+                ansible.builtin.file:
+                  path: /srv/quote
+                  state: directory
+                  recurse: true
+                  setype: httpd_sys_content_t
+              - name: Firewall port
+                ansible.posix.firewalld:
+                  port: "{{port}}/tcp"
+                  permanent: true
+                  immediate: true
+                  state: enabled
+              - name: httpd running and enabled
+                ansible.builtin.service:
+                  name: httpd
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Restart httpd
+                ansible.builtin.service:
+                  name: httpd
+                  state: restarted
+          EOF
+          ansible-playbook quote-web.yml
+    - id: firewall-runtime-only
+      description: "Opens the firewall port for the running system only."
+      feedback: "A runtime-only rule is gone after a reboot; the port must be opened permanently as well."
+      expectFail: [boot-state]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > quote-web.yml <<'EOF'
+          - name: Quoting API web server
+            hosts: quoting
+            become: true
+            tasks:
+              - name: httpd package
+                ansible.builtin.dnf:
+                  name: httpd
+                  state: present
+              - name: Site configuration
+                ansible.builtin.copy:
+                  dest: /etc/httpd/conf.d/quote.conf
+                  mode: "0644"
+                  content: |
+                    Listen {{port}}
+                    <VirtualHost *:{{port}}>
+                        DocumentRoot /srv/quote
+                        <Directory /srv/quote>
+                            Require all granted
+                        </Directory>
+                    </VirtualHost>
+                notify: Restart httpd
+              - name: Web port label
+                community.general.seport:
+                  ports: "{{port}}"
+                  proto: tcp
+                  setype: http_port_t
+                  state: present
+              - name: Content label rule
+                community.general.sefcontext:
+                  target: "/srv/quote(/.*)?"
+                  setype: httpd_sys_content_t
+                  state: present
+              - name: Apply the label
+                ansible.builtin.command: restorecon -R -v /srv/quote
+                register: restore
+                changed_when: "'Relabeled' in restore.stdout"
+              - name: Firewall port
+                ansible.posix.firewalld:
+                  port: "{{port}}/tcp"
+                  permanent: false
+                  immediate: true
+                  state: enabled
+              - name: httpd running and enabled
+                ansible.builtin.service:
+                  name: httpd
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Restart httpd
+                ansible.builtin.service:
+                  name: httpd
+                  state: restarted
+          EOF
+          ansible-playbook quote-web.yml
+    - id: selinux-off
+      description: "Switches SELinux to permissive instead of labelling the port."
+      feedback: "SELinux must stay enforcing; fix the labels instead."
+      expectFail: [enforcing, port-label]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > quote-web.yml <<'EOF'
+          - name: Quoting API web server
+            hosts: quoting
+            become: true
+            tasks:
+              - name: httpd package
+                ansible.builtin.dnf:
+                  name: httpd
+                  state: present
+              - name: Site configuration
+                ansible.builtin.copy:
+                  dest: /etc/httpd/conf.d/quote.conf
+                  mode: "0644"
+                  content: |
+                    Listen {{port}}
+                    <VirtualHost *:{{port}}>
+                        DocumentRoot /srv/quote
+                        <Directory /srv/quote>
+                            Require all granted
+                        </Directory>
+                    </VirtualHost>
+                notify: Restart httpd
+              - name: SELinux out of the way
+                ansible.posix.selinux:
+                  policy: targeted
+                  state: permissive
+              - name: Content label rule
+                community.general.sefcontext:
+                  target: "/srv/quote(/.*)?"
+                  setype: httpd_sys_content_t
+                  state: present
+              - name: Apply the label
+                ansible.builtin.command: restorecon -R -v /srv/quote
+                register: restore
+                changed_when: "'Relabeled' in restore.stdout"
+              - name: Firewall port
+                ansible.posix.firewalld:
+                  port: "{{port}}/tcp"
+                  permanent: true
+                  immediate: true
+                  state: enabled
+              - name: httpd running and enabled
+                ansible.builtin.service:
+                  name: httpd
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Restart httpd
+                ansible.builtin.service:
+                  name: httpd
+                  state: restarted
+          EOF
+          ansible-playbook quote-web.yml
+  solution:
+    explanation: |
+      httpd is installed and configured to listen on the required port. `seport` adds the port to `http_port_t` and
+      `sefcontext` plus `restorecon` give `/srv/quote` a web content type through a persistent rule; `firewalld` opens the
+      port permanently and immediately; the service is started and enabled. SELinux stays enforcing, the handler restarts
+      httpd only when the configuration changed, and every module reports no change on the second run.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > quote-web.yml <<'EOF'
+          - name: Quoting API web server
+            hosts: quoting
+            become: true
+            tasks:
+              - name: httpd package
+                ansible.builtin.dnf:
+                  name: httpd
+                  state: present
+              - name: Site configuration
+                ansible.builtin.copy:
+                  dest: /etc/httpd/conf.d/quote.conf
+                  mode: "0644"
+                  content: |
+                    Listen {{port}}
+                    <VirtualHost *:{{port}}>
+                        DocumentRoot /srv/quote
+                        <Directory /srv/quote>
+                            Require all granted
+                        </Directory>
+                    </VirtualHost>
+                notify: Restart httpd
+              - name: Web port label
+                community.general.seport:
+                  ports: "{{port}}"
+                  proto: tcp
+                  setype: http_port_t
+                  state: present
+              - name: Content label rule
+                community.general.sefcontext:
+                  target: "/srv/quote(/.*)?"
+                  setype: httpd_sys_content_t
+                  state: present
+              - name: Apply the label
+                ansible.builtin.command: restorecon -R -v /srv/quote
+                register: restore
+                changed_when: "'Relabeled' in restore.stdout"
+              - name: Firewall port
+                ansible.posix.firewalld:
+                  port: "{{port}}/tcp"
+                  permanent: true
+                  immediate: true
+                  state: enabled
+              - name: httpd running and enabled
+                ansible.builtin.service:
+                  name: httpd
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Restart httpd
+                ansible.builtin.service:
+                  name: httpd
+                  state: restarted
+          EOF
+          ansible-playbook quote-web.yml
+    alternatives:
+      - id: semanage-commands
+        description: "Labels the port with the semanage command guarded by a check instead of the seport module."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > quote-web.yml <<'EOF'
+              - name: Quoting API web server
+                hosts: quoting
+                become: true
+                tasks:
+                  - name: httpd package
+                    ansible.builtin.dnf:
+                      name: httpd
+                      state: present
+                  - name: Site configuration
+                    ansible.builtin.copy:
+                      dest: /etc/httpd/conf.d/quote.conf
+                      mode: "0644"
+                      content: |
+                        Listen {{port}}
+                        <VirtualHost *:{{port}}>
+                            DocumentRoot /srv/quote
+                            <Directory /srv/quote>
+                                Require all granted
+                            </Directory>
+                        </VirtualHost>
+                    notify: Restart httpd
+                  - name: Is the port labelled
+                    ansible.builtin.shell: semanage port -l | awk '$1 == "http_port_t" && $2 == "tcp"' | grep -qw {{port}}
+                    register: portlabel
+                    changed_when: false
+                    failed_when: false
+                  - name: Label the port
+                    ansible.builtin.shell: semanage port -a -t http_port_t -p tcp {{port}} || semanage port -m -t http_port_t -p tcp {{port}}
+                    when: portlabel.rc != 0
+                  - name: Content label rule
+                    community.general.sefcontext:
+                      target: "/srv/quote(/.*)?"
+                      setype: httpd_sys_content_t
+                      state: present
+                  - name: Apply the label
+                    ansible.builtin.command: restorecon -R -v /srv/quote
+                    register: restore
+                    changed_when: "'Relabeled' in restore.stdout"
+                  - name: Firewall port
+                    ansible.posix.firewalld:
+                      port: "{{port}}/tcp"
+                      permanent: true
+                      immediate: true
+                      state: enabled
+                  - name: httpd running and enabled
+                    ansible.builtin.service:
+                      name: httpd
+                      state: started
+                      enabled: true
+                handlers:
+                  - name: Restart httpd
+                    ansible.builtin.service:
+                      name: httpd
+                      state: restarted
+              EOF
+              ansible-playbook quote-web.yml

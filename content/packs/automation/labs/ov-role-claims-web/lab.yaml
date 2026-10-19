@@ -1,0 +1,662 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-role-claims-web
+  title: "Package the claims web setup as a role"
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [ansible, roles, dependencies, handlers, tier-b]
+  version: 1
+spec:
+  description: |
+    **`/home/learner/claims-automation/claims-web.yml`** sets up the claims portal on the web nodes: nginx, a document
+    root with a landing page, the site configuration and a firewall rule. Turn it into a role and keep the end
+    state unchanged.
+
+    - Create the role **`claims_web`** under `roles/` with its tasks, a handler that reloads nginx when the site
+      configuration changes, a Jinja2 template for that configuration, and **defaults** for the port (`claims_port`,
+      {{port}}) and the document root (`claims_docroot`, {{docroot}}).
+    - The firewall rule must no longer be a task of this role: the project already has a role **`roles/ov_firewall`**
+      (do not edit it). Make `claims_web` depend on it so that the port is opened permanently and immediately.
+    - Write **`site.yml`**: exactly **three lines** (the host group, `roles:` and the role). Privilege escalation is
+      already configured in `ansible.cfg`.
+
+    Run `site.yml`; the grader runs it again and expects no changes.
+  objectives:
+    - "Structure a role: tasks, handlers, templates, defaults, meta"
+    - "Declare a role dependency and pass variables to it"
+    - "Keep a site playbook minimal"
+  params:
+    port:
+      type: choice
+      values: [8008, 8009, 9000]
+    docroot:
+      type: choice
+      values: [/usr/share/nginx/claims, /usr/share/nginx/portal, /usr/share/nginx/orrinvale]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/roles/ov_firewall/tasks $p/roles/ov_firewall/defaults
+        cat > $p/roles/ov_firewall/defaults/main.yml <<'EOF'
+        ov_firewall_ports: []
+        EOF
+        cat > $p/roles/ov_firewall/tasks/main.yml <<'EOF'
+        - name: Open ports in firewalld
+          ansible.posix.firewalld:
+            port: "{{ item }}"
+            permanent: true
+            immediate: true
+            state: enabled
+          loop: "{{ ov_firewall_ports }}"
+        EOF
+        cat > $p/claims-web.yml <<'EOF'
+        - name: Claims web nodes
+          hosts: claims_web
+          vars:
+            claims_port: {{port}}
+            claims_docroot: {{docroot}}
+          tasks:
+            - name: nginx package
+              ansible.builtin.dnf:
+                name: nginx
+                state: present
+            - name: Document root
+              ansible.builtin.file:
+                path: "{{ claims_docroot }}"
+                state: directory
+                mode: "0755"
+            - name: Landing page
+              ansible.builtin.copy:
+                dest: "{{ claims_docroot }}/index.html"
+                content: "Orrin and Vale claims portal on {{ inventory_hostname }}\n"
+                mode: "0644"
+            - name: Site configuration
+              ansible.builtin.copy:
+                dest: /etc/nginx/nginx.conf
+                mode: "0644"
+                content: |
+                  user nginx;
+                  worker_processes 1;
+                  error_log /var/log/nginx/error.log;
+                  pid /run/nginx.pid;
+                  events {
+                      worker_connections 256;
+                  }
+                  http {
+                      access_log /var/log/nginx/access.log;
+                      default_type text/plain;
+                      server {
+                          listen {{ claims_port }};
+                          server_name {{ inventory_hostname }};
+                          root {{ claims_docroot }};
+                          index index.html;
+                      }
+                  }
+              notify: Reload nginx
+            - name: Open the portal port
+              ansible.posix.firewalld:
+                port: "{{ claims_port }}/tcp"
+                permanent: true
+                immediate: true
+                state: enabled
+            - name: nginx running and enabled
+              ansible.builtin.service:
+                name: nginx
+                state: started
+                enabled: true
+          handlers:
+            - name: Reload nginx
+              ansible.builtin.service:
+                name: nginx
+                state: reloaded
+        EOF
+        (cd $p && find roles/ov_firewall -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1 > /var/tmp/.ct-fw-role.sum)
+        chown -R learner:learner $p
+  checks:
+    - id: portal-web1
+      description: "ov-claims-web1 serves the portal on the required port, the port is open in the firewall now and permanently, and nginx starts at boot"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.reuse.roles, automation.control-flow.handlers]
+      weight: 2
+      command: |
+        b=$(curl -s -m 5 http://localhost:{{port}}/ || true)
+        [ "$b" = "Orrin and Vale claims portal on ov-claims-web1" ] && s=serving || s=not-serving
+        firewall-cmd --permanent --list-ports | tr ' ' '\n' | grep -qx '{{port}}/tcp' && f=open || f=closed
+        firewall-cmd --list-ports | tr ' ' '\n' | grep -qx '{{port}}/tcp' && g=live || g=not-live
+        echo "$s $f $g $(systemctl is-enabled nginx)"
+      expect: { match: exact, value: "serving open live enabled" }
+    - id: portal-web2
+      description: "ov-claims-web2 serves the portal on the required port, the port is open in the firewall now and permanently, and nginx starts at boot"
+      type: shell
+      on: ov-claims-web2
+      skills: [automation.reuse.roles, automation.control-flow.handlers]
+      weight: 2
+      command: |
+        b=$(curl -s -m 5 http://localhost:{{port}}/ || true)
+        [ "$b" = "Orrin and Vale claims portal on ov-claims-web2" ] && s=serving || s=not-serving
+        firewall-cmd --permanent --list-ports | tr ' ' '\n' | grep -qx '{{port}}/tcp' && f=open || f=closed
+        firewall-cmd --list-ports | tr ' ' '\n' | grep -qx '{{port}}/tcp' && g=live || g=not-live
+        echo "$s $f $g $(systemctl is-enabled nginx)"
+      expect: { match: exact, value: "serving open live enabled" }
+    - id: structure
+      description: "The role claims_web has tasks, a handler, a template, defaults for port and document root and a dependency on the firewall role; site.yml is three lines and the supplied firewall role is untouched"
+      type: shell
+      on: ov-ctl
+      skills: [automation.reuse.roles, automation.control-flow.handlers]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - <<'PY' 2>/dev/null || echo no-project
+        import os, subprocess, yaml
+        p = '/home/learner/claims-automation/'
+        bad = []
+        def load(f):
+            try:
+                return yaml.safe_load(open(p + f))
+            except Exception:
+                return None
+        for f in ('tasks/main.yml', 'handlers/main.yml', 'defaults/main.yml', 'meta/main.yml'):
+            if not os.path.exists(p + 'roles/claims_web/' + f): bad.append('missing-' + f.split('/')[0])
+        tp = p + 'roles/claims_web/templates'
+        if not (os.path.isdir(tp) and any(n.endswith('.j2') for n in os.listdir(tp))): bad.append('no-template')
+        d = load('roles/claims_web/defaults/main.yml') or {}
+        if str(d.get('claims_port')) != '{{port}}' or str(d.get('claims_docroot')) != '{{docroot}}': bad.append('defaults')
+        v = load('roles/claims_web/vars/main.yml') or {}
+        if 'claims_port' in v or 'claims_docroot' in v: bad.append('vars-override')
+        m = load('roles/claims_web/meta/main.yml') or {}
+        if 'ov_firewall' not in str(m.get('dependencies')): bad.append('no-dependency')
+        t = load('roles/claims_web/tasks/main.yml')
+        if 'firewalld' in open(p + 'roles/claims_web/tasks/main.yml').read() if os.path.exists(p + 'roles/claims_web/tasks/main.yml') else False: bad.append('firewall-inline')
+        try:
+            lines = [l for l in open(p + 'site.yml').read().splitlines() if l.strip() and not l.strip().startswith('#') and l.strip() != '---']
+            pl = yaml.safe_load(open(p + 'site.yml')) or []
+            if len(lines) != 3 or 'claims_web' not in str(pl[0].get('roles')): bad.append('site-not-three-lines')
+        except Exception:
+            bad.append('no-site')
+        out = subprocess.run("cd %s && find roles/ov_firewall -type f | sort | xargs sha256sum | sha256sum | cut -d' ' -f1" % p, shell=True, capture_output=True, text=True).stdout.strip()
+        if out != open('/var/tmp/.ct-fw-role.sum').read().strip(): bad.append('firewall-role-edited')
+        print('ok' if not bad else ','.join(bad))
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "site.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.reuse.roles]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation site.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Role layout"
+      body: |
+        `ansible-galaxy role init --offline roles/claims_web` creates the directory skeleton (`tasks`, `handlers`, `templates`, `defaults`, `meta`). Tasks move to `tasks/main.yml`, the handler to `handlers/main.yml`, the settings you want callers to override to `defaults/main.yml`.
+      cost: 1
+    - title: "Defaults or vars"
+      body: |
+        Role *defaults* have the lowest precedence, so a play, inventory or `-e` can override them; a value in `vars/main.yml` cannot be overridden that easily. Settings meant to be tuned belong in defaults.
+      cost: 1
+    - title: "Pulling in the firewall role"
+      body: |
+        `meta/main.yml` lists `dependencies:`; each dependency can pass variables, for example `vars: { ov_firewall_ports: [...] }`. Look at `roles/ov_firewall` to see which variable it expects. Privilege escalation is already switched on in `ansible.cfg`, so `site.yml` needs no `become`.
+      cost: 2
+  misconceptions:
+    - id: settings-in-vars
+      description: "Puts the port and document root into vars/main.yml."
+      feedback: "Settings that callers may want to change belong in defaults/main.yml, where they can be overridden."
+      expectFail: [structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p roles/claims_web/tasks roles/claims_web/handlers roles/claims_web/defaults roles/claims_web/meta roles/claims_web/templates roles/claims_web/vars
+          cat > roles/claims_web/vars/main.yml <<'EOF'
+          claims_port: {{port}}
+          claims_docroot: {{docroot}}
+          EOF
+          cat > roles/claims_web/tasks/main.yml <<'EOF'
+          - name: nginx package
+            ansible.builtin.dnf:
+              name: nginx
+              state: present
+          - name: Document root
+            ansible.builtin.file:
+              path: "{{ claims_docroot }}"
+              state: directory
+              mode: "0755"
+          - name: Landing page
+            ansible.builtin.copy:
+              dest: "{{ claims_docroot }}/index.html"
+              content: "Orrin and Vale claims portal on {{ inventory_hostname }}\n"
+              mode: "0644"
+          - name: Site configuration
+            ansible.builtin.template:
+              src: nginx.conf.j2
+              dest: /etc/nginx/nginx.conf
+              mode: "0644"
+              validate: nginx -t -c %s
+            notify: Reload nginx
+          - name: nginx running and enabled
+            ansible.builtin.service:
+              name: nginx
+              state: started
+              enabled: true
+          EOF
+          cat > roles/claims_web/handlers/main.yml <<'EOF'
+          - name: Reload nginx
+            ansible.builtin.service:
+              name: nginx
+              state: reloaded
+          EOF
+          cat > roles/claims_web/templates/nginx.conf.j2 <<'EOF'
+          user nginx;
+          worker_processes 1;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+          events {
+              worker_connections 256;
+          }
+          http {
+              access_log /var/log/nginx/access.log;
+              default_type text/plain;
+              server {
+                  listen {{ claims_port }};
+                  server_name {{ inventory_hostname }};
+                  root {{ claims_docroot }};
+                  index index.html;
+              }
+          }
+          EOF
+          cat > roles/claims_web/meta/main.yml <<'EOF'
+          dependencies:
+            - role: ov_firewall
+              vars:
+                ov_firewall_ports:
+                  - "{{ claims_port }}/tcp"
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: claims_web
+            roles:
+              - claims_web
+          EOF
+          rmdir roles/claims_web/vars 2>/dev/null || true
+          ansible-playbook site.yml
+    - id: firewall-inside
+      description: "Opens the firewall port inside the role's own tasks instead of depending on the firewall role."
+      feedback: "A firewall role already exists; the claims_web role should declare it as a dependency."
+      expectFail: [structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p roles/claims_web/tasks roles/claims_web/handlers roles/claims_web/defaults roles/claims_web/meta roles/claims_web/templates roles/claims_web/vars
+          cat > roles/claims_web/defaults/main.yml <<'EOF'
+          claims_port: {{port}}
+          claims_docroot: {{docroot}}
+          EOF
+          cat > roles/claims_web/tasks/main.yml <<'EOF'
+          - name: nginx package
+            ansible.builtin.dnf:
+              name: nginx
+              state: present
+          - name: Document root
+            ansible.builtin.file:
+              path: "{{ claims_docroot }}"
+              state: directory
+              mode: "0755"
+          - name: Landing page
+            ansible.builtin.copy:
+              dest: "{{ claims_docroot }}/index.html"
+              content: "Orrin and Vale claims portal on {{ inventory_hostname }}\n"
+              mode: "0644"
+          - name: Site configuration
+            ansible.builtin.template:
+              src: nginx.conf.j2
+              dest: /etc/nginx/nginx.conf
+              mode: "0644"
+              validate: nginx -t -c %s
+            notify: Reload nginx
+          - name: nginx running and enabled
+            ansible.builtin.service:
+              name: nginx
+              state: started
+              enabled: true
+          - name: Open the portal port
+            ansible.posix.firewalld:
+              port: "{{ claims_port }}/tcp"
+              permanent: true
+              immediate: true
+              state: enabled
+          EOF
+          cat > roles/claims_web/handlers/main.yml <<'EOF'
+          - name: Reload nginx
+            ansible.builtin.service:
+              name: nginx
+              state: reloaded
+          EOF
+          cat > roles/claims_web/templates/nginx.conf.j2 <<'EOF'
+          user nginx;
+          worker_processes 1;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+          events {
+              worker_connections 256;
+          }
+          http {
+              access_log /var/log/nginx/access.log;
+              default_type text/plain;
+              server {
+                  listen {{ claims_port }};
+                  server_name {{ inventory_hostname }};
+                  root {{ claims_docroot }};
+                  index index.html;
+              }
+          }
+          EOF
+          cat > roles/claims_web/meta/main.yml <<'EOF'
+          dependencies: []
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: claims_web
+            roles:
+              - claims_web
+          EOF
+          rmdir roles/claims_web/vars 2>/dev/null || true
+          ansible-playbook site.yml
+    - id: fat-site
+      description: "Keeps a task list in site.yml next to the role."
+      feedback: "site.yml should only apply the role: three lines."
+      expectFail: [structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p roles/claims_web/tasks roles/claims_web/handlers roles/claims_web/defaults roles/claims_web/meta roles/claims_web/templates roles/claims_web/vars
+          cat > roles/claims_web/defaults/main.yml <<'EOF'
+          claims_port: {{port}}
+          claims_docroot: {{docroot}}
+          EOF
+          cat > roles/claims_web/tasks/main.yml <<'EOF'
+          - name: nginx package
+            ansible.builtin.dnf:
+              name: nginx
+              state: present
+          - name: Document root
+            ansible.builtin.file:
+              path: "{{ claims_docroot }}"
+              state: directory
+              mode: "0755"
+          - name: Landing page
+            ansible.builtin.copy:
+              dest: "{{ claims_docroot }}/index.html"
+              content: "Orrin and Vale claims portal on {{ inventory_hostname }}\n"
+              mode: "0644"
+          - name: Site configuration
+            ansible.builtin.template:
+              src: nginx.conf.j2
+              dest: /etc/nginx/nginx.conf
+              mode: "0644"
+              validate: nginx -t -c %s
+            notify: Reload nginx
+          - name: nginx running and enabled
+            ansible.builtin.service:
+              name: nginx
+              state: started
+              enabled: true
+          EOF
+          cat > roles/claims_web/handlers/main.yml <<'EOF'
+          - name: Reload nginx
+            ansible.builtin.service:
+              name: nginx
+              state: reloaded
+          EOF
+          cat > roles/claims_web/templates/nginx.conf.j2 <<'EOF'
+          user nginx;
+          worker_processes 1;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+          events {
+              worker_connections 256;
+          }
+          http {
+              access_log /var/log/nginx/access.log;
+              default_type text/plain;
+              server {
+                  listen {{ claims_port }};
+                  server_name {{ inventory_hostname }};
+                  root {{ claims_docroot }};
+                  index index.html;
+              }
+          }
+          EOF
+          cat > roles/claims_web/meta/main.yml <<'EOF'
+          dependencies:
+            - role: ov_firewall
+              vars:
+                ov_firewall_ports:
+                  - "{{ claims_port }}/tcp"
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: claims_web
+            roles:
+              - claims_web
+            tasks:
+              - ansible.builtin.debug:
+                  msg: portal configured
+          EOF
+          rmdir roles/claims_web/vars 2>/dev/null || true
+          ansible-playbook site.yml
+  solution:
+    explanation: |
+      The legacy tasks move into `roles/claims_web/tasks/main.yml`, the reload handler into `handlers/main.yml`,
+      the configuration into a Jinja2 template, and the port and document root become role defaults. The firewall
+      step is replaced by a dependency in `meta/main.yml` on `ov_firewall`, passing the port. `site.yml` then only
+      names the host group and the role, and `become` comes from `ansible.cfg`. The end state matches the legacy
+      playbook, and a second run changes nothing.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p roles/claims_web/tasks roles/claims_web/handlers roles/claims_web/defaults roles/claims_web/meta roles/claims_web/templates roles/claims_web/vars
+          cat > roles/claims_web/defaults/main.yml <<'EOF'
+          claims_port: {{port}}
+          claims_docroot: {{docroot}}
+          EOF
+          cat > roles/claims_web/tasks/main.yml <<'EOF'
+          - name: nginx package
+            ansible.builtin.dnf:
+              name: nginx
+              state: present
+          - name: Document root
+            ansible.builtin.file:
+              path: "{{ claims_docroot }}"
+              state: directory
+              mode: "0755"
+          - name: Landing page
+            ansible.builtin.copy:
+              dest: "{{ claims_docroot }}/index.html"
+              content: "Orrin and Vale claims portal on {{ inventory_hostname }}\n"
+              mode: "0644"
+          - name: Site configuration
+            ansible.builtin.template:
+              src: nginx.conf.j2
+              dest: /etc/nginx/nginx.conf
+              mode: "0644"
+              validate: nginx -t -c %s
+            notify: Reload nginx
+          - name: nginx running and enabled
+            ansible.builtin.service:
+              name: nginx
+              state: started
+              enabled: true
+          EOF
+          cat > roles/claims_web/handlers/main.yml <<'EOF'
+          - name: Reload nginx
+            ansible.builtin.service:
+              name: nginx
+              state: reloaded
+          EOF
+          cat > roles/claims_web/templates/nginx.conf.j2 <<'EOF'
+          user nginx;
+          worker_processes 1;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+          events {
+              worker_connections 256;
+          }
+          http {
+              access_log /var/log/nginx/access.log;
+              default_type text/plain;
+              server {
+                  listen {{ claims_port }};
+                  server_name {{ inventory_hostname }};
+                  root {{ claims_docroot }};
+                  index index.html;
+              }
+          }
+          EOF
+          cat > roles/claims_web/meta/main.yml <<'EOF'
+          dependencies:
+            - role: ov_firewall
+              vars:
+                ov_firewall_ports:
+                  - "{{ claims_port }}/tcp"
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: claims_web
+            roles:
+              - claims_web
+          EOF
+          rmdir roles/claims_web/vars 2>/dev/null || true
+          ansible-playbook site.yml
+    alternatives:
+      - id: split-tasks
+        description: "Splits the role's tasks into install and configure files that main.yml imports."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              mkdir -p roles/claims_web/tasks roles/claims_web/handlers roles/claims_web/defaults roles/claims_web/meta roles/claims_web/templates roles/claims_web/vars
+              cat > roles/claims_web/defaults/main.yml <<'EOF'
+              claims_port: {{port}}
+              claims_docroot: {{docroot}}
+              EOF
+              cat > roles/claims_web/tasks/install.yml <<'EOF'
+              - name: nginx package
+                ansible.builtin.dnf:
+                  name: nginx
+                  state: present
+              - name: Document root
+                ansible.builtin.file:
+                  path: "{{ claims_docroot }}"
+                  state: directory
+                  mode: "0755"
+              - name: Landing page
+                ansible.builtin.copy:
+                  dest: "{{ claims_docroot }}/index.html"
+                  content: "Orrin and Vale claims portal on {{ inventory_hostname }}\n"
+                  mode: "0644"
+              EOF
+              cat > roles/claims_web/tasks/configure.yml <<'EOF'
+              - name: Site configuration
+                ansible.builtin.template:
+                  src: nginx.conf.j2
+                  dest: /etc/nginx/nginx.conf
+                  mode: "0644"
+                  validate: nginx -t -c %s
+                notify: Reload nginx
+              - name: nginx running and enabled
+                ansible.builtin.service:
+                  name: nginx
+                  state: started
+                  enabled: true
+              EOF
+              cat > roles/claims_web/tasks/main.yml <<'EOF'
+              - ansible.builtin.import_tasks: install.yml
+              - ansible.builtin.import_tasks: configure.yml
+              EOF
+              cat > roles/claims_web/handlers/main.yml <<'EOF'
+              - name: Reload nginx
+                ansible.builtin.service:
+                  name: nginx
+                  state: reloaded
+              EOF
+              cat > roles/claims_web/templates/nginx.conf.j2 <<'EOF'
+              user nginx;
+              worker_processes 1;
+              error_log /var/log/nginx/error.log;
+              pid /run/nginx.pid;
+              events {
+                  worker_connections 256;
+              }
+              http {
+                  access_log /var/log/nginx/access.log;
+                  default_type text/plain;
+                  server {
+                      listen {{ claims_port }};
+                      server_name {{ inventory_hostname }};
+                      root {{ claims_docroot }};
+                      index index.html;
+                  }
+              }
+              EOF
+              cat > roles/claims_web/meta/main.yml <<'EOF'
+              dependencies:
+                - role: ov_firewall
+                  vars:
+                    ov_firewall_ports:
+                      - "{{ claims_port }}/tcp"
+              EOF
+              cat > site.yml <<'EOF'
+              - hosts: claims_web
+                roles:
+                  - claims_web
+              EOF
+              rmdir roles/claims_web/vars 2>/dev/null || true
+              ansible-playbook site.yml

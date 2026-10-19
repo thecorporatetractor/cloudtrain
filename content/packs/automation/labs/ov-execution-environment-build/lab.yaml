@@ -1,0 +1,313 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-execution-environment-build
+  title: "Build and run an execution environment for the claims project"
+  domain: automation
+  frameworks: [ex374-aligned:execution-environments]
+  difficulty: hard
+  estimatedMinutes: 45
+  tags: [ansible, execution-environments, ansible-builder, podman, tier-c, blocked]
+  version: 1
+spec:
+  description: |
+    The claims project needs the collection **`orrinvale.claims`** (a tarball in `/home/learner/claims-automation/collections`)
+    and the Python package **`jmespath`**, which the base environment lacks. The build host `ov-ee-1` has Podman and an
+    in-lab registry on port 5000; the mirrored base image is `ov-ee-1:5000/ov/ee-base:1`. There is no internet.
+
+    - Write the definition **`execution-environment.yml`** in the project (with its requirement files) so that the
+      environment is built on the mirrored base image and adds the collection and the Python package.
+    - Build it with `ansible-builder` (the container runtime is Podman on `ov-ee-1`; `ov-ctl` has none) as
+      **`ov-ee-1:5000/ov/claims-ee:{{eetag}}`** and push it to the in-lab registry (plain HTTP).
+    - Run the supplied **`site.yml`** inside that environment on `ov-ee-1`, with the project mounted at `/runner`, and
+      copy the result file `ee-proof.json` it writes back to the project directory on `ov-ctl`.
+  objectives:
+    - "Describe an execution environment with a definition file"
+    - "Build and publish an execution environment image"
+    - "Run a playbook inside an execution environment"
+  params:
+    eetag:
+      type: choice
+      values: ["1.0", "1.1", "2.0"]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-ee-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 2048 }, access: [ssh] }
+  setup:
+    - on: ov-ee-1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - on: ov-ee-1
+      timeoutSec: 600
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-ee-seeded ] && exit 0
+        rpm -q podman >/dev/null 2>&1 || dnf -y -q install podman >/dev/null
+        rpm -q rsync >/dev/null 2>&1 || dnf -y -q install rsync >/dev/null
+        loginctl enable-linger ovauto
+        grep -q '^ovauto:' /etc/subuid || usermod --add-subuids 200000-265535 --add-subgids 200000-265535 ovauto
+        for i in ov-registry:3 ov-ee-base:1; do
+          podman image exists localhost/$i || { echo "blocked: image localhost/$i is not preloaded in this el-vm image (needs the registry image and the mirrored EE base image)" >&2; exit 1; }
+        done
+        podman run -d --name ov-registry --restart=always -p 5000:5000 localhost/ov-registry:3 >/dev/null
+        printf '[[registry]]\nlocation = "ov-ee-1:5000"\ninsecure = true\n' > /etc/containers/registries.conf.d/ov-registry.conf
+        podman tag localhost/ov-ee-base:1 ov-ee-1:5000/ov/ee-base:1
+        podman push --tls-verify=false ov-ee-1:5000/ov/ee-base:1 >/dev/null
+        firewall-cmd -q --permanent --add-port=5000/tcp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-ee-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        builders:
+          hosts:
+            ov-ee-1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/collections
+        c=$(mktemp -d)
+        mkdir -p $c/orrinvale/claims/plugins/filter
+        printf 'namespace: orrinvale\nname: claims\nversion: 1.0.0\nreadme: README.md\nauthors: [Orrin and Vale automation]\n' > $c/orrinvale/claims/galaxy.yml
+        echo 'Claims helpers' > $c/orrinvale/claims/README.md
+        cat > $c/orrinvale/claims/plugins/filter/claim_ref.py <<'PYX'
+        class FilterModule(object):
+            def filters(self):
+                return {"claim_ref": lambda v: "CLM-" + str(v).upper()}
+        PYX
+        chown -R learner:learner $c
+        ct-ansible run $c/orrinvale/claims ansible-galaxy collection build --output-path /home/learner/claims-automation/collections >/dev/null
+        cat > $p/site.yml <<'EOF'
+        - hosts: localhost
+          connection: local
+          gather_facts: false
+          tasks:
+            - name: Prove the collection and the Python package are present
+              ansible.builtin.copy:
+                dest: /runner/ee-proof.json
+                content: "{{ {'claim': 'x1' | orrinvale.claims.claim_ref, 'lookup': [{'a': 1}] | community.general.json_query('[0].a')} | to_nice_json }}\n"
+        EOF
+        echo "{{eetag}}" > $p/.ee-tag
+        chown -R learner:learner $p
+  checks:
+    - id: definition-file
+      description: "The execution environment definition builds on the mirrored base image and adds the claims collection and the jmespath package"
+      type: shell
+      on: ov-ctl
+      skills: [automation.advanced.execution-environments]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - <<'PY' 2>/dev/null || echo no-definition
+        import yaml
+        p = '/home/learner/claims-automation/'
+        try:
+            d = yaml.safe_load(open(p + 'execution-environment.yml'))
+        except Exception:
+            print('no-definition'); raise SystemExit
+        bad = []
+        if d.get('version') != 3: bad.append('version')
+        base = str(((d.get('images') or {}).get('base_image') or {}).get('name', ''))
+        if not base.startswith('ov-ee-1:5000/'): bad.append('base-not-mirrored')
+        dep = d.get('dependencies') or {}
+        import os
+        def content(v, default):
+            if isinstance(v, (list, dict)): return str(v)
+            f = p + str(v or default)
+            return open(f).read() if os.path.exists(f) else ''
+        gal = content(dep.get('galaxy'), 'requirements.yml')
+        if 'orrinvale' not in str(dep.get('galaxy')) + gal: bad.append('no-collection')
+        py = content(dep.get('python'), 'requirements.txt')
+        if not py: bad.append('no-python-requirements')
+        elif 'jmespath' not in py: bad.append('no-jmespath')
+        print('ok' if not bad else ','.join(bad))
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: registry-tag
+      description: "The in-lab registry holds the claims environment under the requested tag"
+      type: shell
+      on: ov-ee-1
+      skills: [automation.advanced.execution-environments]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        curl -s -m 8 http://localhost:5000/v2/ov/claims-ee/tags/list | grep -o '"{{eetag}}"' | tr -d '"' || echo missing
+      expect: { match: exact, value: "{{eetag}}" }
+    - id: image-contents
+      description: "The pushed image contains the collection and the Python package"
+      type: shell
+      on: ov-ee-1
+      skills: [automation.advanced.execution-environments]
+      weight: 3
+      timeoutSec: 180
+      command: |
+        echo "$(podman run --rm ov-ee-1:5000/ov/claims-ee:{{eetag}} sh -c 'ansible-galaxy collection list 2>/dev/null | grep -c orrinvale.claims') $(podman run --rm ov-ee-1:5000/ov/claims-ee:{{eetag}} python3 -c 'import jmespath' && echo jmespath)"
+      expect: { match: exact, value: "1 jmespath" }
+    - id: proof-from-ee
+      description: "The site playbook ran inside the environment and left its result file"
+      type: shell
+      on: ov-ctl
+      skills: [automation.advanced.execution-environments]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - <<'PY' 2>/dev/null || echo no-proof
+        import json
+        d = json.load(open('/home/learner/claims-automation/ee-proof.json'))
+        print('ok' if d.get('claim') == 'CLM-X1' and d.get('lookup') == 1 else 'wrong-content')
+        PY
+      expect: { match: exact, value: "ok" }
+  hints:
+    - title: "The definition file"
+      body: |
+        `ansible-builder` reads a YAML definition (`version: 3`). `images.base_image.name` names the base, `dependencies.galaxy` points to a requirements file for collections and `dependencies.python` to a requirements file for Python packages.
+      cost: 1
+    - title: "No internet"
+      body: |
+        The base image comes from the in-lab registry on `ov-ee-1:5000`. The collection is a tarball in `collections/`; `additional_build_files` copies it into the build context so the requirements file can refer to it.
+      cost: 1
+    - title: "Where the container runtime is"
+      body: |
+        `ov-ctl` has no container runtime. `ansible-builder create` writes a build context there; copy it to `ov-ee-1` (which has Podman) and build, push (`--tls-verify=false`) and run there.
+      cost: 2
+  misconceptions:
+    - id: public-base-image
+      description: "Uses the public base image name from the documentation."
+      feedback: "There is no internet in the lab; start from the mirrored base image in the in-lab registry."
+      expectFail: [definition-file]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > execution-environment.yml <<'EOF'
+          version: 3
+          images:
+            base_image:
+              name: quay.io/ansible/community-ee-base:latest
+          dependencies:
+            galaxy: requirements.yml
+            python: requirements.txt
+          additional_build_files:
+            - src: collections/orrinvale-claims-1.0.0.tar.gz
+              dest: collections
+          EOF
+          ansible-builder create -f execution-environment.yml --context context
+    - id: no-collection
+      description: "Builds an environment with the Python package but without the claims collection."
+      feedback: "The playbook needs the orrinvale.claims filter; add the collection to the galaxy requirements."
+      expectFail: [definition-file, image-contents]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 1200
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > execution-environment.yml <<'EOF'
+          version: 3
+          images:
+            base_image:
+              name: ov-ee-1:5000/ov/ee-base:1
+          dependencies:
+            galaxy: requirements.yml
+            python: requirements.txt
+          additional_build_files:
+            - src: collections/orrinvale-claims-1.0.0.tar.gz
+              dest: collections
+          EOF
+          cat > requirements.yml <<'EOF'
+          collections: []
+          EOF
+          echo jmespath > requirements.txt
+          ansible-builder create -f execution-environment.yml --context context
+          rsync -a --delete context/ ov-ee-1:ee-context/
+          ssh ov-ee-1 'cd ee-context && sudo podman build -f Containerfile -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
+          ssh ov-ee-1 'sudo podman push --tls-verify=false ov-ee-1:5000/ov/claims-ee:{{eetag}}'
+          mkdir -p artifacts
+          rsync -a --exclude context --exclude artifacts ./ ov-ee-1:ee-run/
+          ssh ov-ee-1 'cd ee-run && sudo podman run --rm -v "$PWD":/runner:Z ov-ee-1:5000/ov/claims-ee:{{eetag}} ansible-playbook -i localhost, -c local /runner/site.yml' || true
+          rsync -a ov-ee-1:ee-run/ee-proof.json ./ee-proof.json || true
+  solution:
+    explanation: |
+      The definition names the mirrored base image, the galaxy requirements file (the collection tarball, shipped into the
+      build context with `additional_build_files`) and a Python requirements file with `jmespath`. `ansible-builder create`
+      writes the build context on the control node; the context is copied to `ov-ee-1`, built with Podman, pushed to the
+      in-lab registry and used to run the site playbook, whose result file is copied back.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 1500
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > execution-environment.yml <<'EOF'
+          version: 3
+          images:
+            base_image:
+              name: ov-ee-1:5000/ov/ee-base:1
+          dependencies:
+            galaxy: requirements.yml
+            python: requirements.txt
+          additional_build_files:
+            - src: collections/orrinvale-claims-1.0.0.tar.gz
+              dest: collections
+          EOF
+          cat > requirements.yml <<'EOF'
+          collections:
+            - name: collections/orrinvale-claims-1.0.0.tar.gz
+              type: file
+          EOF
+          echo jmespath > requirements.txt
+          ansible-builder create -f execution-environment.yml --context context
+          rsync -a --delete context/ ov-ee-1:ee-context/
+          ssh ov-ee-1 'cd ee-context && sudo podman build -f Containerfile -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
+          ssh ov-ee-1 'sudo podman push --tls-verify=false ov-ee-1:5000/ov/claims-ee:{{eetag}}'
+          mkdir -p artifacts
+          rsync -a --exclude context --exclude artifacts ./ ov-ee-1:ee-run/
+          ssh ov-ee-1 'cd ee-run && sudo podman run --rm -v "$PWD":/runner:Z ov-ee-1:5000/ov/claims-ee:{{eetag}} ansible-playbook -i localhost, -c local /runner/site.yml'
+          rsync -a ov-ee-1:ee-run/ee-proof.json ./ee-proof.json
+    alternatives:
+      - id: tagged-twice
+        description: "Also tags the pushed image as latest on the build host."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 1500
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > execution-environment.yml <<'EOF'
+              version: 3
+              images:
+                base_image:
+                  name: ov-ee-1:5000/ov/ee-base:1
+              dependencies:
+                galaxy: requirements.yml
+                python: requirements.txt
+              additional_build_files:
+                - src: collections/orrinvale-claims-1.0.0.tar.gz
+                  dest: collections
+              EOF
+              cat > requirements.yml <<'EOF'
+              collections:
+                - name: collections/orrinvale-claims-1.0.0.tar.gz
+                  type: file
+              EOF
+              echo jmespath > requirements.txt
+              ansible-builder create -f execution-environment.yml --context context
+              rsync -a --delete context/ ov-ee-1:ee-context/
+              ssh ov-ee-1 'cd ee-context && sudo podman build -f Containerfile -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
+              ssh ov-ee-1 'sudo podman push --tls-verify=false ov-ee-1:5000/ov/claims-ee:{{eetag}}; sudo podman tag ov-ee-1:5000/ov/claims-ee:{{eetag}} ov-ee-1:5000/ov/claims-ee:latest'
+              mkdir -p artifacts
+              rsync -a --exclude context --exclude artifacts ./ ov-ee-1:ee-run/
+              ssh ov-ee-1 'cd ee-run && sudo podman run --rm -v "$PWD":/runner:Z ov-ee-1:5000/ov/claims-ee:{{eetag}} ansible-playbook -i localhost, -c local /runner/site.yml'
+              rsync -a ov-ee-1:ee-run/ee-proof.json ./ee-proof.json

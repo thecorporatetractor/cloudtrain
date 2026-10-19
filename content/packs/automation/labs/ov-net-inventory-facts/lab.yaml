@@ -1,0 +1,490 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-net-inventory-facts
+  title: "Collect facts from the branch routers"
+  domain: automation
+  frameworks: [ex457-aligned:variables-facts, ex457-aligned:dev-workflow]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [ansible, network, frr, facts, inventory, tier-n, blocked]
+  version: 1
+spec:
+  description: |
+    Orrin and Vale's three branch routers `ov-branch-lon-gw`, `ov-branch-man-gw` and `ov-branch-lds-gw` run FRR and are
+    reachable over SSH from the control node (user `ovauto`, key-only, passwordless sudo). The project
+    `/home/learner/net` has an `ansible.cfg` but no inventory yet.
+
+    - Write **`inventory.yml`** with the group `branch_routers` holding the three routers, using the **ssh connection
+      plugin** and a **network OS** value that names FRR for each of them.
+    - Write **`facts.yml`** that gathers the interface and the IPv4 routing facts of every router (FRR's JSON output
+      from `vtysh`) and saves **one JSON file per router** as `/home/learner/net/facts/<router>.json`, each with the two
+      top-level keys `interfaces` and `routes`. Keep only fields that stay the same between runs (interface state and
+      addresses, route prefixes and protocols) and drop the ones that change on every read, such as uptimes, timers and
+      counters.
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Describe network devices in an inventory"
+    - "Gather structured device facts"
+    - "Save per-device data on the control node"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-man-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-lds-gw, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth3" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-man-gw:eth3" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-lds-gw:eth3" }
+      - { a: "ov-branch-lon-gw:eth1", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-branch-lon-gw:eth2", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      timeoutSec: 120
+      run: &ov-router |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=21 ;; ov-branch-man-gw) a=22 ;; ov-branch-lds-gw) a=23 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth3 up
+        ip addr replace 10.70.0.$a/24 dev eth3
+        for c in sshd useradd chpasswd sudo python3; do
+          command -v $c >/dev/null 2>&1 || { echo "blocked: this frr image has no $c; routers need openssh-server, sudo, python3 and an automation account (image rebuild)" >&2; exit 1; }
+        done
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-branch-man-gw, timeoutSec: 120, run: *ov-router }
+    - { on: ov-branch-lds-gw, timeoutSec: 120, run: *ov-router }
+    - on: ov-branch-lon-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        interface eth2
+         ip address 10.{{octet}}.2.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+        !
+    - on: ov-branch-man-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.2/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+        !
+    - on: ov-branch-lds-gw
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.3/32
+         ip ospf area 0
+        !
+        interface eth1
+         ip address 10.{{octet}}.2.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 10
+         ip ospf dead-interval 40
+        !
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+        !
+    - on: ov-ctl
+      timeoutSec: 300
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.21 ov-branch-man-gw=10.70.0.22 ov-branch-lds-gw=10.70.0.23
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw
+        p=/home/learner/net
+        install -d -o learner -g learner $p
+
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/facts
+        chown -R learner:learner $p
+  checks:
+    - id: inventory-ok
+      description: "The inventory lists the three branch routers with the ssh connection and a network OS that names FRR"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.connections, automation.network.backup-facts]
+      weight: 2
+      command: |
+        out=$(ct-ansible run /home/learner/net ansible-inventory --list 2>/dev/null)
+        echo "$out" | /opt/ansible/bin/python3 -c '
+        import json, sys
+        try:
+            hv = json.load(sys.stdin)["_meta"]["hostvars"]
+        except Exception:
+            print("no-inventory"); raise SystemExit
+        bad = []
+        for h in ("ov-branch-lon-gw", "ov-branch-man-gw", "ov-branch-lds-gw"):
+            v = hv.get(h)
+            if v is None: bad.append(h + ":missing"); continue
+            if v.get("ansible_connection", "ssh") != "ssh": bad.append(h + ":connection")
+            if "frr" not in str(v.get("ansible_network_os", "")): bad.append(h + ":network_os")
+        print("ok" if not bad else " ".join(bad))
+        '
+      expect: { match: exact, value: "ok" }
+    - id: facts-lon
+      description: "A JSON file for ov-branch-lon-gw holds its interface and routing facts under the keys interfaces and routes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.connections, automation.network.backup-facts]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/net/facts/ov-branch-lon-gw.json <<'PY' 2>/dev/null || echo unreadable
+        import json, sys
+        d = json.load(open(sys.argv[1]))
+        ok = isinstance(d.get("interfaces"), dict) and "lo" in d["interfaces"] and isinstance(d.get("routes"), dict) and "10.255.{{octet}}.1/32" in d["routes"]
+        print("ok" if ok else "incomplete")
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: facts-man
+      description: "A JSON file for ov-branch-man-gw holds its interface and routing facts under the keys interfaces and routes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.connections, automation.network.backup-facts]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/net/facts/ov-branch-man-gw.json <<'PY' 2>/dev/null || echo unreadable
+        import json, sys
+        d = json.load(open(sys.argv[1]))
+        ok = isinstance(d.get("interfaces"), dict) and "lo" in d["interfaces"] and isinstance(d.get("routes"), dict) and "10.255.{{octet}}.2/32" in d["routes"]
+        print("ok" if ok else "incomplete")
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: facts-lds
+      description: "A JSON file for ov-branch-lds-gw holds its interface and routing facts under the keys interfaces and routes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.connections, automation.network.backup-facts]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/net/facts/ov-branch-lds-gw.json <<'PY' 2>/dev/null || echo unreadable
+        import json, sys
+        d = json.load(open(sys.argv[1]))
+        ok = isinstance(d.get("interfaces"), dict) and "lo" in d["interfaces"] and isinstance(d.get("routes"), dict) and "10.255.{{octet}}.3/32" in d["routes"]
+        print("ok" if ok else "incomplete")
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "facts.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.connections, automation.network.backup-facts]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        ct-ansible recap /home/learner/net facts.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Describing a device in the inventory"
+      body: |
+        Besides the host name, a device needs to know how to be reached (`ansible_connection`) and what kind of device it is (`ansible_network_os`). Set both once in the group's `vars`.
+      cost: 1
+    - title: "Where the facts come from"
+      body: |
+        FRR prints structured output when you append `json` to a show command, for example `vtysh -c 'show ip route json'`. `from_json` turns the text into data. That data also holds uptimes and counters that change on every read; saving it whole makes every run rewrite the file. Pick the stable fields (for example with `map(attribute=...)` or a loop that builds a smaller dictionary) before `to_nice_json` writes the file.
+      cost: 1
+    - title: "One file per router"
+      body: |
+        A task that runs for every host can write a file named after `inventory_hostname`; `delegate_to: localhost` (with `become: false`) puts the file on the control node.
+      cost: 1
+  misconceptions:
+    - id: one-shared-file
+      description: "Writes the facts of all routers into one file."
+      feedback: "Each router needs its own file named after it."
+      expectFail: [facts-lon, facts-man, facts-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > inventory.yml <<'EOF'
+          branch_routers:
+            hosts:
+              ov-branch-lon-gw:
+              ov-branch-man-gw:
+              ov-branch-lds-gw:
+            vars:
+              ansible_connection: ssh
+              ansible_network_os: frr
+              ansible_python_interpreter: /usr/bin/python3
+          EOF
+          cat > facts.yml <<'EOF'
+          - name: Router facts
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Interfaces
+                ansible.builtin.command: vtysh -c 'show interface json'
+                register: ifaces
+                changed_when: false
+              - name: Routes
+                ansible.builtin.command: vtysh -c 'show ip route json'
+                register: routes
+                changed_when: false
+              - name: One JSON file per router
+                ansible.builtin.copy:
+                  dest: /home/learner/net/facts/all.json
+                  content: "{{ {'interfaces': ifaces.stdout | from_json, 'routes': routes.stdout | from_json} | to_nice_json }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          EOF
+          ansible-playbook facts.yml || true
+    - id: plain-text
+      description: "Saves the plain text of the show commands instead of structured data."
+      feedback: "The files must hold JSON data with the keys interfaces and routes, not screen output."
+      expectFail: [facts-lon, facts-man, facts-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > inventory.yml <<'EOF'
+          branch_routers:
+            hosts:
+              ov-branch-lon-gw:
+              ov-branch-man-gw:
+              ov-branch-lds-gw:
+            vars:
+              ansible_connection: ssh
+              ansible_network_os: frr
+              ansible_python_interpreter: /usr/bin/python3
+          EOF
+          cat > facts.yml <<'EOF'
+          - name: Router facts
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Interfaces
+                ansible.builtin.command: vtysh -c 'show interface'
+                register: ifaces
+                changed_when: false
+              - name: Routes
+                ansible.builtin.command: vtysh -c 'show ip route'
+                register: routes
+                changed_when: false
+              - name: One JSON file per router
+                ansible.builtin.copy:
+                  dest: /home/learner/net/facts/{{ inventory_hostname }}.json
+                  content: "{{ ifaces.stdout }}\n{{ routes.stdout }}\n"
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          EOF
+          ansible-playbook facts.yml || true
+    - id: local-connection
+      description: "Declares the routers with the local connection plugin."
+      feedback: "The routers are separate devices reached over SSH; a local connection runs the commands on the control node."
+      expectFail: [inventory-ok, facts-lon]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > inventory.yml <<'EOF'
+          branch_routers:
+            hosts:
+              ov-branch-lon-gw:
+              ov-branch-man-gw:
+              ov-branch-lds-gw:
+            vars:
+              ansible_connection: local
+              ansible_network_os: frr
+              ansible_python_interpreter: /usr/bin/python3
+          EOF
+          cat > facts.yml <<'EOF'
+          - name: Router facts
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Interfaces
+                ansible.builtin.command: vtysh -c 'show interface json'
+                register: ifaces
+                changed_when: false
+              - name: Routes
+                ansible.builtin.command: vtysh -c 'show ip route json'
+                register: routes
+                changed_when: false
+              - name: One JSON file per router
+                ansible.builtin.copy:
+                  dest: /home/learner/net/facts/{{ inventory_hostname }}.json
+                  content: |
+                    {%- set ns = namespace(r={}, i={}) -%}
+                    {%- for p, es in (routes.stdout | from_json).items() -%}
+                    {%- set ns.r = ns.r | combine({p: es | map(attribute='protocol') | list}) -%}
+                    {%- endfor -%}
+                    {%- for n, d in (ifaces.stdout | from_json).items() -%}
+                    {%- set ns.i = ns.i | combine({n: {'state': d.operationalStatus | default('unknown'), 'addresses': d.ipAddresses | default([]) | map(attribute='address') | list}}) -%}
+                    {%- endfor -%}
+                    {{ {'interfaces': ns.i, 'routes': ns.r} | to_nice_json }}
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          EOF
+          ansible-playbook facts.yml || true
+  solution:
+    explanation: |
+      The inventory groups the three routers with `ansible_connection: ssh` and `ansible_network_os: frr` as group
+      variables. The play runs two read-only vtysh commands per router (marked `changed_when: false`), converts the
+      JSON output to data and writes one JSON file per router on the control node with the `copy` module, which only
+      rewrites a file when its content changes, so a second run reports nothing.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          cat > inventory.yml <<'EOF'
+          branch_routers:
+            hosts:
+              ov-branch-lon-gw:
+              ov-branch-man-gw:
+              ov-branch-lds-gw:
+            vars:
+              ansible_connection: ssh
+              ansible_network_os: frr
+              ansible_python_interpreter: /usr/bin/python3
+          EOF
+          cat > facts.yml <<'EOF'
+          - name: Router facts
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Interfaces
+                ansible.builtin.command: vtysh -c 'show interface json'
+                register: ifaces
+                changed_when: false
+              - name: Routes
+                ansible.builtin.command: vtysh -c 'show ip route json'
+                register: routes
+                changed_when: false
+              - name: One JSON file per router
+                ansible.builtin.copy:
+                  dest: /home/learner/net/facts/{{ inventory_hostname }}.json
+                  content: |
+                    {%- set ns = namespace(r={}, i={}) -%}
+                    {%- for p, es in (routes.stdout | from_json).items() -%}
+                    {%- set ns.r = ns.r | combine({p: es | map(attribute='protocol') | list}) -%}
+                    {%- endfor -%}
+                    {%- for n, d in (ifaces.stdout | from_json).items() -%}
+                    {%- set ns.i = ns.i | combine({n: {'state': d.operationalStatus | default('unknown'), 'addresses': d.ipAddresses | default([]) | map(attribute='address') | list}}) -%}
+                    {%- endfor -%}
+                    {{ {'interfaces': ns.i, 'routes': ns.r} | to_nice_json }}
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+          EOF
+          ansible-playbook facts.yml
+    alternatives:
+      - id: template-file
+        description: "Keeps the data in a fact and renders each file from a small Jinja2 template."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/net
+              mkdir -p templates
+              cat > templates/facts.json.j2 <<'J2'
+              {%- set ns = namespace(r={}, i={}) -%}
+              {%- for p, es in router_facts.routes.items() -%}
+              {%- set ns.r = ns.r | combine({p: es | map(attribute='protocol') | list}) -%}
+              {%- endfor -%}
+              {%- for n, d in router_facts.interfaces.items() -%}
+              {%- set ns.i = ns.i | combine({n: {'state': d.operationalStatus | default('unknown'), 'addresses': d.ipAddresses | default([]) | map(attribute='address') | list}}) -%}
+              {%- endfor -%}
+              {{ {'interfaces': ns.i, 'routes': ns.r} | to_nice_json }}
+              J2
+              cat > inventory.yml <<'EOF'
+              branch_routers:
+                hosts:
+                  ov-branch-lon-gw:
+                  ov-branch-man-gw:
+                  ov-branch-lds-gw:
+                vars:
+                  ansible_connection: ssh
+                  ansible_network_os: frr
+                  ansible_python_interpreter: /usr/bin/python3
+              EOF
+              cat > facts.yml <<'EOF'
+              - name: Router facts
+                hosts: branch_routers
+                become: true
+                gather_facts: false
+                tasks:
+                  - name: Interfaces
+                    ansible.builtin.command: vtysh -c 'show interface json'
+                    register: ifaces
+                    changed_when: false
+                  - name: Routes
+                    ansible.builtin.command: vtysh -c 'show ip route json'
+                    register: routes
+                    changed_when: false
+                  - name: Keep the data
+                    ansible.builtin.set_fact:
+                      router_facts:
+                        interfaces: "{{ ifaces.stdout | from_json }}"
+                        routes: "{{ routes.stdout | from_json }}"
+                  - name: One JSON file per router
+                    ansible.builtin.template:
+                      src: facts.json.j2
+                      dest: /home/learner/net/facts/{{ inventory_hostname }}.json
+                      mode: "0644"
+                    delegate_to: localhost
+                    become: false
+              EOF
+              ansible-playbook facts.yml

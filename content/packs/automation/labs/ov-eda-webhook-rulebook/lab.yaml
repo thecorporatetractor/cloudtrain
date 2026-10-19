@@ -1,0 +1,389 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-eda-webhook-rulebook
+  title: "React to webhook events with a rulebook"
+  domain: automation
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, eda, rulebook, webhook, tier-a, blocked]
+  version: 1
+spec:
+  description: |
+    The claims cache nodes get stale when an upstream system says so. That system will POST JSON events to a webhook on the
+    control node. The playbook that flushes a node's cache is supplied in `/home/learner/claims-automation/cache-flush.yml`
+    (it runs on the host in the variable `target` and records its `flush_source`); do not edit it.
+
+    Write the rulebook **`claims-rules.yml`** in that directory that listens on a **webhook source on port {{eport}}** and
+    runs the playbook, passing the event's host as `target` and `flush_source: eda`, **only** when an event of type
+    `claims_cache_stale` arrives for a host that is in the inventory. All other events must be ignored.
+
+    Start the rulebook in the background and send these three events to it (path `/events`, JSON body):
+
+    - `{"event_type": "claims_cache_stale", "host": "{{stalehost}}"}`
+    - `{"event_type": "claims_order_created", "host": "{{stalehost}}"}`
+    - `{"event_type": "claims_cache_stale", "host": "ov-unknown-9"}`
+
+    Exactly one flush must have run, on `{{stalehost}}`.
+  objectives:
+    - "Write a rulebook with a webhook source"
+    - "Match events precisely and ignore the rest"
+    - "Pass event data to a playbook"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    eport:
+      type: choice
+      values: [5000, 5001, 5002]
+    stalehost:
+      type: choice
+      values: [ov-claims-web1, ov-claims-web2]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 300
+      run: |
+        command -v ansible-rulebook >/dev/null 2>&1 || { echo "blocked: ansible-rulebook and a JDK are not installed in ansible-ctl:2.21" >&2; exit 1; }
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          vars:
+            ansible_user: ovauto
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        cat > $p/cache-flush.yml <<'EOF'
+        - name: Flush the claims cache
+          hosts: "{{ target }}"
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Record the flush
+              ansible.builtin.shell: echo "$(date +%s) flush source={{ flush_source | default('manual') }} host={{ inventory_hostname }}" >> /var/log/ov-cache-flush.log
+              changed_when: true
+        EOF
+        chown -R learner:learner $p
+        sha256sum $p/cache-flush.yml > /var/tmp/.ct-flush.sum
+  checks:
+    - id: flush-web1
+      description: "ov-claims-web1 flushed its cache through the rulebook exactly as often as its events required"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.eda.rulebooks]
+      weight: 2
+      command: |
+        f=/var/log/ov-cache-flush.log
+        [ "{{stalehost}}" = ov-claims-web1 ] && want="1 1" || want="0 0"
+        have=$(awk '{n++} /source=eda/{s++} END{print n+0, s+0}' $f 2>/dev/null || echo "0 0")
+        [ "$have" = "$want" ] && echo ok || echo "flushes=$have"
+      expect: { match: exact, value: "ok" }
+    - id: flush-web2
+      description: "ov-claims-web2 flushed its cache through the rulebook exactly as often as its events required"
+      type: shell
+      on: ov-claims-web2
+      skills: [automation.eda.rulebooks]
+      weight: 2
+      command: |
+        f=/var/log/ov-cache-flush.log
+        [ "{{stalehost}}" = ov-claims-web2 ] && want="1 1" || want="0 0"
+        have=$(awk '{n++} /source=eda/{s++} END{print n+0, s+0}' $f 2>/dev/null || echo "0 0")
+        [ "$have" = "$want" ] && echo ok || echo "flushes=$have"
+      expect: { match: exact, value: "ok" }
+    - id: flush-db1
+      description: "ov-db-1 flushed its cache through the rulebook exactly as often as its events required"
+      type: shell
+      on: ov-db-1
+      skills: [automation.eda.rulebooks]
+      weight: 1
+      command: |
+        f=/var/log/ov-cache-flush.log
+        [ "{{stalehost}}" = ov-db-1 ] && want="1 1" || want="0 0"
+        have=$(awk '{n++} /source=eda/{s++} END{print n+0, s+0}' $f 2>/dev/null || echo "0 0")
+        [ "$have" = "$want" ] && echo ok || echo "flushes=$have"
+      expect: { match: exact, value: "ok" }
+    - id: flush-target
+      description: "The stale host recorded exactly one flush, started by the rulebook, and no event produced any other flush"
+      type: shell
+      on: ov-ctl
+      skills: [automation.eda.rulebooks]
+      weight: 2
+      command: |
+        d=/home/learner/claims-automation
+        out=$(ct-ansible run $d ansible {{stalehost}} -b -m ansible.builtin.shell -a 'awk "{n++} /source=eda/{s++} END{print n+0, s+0}" /var/log/ov-cache-flush.log 2>/dev/null || echo "0 0"' -o 2>/dev/null)
+        echo "$out" | grep -q '| CHANGED\|| SUCCESS' || { echo unreachable; exit 0; }
+        have=$(echo "$out" | grep -oE '[0-9]+ [0-9]+ *$' | tail -1)
+        [ "$have" = "1 1" ] && echo ok || echo "flushes=${have:-none}"
+      expect: { match: exact, value: "ok" }
+    - id: rulebook
+      description: "claims-rules.yml listens on the webhook source and runs the supplied playbook for stale-cache events of known hosts only"
+      type: shell
+      on: ov-ctl
+      skills: [automation.eda.rulebooks]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - <<'PY' 2>/dev/null || echo no-rulebook
+        import subprocess, yaml
+        p = '/home/learner/claims-automation/'
+        bad = []
+        try:
+            rb = yaml.safe_load(open(p + 'claims-rules.yml'))[0]
+        except Exception:
+            print('no-rulebook'); raise SystemExit
+        src = str(rb.get('sources'))
+        if 'ansible.eda.webhook' not in src or '{{eport}}' not in src: bad.append('source')
+        rules = rb.get('rules') or []
+        if not rules: bad.append('no-rules')
+        for r in rules:
+            c = str(r.get('condition'))
+            a = r.get('action') or {}
+            if 'claims_cache_stale' not in c: bad.append('no-event-type-test')
+            if 'payload.host' not in c: bad.append('no-host-test')
+            pb = a.get('run_playbook') or {}
+            if 'cache-flush' not in str(pb.get('name')): bad.append('wrong-playbook')
+            if 'flush_source' not in str(pb.get('extra_vars')): bad.append('no-flush_source')
+        sumok = subprocess.run('sha256sum -c --quiet /var/tmp/.ct-flush.sum', shell=True, capture_output=True).returncode == 0
+        if not sumok: bad.append('playbook-edited')
+        print('ok' if not bad else ','.join(sorted(set(bad))))
+        PY
+      expect: { match: exact, value: "ok" }
+  hints:
+    - title: "Sources and rules"
+      body: |
+        A rulebook is a YAML list; each entry has `sources` (here `ansible.eda.webhook` with `host` and `port`) and `rules`. A rule has a `condition` over `event.payload` and an `action`.
+      cost: 1
+    - title: "Conditions"
+      body: |
+        Combine tests with `and`: `event.payload.event_type == "..." and event.payload.host in ["a", "b"]`. Events that match no rule are simply dropped.
+      cost: 1
+    - title: "Running a playbook"
+      body: |
+        `action: run_playbook` takes `name` and `extra_vars`; values like `"{{ event.payload.host }}"` are filled from the event. The supplied playbook runs on the host named in `target` and records which source started it. Start the rulebook with `ansible-rulebook --rulebook <file> -i inventory.yml` (in the background, for example with `nohup ... &`) and send events with `curl -H 'Content-Type: application/json' -d '{...}' http://localhost:<port>/events`.
+      cost: 2
+  misconceptions:
+    - id: any-event-matches
+      description: "Tests only the host, so every event for a known host runs the playbook."
+      feedback: "Only events of type claims_cache_stale should trigger the flush; the other event must be ignored."
+      expectFail: [flush-target, rulebook]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > claims-rules.yml <<'EOF'
+          - name: Claims cache events
+            hosts: all
+            sources:
+              - ansible.eda.webhook:
+                  host: 0.0.0.0
+                  port: {{eport}}
+            rules:
+              - name: Flush the cache of a stale host
+                condition: event.payload.host in ["ov-claims-web1", "ov-claims-web2", "ov-db-1"]
+                action:
+                  run_playbook:
+                    name: cache-flush.yml
+                    extra_vars:
+                      target: "{{ event.payload.host }}"
+                      flush_source: eda
+          EOF
+          nohup ansible-rulebook --rulebook claims-rules.yml -i inventory.yml > /tmp/rulebook-ov.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 40); do nc -z localhost {{eport}} && break; sleep 1; done
+          send() { curl -s -m 5 -H 'Content-Type: application/json' -d "$1" http://localhost:{{eport}}/events >/dev/null; }
+          send '{"event_type": "claims_cache_stale", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_order_created", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_cache_stale", "host": "ov-unknown-9"}'
+          sleep 25
+    - id: playbook-without-source
+      description: "Runs the playbook but does not tell it the run came from the rulebook."
+      feedback: "The playbook records its source from the variable flush_source; pass it in extra_vars."
+      expectFail: [flush-target, rulebook]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > claims-rules.yml <<'EOF'
+          - name: Claims cache events
+            hosts: all
+            sources:
+              - ansible.eda.webhook:
+                  host: 0.0.0.0
+                  port: {{eport}}
+            rules:
+              - name: Flush the cache of a stale host
+                condition: event.payload.event_type == "claims_cache_stale" and event.payload.host in ["ov-claims-web1", "ov-claims-web2", "ov-db-1"]
+                action:
+                  run_playbook:
+                    name: cache-flush.yml
+                    extra_vars:
+                      target: "{{ event.payload.host }}"
+          EOF
+          nohup ansible-rulebook --rulebook claims-rules.yml -i inventory.yml > /tmp/rulebook-ov.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 40); do nc -z localhost {{eport}} && break; sleep 1; done
+          send() { curl -s -m 5 -H 'Content-Type: application/json' -d "$1" http://localhost:{{eport}}/events >/dev/null; }
+          send '{"event_type": "claims_cache_stale", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_order_created", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_cache_stale", "host": "ov-unknown-9"}'
+          sleep 25
+    - id: no-host-test
+      description: "Triggers for any host that sends a stale-cache event."
+      feedback: "The rule must check that the host is one of the known inventory hosts."
+      expectFail: [rulebook]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > claims-rules.yml <<'EOF'
+          - name: Claims cache events
+            hosts: all
+            sources:
+              - ansible.eda.webhook:
+                  host: 0.0.0.0
+                  port: {{eport}}
+            rules:
+              - name: Flush the cache of a stale host
+                condition: event.payload.event_type == "claims_cache_stale"
+                action:
+                  run_playbook:
+                    name: cache-flush.yml
+                    extra_vars:
+                      target: "{{ event.payload.host }}"
+                      flush_source: eda
+          EOF
+          nohup ansible-rulebook --rulebook claims-rules.yml -i inventory.yml > /tmp/rulebook-ov.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 40); do nc -z localhost {{eport}} && break; sleep 1; done
+          send() { curl -s -m 5 -H 'Content-Type: application/json' -d "$1" http://localhost:{{eport}}/events >/dev/null; }
+          send '{"event_type": "claims_cache_stale", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_order_created", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_cache_stale", "host": "ov-unknown-9"}'
+          sleep 25
+  solution:
+    explanation: |
+      The rulebook has one webhook source and one rule. The rule's condition requires the event type `claims_cache_stale` and a
+      host from the inventory, and its action runs the supplied playbook with the host as `target` and `flush_source: eda`.
+      The other two events (a different event type, and an unknown host) match nothing, so exactly one flush is recorded on
+      the target host.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > claims-rules.yml <<'EOF'
+          - name: Claims cache events
+            hosts: all
+            sources:
+              - ansible.eda.webhook:
+                  host: 0.0.0.0
+                  port: {{eport}}
+            rules:
+              - name: Flush the cache of a stale host
+                condition: event.payload.event_type == "claims_cache_stale" and event.payload.host in ["ov-claims-web1", "ov-claims-web2", "ov-db-1"]
+                action:
+                  run_playbook:
+                    name: cache-flush.yml
+                    extra_vars:
+                      target: "{{ event.payload.host }}"
+                      flush_source: eda
+          EOF
+          nohup ansible-rulebook --rulebook claims-rules.yml -i inventory.yml > /tmp/rulebook-ov.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 40); do nc -z localhost {{eport}} && break; sleep 1; done
+          send() { curl -s -m 5 -H 'Content-Type: application/json' -d "$1" http://localhost:{{eport}}/events >/dev/null; }
+          send '{"event_type": "claims_cache_stale", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_order_created", "host": "{{stalehost}}"}'
+          send '{"event_type": "claims_cache_stale", "host": "ov-unknown-9"}'
+          sleep 25
+    alternatives:
+      - id: regex-conditions
+        description: "Uses regular-expression matches in the condition instead of equality and a list."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > claims-rules.yml <<'EOF'
+              - name: Claims cache events
+                hosts: all
+                sources:
+                  - ansible.eda.webhook:
+                      host: 0.0.0.0
+                      port: {{eport}}
+                rules:
+                  - name: Flush the cache of a stale host
+                    condition: event.payload.event_type is match("claims_cache_stale") and event.payload.host is match("ov-(claims-web[12]|db-1)")
+                    action:
+                      run_playbook:
+                        name: cache-flush.yml
+                        extra_vars:
+                          target: "{{ event.payload.host }}"
+                          flush_source: eda
+              EOF
+              nohup ansible-rulebook --rulebook claims-rules.yml -i inventory.yml > /tmp/rulebook-ov.log 2>&1 &
+              pid=$!
+              trap 'kill $pid 2>/dev/null || true' EXIT
+              for i in $(seq 40); do nc -z localhost {{eport}} && break; sleep 1; done
+              send() { curl -s -m 5 -H 'Content-Type: application/json' -d "$1" http://localhost:{{eport}}/events >/dev/null; }
+              send '{"event_type": "claims_cache_stale", "host": "{{stalehost}}"}'
+              send '{"event_type": "claims_order_created", "host": "{{stalehost}}"}'
+              send '{"event_type": "claims_cache_stale", "host": "ov-unknown-9"}'
+              sleep 25
