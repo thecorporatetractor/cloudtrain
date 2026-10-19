@@ -24,7 +24,7 @@ spec:
        same qdisc tree as the netem qdisc.
 
     `ping 10.70.1.2` should now show a round trip of about {{delay}} ms. The change is
-    runtime only. Do not touch `eth0`.
+    runtime only. Do not touch the management interface (shown by `ip route show default`).
   objectives:
     - Attach a netem qdisc with delay and loss to an interface
     - Chain a token bucket filter to cap the rate
@@ -124,14 +124,16 @@ spec:
         awk -v a="${a:-0}" 'BEGIN { print (a >= {{delay}} && a <= {{delay}} + 40) ? "ok" : "avg=" a }'
       expect: {match: exact, value: ok}
     - id: only-depot-link
-      description: eth0 has no netem or tbf qdisc
+      description: The management interface has no netem or tbf qdisc
       type: shell
       on: tr-net-01
       skills: [linux.net.traffic-control]
       weight: 0.5
       command: |
         tc qdisc show dev depot0 | grep -q 'qdisc netem' || { echo not-configured; exit 0; }
-        tc qdisc show dev eth0 | grep -Ec 'netem|tbf' || true
+        m=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+        [ -n "$m" ] || { echo no-default-route; exit 0; }
+        tc qdisc show dev "$m" | grep -Ec 'netem|tbf' || true
       expect: {match: exact, value: "0"}
   hints:
     - title: Start with netem

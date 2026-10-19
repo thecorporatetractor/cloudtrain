@@ -22,10 +22,10 @@ spec:
 
     - IPv4 address **10.40.2.15/24** and IPv6 address **fd00:40:2::15/64** on `eth1`;
     - a **route to {{bb}}.0/24 via the gateway 10.40.2.1** on `eth1` (the host has a default
-      route on `eth0`, which must stay as it is);
+      route on the management interface, which must stay as it is);
     - the static host name **`tr-signal-02`** (`hostnamectl`).
 
-    Do not touch `eth0`, its address or the default route.
+    Do not touch the management interface (shown by `ip route show default`), its address or the default route.
   objectives:
     - Configure a dual-stack static address with Netplan
     - Add a static route through a gateway
@@ -53,7 +53,10 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
-        [ "$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" = eth0 ] || { echo "this lab expects the management NIC to be eth0 (default route is on $(ip -4 route show default | head -1))" >&2; exit 1; }
+        # remember the management interface (the one carrying the default route; eth0, enp1s0, ... depending on the image)
+        mgmt=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        [ -n "$mgmt" ] || { echo "no default route on this host" >&2; exit 1; }
+        echo "$mgmt" > /var/lib/cloudtrain/mgmt-if
         # eth1 is a veth end standing in for a second NIC (the VM has one); eth0 is never touched
         for f in /etc/netplan/*.yaml; do
           [ -f "$f" ] || continue
@@ -150,22 +153,23 @@ spec:
       command: echo "$(hostnamectl --static) $(cat /etc/hostname)"
       expect: {match: exact, value: "tr-signal-02 tr-signal-02"}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the management interface
       type: shell
       on: tr-net-01
       skills: [linux.net.persistent-config]
       weight: 0.5
       command: |
         { ip -4 -o addr show dev eth1 scope global | grep -q '10.40.2.15' || grep -rqs '10.40.2.15' /etc/netplan /etc/systemd/network; } || { echo not-configured; exit 0; }
-        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+        cur=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        [ -n "$cur" ] && [ "$cur" = "$(cat /var/lib/cloudtrain/mgmt-if 2>/dev/null)" ] && echo ok || echo "default-route=$cur"
+      expect: {match: exact, value: ok}
   hints:
     - title: One file for eth1
       body: "Netplan reads YAML from /etc/netplan/*.yaml. Add a file with ethernets: eth1: addresses: [...] and routes: - to: <prefix> via: <gateway>. Both address families go in the same addresses list."
       cost: 0
     - title: Apply it safely
       command: sudo netplan try
-      body: "netplan try applies the configuration and rolls back if you do not confirm; netplan apply applies it right away. Neither touches eth0 if the file only describes eth1. Files must be mode 0600."
+      body: "netplan try applies the configuration and rolls back if you do not confirm; netplan apply applies it right away. Neither touches the management interface if the file only describes eth1. Files must be mode 0600."
       cost: 1
     - title: Host name
       command: sudo hostnamectl set-hostname tr-signal-02
