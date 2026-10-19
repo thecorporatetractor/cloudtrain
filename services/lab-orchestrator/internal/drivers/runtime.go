@@ -27,6 +27,9 @@ type RuntimeOptions struct {
 	ImagePullSecrets []string
 	// RuntimeClassName for container nodes (e.g. "kata").
 	RuntimeClassName string
+	// TierRuntimeClasses maps catalog image tiers to RuntimeClasses
+	// (prototype, docs/kata-spike.md); empty = off.
+	TierRuntimeClasses map[string]string
 	// AdminImageRef is the catalog ref of the entry node's admin sidecar
 	// image (default "jumphost:1").
 	AdminImageRef string
@@ -100,7 +103,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	container := &ContainerDriver{
 		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: registry,
 		ImageMirrors: mirrors, ImagePullSecrets: secrets,
-		RuntimeClassName: o.RuntimeClassName, Executor: o.Executor, Catalog: o.Catalog,
+		RuntimeClassName: o.RuntimeClassName, TierRuntimeClasses: o.TierRuntimeClasses, Executor: o.Executor, Catalog: o.Catalog,
 		PersistentHome: o.PersistentHome, HomeStorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
 		UserNamespaces: o.UserNamespaces, DenyLearnerSudo: o.DenyLearnerSudo,
 	}

@@ -64,4 +64,6 @@ cosign verify ghcr.io/thecorporatetractor/cloudtrain/<image>:<tag> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
+Container images are scanned in CI with Trivy and Grype. The Security tab shows fixable findings only (HIGH and CRITICAL for platform images, CRITICAL for lab images); the full reports are workflow artifacts. See [Image scan policy](docs/security-ci.md#image-scan-policy).
+
 How the pipelines work is described in [docs/security-ci.md](docs/security-ci.md).

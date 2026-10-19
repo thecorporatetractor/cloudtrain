@@ -1,0 +1,144 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: systemd-service-lifecycle-kata
+  title: Bring the passenger-info service up at boot
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain, lfcs:essential-commands, linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [systemd, systemctl, services]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail's passenger information screens get their departure text from a
+    small service on **`tr-pis-01`** (`ssh tr-pis-01`; you have `sudo` there).
+
+    The new service **`tr-pis.service`** is installed but nobody started it, and after
+    the next reboot the screens would stay dark. At the same time the **legacy**
+    `pis-old.service` is still running and fights over the same screens.
+
+    1. Start `tr-pis.service` now and make it **start at every boot**.
+    2. Stop `pis-old.service` and make sure **nothing can start it** any more, not
+       even another unit that depends on it or an operator typing `systemctl start`.
+    3. Confirm both states with `systemctl`.
+  objectives:
+    - Start, stop, enable and disable systemd services
+    - Mask a unit so it cannot be started
+    - Read a unit's state with systemctl status and is-enabled
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-pis-01
+        driver: container
+        image: deb-sys:24.04
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh]
+  setup:
+    - on: tr-pis-01
+      run: |
+        set -eu
+        printf '%s\n' '#!/bin/sh' 'mkdir -p /run/tr-pis' 'while :; do date "+%H:%M departures ok" > /run/tr-pis/$1; sleep 5; done' > /usr/local/bin/tr-pis-feed
+        chmod 0755 /usr/local/bin/tr-pis-feed
+        printf '%s\n' '[Unit]' 'Description=Tallowmere passenger information feed' '[Service]' 'ExecStart=/usr/local/bin/tr-pis-feed current' '[Install]' 'WantedBy=multi-user.target' > /usr/lib/systemd/system/tr-pis.service
+        printf '%s\n' '[Unit]' 'Description=Legacy passenger information feed (retired)' '[Service]' 'ExecStart=/usr/local/bin/tr-pis-feed legacy' '[Install]' 'WantedBy=multi-user.target' > /usr/lib/systemd/system/pis-old.service
+        systemctl daemon-reload
+        systemctl disable --now tr-pis.service >/dev/null 2>&1 || true
+        systemctl enable --now pis-old.service
+  checks:
+    - id: pis-running
+      description: tr-pis.service is running
+      type: shell
+      on: tr-pis-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: systemctl is-active tr-pis.service || true
+      expect: {match: exact, value: active}
+    - id: pis-enabled
+      description: tr-pis.service starts at boot
+      type: shell
+      on: tr-pis-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: systemctl is-enabled tr-pis.service 2>/dev/null || true
+      expect: {match: exact, value: enabled}
+    - id: old-stopped
+      description: pis-old.service is not running
+      type: shell
+      on: tr-pis-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: systemctl is-active pis-old.service || true
+      expect: {match: exact, value: inactive}
+    - id: old-masked
+      description: pis-old.service is masked so nothing can start it
+      type: shell
+      on: tr-pis-01
+      skills: [linux.systemd.units]
+      weight: 1.5
+      command: systemctl is-enabled pis-old.service 2>/dev/null || true
+      expect: {match: exact, value: masked}
+  hints:
+    - title: See the current state
+      command: systemctl status tr-pis.service pis-old.service
+      body: "`Loaded:` shows whether a unit is enabled at boot, `Active:` whether it runs now. These are independent."
+      cost: 0
+    - title: Now and at boot in one command
+      body: "`systemctl enable --now <unit>` enables the unit and starts it; `disable --now` does the opposite."
+      cost: 1
+    - title: Stronger than disable
+      body: "A disabled unit can still be started by hand or as a dependency. `systemctl mask` links the unit to /dev/null so every start is refused. Stop it as well: masking does not stop a running unit."
+      cost: 2
+  misconceptions:
+    - id: started-not-enabled
+      description: Starts tr-pis.service but does not enable it.
+      feedback: "systemctl start lasts until the next reboot. Enable the unit so multi-user.target pulls it in at boot."
+      expectFail: [pis-enabled]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: sudo sh -c 'systemctl start tr-pis.service && systemctl stop pis-old.service && systemctl mask pis-old.service'
+    - id: disabled-not-masked
+      description: Disables the legacy service instead of masking it.
+      feedback: "A disabled unit can still be started by hand or by another unit. systemctl mask makes every start fail."
+      expectFail: [old-masked]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: sudo sh -c 'systemctl enable --now tr-pis.service && systemctl disable --now pis-old.service'
+    - id: masked-still-running
+      description: Masks the legacy service without stopping it.
+      feedback: "mask only changes what can start in future; the running process stays until you stop it (or use mask --now)."
+      expectFail: [old-stopped]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: sudo sh -c 'systemctl enable --now tr-pis.service && systemctl mask pis-old.service'
+  solution:
+    explanation: |
+      enable --now starts tr-pis.service and links it into multi-user.target for later
+      boots. mask --now stops pis-old.service and points the unit at /dev/null, so no
+      start request (manual or as a dependency) can bring it back.
+    steps:
+      - on: tr-pis-01
+        as: learner
+        run: |
+          sudo systemctl enable --now tr-pis.service
+          sudo systemctl mask --now pis-old.service
+          systemctl is-enabled tr-pis.service pis-old.service || true
+    alternatives:
+      - id: separate-commands
+        description: Start, enable, stop and mask with one command each.
+        steps:
+          - on: tr-pis-01
+            as: learner
+            run: |
+              sudo systemctl start tr-pis.service
+              sudo systemctl enable tr-pis.service
+              sudo systemctl stop pis-old.service
+              sudo systemctl disable pis-old.service
+              sudo systemctl mask pis-old.service

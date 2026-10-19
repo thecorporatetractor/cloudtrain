@@ -269,15 +269,16 @@ Design decisions to know when verifying:
 
 ### docker-vm:29 rebuild with the supply-chain tools (2026-10-19)
 
-Shipped from the wishlist above: cosign v2.6.5, notation v1.3.2 and trivy v0.75.0 in
-`/usr/local/bin` (release assets, sha256 in `deploy/versions.env`), the upstream Trivy DB (schema 2,
-built 2026-10-18T18:39Z, pinned by layer digest) in `/var/lib/trivy` (`trivy --cache-dir /var/lib/trivy
+Shipped from the wishlist above: cosign v2.6.5 (`COSIGN_V2_*`; kubeadm:1.37-full has v3, `COSIGN_V3_*`), notation
+v1.3.2 and trivy (`TRIVY_VERSION`, shared with kubeadm:1.37-full, 0.76.0) in `/usr/local/bin` (release assets, sha256 in `deploy/versions.env`), the upstream Trivy DB (schema 2,
+built 2026-10-18T18:39Z, `TRIVY_DB_REF` by manifest digest, shared with kubeadm:1.37-full) in `/var/lib/trivy` (`trivy --cache-dir /var/lib/trivy
 --skip-db-update`; world-readable, labs copy it), and preloaded `moby/buildkit:v0.23.2`,
 `moby/buildkit:buildx-stable-1`, `moby/buildkit:rootless` and `docker/buildkit-syft-scanner:stable-1`
 (digests in `tools/images/lock/docker-vm.lock`). Licences: all Apache-2.0, separate programs, texts in
 `/usr/share/doc/cloudtrain-supply-chain`. Size: containerDisk qcow2 1.86 GiB, image 1.8 GB -> 3.96 GB.
 The Trivy DB layer is republished upstream every few hours and old layers are not kept forever:
-refresh `TRIVY_DB_*` in `deploy/versions.env` when the pinned one disappears (the build says so).
+refresh `TRIVY_DB_REF`/`TRIVY_DB_DATE` with `tools/images/kubeadm-addons/trivy-db-pin.sh` when the pinned
+one disappears (the build fails on the download).
 
 Live verify from the image-gaps clone (`labctl verify`, batch label, `--parallel 1`): ctr-cosign-sign-verify
 pass, ctr-ci-rootless-buildkit pass, ctr-scan-triage-vex pass. Lab fixes made on the way:

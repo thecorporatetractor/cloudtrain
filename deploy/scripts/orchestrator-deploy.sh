@@ -82,13 +82,15 @@ fi
 # cluster's default class and CDI StorageProfile (see docs/storage.md).
 # VCLUSTER_POD_SECURITY (baseline|restricted) sets --vcluster-pod-security.
 # NETWORK_MODE (see above) sets --network-mode; LAB_MTU sets --lab-mtu.
+# TIER_RUNTIME_CLASSES (prototype, docs/kata-spike.md; e.g. B=kata-clh) sets
+# --tier-runtime-classes.
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 # Cluster-scoped RBAC and admission objects (and the Roles in kube-system) of a
 # separate instance carry its namespace as a suffix.
 SUF=""; [[ $NS != cloudtrain-system ]] && SUF="-$NS"
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
+    | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" TRC="${TIER_RUNTIME_CLASSES:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
         (select(.kind == "ClusterRole" or .kind == "Role" or .kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") | .metadata.name) += strenv(SUF) |
@@ -113,7 +115,8 @@ manifests() {
         (select(.kind == "Deployment" and strenv(PT) != "") | .spec.template.spec.containers[0].args) += ["--provision-timeout=" + strenv(PT)] |
         (select(.kind == "Deployment" and strenv(PSS) != "") | .spec.template.spec.containers[0].args) += ["--vcluster-pod-security=" + strenv(PSS)] |
         (select(.kind == "Deployment" and strenv(NM) != "") | .spec.template.spec.containers[0].args) += ["--network-mode=" + strenv(NM)] |
-        (select(.kind == "Deployment" and strenv(MTU) != "") | .spec.template.spec.containers[0].args) += ["--lab-mtu=" + strenv(MTU)]' \
+        (select(.kind == "Deployment" and strenv(MTU) != "") | .spec.template.spec.containers[0].args) += ["--lab-mtu=" + strenv(MTU)] |
+        (select(.kind == "Deployment" and strenv(TRC) != "") | .spec.template.spec.containers[0].args) += ["--tier-runtime-classes=" + strenv(TRC)]' \
     | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
 log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}"

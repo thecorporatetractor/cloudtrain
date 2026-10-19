@@ -3,7 +3,8 @@
 # (vm-images.yml; docs/deploy.md, "Publishing containerDisks"), nor tools/images/linux-pod,
 # which needs the package mirror as a build context. Pull requests build only the
 # images whose inputs changed (`plan` job, per-image `paths`). Every build: Trivy +
-# Grype (SARIF; fail on a CRITICAL vulnerability that has a fix), SBOMs as artifacts. Push to main and v* tags
+# Grype (fail on a CRITICAL vulnerability that has a fix; SARIF for fixable findings only, per
+# tier, see docs/security-ci.md), full reports and SBOMs as artifacts. Push to main and v* tags
 # only: push to GHCR, cosign keyless signature, SLSA build provenance and SBOM
 # attestations (stored in the registry and in GitHub's attestation store).
 name: images
@@ -117,10 +118,64 @@ jobs:
           push: false
           provenance: false
       - run: bash .github/scripts/install-tools.sh trivy grype syft
-      - name: Trivy (SARIF, all severities)
-        run: trivy image --scanners vuln,secret --format sarif --output trivy.sarif "$IMAGE"
-      - name: Grype (SARIF)
-        run: grype --output sarif --file grype.sarif "$IMAGE"
+      # Full reports: every finding, every severity, fixed or not. Kept as a workflow
+      # artifact and summarised in the job summary; never uploaded to code scanning.
+      - name: Trivy full report
+        run: |
+          trivy image --scanners vuln,secret --format json --output trivy-full.json "$IMAGE"
+          trivy convert --format table --output trivy-full.txt trivy-full.json
+      - name: Grype full report
+        run: grype -o json=grype-full.json -o table=grype-full.txt "$IMAGE"
+      # Code scanning gets only what someone can act on (docs/security-ci.md, "Image scan
+      # policy"). Platform images: fixable HIGH and CRITICAL. Lab and workstation images
+      # (they bundle third-party tools on purpose): fixable CRITICAL, Trivy only.
+      - name: Trivy SARIF (fixable, by tier)
+        env:
+          TIER: ${{ matrix.tier }}
+        run: |
+          sev=CRITICAL; [[ $TIER == platform ]] && sev=HIGH,CRITICAL
+          trivy image --scanners vuln,secret --severity "$sev" --ignore-unfixed \
+            --format sarif --output trivy.sarif "$IMAGE"
+      - name: Grype SARIF (platform images only; fixable HIGH and CRITICAL)
+        if: matrix.tier == 'platform'
+        run: |
+          grype --only-fixed -o sarif=grype-all.sarif "$IMAGE"
+          # Grype SARIF level: error = Critical or High; warning/note = the rest
+          jq '.runs[] |= (
+                .results = [(.results // [])[] | select(.level == "error")]
+                | ([.results[].ruleId] | unique) as $ids
+                | .tool.driver.rules = [(.tool.driver.rules // [])[] | select(.id as $i | $ids | index($i))])' \
+            grype-all.sarif > grype.sarif
+      - name: Job summary
+        env:
+          NAME: ${{ matrix.name }}
+          TIER: ${{ matrix.tier }}
+        run: |
+          {
+            echo "### $NAME ($TIER image)"
+            echo
+            echo "Full reports: artifact \`scan-reports-$NAME\`. Code scanning receives fixable findings only (docs/security-ci.md)."
+            echo
+            echo "| Scanner | Severity | All | With a fix |"
+            echo "|---|---|---|---|"
+            for sev in CRITICAL HIGH MEDIUM LOW; do
+              t=$(jq --arg s "$sev" '[.Results[]?.Vulnerabilities[]? | select(.Severity == $s)] | length' trivy-full.json)
+              f=$(jq --arg s "$sev" '[.Results[]?.Vulnerabilities[]? | select(.Severity == $s and (.FixedVersion // "") != "")] | length' trivy-full.json)
+              echo "| Trivy | $sev | $t | $f |"
+              g=$(jq --arg s "$sev" '[.matches[] | select((.vulnerability.severity | ascii_upcase) == $s)] | length' grype-full.json)
+              gf=$(jq --arg s "$sev" '[.matches[] | select((.vulnerability.severity | ascii_upcase) == $s and .vulnerability.fix.state == "fixed")] | length' grype-full.json)
+              echo "| Grype | $sev | $g | $gf |"
+            done
+            echo
+            echo "<details><summary>Fixable CRITICAL and HIGH (Trivy, first 200)</summary>"
+            echo
+            echo "| Severity | Package | Installed | Fixed in | CVE |"
+            echo "|---|---|---|---|---|"
+            jq -r '[.Results[]?.Vulnerabilities[]? | select((.Severity == "CRITICAL" or .Severity == "HIGH") and (.FixedVersion // "") != "")]
+                   | sort_by(.Severity) | .[:200][]
+                   | "| \(.Severity) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion) | \(.VulnerabilityID) |"' trivy-full.json
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: SBOMs (SPDX + CycloneDX)
         env:
           NAME: ${{ matrix.name }}
@@ -133,10 +188,20 @@ jobs:
           sarif_file: trivy.sarif
           category: trivy-image-${{ matrix.name }}
       - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
-        if: always() && hashFiles('grype.sarif') != ''
+        if: always() && matrix.tier == 'platform' && hashFiles('grype.sarif') != ''
         with:
           sarif_file: grype.sarif
           category: grype-image-${{ matrix.name }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: scan-reports-${{ matrix.name }}
+          path: |
+            trivy-full.json
+            trivy-full.txt
+            grype-full.json
+            grype-full.txt
+          retention-days: 30
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-image-${{ matrix.name }}
@@ -170,6 +235,7 @@ jobs:
       matrix:
         include:
           - name: lab-orchestrator
+            tier: platform
             paths: services/lab-orchestrator/* go.work go.work.sum deploy/vcluster/values.yaml deploy/versions.env .dockerignore
             context: .
             file: services/lab-orchestrator/Dockerfile
@@ -177,16 +243,19 @@ jobs:
           # Platform: the gateway (BFF + labctl + content) and the web app (static build
           # behind unprivileged nginx). Deployed by deploy/charts/cloudtrain.
           - name: gateway
+            tier: platform
             paths: services/gateway/* services/lab-orchestrator/* packages/* content/* pnpm-lock.yaml package.json pnpm-workspace.yaml turbo.json .dockerignore
             context: .
             file: services/gateway/Dockerfile
             args: ''
           - name: web
+            tier: platform
             paths: apps/web/* packages/* pnpm-lock.yaml package.json pnpm-workspace.yaml turbo.json .dockerignore
             context: .
             file: apps/web/Dockerfile
             args: ''
           - name: jumphost
+            tier: lab
             paths: tools/images/jumphost/*
             context: tools/images/jumphost
             file: tools/images/jumphost/Dockerfile
@@ -195,22 +264,26 @@ jobs:
               UBUNTU_APT_SNAPSHOT KUBECTL_VERSION=LAB_K8S_VERSION HELM_VERSION HELM_TARBALL_SHA256
               ETCD_VERSION ETCD_TARBALL_SHA256 YQ_VERSION YQ_BINARY_SHA256
           - name: frr
+            tier: lab
             paths: tools/images/netdev/frr/*
             context: tools/images/netdev/frr
             file: tools/images/netdev/frr/Dockerfile
             args: ''
           - name: nettools
+            tier: lab
             paths: tools/images/netdev/nettools/*
             context: tools/images/netdev/nettools
             file: tools/images/netdev/nettools/Dockerfile
             args: ''
           - name: netsvc
+            tier: lab
             paths: tools/images/netdev/netsvc/*
             context: tools/images/netdev/netsvc
             file: tools/images/netdev/netsvc/Dockerfile
             args: ''
           # In-lab OCI registry (catalog oci-registry:3): thin layer on CNCF Distribution registry:3.
           - name: oci-registry
+            tier: lab
             paths: tools/images/oci-registry/*
             context: tools/images/oci-registry
             file: tools/images/oci-registry/Dockerfile
@@ -219,6 +292,7 @@ jobs:
           # Terraform flavour is built locally with tools/images/build-iac-ws.sh and is
           # never published from public CI (decision 2026-10-17, docs/handoff.md).
           - name: iac-ws-tofu
+            tier: lab
             paths: tools/images/iac/*
             context: tools/images/iac
             file: tools/images/iac/Dockerfile
@@ -232,6 +306,7 @@ jobs:
           # Ansible control node (catalog ansible-ctl:2.21). ansible-core is GPL-3.0-or-later,
           # shipped as a separate program with its licence text (docs/handoffs/automation.md).
           - name: ansible-ctl
+            tier: lab
             paths: tools/images/ansible/*
             context: tools/images/ansible
             file: tools/images/ansible/Dockerfile
@@ -240,6 +315,7 @@ jobs:
           # Kusto.Language from Apache-2.0 source, Azure-Sentinel sample data (MIT). The build
           # runs KustoLoco's test suites on the patched tree.
           - name: kql-ws
+            tier: lab
             paths: tools/images/kql-ws/*
             context: tools/images/kql-ws
             file: tools/images/kql-ws/Dockerfile

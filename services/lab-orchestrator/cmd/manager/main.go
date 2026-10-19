@@ -39,7 +39,7 @@ func main() {
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues                                       string
 		sessionSelector, leaderElectionID, netToolsImage                                                          string
 		storageClass, homeStorageClass, vmDiskStorageClass, vmDiskVolumeMode, vmDiskAccessModes, storagePreflight string
-		vmDisks, userNamespaces, vclusterPodSecurity                                                              string
+		vmDisks, userNamespaces, vclusterPodSecurity, tierRuntimeClasses                                          string
 		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag                                               string
 		sessionClusterRole, serviceAccount                                                                        string
 		labMTU                                                                                                    int
@@ -62,6 +62,7 @@ func main() {
 	flag.StringVar(&imagePullSecrets, "image-pull-secrets", "", "Secrets in the session namespace that lab pods (and ephemeral VM containerDisks: the first one) pull with, comma separated; added to the catalog's imagePullSecrets")
 	flag.StringVar(&netToolsImage, "net-tools-image", "nettools:1", "catalog image for link init/sidecar containers (iproute2, tc, tcpdump)")
 	flag.StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for container nodes (e.g. kata); empty = cluster default")
+	flag.StringVar(&tierRuntimeClasses, "tier-runtime-classes", "", "prototype (docs/kata-spike.md): RuntimeClass per catalog image tier, <tier>=<RuntimeClass> comma separated (e.g. B=kata-clh); overrides --runtime-class for those images, mappings whose RuntimeClass is missing are dropped at startup; empty = off")
 	flag.StringVar(&catalogPaths, "image-catalog", "/etc/cloudtrain/catalog", "image catalog files or directories, comma separated; later ones override earlier ones")
 	flag.StringVar(&adminImageRef, "admin-image-ref", "jumphost:1", "catalog ref of the entry node's admin sidecar image")
 	flag.StringVar(&helmBin, "helm", "helm", "helm binary used to install virtual clusters")
@@ -227,6 +228,24 @@ func main() {
 		log.Error(nil, "--user-namespaces must be auto, true or false", "value", userNamespaces)
 		os.Exit(1)
 	}
+	tierRCs, err := drivers.ParseTierRuntimeClasses(tierRuntimeClasses)
+	if err != nil {
+		log.Error(err, "invalid --tier-runtime-classes")
+		os.Exit(1)
+	}
+	if len(tierRCs) > 0 {
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for RuntimeClass detection")
+			os.Exit(1)
+		}
+		var dropped map[string]string
+		tierRCs, dropped = drivers.DetectTierRuntimeClasses(context.Background(), direct, tierRCs)
+		for t, why := range dropped {
+			log.Info("tier sandbox unavailable; its systemd images fail, the others use the default runtime", "tier", t, "reason", why)
+		}
+		log.Info("tier sandboxes", "enabled", drivers.FormatTiers(tierRCs))
+	}
 	netMode, err := network.ParseMode(networkModeFlag)
 	if err != nil {
 		log.Error(err, "invalid --network-mode")
@@ -260,7 +279,7 @@ func main() {
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, ImageMirrors: mirrors, ImagePullSecrets: pullSecrets,
-		RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
+		RuntimeClassName: runtimeClass, TierRuntimeClasses: tierRCs, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
 		VClusterPodSecurity: vclusterPodSecurity,
 		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass, HomeStorageClass: homeStorageClass,
