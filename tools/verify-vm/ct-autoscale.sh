@@ -51,8 +51,9 @@ while sleep "$INTERVAL"; do
     c=$(docker exec "$n" sh -c 'ps -eo etimes,args | awk "\$1 > 900 && /[\/]opt\/cni\/bin\/kube-ovn/" | wc -l' 2>/dev/null || echo 0)
     stall=$((stall + c))
   done
-  # lab-setup failures ("phase Failed: action N on X exited 1") are not capacity timeouts
-  tmo=$(find "$RES/labs" -name '*.json' -newermt "-$((2 * INTERVAL)) sec" -exec jq -r 'select(.status != "pass") | .failingStep' {} + 2>/dev/null | grep -viE 'phase Failed: action|action [0-9]+ on ' | grep -ciE 'timed out|timeout|deadline|not ready' || true)
+  # lab-setup failures ("phase Failed: action N on X exited 1") and lab-step non-zero exits
+  # ("<kind> step N: on X exited N") are lab bugs, not capacity timeouts; exec "context deadline exceeded" still counts
+  tmo=$(find "$RES/labs" -name '*.json' -newermt "-$((2 * INTERVAL)) sec" -exec jq -r 'select(.status != "pass") | .failingStep' {} + 2>/dev/null | grep -viE 'phase Failed: action|action [0-9]+ on |(base|mutation|alternative|solution) step [0-9]+: on [^ ]+ exited [0-9]+' | grep -ciE 'timed out|timeout|deadline|not ready' || true)
   read -r load1 _ < /proc/loadavg
   read -r rv rp hr pr hs ps fj fr < <(jobs)
   vmi=$(vmis)
