@@ -48,6 +48,9 @@ const (
 	MsgTimeout     = "the check timed out"
 	MsgError       = "the check could not run"
 	MsgUnsupported = "this check type is not supported by the grader"
+	// MsgNoHostAccess: ssh from the workstation could not log in to the host
+	// (the platform's management login was refused or the host unreachable).
+	MsgNoHostAccess = "the grader could not log in to this host: keep SSH running and reachable from the workstation and keep the platform's management access (/etc/ssh/sshd_config.d/0-cloudtrain-grader.conf and /etc/ssh/cloudtrain/)"
 )
 
 // Executor runs a request on a topology node ("node" or "node/member").
@@ -167,6 +170,11 @@ func (g *Grader) run(ctx context.Context, c labsv1.Check) labsv1.CheckResult {
 	case errors.Is(err, errTimeout):
 		r.Message = MsgTimeout
 		return r
+	case errors.Is(err, errNoHostAccess):
+		// Never graded on what a locked-out probe printed (an empty stdout
+		// must not satisfy an "expect nothing" check).
+		r.Message = MsgNoHostAccess
+		return r
 	case errors.Is(err, drivers.ErrUnsupported):
 		r.Message = MsgUnsupported
 		if r.Output == "" {
@@ -201,7 +209,10 @@ func (g *Grader) run(ctx context.Context, c labsv1.Check) labsv1.CheckResult {
 	return r
 }
 
-var errTimeout = errors.New("timeout")
+var (
+	errTimeout      = errors.New("timeout")
+	errNoHostAccess = errors.New("no ssh access to the host")
+)
 
 func (g *Grader) target(on string) string {
 	if on != "" {
@@ -241,6 +252,9 @@ func (g *Grader) run1(ctx context.Context, on string, kind drivers.ExecKind, use
 			return res, errTimeout
 		}
 		return res, err
+	}
+	if res.NoHostAccess {
+		return res, errNoHostAccess
 	}
 	if res.ExitCode == 124 || res.ExitCode == 137 {
 		return res, errTimeout

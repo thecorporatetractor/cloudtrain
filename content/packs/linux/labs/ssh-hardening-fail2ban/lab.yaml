@@ -24,6 +24,10 @@ spec:
     Put the sshd settings where they take effect (this host has drop-in files under
     `/etc/ssh/sshd_config.d`; the first value for a keyword wins), keep `sshd -t` clean,
     reload the daemon and do not lock yourself out: your own key login must keep working.
+    Keep the platform's management access too: `/etc/ssh/sshd_config.d/0-cloudtrain-grader.conf`
+    and `/etc/ssh/cloudtrain/` let only root from the workstation with the platform's key in
+    (none of your settings above changes for anyone else). Without them this host cannot be
+    graded, so leave both alone.
     Write the jail in `/etc/fail2ban/jail.d/` or `/etc/fail2ban/jail.local`.
   objectives:
     - Find the effective sshd configuration with sshd -T and the drop-in precedence rules
@@ -185,6 +189,20 @@ spec:
           printf '%s\n' 'PasswordAuthentication no' 'PermitRootLogin no' 'Ciphers {{ciphers}},aes128-ctr' | sudo tee /etc/ssh/sshd_config.d/00-harden.conf >/dev/null
           sudo mkdir -p /etc/fail2ban/jail.d
           printf '[sshd]\nenabled = true\nmaxretry = 5\nbantime = 10m\n' | sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null
+          sudo systemctl reload ssh
+    - id: lock-out-management
+      description: Hardens correctly but clears out every drop-in, the platform's management access included.
+      feedback: "With 0-cloudtrain-grader.conf gone the platform cannot log in to grade this host. Remove only the legacy drop-in; keep management access when you harden SSH."
+      expectFail: [password-off, root-off, pubkey-on, ciphers, config-valid, jail]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          sudo sh -c 'rm -f /etc/ssh/sshd_config.d/*.conf'
+          printf '%s\n' 'PasswordAuthentication no' 'PermitRootLogin no' 'PubkeyAuthentication yes' 'Ciphers {{ciphers}}' | sudo tee /etc/ssh/sshd_config.d/00-harden.conf >/dev/null
+          sudo mkdir -p /etc/fail2ban/jail.d
+          printf '[sshd]\nenabled = true\nmaxretry = 5\nbantime = 10m\n' | sudo tee /etc/fail2ban/jail.d/sshd.local >/dev/null
+          sudo sshd -t
           sudo systemctl reload ssh
   solution:
     explanation: |

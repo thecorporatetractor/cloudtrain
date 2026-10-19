@@ -255,7 +255,9 @@ type cloudInit struct {
 }
 
 // Render returns the #cloud-config document: the learner account (sudo
-// without password, learner key), root reachable with the admin key only,
+// without password, learner key), root reachable with the admin key only
+// (and from the entry node whatever the host's sshd policy, see
+// graderaccess.go),
 // pinned host keys, a static /etc/hosts with every lab host, and a resolver
 // for kubelet that is not the host cluster's DNS (see lab-demo.sh).
 func (c cloudInit) Render() ([]byte, error) {
@@ -269,6 +271,7 @@ func (c cloudInit) Render() ([]byte, error) {
 		{Path: "/etc/hosts", Content: hosts.String()},
 		{Path: "/root/.ssh/authorized_keys", Content: string(c.AdminPub), Permissions: "0600"},
 	}
+	files = append(files, graderAccessFiles(c.AdminPub, c.HostKey)...)
 	files = append(files, c.Files...)
 	runcmd := []any{[]any{"bash", "-c", "date +%s.%N > /var/log/cloudtrain-boot.ts"}}
 	for _, r := range c.RunCmd {

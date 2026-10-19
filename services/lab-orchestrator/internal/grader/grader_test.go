@@ -164,3 +164,21 @@ func TestDefaultTimeouts(t *testing.T) {
 		}
 	}
 }
+
+// A host that refuses the grader's ssh login fails every check with a clear
+// message, even a check that expects empty output.
+func TestGradeNoHostAccess(t *testing.T) {
+	checks := []labsv1.Check{
+		{ID: "empty", Type: "shell", On: "vm1", Command: "find / -perm -0002 -type f", Expect: &labsv1.Expectation{Match: "exact", Value: ""}},
+		{ID: "svc", Type: "service-state", On: "vm1", Target: "ssh"},
+	}
+	f := &fakeExec{reply: func(string, drivers.ExecRequest) (drivers.ExecResult, error) {
+		return drivers.ExecResult{Stderr: "root@192.168.100.10: Permission denied (publickey).\n", ExitCode: 255, NoHostAccess: true}, nil
+	}}
+	_, res := (&Grader{Exec: f, Entry: "ws"}).Grade(context.Background(), checks)
+	for _, r := range res {
+		if r.Passed || r.Message != MsgNoHostAccess || !strings.Contains(r.Output, "Permission denied") {
+			t.Errorf("%s: passed=%v message=%q output=%q", r.ID, r.Passed, r.Message, r.Output)
+		}
+	}
+}
