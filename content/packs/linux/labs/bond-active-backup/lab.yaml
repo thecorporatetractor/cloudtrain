@@ -129,15 +129,21 @@ spec:
       command: |
         python3 - <<'EOP'
         import glob, re
-        bond, ports = None, []
+        bond, ports, others = None, [], []
         for f in glob.glob("/etc/NetworkManager/system-connections/*.nmconnection"):
             t = open(f).read()
             if re.search(r"^type=bond\s*$", t, re.M):
                 bond = t
             elif re.search(r"^(slave-type|port-type)=bond\s*$", t, re.M):
-                m = re.search(r"^interface-name=(\S+)", t, re.M)
-                if m:
-                    ports.append(m.group(1))
+                others.append(t)
+        buuid = re.search(r"^uuid=(\S+)", bond or "", re.M)
+        bname = re.search(r"^interface-name=(\S+)", bond or "", re.M)
+        targets = {x.group(1) for x in (buuid, bname) if x} | {"bond0"}
+        for t in others:
+            m = re.search(r"^interface-name=(\S+)", t, re.M)
+            c = re.search(r"^(?:master|controller)=(\S+)", t, re.M)
+            if m and c and c.group(1) in targets:
+                ports.append(m.group(1))
         if not bond:
             print("no-bond-profile"); raise SystemExit
         mode = re.search(r"^mode=(\S+)", bond, re.M)

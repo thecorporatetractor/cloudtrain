@@ -115,7 +115,9 @@ spec:
       on: tr-net-01
       skills: [linux.net.troubleshooting]
       weight: 0.5
-      command: ip route get 10.66.9.20 from 10.66.1.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1
+      command: |
+        [ "$(ip route get 10.66.9.20 from 10.66.2.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1)" = "dev eth2" ] || { echo not-fixed; exit 0; }
+        ip route get 10.66.9.20 from 10.66.1.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1
       expect: {match: exact, value: dev eth1}
     - id: persistent
       description: The policy routing is in the persistent network configuration
@@ -133,14 +135,14 @@ spec:
         ok = any(str(r.get("table")) in tables and r.get("via") == "10.66.2.1" and r.get("to") in ("default", "0.0.0.0/0") for r in (d.get("routes") or []))
         if pol and ok:
             print("persistent"); raise SystemExit
-        txt = ""
         for f in glob.glob("/etc/systemd/network/**/*", recursive=True):
             try:
-                txt += open(f).read() + "\n"
+                t = open(f).read()
             except (OSError, IsADirectoryError):
-                pass
-        if re.search(r"From=10\.66\.2\.5", txt) and re.search(r"Gateway=10\.66\.2\.1", txt) and re.search(r"Table=", txt):
-            print("persistent"); raise SystemExit
+                continue
+            tab = re.findall(r"^Table=(\S+)", t, re.M)
+            if re.search(r"^From=10\.66\.2\.5", t, re.M) and re.search(r"^Gateway=10\.66\.2\.1", t, re.M) and tab and len(set(tab)) == 1:
+                print("persistent"); raise SystemExit
         print("runtime-only")
         EOP
       expect: {match: exact, value: persistent}
@@ -150,7 +152,9 @@ spec:
       on: tr-net-01
       skills: [linux.net.troubleshooting]
       weight: 0.5
-      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      command: |
+        [ "$(ip route get 10.66.9.20 from 10.66.2.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1)" = "dev eth2" ] || { echo not-fixed; exit 0; }
+        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
       expect: {match: exact, value: eth0}
   hints:
     - title: Follow the packets

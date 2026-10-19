@@ -58,6 +58,7 @@ spec:
       run: |
         set -eu
         V=/var/lib/cloudtrain; install -d -m 0700 $V
+        command -v tcpdump >/dev/null 2>&1 || { echo "tcpdump is missing from the image" >&2; exit 1; }
         for u in tr-collector tr-signal-sender; do systemctl stop $u.service 2>/dev/null || true; done
         nft delete table inet trhb 2>/dev/null || true
         for n in tr-signal-03 rtr; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
@@ -154,7 +155,10 @@ spec:
       command: |
         if [ "{{dropat}}" = tr-signal-03 ]; then
           # the sender never emits the packets: the evidence is a valid, empty capture taken on the path
-          tcpdump -nr /home/learner/answers/heartbeats.pcap >/dev/null 2>&1 && echo captured || echo "no-capture"
+          f=/home/learner/answers/heartbeats.pcap
+          tcpdump -nr $f >/dev/null 2>&1 || { echo "no-capture"; exit 0; }
+          [ $f -nt /var/lib/cloudtrain/drop.hop ] || { echo "stale-capture"; exit 0; }
+          [ "$(tcpdump -nr $f 'not (udp dst port 5140)' 2>/dev/null | wc -l)" = 0 ] && echo captured || echo "other-traffic"
           exit 0
         fi
         n=$(tcpdump -nr /home/learner/answers/heartbeats.pcap 'src host 10.65.1.2 and udp dst port 5140' 2>/dev/null | wc -l)
@@ -167,6 +171,7 @@ spec:
       skills: [linux.net.capture]
       weight: 0.5
       command: |
+        [ -s /home/learner/answers/drop.txt ] || { echo not-answered; exit 0; }
         a=$(systemctl is-active tr-signal-sender.service tr-collector.service | paste -sd,)
         n=$(wc -l < /var/lib/tr-heartbeat/received.log)
         echo "$a received=$n"
