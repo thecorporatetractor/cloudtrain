@@ -37,6 +37,24 @@ if ((${#missing[@]})); then
     || die "modprobe failed; on WSL2 check that /lib/modules/$(uname -r) exists"
 fi
 
+# Host AppArmor (native Linux hosts; WSL has none, so this is a no-op there): kind nodes are
+# privileged, lab pods unconfined, and path-attached host profiles then confine rsyslogd,
+# chronyd and tcpdump inside lab containers (docs/dev-environment.md, "Host AppArmor").
+# Unload exactly those three, without sudo, through a privileged container. Not persistent:
+# after a host reboot run this again, or disable them for good as tools/verify-vm/tune.sh does.
+if [[ -d /sys/kernel/security/apparmor ]]; then
+  aa=()
+  for f in usr.sbin.rsyslogd usr.sbin.chronyd usr.bin.tcpdump; do
+    [[ -r /etc/apparmor.d/$f ]] && aa+=("$(sed -nE 's/^profile ([^ ]+) .*/\1/p; s/^(\/[^ ]+) .*\{.*/\1/p' "/etc/apparmor.d/$f" | head -1)")
+  done
+  if ((${#aa[@]})); then
+    docker run --rm --privileged --entrypoint sh -v /sys/kernel/security:/sys/kernel/security "$KIND_NODE_IMAGE" -c \
+      'for n in "$@"; do awk -v n="$n" '"'"'$1 == n { f = 1 } END { exit !f }'"'"' /sys/kernel/security/apparmor/profiles || continue
+         printf %s "$n" > /sys/kernel/security/apparmor/.remove && echo "host-prep: unloaded host AppArmor profile $n"; done' sh "${aa[@]}" \
+      || warn "could not unload host AppArmor profiles ${aa[*]}; rsyslogd/chronyd/tcpdump labs may fail"
+  fi
+fi
+
 for d in "${devices[@]}"; do
   [[ -c $d ]] || die "$d missing after module load"
 done
