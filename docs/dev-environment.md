@@ -299,7 +299,9 @@ DataVolume imported from the containerDisk. Its size is the catalog `diskSize`, 
 `DefaultVMDiskSize` (12Gi, for the 10 GiB images) when the entry has none. CDI keeps 6 % for
 filesystem overhead, so a disk smaller than the image's virtual size plus that fails the import
 with "A larger PVC is required". The catalog therefore sizes disks at virtual size x 1.15: 12Gi
-for the kubeadm:1.37 and 1.36 images, 14Gi for kubeadm:1.37-full/-sec and docker-vm:29 (12 GiB).
+for the kubeadm:1.37 and 1.36 images, 19Gi for kubeadm:1.37-full/-sec (16 GiB: the Trivy DB, the
+Go base image and a Trivy export of a buildah image do not fit the free space of a 12 GiB root
+when the VM boots from the ephemeral containerDisk) and 14Gi for docker-vm:29 (12 GiB).
 `build.sh` refuses to build an image whose catalog `diskSize` is below that.
 
 All VM images share the same conventions: Ubuntu cloud image with cloud-init and sshd,

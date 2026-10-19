@@ -59,7 +59,7 @@ case $VARIANT in
   etcd-host)
     TAG="$ETCD_HOST_IMAGE"; REF=etcd-host:3.6; GUEST=etcd-host; DISK_SIZE=4G ;;
   kubeadm-full)
-    TAG="${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}"; REF=kubeadm:1.37-full; GUEST=kubeadm-addons; DISK_SIZE=12G
+    TAG="${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}"; REF=kubeadm:1.37-full; GUEST=kubeadm-addons; DISK_SIZE=16G
     K8S_VERSION=$LAB_K8S_VERSION; STAGED_VERSION="" ;;
   el-vm)
     TAG="$EL_VM_IMAGE"; REF=el-vm:10; GUEST=el-vm; DISK_SIZE=10G ;;

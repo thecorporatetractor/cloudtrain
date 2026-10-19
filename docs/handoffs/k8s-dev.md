@@ -29,11 +29,14 @@ compile` passes for sim-k8s-admin, -developer, -security.
   Traefik's LoadBalancer Service, so MetalLB is needed); `xkd-top-memory-report`:
   `addons-install metrics-server`.
 
-**Still blocked (the full image has no such tool):** buildah (build-waybill-image,
-xkd-build-tag-image, waybill-image-slim-scan), Trivy + offline DB (sbom-dispatch-image,
-xks-sbom-spdx, xks-scan-pick-image), cosign + signed layouts (xks-signature-verify), a
-CSI driver with expansion (xka-expand-claim). These need a kubeadm-full rebuild
-(~30 min TCG in the heavy slot) with those packages.
+**Unblocked 2026-10-19 (feat/kubeadm-image-tools):** buildah is in every kubeadm image;
+kubeadm:1.37-full/-sec add Trivy with a dated offline DB, cosign with the signed
+`/opt/qm-signing` fixture, podman.socket (Trivy reads buildah images through it), the
+golang:1.25 and static-nonroot:2026.10 base images in buildah's storage, and
+`addons-install csi-hostpath` (see docs/dev-environment.md "kubeadm extras"). Verified
+live on the VM: build-waybill-image, xkd-build-tag-image, xka-expand-claim,
+xks-signature-verify, xks-sbom-spdx; sbom-dispatch-image, xks-scan-pick-image and
+waybill-image-slim-scan are re-queued in the batch runner.
 
 **Lab bugs fixed:** `xka-crd-custom-resource` (the "operator" loop never started:
 `pgrep -f /tmp/berth-operator.sh` matched the setup shell's own command line; now
@@ -70,7 +73,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 
 | Lab | Tier | Status | Notes |
 |---|---|---|---|
-| build-waybill-image | K | built, **blocked** | kubeadm:1.37 node image has no build tool; needs `buildah` |
+| build-waybill-image | K | **verified** | buildah on the kubeadm node image (2026-10-19) |
 | ledger-export-cronjob | V | **verified** | 7 runs, 613 s |
 | parallel-manifest-job | V | **verified** | 6 runs, 747 s |
 | tariff-cache-statefulset | K | built | uses pre-provisioned local PVs + no-provisioner StorageClass, so no dynamic provisioner is needed; vm-slot verify pending |
@@ -90,7 +93,7 @@ Round 3: every V task below is **verified**; the K tasks are `built`.
 | design-build | xkd-cronjob-cleanup | V | |
 | design-build | xkd-job-completions | V | |
 | design-build | xkd-init-container-seed | V | |
-| design-build | xkd-build-tag-image | K | **buildah** on the kubeadm node image |
+| design-build | xkd-build-tag-image | K | none (buildah on the node image since 2026-10-19) |
 | design-build | xkd-pvc-mount-pod | K | none (static PV in class `yard-notes`) |
 | design-build | xkd-workload-kind-choice | K | |
 | deployment | xkd-canary-share | V | |
@@ -168,7 +171,7 @@ resume").
 
 ## Platform blockers
 
-- kubeadm:1.37 has no image build tool (`buildah`), which blocks build-waybill-image and xkd-build-tag-image. `oci-registry:3`, listed for build-waybill-image in the curriculum, is not in the catalog; the lab was designed so that it does not need a registry (OCI archive, then `ctr import`, then `imagePullPolicy: Never`).
+- Resolved 2026-10-19: kubeadm images ship `buildah`, so build-waybill-image and xkd-build-tag-image run. `oci-registry:3`, listed for build-waybill-image in the curriculum, is not in the catalog; the lab was designed so that it does not need a registry (OCI archive, then `ctr import`, then `imagePullPolicy: Never`).
 - No metrics-server on kubeadm clusters, which blocks xkd-top-memory-report.
 - No ingress controller or default IngressClass on kubeadm, which blocks xkd-ingress-path.
 - workloadImages is limited to busybox, httpd (2.4 and 2.4-alpine), redis and caddy. Tasks that call for "tag 2.7" or "3.4" images were adapted: httpd:2.4-alpine to httpd:2.4, and a non-pullable `registry.quillmoor.example/...` image where only the spec is graded (kustomize).

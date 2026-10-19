@@ -214,9 +214,9 @@ func TestRepoCatalogDiskSizes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, ref := range []string{"kubeadm:1.37-full", "kubeadm:1.37-sec", "docker-vm:29"} {
-		if got := c.Images[ref].DiskSize; got != "14Gi" {
-			t.Errorf("%s diskSize = %q, want 14Gi (12 GiB image x 1.15)", ref, got)
+	for ref, want := range map[string]string{"kubeadm:1.37": "12Gi", "kubeadm:1.37-full": "19Gi", "kubeadm:1.37-sec": "19Gi", "docker-vm:29": "14Gi"} {
+		if got := c.Images[ref].DiskSize; got != want {
+			t.Errorf("%s diskSize = %q, want %s (virtual size x 1.15)", ref, got, want)
 		}
 	}
 }

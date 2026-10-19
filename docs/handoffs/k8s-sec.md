@@ -29,11 +29,14 @@ compile` passes for sim-k8s-admin, -developer, -security.
   Traefik's LoadBalancer Service, so MetalLB is needed); `xkd-top-memory-report`:
   `addons-install metrics-server`.
 
-**Still blocked (the full image has no such tool):** buildah (build-waybill-image,
-xkd-build-tag-image, waybill-image-slim-scan), Trivy + offline DB (sbom-dispatch-image,
-xks-sbom-spdx, xks-scan-pick-image), cosign + signed layouts (xks-signature-verify), a
-CSI driver with expansion (xka-expand-claim). These need a kubeadm-full rebuild
-(~30 min TCG in the heavy slot) with those packages.
+**Unblocked 2026-10-19 (feat/kubeadm-image-tools):** buildah is in every kubeadm image;
+kubeadm:1.37-full/-sec add Trivy with a dated offline DB, cosign with the signed
+`/opt/qm-signing` fixture, podman.socket (Trivy reads buildah images through it), the
+golang:1.25 and static-nonroot:2026.10 base images in buildah's storage, and
+`addons-install csi-hostpath` (see docs/dev-environment.md "kubeadm extras"). Verified
+live on the VM: build-waybill-image, xkd-build-tag-image, xka-expand-claim,
+xks-signature-verify, xks-sbom-spdx; sbom-dispatch-image, xks-scan-pick-image and
+waybill-image-slim-scan are re-queued in the batch runner.
 
 **Lab bugs fixed:** `xka-crd-custom-resource` (the "operator" loop never started:
 `pgrep -f /tmp/berth-operator.sh` matched the setup shell's own command line; now
@@ -119,10 +122,10 @@ against the solution and every mutation in the jumphost image).
 | cis-apiserver-findings | kube-bench on the nodes |
 | falco-shell-in-container, xks-detection-rule-output | Falco as a systemd service (`falco*`) on the nodes |
 | gvisor-runtimeclass, xks-runtimeclass-move | gVisor `runsc` + containerd `runsc` handler |
-| sbom-dispatch-image, xks-sbom-spdx | Trivy (offline DB) on the nodes |
-| xks-scan-pick-image | Trivy offline DB; setup needs 1-3 of the 4 workload images to have CRITICAL findings |
-| waybill-image-slim-scan | buildah, Trivy, offline `registry.quillmoor.example/mirror/golang:1.25` and `.../base/static-nonroot:2026.10` |
-| xks-signature-verify | cosign plus pre-signed OCI layouts `/opt/qm-signing/parcel-api-{blue,green,amber}` and `release.pub`, images loaded on every node |
+| sbom-dispatch-image, xks-sbom-spdx | Trivy (offline DB) on the nodes (shipped in kubeadm:1.37-sec 2026-10-19) |
+| xks-scan-pick-image | Trivy offline DB; setup needs 1-3 of the 4 workload images to have CRITICAL findings (shipped in kubeadm:1.37-sec 2026-10-19) |
+| waybill-image-slim-scan | buildah, Trivy, offline `registry.quillmoor.example/mirror/golang:1.25` and `.../base/static-nonroot:2026.10` (shipped in kubeadm:1.37-sec 2026-10-19) |
+| xks-signature-verify | cosign plus pre-signed OCI layouts `/opt/qm-signing/parcel-api-{blue,green,amber}` and `release.pub`, images loaded on every node (shipped in kubeadm:1.37-sec 2026-10-19) |
 
 These labs reference `kubeadm:1.37` (so lab-verify passes; `kubeadm:1.37-sec` is not
 in the catalog) and fail setup with `prerequisite missing: ...`. When

@@ -29,11 +29,14 @@ compile` passes for sim-k8s-admin, -developer, -security.
   Traefik's LoadBalancer Service, so MetalLB is needed); `xkd-top-memory-report`:
   `addons-install metrics-server`.
 
-**Still blocked (the full image has no such tool):** buildah (build-waybill-image,
-xkd-build-tag-image, waybill-image-slim-scan), Trivy + offline DB (sbom-dispatch-image,
-xks-sbom-spdx, xks-scan-pick-image), cosign + signed layouts (xks-signature-verify), a
-CSI driver with expansion (xka-expand-claim). These need a kubeadm-full rebuild
-(~30 min TCG in the heavy slot) with those packages.
+**Unblocked 2026-10-19 (feat/kubeadm-image-tools):** buildah is in every kubeadm image;
+kubeadm:1.37-full/-sec add Trivy with a dated offline DB, cosign with the signed
+`/opt/qm-signing` fixture, podman.socket (Trivy reads buildah images through it), the
+golang:1.25 and static-nonroot:2026.10 base images in buildah's storage, and
+`addons-install csi-hostpath` (see docs/dev-environment.md "kubeadm extras"). Verified
+live on the VM: build-waybill-image, xkd-build-tag-image, xka-expand-claim,
+xks-signature-verify, xks-sbom-spdx; sbom-dispatch-image, xks-scan-pick-image and
+waybill-image-slim-scan are re-queued in the batch runner.
 
 **Lab bugs fixed:** `xka-crd-custom-resource` (the "operator" loop never started:
 `pgrep -f /tmp/berth-operator.sh` matched the setup shell's own command line; now
@@ -126,7 +129,7 @@ current `kubeadm:1.37` image does not ship:
 | brokers-gateway-routes, xka-httproute-split | gateway (Gateway API + GatewayClass traefik) |
 | loadbalancer-kiosk-ip, xka-loadbalancer-address | metallb |
 | manifest-store-dynamic, xka-default-storageclass | local-path |
-| xka-expand-claim | a CSI driver with volume expansion (`csi-hostpath`; foundations has no such add-on) |
+| xka-expand-claim | resolved 2026-10-19: `addons-install csi-hostpath` (verified) |
 
 Foundations publishes the add-ons on a separate catalog ref `kubeadm:1.37-full`. Once
 merged, either the add-ons land in `kubeadm:1.37` or these labs (and their curriculum
