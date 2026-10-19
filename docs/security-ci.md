@@ -360,3 +360,4 @@ For the README:
 ```
 
 The Scorecard badge needs the repository to be public and one `scorecard.yml` run on `main`.
+<!-- proof PR: docs-only change, every required check must report -->
