@@ -66,6 +66,17 @@ spec:
         [ -s /etc/machine-id ] || systemd-machine-id-setup
         ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1 || ssh-keygen -A >/dev/null
         systemctl enable cloud-init >/dev/null 2>&1 || true
+        # The lab access path opens a new ssh connection per check; sshd re-reads host keys from
+        # disk for every connection, so deleting /etc/ssh/ssh_host_* would lock the grader out.
+        # Keep a private copy of the keys and point the running daemon at it (reload, not restart).
+        install -d -m 0700 /var/lib/cloudtrain/hostkeys
+        : > /etc/ssh/sshd_config.d/00-cloudtrain-hostkeys.conf
+        for k in /etc/ssh/ssh_host_*_key; do
+          install -m 0600 "$k" /var/lib/cloudtrain/hostkeys/$(basename "$k")
+          echo "HostKey /var/lib/cloudtrain/hostkeys/$(basename "$k")" >> /etc/ssh/sshd_config.d/00-cloudtrain-hostkeys.conf
+        done
+        sshd -t
+        systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
   checks:
     - id: machine-id
       description: /etc/machine-id exists and is empty
