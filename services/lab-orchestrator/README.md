@@ -57,7 +57,7 @@ the wrong kind, fails the node permanently with the list of known refs.
 Checks, setup steps and mutations reach a VM-backed host as root over ssh from
 the entry node's admin sidecar. So that hardening labs (`PermitRootLogin no`,
 `AllowUsers`/`AllowGroups`, `AuthenticationMethods`, ...) do not lock the grader
-out, cloud-init installs `/etc/ssh/sshd_config.d/00-cloudtrain-grader.conf`, which
+out, cloud-init installs `/etc/ssh/sshd_config.d/0-cloudtrain-grader.conf`, which
 only includes `/etc/ssh/cloudtrain/grader.conf`: a `Match User root Address
 192.168.99.5` block that allows root with the admin key from
 `/etc/ssh/cloudtrain/grader_keys` (not root's `authorized_keys`). The drop-in also
@@ -71,7 +71,9 @@ another host or with another key follows the learner's policy. Lab authors:
 
 - grade sshd with `sshd -T`, and probe "root is refused" from the host itself
   (`ssh ... root@127.0.0.1` with a probe key), never from the workstation;
-- setup steps must not delete these files (`rm sshd_config.d/00-*` would);
+- setup steps must not delete these files (the drop-in is named `0-...` so that it
+  sorts before the usual `00-`...`99-` drop-ins: in the per-connection pass the first
+  Match value wins);
 - tell learners in hardening descriptions to keep the file. If the grader's ssh
   login fails (refused or unreachable), every check on that host fails with
   "the grader could not log in to this host ..." whatever its expect is.
@@ -79,7 +81,12 @@ another host or with another key follows the learner's policy. Lab authors:
 Ciphers, KEX, MACs, host key algorithms, `ListenAddress`/`Port`, firewalls and
 fail2ban bans of 192.168.99.5 cannot be overridden this way and still lock the
 grader out (OpenSSH 9.8+ `PerSourcePenalties` also delays it for a few seconds after
-failed logins from the workstation).
+failed logins from the workstation). Neither can a learner `Match` block that adds
+`DenyUsers root`/`DenyGroups root` for the workstation (Allow/Deny lists inside Match
+blocks add up), PAM account rules (`pam_access`), a `nologin` shell for root, or an
+`sshd_config` rewritten without the `Include` of `sshd_config.d`. Side effect: root
+from the workstation with any other key (e.g. a learner key added to root's
+`authorized_keys`) is always refused.
 
 ### Per-session lab network (`labnet.go`)
 

@@ -26,9 +26,9 @@ spec:
     2. Fix the host configuration (not the profile!) so that every rule passes, keeping `sshd` running.
     3. Rescan and write the HTML report to **`/home/learner/answers/after.html`**.
 
-    Keep the platform's management access in place: `/etc/ssh/sshd_config.d/00-cloudtrain-grader.conf`
-    lets only root from the workstation with the platform's key in, is not part of what the profile
-    scans, and is how this host is graded.
+    Keep the platform's management access in place: `/etc/ssh/sshd_config.d/0-cloudtrain-grader.conf`
+    and `/etc/ssh/cloudtrain/` let only root from the workstation with the platform's key in; they
+    set none of the profile's keywords, and they are how this host is graded.
   objectives:
   - Run an OpenSCAP evaluation with a tailoring file
   - Remediate failing rules by hand and prove it with a rescan
@@ -84,7 +84,10 @@ spec:
       printf 'PermitRootLogin yes\nPermitEmptyPasswords yes\nMaxAuthTries 10\nX11Forwarding yes\n' | cat - /etc/ssh/sshd_config > /tmp/sshd_new && cat /tmp/sshd_new > /etc/ssh/sshd_config && rm -f /tmp/sshd_new
       rm -f /etc/ssh/sshd_config.d/*tr-*.conf
       sshd -t && systemctl reload sshd >/dev/null 2>&1 || true
-      systemctl disable --now auditd >/dev/null 2>&1 || true
+      # auditd refuses `systemctl stop` (RefuseManualStop); a clean SIGTERM exit stops it for good.
+      systemctl disable auditd >/dev/null 2>&1 || true
+      pkill -TERM -x auditd || true
+      for i in $(seq 1 20); do systemctl is-active -q auditd || break; sleep 1; done
   checks:
   - id: scan-clean
     description: The profile scan passes every rule
@@ -114,13 +117,13 @@ spec:
       match: exact
       value: intact
   - id: services-ok
-    description: sshd is valid and running and auditd is active
+    description: sshd is valid and running and auditd is enabled and active
     type: shell
     'on': tr-scap-01
     skills: *id001
     weight: 1.5
     command: |
-      sshd -t 2>/dev/null && systemctl is-active sshd >/dev/null && systemctl is-active auditd >/dev/null && echo ok || echo broken
+      sshd -t 2>/dev/null && systemctl is-active sshd >/dev/null && systemctl is-active auditd >/dev/null && systemctl is-enabled auditd >/dev/null && echo ok || echo broken
     expect:
       match: exact
       value: ok
@@ -140,8 +143,9 @@ spec:
     body: oscap prints "Title / Rule / Result" blocks; filter with grep -B3 "^Result.*fail".
     cost: 0
   - title: sshd precedence
-    body: sshd uses the first value it reads for a keyword, so edit or remove the old lines instead of
-      appending a second one.
+    body: sshd uses the first value it reads for a keyword, and the drop-ins in /etc/ssh/sshd_config.d are
+      read before the rest of sshd_config, so edit or remove the old lines (there and in the drop-ins)
+      instead of appending a second one. sshd -T shows the effective value.
     cost: 1
   misconceptions:
   - id: profile-edit
@@ -170,22 +174,23 @@ spec:
       as: learner
       timeoutSec: 300
       run: |
-        sudo sed -i -E '/^(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config
+        sudo sh -c "sed -i -E '/^[[:space:]]*(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf"
         printf 'PermitRootLogin no\nPermitEmptyPasswords no\nMaxAuthTries 4\nX11Forwarding no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
         sudo sshd -t && sudo systemctl reload sshd
         sudo oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --results /tmp/tr-scan.xml --report /home/learner/answers/after.html $(sudo cat /var/lib/cloudtrain/ds.path) >/dev/null 2>&1 || true
   solution:
     explanation: |
       oscap lists the failing rules with their IDs. The four sshd rules need PermitRootLogin no, PermitEmptyPasswords no,
-      MaxAuthTries 4 (or lower) and X11Forwarding no in sshd_config (the first occurrence wins for sshd), and the audit rule needs
-      auditd enabled and running. A rescan with --report writes the HTML evidence.
+      MaxAuthTries 4 (or lower) and X11Forwarding no; the first occurrence wins for sshd and the distribution's
+      50-redhat.conf drop-in sets X11Forwarding yes before sshd_config is read, so the old lines go from the drop-ins
+      too. The audit rule needs auditd enabled and running. A rescan with --report writes the HTML evidence.
     steps:
     - 'on': tr-scap-01
       as: learner
       timeoutSec: 180
       run: |
         sudo oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --results /tmp/before.xml $(sudo cat /var/lib/cloudtrain/ds.path) | grep -B1 -A1 '^Result.*fail'
-        sudo sed -i -E '/^(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config
+        sudo sh -c "sed -i -E '/^[[:space:]]*(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf"
         printf 'PermitRootLogin no\nPermitEmptyPasswords no\nMaxAuthTries 4\nX11Forwarding no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
         sudo sshd -t && sudo systemctl reload sshd
         sudo systemctl enable --now auditd

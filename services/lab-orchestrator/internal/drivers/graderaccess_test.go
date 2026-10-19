@@ -32,7 +32,7 @@ func TestCloudInitGraderAccess(t *testing.T) {
 			global = append(global, l)
 		}
 	}
-	if strings.Join(global, "|") != "HostKey /etc/ssh/ssh_host_ed25519_key|HostKey "+GraderHostKey+"|Include "+GraderMatch {
+	if strings.Join(global, "|") != "HostKey "+GraderHostKey+"|HostKey /etc/ssh/ssh_host_ed25519_key|Include "+GraderMatch {
 		t.Errorf("drop-in must only pin the host key and include the Match file: %q", global)
 	}
 	if files[GraderHostKey] != string(host.Private) || files[GraderHostKey+".pub"] != strings.TrimSpace(string(host.Public))+"\n" {
@@ -65,12 +65,14 @@ func TestHostAccessFailed(t *testing.T) {
 		{ExecResult{ExitCode: 255, Stderr: "ssh: connect to host 192.168.100.10 port 22: Connection refused"}, true},
 		{ExecResult{ExitCode: 255, Stderr: "kex_exchange_identification: read: Connection reset by peer"}, true},
 		{ExecResult{ExitCode: 255, Stderr: "Connection closed by 192.168.100.10 port 22"}, true},
-		// the command ran: output, other exit codes, or more than ssh's one line
+		{ExecResult{ExitCode: 255, Stderr: "@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.\n"}, true},
+		{ExecResult{ExitCode: 255, Stderr: "Unable to negotiate with 192.168.100.10 port 22: no matching cipher found."}, true},
+		{ExecResult{ExitCode: 255}, true}, // peer closed after the banner
+		// the command ran: output, other exit codes, or its own last error line
 		{ExecResult{ExitCode: 255, Stdout: "refused\n", Stderr: "root@127.0.0.1: Permission denied (publickey)."}, false},
 		{ExecResult{ExitCode: 1, Stderr: "root@192.168.100.10: Permission denied (publickey)."}, false},
-		{ExecResult{ExitCode: 255, Stderr: "probing\nroot@127.0.0.1: Permission denied (publickey)."}, false},
 		{ExecResult{ExitCode: 255, Stderr: "learner@127.0.0.1: Permission denied (publickey)."}, false},
-		{ExecResult{ExitCode: 255}, false},
+		{ExecResult{ExitCode: 255, Stderr: "root@127.0.0.1: Permission denied (publickey).\nprobe finished"}, false},
 	} {
 		if got := hostAccessFailed(tt.res); got != tt.want {
 			t.Errorf("hostAccessFailed(%+v) = %v, want %v", tt.res, got, tt.want)

@@ -50,7 +50,7 @@ const (
 	MsgUnsupported = "this check type is not supported by the grader"
 	// MsgNoHostAccess: ssh from the workstation could not log in to the host
 	// (the platform's management login was refused or the host unreachable).
-	MsgNoHostAccess = "the grader could not log in to this host: keep SSH running and reachable from the workstation and keep the platform's management access (/etc/ssh/sshd_config.d/00-cloudtrain-grader.conf)"
+	MsgNoHostAccess = "the grader could not log in to this host: keep SSH running and reachable from the workstation and keep the platform's management access (/etc/ssh/sshd_config.d/0-cloudtrain-grader.conf and /etc/ssh/cloudtrain/)"
 )
 
 // Executor runs a request on a topology node ("node" or "node/member").
