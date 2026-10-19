@@ -2358,7 +2358,6 @@ _CloudTrain is not affiliated with or endorsed by Microsoft Corporation. SC-200 
 | `gitea:1` | container | A | proposed | In-lab Git server for Git workflow, module sources and Ansible content |
 | `ansible-node:1` | container | A | proposed | sshd managed-node pod with a sudo-enabled student user (no systemd) |
 | `awx:24` | service | C | spike | AWX controller pool (Apache-2.0; releases paused upstream), per-learner org or per-learner instance |
-| `galaxy-ng:4` | service | A | proposed | Private Galaxy (Pulp galaxy_ng) for collection publish labs |
 | `srlinux:25` | container | N | spike | Nokia SR Linux; hosted-training EULA to be confirmed |
 
 ## Appendix: alignment frameworks declared here
