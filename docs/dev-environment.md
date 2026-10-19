@@ -91,24 +91,26 @@ test). It should be the same as the `docker stop` case plus host-prep reloading 
 
 ### Cluster profiles (`KIND_PROFILE`)
 
-`task dev:up` builds one of two cluster flavours ([any-kubernetes.md](any-kubernetes.md)):
+`task dev:up` builds one of three cluster flavours ([any-kubernetes.md](any-kubernetes.md)):
 
 | Profile | Cluster | Primary CNI | Kube-OVN | Orchestrator |
 |---|---|---|---|---|
 | `kubeovn-primary` (default) | `cloudtrain-dev` | Kube-OVN | primary | `--network-mode=primary` |
 | `managed-cni` | `cloudtrain-mcni` | Cilium (`deploy/cilium/values.yaml`), stands in for a managed cloud's CNI | non-primary behind Multus (`deploy/kube-ovn/values-secondary.yaml`) | `--network-mode=secondary` |
+| `managed-cni-calico` | `cloudtrain-calico` | Calico VXLAN (`deploy/calico/kind.sed` over the pinned upstream `calico-vxlan.yaml`, `CALICO_VERSION`), a second managed-CNI stand-in | non-primary behind Multus, as `managed-cni` | `--network-mode=secondary` |
 
 ```bash
 task dev:up KIND_PROFILE=managed-cni              # control plane + 2 workers (deploy/kind/cluster-managed-cni.yaml)
 task orchestrator:deploy KIND_PROFILE=managed-cni # adds --network-mode=secondary
 task lab:verify KIND_PROFILE=managed-cni -- <lab dir>
 task dev:down KIND_PROFILE=managed-cni            # deletes only cloudtrain-mcni
+# the same commands with KIND_PROFILE=managed-cni-calico use cluster cloudtrain-calico
 ```
 
 `CT_CLUSTER_NAME` overrides the cluster name of either profile (the remote verify VM
 uses it with `KIND_CONFIG=tools/verify-vm/kind-managed-cni.yaml` for a throwaway
-cluster next to the batch runner's). The two profiles are separate clusters, so a
-`managed-cni` cluster never touches `cloudtrain-dev`.
+cluster next to the batch runner's). The profiles are separate clusters, so a
+`managed-cni*` cluster never touches `cloudtrain-dev`.
 
 ### Storage on kind
 

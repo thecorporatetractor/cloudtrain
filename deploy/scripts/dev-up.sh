@@ -3,7 +3,8 @@
 # Idempotent: re-running converges an existing cluster.
 # KIND_PROFILE (lib.sh): kubeovn-primary (default, cluster cloudtrain-dev) or
 # managed-cni (cluster cloudtrain-mcni: Cilium primary, Kube-OVN non-primary
-# behind Multus, emulating a managed cloud cluster; docs/any-kubernetes.md).
+# behind Multus, emulating a managed cloud cluster; docs/any-kubernetes.md) or
+# managed-cni-calico (cluster cloudtrain-calico: the same with Calico VXLAN primary).
 # Host overrides (default: the reference machine's files):
 #   KIND_CONFIG=<file>            kind cluster config, used only when the cluster is created
 #   KUBE_OVN_EXTRA_VALUES=<file>  extra Helm values merged over deploy/kube-ovn/values.yaml
@@ -13,7 +14,8 @@ for t in docker kind kubectl helm virtctl jq yq curl; do need "$t"; done
 T0=$SECONDS
 DEFAULT_KIND_CONFIG=$REPO_ROOT/deploy/kind/cluster.yaml
 KUBE_OVN_PROFILE_VALUES=()
-if [[ $KIND_PROFILE == managed-cni ]]; then
+if ((SECONDARY_PROFILE)); then
+  # Both managed-cni profiles share one kind config (no default CNI, pod subnet 10.32.0.0/16).
   DEFAULT_KIND_CONFIG=$REPO_ROOT/deploy/kind/cluster-managed-cni.yaml
   KUBE_OVN_PROFILE_VALUES=(-f "$REPO_ROOT/deploy/kube-ovn/values-secondary.yaml")
 fi
@@ -78,6 +80,25 @@ if [[ $KIND_PROFILE == managed-cni ]]; then
   wait_for "all nodes Ready (Cilium)" 300 k wait --for=condition=Ready nodes --all --timeout=5s
 fi
 
+# --- 1c. Calico (managed-cni-calico: the primary CNI, VXLAN overlay) ---------
+# Upstream calico-vxlan.yaml, sha256-checked (the same pinned file the golden image uses),
+# then deploy/calico/kind.sed: pool = the kind podSubnet, VXLAN Always.
+if [[ $KIND_PROFILE == managed-cni-calico ]]; then
+  log "installing Calico $CALICO_VERSION (primary CNI, VXLAN)"
+  fetch_pinned "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico-vxlan.yaml" \
+    "$CALICO_MANIFEST_SHA256" "$MANIFEST_CACHE/calico-vxlan-${CALICO_VERSION}.yaml"
+  CALICO_KIND_YAML="$MANIFEST_CACHE/calico-kind-${CALICO_VERSION}.yaml"
+  sed "s|@POD_CIDR@|$KIND_POD_CIDR|" "$REPO_ROOT/deploy/calico/kind.sed" \
+    | sed -f - "$MANIFEST_CACHE/calico-vxlan-${CALICO_VERSION}.yaml" > "$CALICO_KIND_YAML"
+  grep -A1 'name: CALICO_IPV4POOL_CIDR$' "$CALICO_KIND_YAML" | grep -q "value: \"$KIND_POD_CIDR\"" \
+    || die "could not set CALICO_IPV4POOL_CIDR in $CALICO_KIND_YAML"
+  grep -A1 'name: CALICO_IPV4POOL_VXLAN$' "$CALICO_KIND_YAML" | grep -q 'value: "Always"' \
+    || die "could not set CALICO_IPV4POOL_VXLAN in $CALICO_KIND_YAML"
+  k apply -f "$CALICO_KIND_YAML" >/dev/null
+  wait_for "calico-node rolled out" 600 k -n kube-system rollout status ds/calico-node --timeout=5s
+  wait_for "all nodes Ready (Calico)" 300 k wait --for=condition=Ready nodes --all --timeout=5s
+fi
+
 # --- 2. Kube-OVN (primary CNI; non-primary behind Multus for managed-cni) -----
 CP_NODE="${CLUSTER_NAME}-control-plane"
 # Docker's address for the node container (what kubelet will report once it is up).
@@ -134,7 +155,7 @@ log "installing KubeVirt $KUBEVIRT_VERSION"
 fetch_pinned "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml" \
   "$KUBEVIRT_OPERATOR_SHA256" "$MANIFEST_CACHE/kubevirt-operator-${KUBEVIRT_VERSION}.yaml"
 k apply -f "$MANIFEST_CACHE/kubevirt-operator-${KUBEVIRT_VERSION}.yaml" >/dev/null
-if [[ $KIND_PROFILE == managed-cni ]]; then
+if ((SECONDARY_PROFILE)); then
   # Lab VMs take the session lab segment as their Multus default network
   # (multus.default: true), never the pod network: no bridge on the pod network.
   yq '.spec.configuration.network.permitBridgeInterfaceOnPodNetwork = false' "$REPO_ROOT/deploy/kubevirt/kubevirt-cr.yaml" | k apply -f - >/dev/null
