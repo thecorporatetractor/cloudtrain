@@ -107,7 +107,7 @@ Closed on branch `fix/linux-r5-w4-followups` (still `built`; each changed lab ne
 - [x] chrony-server-isolated: `outsider-refused` needs the probe to run (namespace and config present), no fatal error text, and either "no suitable source" or the timeout line. The `server-persistent`/`allow all` expectFail notes stay as documented.
 - [x] wireguard-depot-tunnel: unchanged by design (single-action mutations; listed checks fail, others may too).
 - [x] "kept" guards gated on the lab's main change: veth-netns-plumbing host-untouched, subnet-plan-depots / fix-routing-asymmetric / static-ip-persistent / xlf-static-ip-netplan eth0-untouched (and fix-routing-asymmetric eth1-path-kept), runtime-routes-two-sites addresses-kept, tcpdump-lost-heartbeats fault-intact, nmcli-bond-el dhcp-kept, firewalld-zones-el default-zone-kept.
-- [x] fix-routing-asymmetric networkd branch: unchanged (the `persistent` check already requires From/Gateway/Table together); not tied to one table id, left as is.
+- [x] fix-routing-asymmetric networkd branch: From, Gateway and one single Table must appear in the same networkd file.
 - [x] tcpdump-lost-heartbeats: setup fails early when tcpdump is missing; the sender-drop capture must be newer than setup and contain only UDP 5140 traffic.
 - [x] nftables-from-scratch: `log-limited` needs `limit rate` before `log prefix "tr-drop: "` on the same rule.
 - [x] mtu-mismatch-tunnel: the nft branch ignores comments and requires the maxseg clamp on a `tun-dep` line.
