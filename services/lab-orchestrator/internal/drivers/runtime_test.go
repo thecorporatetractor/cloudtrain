@@ -248,6 +248,11 @@ func TestKubeadmUserdata(t *testing.T) {
 			t.Fatalf("%s: invalid yaml: %v", m.Name, err)
 		}
 		s := string(ud)
+		// The podman bridge config of the node image is removed on every member
+		// (before init/join), so no pod sandbox lands on it.
+		if !strings.Contains(s, "rm -f /etc/cni/net.d/87-podman-bridge.conflist") {
+			t.Errorf("%s: stray CNI config not removed\n%s", m.Name, s)
+		}
 		switch m.Name {
 		case "yard-cp-1":
 			for _, w := range []string{"kubeadm init", "__KUBE_VERSION__", "controlPlaneEndpoint: 192.168.100.10:6443", "cni-install", PodCIDR, "node-role.kubernetes.io/control-plane"} {
