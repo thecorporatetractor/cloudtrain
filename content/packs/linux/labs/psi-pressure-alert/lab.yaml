@@ -18,7 +18,7 @@ spec:
     `tr-psi-01` (`ssh tr-psi-01`; you have `sudo`) runs several slices and the monitoring team wants a
     pressure-based alert instead of load average. Read the pressure stall information while the current load
     runs (`/proc/pressure/*` for the system, `cpu.pressure`, `memory.pressure` and `io.pressure` below
-    `/sys/fs/cgroup/<slice>`), find the slice whose tasks are stalled, then write
+    `/sys/fs/cgroup/tr.slice/<slice>`; a dash in a slice name nests it under `tr.slice`), find the slice whose tasks are stalled, then write
     **`/etc/tr-monitor/psi.conf`** with:
 
     ```
@@ -85,7 +85,7 @@ spec:
     timeoutSec: 30
     command: |
       got=$(sed -n 's/^slice=//p' /etc/tr-monitor/psi.conf 2>/dev/null | head -1)
-      best=$(for s in /sys/fs/cgroup/tr-*.slice; do v=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' $s/cpu.pressure 2>/dev/null); echo "${v:-0} $(basename $s)"; done | sort -rn | head -1 | awk '{print $2}')
+      best=$(for s in /sys/fs/cgroup/tr.slice/tr-*.slice; do v=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' $s/cpu.pressure 2>/dev/null); echo "${v:-0} $(basename $s)"; done | sort -rn | head -1 | awk '$1+0 > 0 {print $2}')
       [ "$got" = "$best" ] && echo ok || echo "got=$got best=$best"
     expect:
       match: exact
@@ -109,15 +109,15 @@ spec:
     weight: 2.5
     command: |
       t=$(sed -n 's/^some_avg10_threshold=//p' /etc/tr-monitor/psi.conf 2>/dev/null | head -1)
-      cul=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' /sys/fs/cgroup/{{cul}}.slice/cpu.pressure)
-      idle=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' /sys/fs/cgroup/tr-web.slice/cpu.pressure)
+      cul=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' /sys/fs/cgroup/tr.slice/{{cul}}.slice/cpu.pressure)
+      idle=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print $i}}' /sys/fs/cgroup/tr.slice/tr-web.slice/cpu.pressure)
       awk -v t="${t:-x}" -v c="$cul" -v i="$idle" 'BEGIN{ if (t !~ /^[0-9.]+$/) print "not-a-number"; else print (t+0 >= 5 && t+0 < c+0 && t+0 > i+0) ? "ok" : "t=" t " culprit=" c " idle=" i }'
     expect:
       match: exact
       value: ok
   hints:
   - title: Where
-    body: cat /proc/pressure/cpu for the host and cat /sys/fs/cgroup/SLICE/cpu.pressure for a slice; some
+    body: cat /proc/pressure/cpu for the host and cat /sys/fs/cgroup/tr.slice/SLICE/cpu.pressure for a slice; some
       and full lines carry avg10, avg60 and avg300.
     cost: 0
   misconceptions:
@@ -169,6 +169,6 @@ spec:
       timeoutSec: 180
       run: |
         cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory
-        for s in /sys/fs/cgroup/tr-*.slice; do echo $s; cat $s/cpu.pressure; done
+        for s in /sys/fs/cgroup/tr.slice/tr-*.slice; do echo $s; cat $s/cpu.pressure; done
         sudo install -d /etc/tr-monitor
         printf 'slice={{cul}}.slice\nresource=cpu\nsome_avg10_threshold=20\n' | sudo tee /etc/tr-monitor/psi.conf >/dev/null

@@ -6,6 +6,7 @@
 #     so `dnf install` works with no network
 #   - SELinux enforcing (targeted), firewalld installed and enabled, auditd, chrony
 #   - admin/storage tools for Linux labs (LVM, mdadm, parted, xfsprogs, nfs-utils, ...)
+#   - PSI enabled (psi=1 kernel argument)
 # No users or keys are baked in: the runtime injects `learner` (passwordless sudo), root's
 # authorized_keys and the ssh host key through cloud-init.
 set -euxo pipefail
@@ -47,6 +48,20 @@ grep -q '^SELINUX=enforcing' /etc/selinux/config
 firewall-offline-cmd --set-default-zone=public || true   # ZONE_ALREADY_SET is fine
 firewall-offline-cmd --zone=public --add-service=ssh || true   # ALREADY_ENABLED is fine
 firewall-offline-cmd --zone=public --list-services | grep -qw ssh
+
+# PSI (pressure stall information): the EL kernel is built with CONFIG_PSI_DEFAULT_DISABLED, so
+# /proc/pressure/* and the cgroup *.pressure files exist only with psi=1 on the command line.
+# grubby updates every BLS entry; /etc/kernel/cmdline and GRUB_CMDLINE_LINUX carry it to kernels
+# installed later.
+grubby --update-kernel=ALL --args=psi=1
+if [ -f /etc/kernel/cmdline ]; then
+  grep -qw psi=1 /etc/kernel/cmdline || sed -i 's/[[:space:]]*$/ psi=1/' /etc/kernel/cmdline
+fi
+if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub && ! grep -q '^GRUB_CMDLINE_LINUX=.*psi=1' /etc/default/grub; then
+  sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 psi=1"/' /etc/default/grub
+fi
+n=$(grubby --info=ALL | grep -c '^args=')
+[ "$n" -gt 0 ] && [ "$(grubby --info=ALL | grep '^args=' | grep -cw 'psi=1')" = "$n" ]
 
 cat > /etc/cloudtrain-release <<R
 CLOUDTRAIN_IMAGE=${CLOUDTRAIN_IMAGE##*/}
