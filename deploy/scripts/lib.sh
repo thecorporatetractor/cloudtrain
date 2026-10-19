@@ -107,7 +107,8 @@ load_image() {
   done
   ((${#todo[@]})) || { [[ ${KIND_LOAD_VERBOSE:-0} == 1 ]] && log "ok: $img already on $*"; return 0; }
   log "loading $img into ${todo[*]}"
-  if kind load docker-image --name "$CLUSTER_NAME" --nodes "$(IFS=,; echo "${todo[*]}")" "$img" >/dev/null 2>&1; then return 0; fi
+  local nodelist; nodelist=$(printf '%s,' "${todo[@]}")
+  if kind load docker-image --name "$CLUSTER_NAME" --nodes "${nodelist%,}" "$img" >/dev/null 2>&1; then return 0; fi
   warn "kind load $img failed; retrying per node with a single-platform save"
   for node in "${todo[@]}"; do
     if ((pulled)); then node_has_image "$node" "$img" && continue
