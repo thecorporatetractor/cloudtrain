@@ -78,6 +78,7 @@ IMG_FAIL_MAX=${IMG_FAIL_MAX:-21600}
 IMG_MAX_TRIES=${IMG_MAX_TRIES:-5}
 IMG_BUILD_TIMEOUT=${IMG_BUILD_TIMEOUT:-3h}
 IMG_REQUEUE=${IMG_REQUEUE:-1}
+IMG_MIN_FREE_GB=${IMG_MIN_FREE_GB:-100}   # free GB on the Docker root before a build starts (kubelet disk-pressure eviction is near 85% used)
 IMGD=$RES/state/images
 VM_IMAGES="kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm"
 IMG_ORDER="workloads jumphost linux-pod frr nettools netsvc ansible-ctl iac-ws-terraform iac-ws-tofu kql-ws oci-registry kubeadm-node kubeadm-full kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm mirror"
@@ -162,6 +163,15 @@ labs_using() { # labs_using <target>...: ids of built labs whose curriculum imag
     for r in ${lrefs//,/ }; do [[ " $refs " == *" $r "* ]] && { echo "$id"; break; }; done
   done < <(lab_list) | paste -sd, -
 }
+docker_free_gb() { df -BG --output=avail "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)" 2>/dev/null | tail -1 | tr -dc 0-9; }
+# Enough disk for a build? Prunes unused build cache older than 24h first; the check is not a failure (no backoff step).
+disk_ok() {
+  local f; f=$(docker_free_gb); f=${f:-0}
+  (( f >= IMG_MIN_FREE_GB )) && return 0
+  docker builder prune -f --filter until=24h >/dev/null 2>&1; docker image prune -f >/dev/null 2>&1
+  f=$(docker_free_gb); f=${f:-0}
+  (( f >= IMG_MIN_FREE_GB )) || { log "image refresh: only ${f}G free on the Docker root (need ${IMG_MIN_FREE_GB}G); build deferred"; return 1; }
+}
 # Builds every pending target that is due (one at a time, each in the build slot). Runs detached from the
 # loop (`images-run`), holds state/images/refresh.flock, and requeues the labs of what it rebuilt.
 image_refresh_run() {
@@ -173,10 +183,12 @@ image_refresh_run() {
     n=0; next=0; [[ -f $IMGD/fail.$t ]] && read -r n next < "$IMGD/fail.$t"
     (( $(date +%s) >= next )) || continue
     cmd=$(target_cmd "$t") || { log "image refresh: unknown target $t; dropped"; pending_drop "$t"; continue; }
+    disk_ok || { echo "$n $(( $(date +%s) + IMG_FAIL_BASE ))" > "$IMGD/fail.$t"; continue; }
     log "image refresh: $t at ${rev:0:9}$( ((n)) && echo " (retry $n)")"
     (cd "$REPO" && DOCKERIO_MIRROR=${DOCKERIO_MIRROR:-mirror.gcr.io} GUESTFS_KVM=${GUESTFS_KVM:-1} LOAD_INTO_KIND=1 OCI_IMAGE_REVISION=$rev \
        tools/slots/run.sh build -- timeout -k 2m "$IMG_BUILD_TIMEOUT" bash -c "$cmd") >"$IMGD/$t.log" 2>&1 9>&- 8>&-
     rc=$?
+    docker builder prune -f --filter until=30m >/dev/null 2>&1; docker image prune -f >/dev/null 2>&1   # this build's cache and dangling layers
     if (( rc == 0 )); then
       pending_drop "$t"; rm -f "$IMGD/fail.$t"; built+=("$t")
       printf '%s %s %s\n' "$(date -u +%FT%TZ)" "${rev:0:9}" "$t" >> "$RES/state/images-built.txt"
