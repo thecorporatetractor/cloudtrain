@@ -186,15 +186,52 @@ spec:
       # the supplied files, for the graded run of the role
       rm -rf /var/lib/ct-lint; install -d -m 0700 /var/lib/ct-lint
       cp $p/site.yml /var/lib/ct-lint/site.yml; cp $r/defaults/main.yml /var/lib/ct-lint/defaults.yml; cp $r/templates/gateway.conf.j2 /var/lib/ct-lint/gateway.conf.j2
+      # the graded run of the role, shared by lint-production and gateway-state (root-owned, prints ok or a reason)
+      cat > /var/lib/ct-lint/judge-role.sh <<'JUDGE'
+      # The role is judged by what it does, not by what is already on the gateway: its tasks and metadata are copied as
+      # the learner (into a root-owned archive) next to the supplied playbook, defaults and template, the gateway is put
+      # back into its starting state, and the grading account ctjudge (own uid, own key, fresh home) applies the copy with
+      # a fixed configuration. Project code, lookups, delegation and connection variables are refused.
+      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
+      ( ulimit -f 65536; ct-ansible run /home/learner/branch-automation/roles/branch_gateway timeout 30 tar -cf - tasks meta $(ct-ansible run /home/learner/branch-automation/roles/branch_gateway sh -c 'for d in handlers vars; do [ -d $d ] && echo $d; done') > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      r=$j/p/roles/branch_gateway
+      install -d $j/home $r/defaults $r/templates
+      cp /var/lib/ct-lint/site.yml $j/p/site.yml; cp /var/lib/ct-lint/defaults.yml $r/defaults/main.yml; cp /var/lib/ct-lint/gateway.conf.j2 $r/templates/gateway.conf.j2
+      printf '[defaults]\ninventory = %s/p/inventory.ini\nremote_user = ovauto\nretry_files_enabled = false\n' $j > $j/p/ansible.cfg
+      printf 'ov-branch-lon-gw\n[branch_gateways]\nov-branch-lon-gw\n' > $j/p/inventory.ini
+      chown -R ctjudge $j
+      runuser -u ctjudge -- timeout 30 tar -x --no-same-owner --no-same-permissions -C $r -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      cd $j/p
+      # the role may not pull in other roles (a dependency outside the copy would bring its own tasks and code)
+      deps=$(runuser -u ctjudge -- env -i PATH=/usr/bin:/bin /opt/ansible/bin/python3 -I -c 'import yaml,sys
+      try:
+          d = yaml.safe_load(open("roles/branch_gateway/meta/main.yml")) or {}
+          print("ok" if isinstance(d, dict) and not d.get("dependencies") else "dependencies")
+      except Exception:
+          print("meta-unreadable")' 2>/dev/null)
+      [ "$deps" = ok ] || { echo "${deps:-meta-unreadable}"; exit 0; }
+      [ -z "$(find roles \( -type l -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
+      ! grep -rIEqi '(^|[^a-z0-9_])(lookup|query)([^a-z0-9_]|$)|[{%(,|=[:space:]]q([^a-z0-9_]|$)|with_[a-z]|(^|[^a-z0-9_])ansible_[a-z_]*[[:space:]]*[:=]|proxycommand|(^|[[:space:]-])(connection|delegate_to|local_action|environment)[[:space:]]*:|(include|import)_(tasks|role|playbook|vars)|vars_files' roles || { echo not-allowed; exit 0; }
+      S() { runuser -u ctjudge -- env -i HOME=$j/home PATH=/usr/bin:/bin timeout 30 ssh ovauto@ov-branch-lon-gw "$1" 2>/dev/null; }
+      S "sudo -n sh -c 'rm -rf /etc/ov/branch-gw && mkdir -p /etc/ov/branch-gw/secrets && echo key-{{tok}} > /etc/ov/branch-gw/secrets/key && chmod 0644 /etc/ov/branch-gw/secrets/key && chmod 0755 /etc/ov/branch-gw /etc/ov/branch-gw/secrets'" || { echo reset-failed; exit 0; }
+      runuser -u ctjudge -- env -i HOME=$j/home PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_CONFIG=$j/p/ansible.cfg ANSIBLE_NOCOLOR=1 timeout 140 ansible-playbook site.yml >/dev/null 2>&1 || { echo role-run-failed; exit 0; }
+      # nothing the role run started may outlive it (it shares the grading account with the read-back below)
+      pkill -KILL -u ctjudge 2>/dev/null; sleep 1
+      st=$(S "sudo -n sh -c 'd=/etc/ov/branch-gw; stat -c %a \$d \$d/secrets \$d/secrets/key \$d/gateway.conf \$d/resolvers.conf \$d/legacy; cat \$d/gateway.conf; echo --; cat \$d/resolvers.conf; echo --; cat \$d/legacy; echo --; cat \$d/secrets/key'"); src=$?
+      want=$(printf '755\n700\n600\n644\n644\n644\n# managed by Ansible\nsite={{site}}\nuplink_mbit={{uplink}}\n--\nnameserver 10.70.0.53\nnameserver 10.70.0.54\n--\nretired=yes\n--\nkey-{{tok}}')
+      [ $src = 0 ] || { echo readback-failed; exit 0; }
+      [ "$st" = "$want" ] && echo ok || echo state-differs
+      JUDGE
+      chmod 0700 /var/lib/ct-lint/judge-role.sh
   checks:
   - id: lint-production
-    description: The project passes ansible-lint at the production profile (judged on a copy without lint configuration, ansible.cfg or project code)
+    description: The project passes ansible-lint at the production profile (judged on a copy without lint configuration, ansible.cfg or project code) and the role still configures the gateway when the grader applies it
     type: shell
     'on': ov-ctl
     skills:
     - automation.quality.lint
     weight: 3
-    timeoutSec: 180
+    timeoutSec: 295
     command: |
       # The learner's tree is only read as the learner. It is streamed (without .git) into a directory owned by the
       # unprivileged account nobody, and every later step runs as nobody, so no learner process can touch the judged copy.
@@ -216,10 +253,25 @@ spec:
       # No learner code is ever loaded by the linter: every ansible.cfg, Python file, plugin, module and module_utils
       # directory and vendored collection is removed, hidden directories too, and only YAML and Jinja files remain
       N sh -c 'find . -mindepth 1 -type d \( -name ".*" -o -name library -o -name module_utils -o -name plugins -o -name "*_plugins" -o -name collections \) -prune -exec rm -rf {} +; find . -type f ! \( -name "*.yml" -o -name "*.yaml" -o -name "*.j2" \) -delete'
-      out=$(N timeout 150 /opt/ansible/bin/ansible-lint -c $cfg --profile production -q --offline 2>&1); rc=$?
+      # role dependencies would make the linter load roles (and their code) from outside the copy
+      d=$(N timeout 30 /opt/ansible/bin/python3 -I -c 'import yaml, glob
+      bad = False
+      for f in glob.glob("roles/*/meta/main.y*ml"):
+          try:
+              m = yaml.safe_load(open(f)) or {}
+              bad = bad or not isinstance(m, dict) or bool(m.get("dependencies"))
+          except Exception:
+              bad = True
+      print("dependencies" if bad else "ok")' 2>/dev/null)
+      [ "$d" = ok ] || { clean; echo "${d:-dependencies}"; exit 0; }
+      out=$(N timeout 120 /opt/ansible/bin/ansible-lint -c $cfg --profile production -q --offline 2>&1); rc=$?
+      pkill -KILL -u nobody 2>/dev/null
       n=$(printf '%s\n' "$out" | grep -c ':[0-9]')
       clean
-      [ "$rc" = 0 ] && echo clean || echo "findings=$n"
+      [ "$rc" = 0 ] || { echo "findings=$n"; exit 0; }
+      # a clean report only counts for a role that still does its job (an emptied role lints clean too)
+      g=$(sh /var/lib/ct-lint/judge-role.sh)
+      [ "$g" = ok ] && echo clean || echo "role-$g"
     expect:
       match: exact
       value: clean
@@ -265,28 +317,12 @@ spec:
     weight: 2
     timeoutSec: 280
     command: |
-      # The role is judged by what it does, not by what is already on the gateway: its tasks and metadata are copied as
-      # the learner (into a root-owned archive) next to the supplied playbook, defaults and template, the gateway is put
-      # back into its starting state, and the grading account ctjudge (own uid, own key, fresh home) applies the copy with
-      # a fixed configuration. Project code, lookups, delegation and connection variables are refused.
-      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
-      ( ulimit -f 65536; ct-ansible run /home/learner/branch-automation/roles/branch_gateway timeout 30 tar -cf - tasks meta $(ct-ansible run /home/learner/branch-automation/roles/branch_gateway sh -c 'for d in handlers vars; do [ -d $d ] && echo $d; done') > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
-      r=$j/p/roles/branch_gateway
-      install -d $j/home $r/defaults $r/templates
-      cp /var/lib/ct-lint/site.yml $j/p/site.yml; cp /var/lib/ct-lint/defaults.yml $r/defaults/main.yml; cp /var/lib/ct-lint/gateway.conf.j2 $r/templates/gateway.conf.j2
-      printf '[defaults]\ninventory = %s/p/inventory.ini\nremote_user = ovauto\nretry_files_enabled = false\n' $j > $j/p/ansible.cfg
-      printf 'ov-branch-lon-gw\n[branch_gateways]\nov-branch-lon-gw\n' > $j/p/inventory.ini
-      chown -R ctjudge $j
-      runuser -u ctjudge -- timeout 30 tar -x --no-same-owner --no-same-permissions -C $r -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
-      cd $j/p
-      [ -z "$(find roles \( -type l -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
-      ! grep -rIEqi '(^|[^a-z0-9_])(lookup|query)([^a-z0-9_]|$)|[{%(,|=[:space:]]q([^a-z0-9_]|$)|with_[a-z]|(^|[^a-z0-9_])ansible_[a-z_]*[[:space:]]*[:=]|proxycommand|(^|[[:space:]-])(connection|delegate_to|local_action|environment)[[:space:]]*:|(include|import)_(tasks|role|playbook|vars)|vars_files' roles || { echo not-allowed; exit 0; }
-      S() { runuser -u ctjudge -- env -i HOME=$j/home PATH=/usr/bin:/bin timeout 30 ssh ovauto@ov-branch-lon-gw "$1" 2>/dev/null; }
-      S "sudo -n sh -c 'rm -rf /etc/ov/branch-gw && mkdir -p /etc/ov/branch-gw/secrets && echo key-{{tok}} > /etc/ov/branch-gw/secrets/key && chmod 0644 /etc/ov/branch-gw/secrets/key && chmod 0755 /etc/ov/branch-gw /etc/ov/branch-gw/secrets'" || { echo reset-failed; exit 0; }
-      runuser -u ctjudge -- env -i HOME=$j/home PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_CONFIG=$j/p/ansible.cfg ANSIBLE_NOCOLOR=1 timeout 200 ansible-playbook site.yml >/dev/null 2>&1 || { echo role-run-failed; exit 0; }
-      st=$(S "sudo -n sh -c 'd=/etc/ov/branch-gw; stat -c %a \$d \$d/secrets \$d/secrets/key \$d/gateway.conf \$d/resolvers.conf \$d/legacy; cat \$d/gateway.conf; echo --; cat \$d/resolvers.conf; echo --; cat \$d/legacy; echo --; cat \$d/secrets/key'")
-      want=$(printf '755\n700\n600\n644\n644\n644\n# managed by Ansible\nsite={{site}}\nuplink_mbit={{uplink}}\n--\nnameserver 10.70.0.53\nnameserver 10.70.0.54\n--\nretired=yes\n--\nkey-{{tok}}')
-      [ "$st" = "$want" ] && echo ok || echo state-differs
+      # The role is judged by what it does, not by what is already on the gateway: its tasks, handlers, vars and metadata
+      # are copied as the learner (into a root-owned archive) next to the supplied playbook, defaults and template, the
+      # gateway is put back into its starting state, and the grading account ctjudge (own uid, own key, fresh home)
+      # applies the copy with a fixed configuration. Project code, role dependencies, lookups, delegation and connection
+      # variables are refused. The script was written by setup (/var/lib/ct-lint/judge-role.sh).
+      sh /var/lib/ct-lint/judge-role.sh
     expect:
       match: exact
       value: ok
