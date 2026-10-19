@@ -38,8 +38,13 @@ type CatalogImage struct {
 	// namespace (tier A): the container driver sets pod hostUsers: false when
 	// the cluster supports it (see userns.go).
 	UserNamespace bool `json:"userNamespace,omitempty"`
-	// Tier is the curriculum environment tier (A, B, C, K, V, N); informational.
+	// Tier is the curriculum environment tier (A, B, C, K, V, N). With the
+	// manager's --tier-runtime-classes it picks the RuntimeClass of container
+	// nodes (see sandbox.go); otherwise informational.
 	Tier string `json:"tier,omitempty"`
+	// Systemd marks a container image whose entrypoint is systemd (PID 1). It
+	// runs privileged, and only inside a tier sandbox RuntimeClass (Kata).
+	Systemd bool `json:"systemd,omitempty"`
 	// Mirrors lists the in-cluster mirror services the image is configured to
 	// use (informational, e.g. [dnf, apt, pypi]; see deploy/mirrors).
 	Mirrors []string `json:"mirrors,omitempty"`

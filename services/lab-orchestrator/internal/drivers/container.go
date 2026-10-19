@@ -72,6 +72,10 @@ type ContainerDriver struct {
 	ImagePullSecrets []string
 	// RuntimeClassName, e.g. "kata"; empty uses the cluster default.
 	RuntimeClassName string
+	// TierRuntimeClasses maps a catalog image tier to the RuntimeClass of its
+	// container nodes (e.g. B -> kata-clh); it overrides RuntimeClassName.
+	// Empty (the default) changes nothing. See sandbox.go.
+	TierRuntimeClasses map[string]string
 	// ClusterDomain for Service DNS names (default "cluster.local").
 	ClusterDomain string
 	// Executor runs Exec requests; nil makes Exec return ErrNotImplemented.
@@ -350,6 +354,9 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 		d.mountHome(ref, pod)
 	}
 	if err := d.decoratePod(ref, pod, false); err != nil {
+		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+	}
+	if err := d.applySandbox(ref, pod); err != nil {
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
 	d.applyUserNamespace(ref, pod)
