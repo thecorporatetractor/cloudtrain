@@ -9,12 +9,16 @@
 #   image-matrix.sh <images.yml> --pr <number>     (GitHub API; GH_TOKEN, REPO)
 #   image-matrix.sh <images.yml> < files.txt
 #
+# MATRIX_YQ selects the image list in the given file (default: the images.yml publish
+# matrix; vm-images.yml uses .images of tools/images/vm-images.yaml). REBUILD_ALL_PATHS
+# (space-separated patterns) adds files whose change rebuilds every image.
+#
 # Prints the GitHub outputs `matrix` ({"include": [...]}) and `any` (true|false).
 set -euo pipefail
 
 wf=${1:?usage: $0 <images.yml> [--all | --pr <number>]}
 shift
-all=$(yq -o=json -I=0 '.jobs.publish.strategy.matrix.include' "$wf")
+all=$(yq -o=json -I=0 "${MATRIX_YQ:-.jobs.publish.strategy.matrix.include}" "$wf")
 [[ $(jq length <<<"$all") -gt 0 ]] || { echo "image-matrix: no images in $wf" >&2; exit 1; }
 
 case ${1:-} in
@@ -39,6 +43,10 @@ if [[ $files == ALL ]]; then rebuild_all=true; else
         .github/scripts/image-matrix.sh | .github/images/* | .grype.yaml) rebuild_all=true ;;
       deploy/versions.env) args_all=true ;;
     esac
+    for p in ${REBUILD_ALL_PATHS:-}; do
+      # shellcheck disable=SC2053 # $p is a pattern on purpose
+      [[ -n $f && $f == $p ]] && rebuild_all=true
+    done
   done <<<"$files"
 fi
 

@@ -58,6 +58,11 @@ The web app has no OIDC settings: the gateway is the OIDC client (BFF).
 ## Install on a fresh cluster
 
 ```bash
+# 0. Optional: the charts are published to GHCR (public, cosign-signed), so no checkout is
+#    needed. Replace deploy/charts/cloudtrain-crds below with
+#    oci://ghcr.io/thecorporatetractor/cloudtrain/charts/cloudtrain-crds --version <chart version>
+#    and deploy/charts/cloudtrain with oci://ghcr.io/thecorporatetractor/cloudtrain/charts/cloudtrain
+#    (the example values files are in the repository).
 # 1. CRDs (once per cluster; upgrade this chart first on every release)
 helm install cloudtrain-crds deploy/charts/cloudtrain-crds -n cloudtrain --create-namespace
 
@@ -384,10 +389,9 @@ would need all of the above.
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.
-- Publishing the charts as OCI artifacts (`helm push` to GHCR in the release); today
-  they install from the repository.
-- containerDisks and the tier-A Linux pod images in CI (see the design below), so a
-  release overlay still leaves those refs on their dev names.
+- `el-vm`, `ubuntu-vm` and the tier-A Linux pod images (`el-lab`, `deb-lab`) in CI: they
+  need the package-mirror content (see the design below), so a release overlay still
+  leaves those refs on their dev names.
 - Mirrors, ServiceMonitors and PodDisruptionBudgets in the chart.
 
 ## Images and registries
@@ -400,7 +404,9 @@ GHCR is the signed source of every image CloudTrain publishes:
 |---|---|---|
 | Platform: `lab-orchestrator`, `gateway`, `web` | `.github/workflows/images.yml` | `ghcr.io/<owner>/<repo>/<name>` |
 | Lab containers marked `publishable: true` in `deploy/images/catalog.yaml` (jumphost, frr, nettools, netsvc, oci-registry, iac-ws-tofu, ansible-ctl, kql-ws) | the same workflow | `ghcr.io/<owner>/<repo>/<publishName>` |
-| Lab containerDisks (kubeadm-node, etcd-host, el-vm, ubuntu-vm, docker-vm) and the tier-A Linux pods (el-lab, deb-lab) | locally or on the verify VM today (they need KVM or the package mirror) | not yet; see [Publishing containerDisks](#publishing-containerdisks-design) |
+| Lab containerDisks (kubeadm-node v1.37, v1.36-upgrade and v1.37-full, etcd-host, docker-vm) | `.github/workflows/vm-images.yml` on GitHub-hosted KVM runners | `ghcr.io/<owner>/<repo>/<publishName>`, see [Publishing containerDisks](#publishing-containerdisks) |
+| `el-vm`, `ubuntu-vm` and the tier-A Linux pods (el-lab, deb-lab) | locally or on the verify VM (they need the package mirror) | not yet |
+| Helm charts `cloudtrain` and `cloudtrain-crds` | the `publish` job of `.github/workflows/charts.yml` | `oci://ghcr.io/<owner>/<repo>/charts/<chart>:<version>`, see [Charts](#charts) |
 
 Every push to `main` and every `v*` tag pushes with the branch, `sha-<commit>` and
 semver tags, a cosign keyless signature, SLSA provenance and an SBOM attestation.
@@ -438,8 +444,10 @@ images:
 
 It is a workflow artifact on every push and a release asset on `v*` tags. The
 orchestrator merges it over the base catalog: in the Helm chart it is the value
-`orchestrator.catalog.releaseOverlay`. Entries CI does not publish yet (containerDisks)
-keep their base image, and the overlay header lists them. Pin by digest, not by tag:
+`orchestrator.catalog.releaseOverlay`. The containerDisks have their own overlay, `catalog-release-vm.yaml`
+from `vm-images.yml` (see [Publishing containerDisks](#publishing-containerdisks)); entries
+CI does not publish (`el-vm`, `ubuntu-vm`, the tier-A pods) keep their base image, and the
+overlay header lists them. Pin by digest, not by tag:
 a mirror keeps the digest, so the signature check below still holds after mirroring.
 
 ### Pulling from the cluster's own registry
@@ -540,64 +548,88 @@ cosign verify ghcr.io/<owner>/<repo>/jumphost@sha256:... \
 An admission policy (Kyverno `verifyImages`, Sigstore policy-controller) can enforce
 the same identity on the mirror's repositories once signatures are copied there.
 
-## Publishing containerDisks (design)
+## Charts
 
-Status: plan, not built. Today the golden VM images are built by
-`tools/images/build.sh` on a KVM machine (developer box or the verify VM) and loaded
-into kind. Nothing publishes them, so a real cluster has no source for `kubeadm:*`,
-`etcd-host`, `el-vm`, `ubuntu-vm` or `docker-vm` (catalog entries already
-`publishable: true` with their `publishName`).
+The `publish` job of `charts.yml` packages `deploy/charts/cloudtrain` and
+`deploy/charts/cloudtrain-crds` and pushes them with `helm push` to
+`oci://ghcr.io/<owner>/<repo>/charts/<chart>:<chart version>`, on every push to `main`
+whose chart version is not in the registry yet. Bumping `version` in `Chart.yaml` is the
+release; an existing version is never overwritten. A tag `<chart>-<version>`
+(`cloudtrain-0.2.0`) releases that chart too and must match `Chart.yaml`. Each chart is
+signed with cosign keyless (by digest) and has SLSA build provenance.
 
-**Runner.** GitHub-hosted `ubuntu-24.04` runners expose `/dev/kvm` (nested
-virtualization on the hosted VM). A udev rule makes it usable by the runner user:
-
-```yaml
-- name: Enable KVM
-  run: |
-    echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
-    sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-    test -w /dev/kvm
+```bash
+helm install cloudtrain-crds oci://ghcr.io/<owner>/<repo>/charts/cloudtrain-crds --version 0.1.0 -n cloudtrain --create-namespace
+cosign verify ghcr.io/<owner>/<repo>/charts/cloudtrain:0.1.0 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/<owner>/<repo>/\.github/workflows/charts\.yml@refs/(heads/main|tags/.+)$'
 ```
 
-The standard runner (4 vCPU, 16 GB RAM, ~14 GB guaranteed free disk, more after
-removing preinstalled toolchains) fits one variant per job: the base cloud image
-(~600 MB), the customised qcow2 (2-6 GB before sparsify) and the compressed
-containerDisk. A larger runner (paid, 8-16 vCPU, 150+ GB) is only needed if
-`kubeadm-full` outgrows it.
+## Publishing containerDisks
 
-**Workflow `vm-images.yml`.**
+`.github/workflows/vm-images.yml` builds the golden VM disks on free GitHub-hosted
+`ubuntu-24.04` runners, which expose `/dev/kvm` once a udev rule makes it writable
+(`.github/actions/build-vm-image`). The list is `tools/images/vm-images.yaml`:
+`kubeadm-node` (catalog `kubeadm:1.37`), `kubeadm-upgrade` (`kubeadm:1.36`), `etcd-host`,
+`docker-vm`, then `kubeadm-full` (`kubeadm:1.37-full` and `-sec`) in a second stage,
+because it layers on the published `kubeadm-node` (pulled by digest, signature verified).
 
-| Step | What |
+| Event | What runs |
 |---|---|
-| Trigger | `push` to `main` and `v*` tags on `tools/images/**`, `deploy/versions.env`, `tools/images/lock/**`; `workflow_dispatch`; PRs build `etcd-host` only (smallest) as a smoke test |
-| Matrix | `kubeadm-node`, `kubeadm-upgrade`, `etcd-host`, `docker-vm`, then `kubeadm-full` in a second job (`needs`), because it layers on the published `kubeadm-node` (pulled by digest instead of the local cache) |
-| Build | `bash tools/images/build.sh <variant>` unchanged: pinned and checksum-verified inputs, lock files checked, `virt-customize` with KVM; `DOCKERIO_MIRROR=mirror.gcr.io` for the preloaded images |
-| Boot test | `tools/images/boot-test.sh` (qemu, KVM) before anything is pushed |
-| Scan + SBOM | Trivy/Grype on the image is of little use for a qcow2; `syft` over the mounted root filesystem (`virt-tar-out` / `guestmount`) for the SBOM, and a package-list diff against the previous release |
-| Push | to `ghcr.io/<owner>/<repo>/<publishName>` with the catalog tag and `sha-<commit>`; cosign keyless signature, provenance and SBOM attestations as in `images.yml`; the digest as a `digest-<publishName>` artifact |
-| Overlay | `images.yml`'s `catalog overlay` job then finds the digests (a `workflow_run` trigger, or one release workflow that calls both as reusable workflows), and `--allow-missing` stops listing containerDisks |
+| Pull request touching the image inputs | builds and boot-smokes only the images whose inputs changed; nothing is pushed or signed, the job has no write token |
+| Push to `main` touching `tools/images/**`, the catalog or `deploy/versions.env` | the images whose inputs that push changed (the shared inputs, build.sh, the builder, versions.env, rebuild all) are built, boot-smoked and published |
+| `v*` tag, weekly schedule (Monday 03:41 UTC) | every image |
+| `workflow_dispatch` | `variants` input: `all` or a comma separated list (`etcd-host` is the smallest) |
 
-**Mirror-content images.** `el-vm` and `ubuntu-vm` carry the package-mirror snapshot
-as a local repository (several GB), built by `tools/mirrors/build-content.sh` from the
-pinned snapshot dates. Two options: (a) run `build-content.sh` in the job (slow,
-tens of minutes, a lot of download), or (b) publish the mirror content once per snapshot
-date as an OCI artifact (`oras push ghcr.io/<owner>/<repo>/mirror-content:<date>`) and
-pull it into the job. Recommendation: (b), since the content changes only when the
-snapshot dates in `deploy/versions.env` change.
+Each build is `bash tools/images/build.sh <variant>` unchanged (pinned and checksum-verified
+inputs, lock files, `virt-customize` with KVM, `DOCKERIO_MIRROR=mirror.gcr.io`), after
+removing the runner's unused toolchains for disk space. The built disk must boot to a login
+prompt under qemu/KVM before anything is pushed; the full lab test
+(`tools/images/boot-test.sh`) needs a cluster and stays a verify-VM check.
 
-**Size and cost.** GHCR storage and egress are free for public packages. For private
-packages, storage counts against the plan's quota: ~10 variants x ~1-3 GB x retained
-versions. A retention job keeps the last N `sha-*` versions per package and every
-semver tag. Hosted runner minutes are free for public repositories; a private
-repository pays per minute (about 10-25 minutes per variant).
+Publishing pushes `ghcr.io/<owner>/<repo>/<publishName>` with the tags `<branch>`,
+`sha-<commit>`, the semver tags and the catalog tag (`v1.37.1`, `3.6`, `29`), signs the
+digest with cosign keyless, attaches SLSA provenance and an SBOM attestation (the dpkg
+database read out of the disk with libguestfs; the pushed image's own SBOM if that fails)
+and uploads the digest as an artifact. The `catalog overlay` job turns those digests into
+`catalog-release-vm.yaml` (workflow artifact, attached to the release on `v*` tags),
+which maps the containerDisk refs to `ghcr.io/<owner>/<repo>/<publishName>@<digest>`.
+`images.yml` writes `catalog-release.yaml` for the container refs. Give the orchestrator
+both: merge them with
+`yq ea '. as $i ireduce ({}; . * $i)' catalog-release.yaml catalog-release-vm.yaml > overlay.yaml`
+and pass the result as `orchestrator.catalog.releaseOverlay`.
 
-**Licensing.** The images contain Ubuntu, AlmaLinux, Kubernetes, etcd, Docker Engine,
-Calico and the add-on charts, all redistributable. Publishing must keep the SBOM and
-licence texts (as the containers do). Anything restricted stays `publishable: false`,
-and `labctl catalog check` would also cover `vm-images.yml` (pass `--workflow` twice
-once it exists).
+**Not built here: `el-vm`, `ubuntu-vm`.** They carry the package-mirror snapshot (several
+GB) built by `tools/mirrors/build-content.sh` from the pinned snapshot dates. The
+planned route is to publish that content once per snapshot date as an OCI artifact
+(`oras push ghcr.io/<owner>/<repo>/mirror-content:<date>`) and pull it into the job.
 
-**Open points.** Whether GitHub keeps `/dev/kvm` on standard hosted runners (it is
-documented for Android emulator use, not as a guarantee); the fallback is a self-hosted
-runner on the verify VM with the same workflow. Signing qcow2 content beyond the OCI
-signature (for vSphere imports later) is out of scope.
+**Cost.** Public repository: hosted-runner minutes and GHCR storage and egress are free. A
+private repository pays per minute (roughly 10 to 25 minutes per variant) and counts
+the images against its package storage quota.
+
+## Dev clusters: pull from GHCR
+
+`task orchestrator:deploy` and `tools/images/load.sh` load lab images from the local Docker
+store into the kind nodes (`kind load`), built by `tools/images/build*.sh`. That default is
+unchanged. With `IMAGE_SOURCE=ghcr` the images CI publishes are pulled from GHCR inside
+each node's containerd instead and tagged with the catalog name, so the catalog and the
+orchestrator need no change and a machine without KVM can run VM labs:
+
+```bash
+IMAGE_SOURCE=ghcr task orchestrator:deploy                 # every publishable catalog image
+IMAGE_SOURCE=ghcr GHCR_TAG=sha-<commit> bash tools/images/load.sh kubeadm-node etcd-host
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IMAGE_SOURCE` | `local` | `local` or `ghcr` |
+| `GHCR_REGISTRY` | `ghcr.io/thecorporatetractor/cloudtrain` | where the packages live (a fork's own) |
+| `GHCR_TAG` | `main` | `main`, `sha-<commit>`, a catalog tag, or `sha256:<digest>` to pin |
+| `GHCR_USER`, `GHCR_TOKEN` | | only for a private package (a token with `read:packages`) |
+
+Images CI does not publish (the Terraform workstation, `moto`, `el-vm`, `ubuntu-vm`, the
+tier-A Linux pods) still come from the local Docker store. A cluster that should pull
+straight from GHCR at run time (no preloading) instead sets
+`CATALOG_OVERLAY=<merged overlay file>` for `task orchestrator:deploy`, or the chart's
+`orchestrator.catalog.releaseOverlay`: the digests then name GHCR and the nodes pull them.
