@@ -21,6 +21,9 @@ case ${VCLUSTER_POD_SECURITY:-baseline} in baseline|restricted) ;; *) die "VCLUS
 # Kube-OVN is not the primary CNI (the managed-cni profiles default to it).
 if [[ -z ${NETWORK_MODE:-} && $SECONDARY_PROFILE == 1 ]]; then NETWORK_MODE=secondary; fi
 case ${NETWORK_MODE:-primary} in primary|secondary) ;; *) die "NETWORK_MODE must be primary or secondary";; esac
+# KIND_PROFILE=kata maps tier B to its Kata RuntimeClass unless TIER_RUNTIME_CLASSES is set
+# (TIER_RUNTIME_CLASSES= , empty, deploys without the flag: the default behaviour).
+if [[ $KATA_PROFILE == 1 && -z ${TIER_RUNTIME_CLASSES+x} ]]; then TIER_RUNTIME_CLASSES=B=$KATA_RUNTIME_CLASS; fi
 
 SVC="$REPO_ROOT/services/lab-orchestrator"
 log "building manager image"
@@ -82,8 +85,8 @@ fi
 # cluster's default class and CDI StorageProfile (see docs/storage.md).
 # VCLUSTER_POD_SECURITY (baseline|restricted) sets --vcluster-pod-security.
 # NETWORK_MODE (see above) sets --network-mode; LAB_MTU sets --lab-mtu.
-# TIER_RUNTIME_CLASSES (prototype, docs/kata-spike.md; e.g. B=kata-clh) sets
-# --tier-runtime-classes.
+# TIER_RUNTIME_CLASSES (prototype, docs/kata-spike.md; e.g. B=kata-clh-runtime-rs) sets
+# --tier-runtime-classes (default with KIND_PROFILE=kata, see above).
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 # Cluster-scoped RBAC and admission objects (and the Roles in kube-system) of a
 # separate instance carry its namespace as a suffix.
@@ -119,7 +122,7 @@ manifests() {
         (select(.kind == "Deployment" and strenv(TRC) != "") | .spec.template.spec.containers[0].args) += ["--tier-runtime-classes=" + strenv(TRC)]' \
     | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
-log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}"
+log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}${TIER_RUNTIME_CLASSES:+, tier runtime classes $TIER_RUNTIME_CLASSES}"
 k apply -f <(manifests) >/dev/null
 k -n "$NS" create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -o yaml | k apply -f - >/dev/null
 # A catalog change alone does not change the pod template: restart to reload it.

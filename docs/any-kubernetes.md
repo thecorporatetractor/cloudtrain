@@ -397,7 +397,7 @@ fail with the fix:
 | CIDR overlap | node, pod and service CIDRs vs `192.168.99.0/24`, `192.168.100.0/24`, `198.18.0.0/15` |
 | StorageClass | default class, configured classes exist, volume mode, snapshot class, CDI StorageProfile complete (from the storage branch) |
 | User namespaces | `runtimeHandlers[].features.userNamespaces` on lab nodes (the existing `DetectUserNamespaces`), `ProcMountType` usable (dry-run pod) |
-| RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes |
+| RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes. **Sandbox section implemented** (`labctl preflight --tier-runtime-classes B=<rc> [--probe] [--systemd-image <img>]`, section 11): Kata RuntimeClasses, the manager's tier map, and with `--probe` a pod per sandbox that must boot its own kernel with the lab features (dummy, GRE, bond, VLAN, WireGuard, netem, md), a guest sized to the pod limit, and a systemd image that boots and accepts `kubectl exec` |
 | Pod Security / admission | session namespace accepts a privileged `net-init` (server-side dry-run), no policy engine rejects it |
 | Registry | every catalog image resolvable from a node (dry-run pull Job) |
 | Versions | Kubernetes minor within the KubeVirt/CDI support range |
@@ -635,3 +635,24 @@ Known startup race: right after KubeVirt reports Available, the first VMI create
 in `verify-kvm.sh` can fail with `virt-api` webhook "connection refused" while the
 virt-api pods restart. Re-running `task dev:verify-kvm` succeeded. Not shown to
 be Calico-specific.
+
+## 11. Kata profile on kind (2026-10-19)
+
+`KIND_PROFILE=kata` (`task dev:up KIND_PROFILE=kata`, cluster `cloudtrain-kata`) is
+Kube-OVN primary plus Kata Containers for tier-B sandboxes
+([kata-spike.md](kata-spike.md), section 10; [dev-environment.md](dev-environment.md),
+"Cluster profiles"). It is opt-in: the other profiles and the orchestrator's default
+(`--tier-runtime-classes` unset) do not change.
+
+| Piece | What the profile does |
+|---|---|
+| Host | `host-prep.sh` loads `vhost_vsock` (this profile only) before the node containers start; nested KVM as for KubeVirt |
+| kind nodes | `/dev/shm` remounted larger, `dbus` installed and started (runtime-rs needs it with the systemd cgroup driver); redone by every `dev:up` |
+| Runtime | kata-deploy `KATA_DEPLOY_VERSION` (chart sha256, image digest), Cloud Hypervisor on runtime-rs only, RuntimeClass `kata-clh-runtime-rs` |
+| Guest kernel | the CloudTrain lab guest kernel (`tools/images/kata-kernel`, published as `kata-lab-kernel:<release>`) through a `config.d` drop-in |
+| Orchestrator | `orchestrator-deploy.sh` adds `--tier-runtime-classes B=kata-clh-runtime-rs` (`TIER_RUNTIME_CLASSES=` turns it off) |
+
+On managed clusters the same tier map points at the provider's RuntimeClass
+(AKS `kata-vm-isolation`, GKE `microvm`), whose guest kernel is not ours.
+`labctl preflight --tier-runtime-classes B=<rc> --probe` reports which lab
+kernel features that guest has; without Kata, tier B stays on KubeVirt.

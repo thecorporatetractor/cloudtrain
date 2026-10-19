@@ -3,7 +3,7 @@
 #
 # Usage: load.sh [name...]     default: all
 #   kubeadm-node | kubeadm-upgrade | etcd-host   containerDisks -> nodes that run VMs
-#   jumphost, linux-pod-el, linux-pod-deb, mirror,
+#   jumphost, linux-pod-el, linux-pod-deb, linux-pod-el-sys, linux-pod-deb-sys, mirror,
 #   iac-ws-terraform, iac-ws-tofu, ansible-ctl, kql-ws -> every node
 #   el-vm | ubuntu-vm | docker-vm                containerDisks -> nodes that run VMs
 #   workloads                                    lab workload images (tools/images/lock/
@@ -67,6 +67,10 @@ for t in "${targets[@]}"; do
                      load_docker_image "$LINUX_POD_EL_IMAGE" $ALL_NODES ;;
     linux-pod-deb)   # shellcheck disable=SC2086
                      load_docker_image "$LINUX_POD_DEB_IMAGE" $ALL_NODES ;;
+    linux-pod-el-sys) # shellcheck disable=SC2086
+                     load_docker_image "$EL_SYS_IMAGE" $ALL_NODES ;;
+    linux-pod-deb-sys) # shellcheck disable=SC2086
+                     load_docker_image "$DEB_SYS_IMAGE" $ALL_NODES ;;
     kubeadm-full)    # shellcheck disable=SC2086
                      load_docker_image "${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}" $VM_NODES ;;
     el-vm)           # shellcheck disable=SC2086

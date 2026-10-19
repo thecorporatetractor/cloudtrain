@@ -1,0 +1,174 @@
+# Kata lab guest kernel (tools/images/kata-kernel, docs/kata-spike.md 4.3): built on a free
+# GitHub-hosted runner (no KVM needed) by the same build.sh as locally, in a pinned container
+# (UBUNTU_BASE_IMAGE + UBUNTU_APT_SNAPSHOT), and checked against the committed
+# modules.builtin and, once pinned, the reproducible vmlinux sha256 (KATA_LAB_KERNEL_SHA256).
+# Pull requests build and check only. Push to main, v* tags and manual runs also publish it as
+# an OCI artifact ghcr.io/<owner>/<repo>/kata-lab-kernel:<release> (release = uname -r =
+# <version>-ct<rev>) when that tag is not published yet, signed with cosign keyless and with
+# SLSA build provenance. A published release is immutable: changing the kernel means bumping
+# KATA_LAB_KERNEL_REV. KIND_PROFILE=kata pulls it (deploy/scripts/kata-up.sh).
+name: kata-kernel
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - tools/images/kata-kernel/**
+      - deploy/versions.env
+      - .github/workflows/kata-kernel.yml
+  pull_request:
+    paths:
+      - tools/images/kata-kernel/**
+      - deploy/versions.env
+      - .github/workflows/kata-kernel.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      built: ${{ steps.what.outputs.build }}
+      release: ${{ steps.what.outputs.release }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # deploy/versions.env changes all the time; rebuild only when a kernel input in it changed
+      # (or anything else in the path filter did). Manual runs and tags always build.
+      - name: Kernel inputs changed?
+        id: what
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          release=$(set -a; . deploy/versions.env; echo "$KATA_LAB_KERNEL_VERSION-ct$KATA_LAB_KERNEL_REV")
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          base=""
+          if [[ $EVENT == pull_request ]]; then base=$PR_BASE
+          elif [[ $EVENT == push && $REF_TYPE == branch && $BEFORE =~ [1-9a-f] ]]; then base=$BEFORE; fi
+          build=true
+          if [[ -n $base ]] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            other=$(git diff --name-only "$base" HEAD -- tools/images/kata-kernel .github/workflows/kata-kernel.yml)
+            keys=$(git diff -U0 "$base" HEAD -- deploy/versions.env \
+              | grep -E '^[+-](KATA_LAB_KERNEL_[A-Z0-9_]*|KATA_KERNEL_CONFIG_[A-Z0-9_]*|UBUNTU_BASE_IMAGE|UBUNTU_APT_SNAPSHOT)=' || true)
+            if [[ -z $other && -z $keys ]]; then build=false; fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "kernel $release: build=$build"
+      - name: Build (tools/images/kata-kernel/build.sh --check)
+        if: steps.what.outputs.build == 'true'
+        env:
+          OUT: ${{ runner.temp }}/kernel
+        run: bash tools/images/kata-kernel/build.sh --check
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.what.outputs.build == 'true'
+        with:
+          name: kata-lab-kernel-${{ steps.what.outputs.release }}
+          path: ${{ runner.temp }}/kernel
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request' && needs.build.outputs.built == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # cosign keyless + attestations (Sigstore OIDC)
+      attestations: write
+    env:
+      RELEASE: ${{ needs.build.outputs.release }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kata-lab-kernel-${{ needs.build.outputs.release }}
+          path: kernel
+      - run: bash .github/scripts/install-tools.sh oras
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Is this release published?
+        id: v
+        run: |
+          set -euo pipefail
+          cd kernel && sha256sum -c SHA256SUMS
+          ref="ghcr.io/${REPO,,}/kata-lab-kernel"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          if digest=$(oras resolve "$ref:$RELEASE" 2>/dev/null); then
+            mkdir -p ../published && oras pull -o ../published "$ref@$digest" >/dev/null
+            if cmp -s vmlinux ../published/vmlinux; then
+              echo "kata-lab-kernel:$RELEASE is already published as $digest (same vmlinux)"
+              echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            echo "::error::kata-lab-kernel:$RELEASE is published with a different vmlinux: bump KATA_LAB_KERNEL_REV"; exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - name: oras push
+        id: push
+        if: steps.v.outputs.publish == 'true'
+        env:
+          REF: ${{ steps.v.outputs.ref }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd kernel
+          digest=$(oras push "$REF:$RELEASE" --format go-template='{{.digest}}' \
+            --artifact-type application/vnd.cloudtrain.kata-kernel.v1 \
+            --annotation "org.opencontainers.image.source=$SOURCE" \
+            --annotation "org.opencontainers.image.revision=$REVISION" \
+            --annotation "org.opencontainers.image.version=$RELEASE" \
+            --annotation "org.opencontainers.image.description=CloudTrain lab guest kernel for Kata (Cloud Hypervisor)" \
+            --annotation "org.opencontainers.image.licenses=GPL-2.0-only" \
+            vmlinux:application/vnd.cloudtrain.kata-kernel.vmlinux \
+            config:text/plain modules.builtin:text/plain SHA256SUMS:text/plain)
+          [[ $digest == sha256:* ]] || { echo "::error::no digest from oras push"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### kata-lab-kernel $RELEASE"
+            echo "\`$REF:$RELEASE\` = \`$REF@$digest\`"
+            echo '```'; cat SHA256SUMS; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: steps.v.outputs.publish == 'true'
+      - name: cosign sign (keyless, by digest)
+        if: steps.v.outputs.publish == 'true'
+        env:
+          REF: ${{ steps.v.outputs.ref }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REF"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: steps.v.outputs.publish == 'true'
+        with:
+          subject-name: ${{ steps.v.outputs.ref }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
