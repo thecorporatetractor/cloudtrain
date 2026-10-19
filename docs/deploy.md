@@ -2,8 +2,8 @@
 
 How to install the CloudTrain platform on a conformant Kubernetes cluster (vCenter,
 AKS, EKS, GKE, bare metal), and how its images get from CI to the cluster's nodes.
-Design background: [any-kubernetes.md](any-kubernetes.md) (sections 1.7, 1.8 and 5,
-decisions 6 and 9). Local development stays on kind
+Design background: [any-kubernetes.md](any-kubernetes.md) (sections 1.7, 1.8, 1.9 and 5,
+decisions 6, 7 and 9). Local development stays on kind
 ([dev-environment.md](dev-environment.md), `task dev:*`).
 
 ## What gets installed
@@ -134,6 +134,8 @@ namespace and with them running labs (`helm.sh/resource-policy: keep`).
 | `orchestrator.images.mirrors`, `.registry`, `.pullSecrets` | | where lab images are pulled from ([Images and registries](#images-and-registries)) |
 | `orchestrator.storageClass`, `.vmDisks`, `.runtimeClass` | default class, `persistent`, cluster default | lab storage and runtime |
 | `orchestrator.watchNamespace`, `.sessionSelector` | all | scope the manager (one manager per session) |
+| `orchestrator.rbac.admissionPolicy` | `true` | the ValidatingAdmissionPolicy that limits the manager's cluster-wide writes ([Orchestrator RBAC](#orchestrator-rbac)) |
+| `orchestrator.rbac.ovnCentral.enabled`, `.namespace`, `.selector` | `true`, `kube-system`, `app=ovn-central` | exec into Kube-OVN's ovn-central for 802.1Q on lab links; `false` drops that Role |
 | `networkPolicy.enabled`, `.ingressNamespaceSelector` | off | admit gateway/web traffic only from the ingress data plane |
 | `postgres.demo.enabled` | off | demo Postgres on an emptyDir; never for real data |
 | `extraObjects` | | provider policies rendered with the release (templated) |
@@ -211,11 +213,182 @@ The charts embed the CRDs, the orchestrator ClusterRole and the image catalog th
 symlinks to their sources (Helm follows them when rendering and packaging), so they
 never drift; `task chart:sync` re-creates the links after a CRD is added or removed.
 
+## Orchestrator RBAC
+
+The lab-orchestrator holds least privilege (decision 7 in
+[any-kubernetes.md](any-kubernetes.md)): no `escalate`, no Secrets or `pods/exec`
+outside lab namespaces, no writes to namespaced objects anywhere else. Sources, all in
+`services/lab-orchestrator/config/rbac/`:
+
+| File | Kind | Scope | Source |
+|---|---|---|---|
+| `role.yaml` | ClusterRole `lab-orchestrator` | cluster-wide | `+kubebuilder:rbac` markers in `internal/controller` (`make manifests`) |
+| `session_role.yaml` | ClusterRole `lab-orchestrator-session` | bound per lab namespace by the manager | markers in `internal/rbac` (`make manifests`) |
+| `leader_election_role.yaml` | Role | the manager's namespace | static |
+| `ovn_central_role.yaml` | Role | `kube-system` (Kube-OVN's ovn-central) | static |
+| `admission_policy.yaml` | ValidatingAdmissionPolicy + binding | requests of the manager's ServiceAccount | static |
+
+### Lab namespaces
+
+A lab namespace carries `labs.cloudtrain.dev/lab-namespace=true`: the namespaces that
+hold LabSessions (`labctl verify` and `labctl exam run` namespaces, the gateway's
+`cloudtrain-sessions`) and the vcluster host namespaces (`ct-vc-*`) the manager
+creates. Before any driver runs, the manager creates a RoleBinding named after the
+session ClusterRole in the session's namespace (and in each vcluster host namespace),
+binding that ClusterRole to its own ServiceAccount. It may do that because it holds
+`bind` on that one ClusterRole (`resourceNames`) and `create` on RoleBindings; it
+cannot bind anything else it does not already hold. A LabSession in a namespace
+without the label stays Pending with condition `Ready=False`, reason
+`NamespaceNotLab`, and is checked again every 30 s.
+
+Deleting a namespace deletes its RoleBindings before the LabSessions' finalizers have
+run, which would leave the manager without permission to tear the sessions down. The
+binding in a session namespace therefore carries the finalizer
+`labs.cloudtrain.dev/session-access` while the namespace holds LabSessions (a
+RoleBinding that is being deleted still authorizes): the manager drops it after
+tearing down the namespace's last session and adds it back for the next one.
+If the manager is uninstalled first, the namespace waits on that finalizer (and on the
+LabSessions' own), as before: remove both by hand. vcluster host namespaces have no
+such finalizer, since the manager deletes them itself after its cleanup.
+
+Label a namespace you create for sessions yourself:
+
+```bash
+kubectl label namespace cloudtrain-sessions labs.cloudtrain.dev/lab-namespace=true \
+  pod-security.kubernetes.io/enforce=privileged
+```
+
+### What the manager calls, and where it is granted
+
+| Who | API calls | Verbs, resources | Granted by |
+|---|---|---|---|
+| Controllers | LabSessions, WarmPools, ExamSessions and their templates, status, finalizers | get list watch create update patch delete on `labs.cloudtrain.dev` | ClusterRole |
+| Controllers | informers of `Owns(Pod)`, `Owns(Service)` (cache filtered to its own label) | get list watch `pods`, `services` | ClusterRole |
+| Controllers | events on sessions | create patch `events` (core, `events.k8s.io`) | session ClusterRole |
+| Leader election | its lease | `leases` CRUD, events | Role in its namespace |
+| Metrics (`--metrics-secure`) | authn/authz of scrapes | create `tokenreviews`, `subjectaccessreviews` | ClusterRole |
+| Startup | storage preflight, user-namespace detection, `--runtime-class` | list `storageclasses`; get list `nodes`; get `runtimeclasses` | ClusterRole |
+| Session access | label check, RoleBinding | get `namespaces`; get create update delete `rolebindings`; bind `clusterroles/lab-orchestrator-session` | ClusterRole (+ policy) |
+| container driver | entry and lab pods, Services, SSH key Secrets, home PVCs, NetworkPolicies, exec for setup and grading | CRUD + deletecollection on `pods services secrets configmaps persistentvolumeclaims`; `pods/exec`; `networkpolicies` | session ClusterRole |
+| vm driver | VMs, VMIs, DataVolumes, root-disk PVCs, cloud-init and SSH Secrets | `virtualmachines virtualmachineinstances` (kubevirt.io), `datavolumes` (cdi.kubevirt.io), PVCs, Secrets | session ClusterRole |
+| k8s-cluster kubeadm | VMs as above, PKI and kubeconfig Secrets, exec on the entry node | as vm driver, `pods/exec` | session ClusterRole |
+| k8s-cluster vcluster | host namespace `ct-vc-*`: create, relabel (Pod Security), delete | get create patch delete `namespaces` | ClusterRole (+ policy) |
+| k8s-cluster vcluster | Helm release: StatefulSet, Services, ServiceAccount, Secret, Role, RoleBinding; cleanup of synced objects | `statefulsets deployments replicasets`, `roles rolebindings`, core objects, deletecollection | session ClusterRole in the host namespace |
+| k8s-cluster vcluster | the chart's Role (created without `escalate`, so the manager holds all of it) | `pods/attach pods/portforward pods/exec`, `pods/status pods/ephemeralcontainers pods/resize`, `pods/log`, `endpoints`, `endpointslices`, events | session ClusterRole |
+| netdev driver | FRR pods, exec | pods, `pods/exec` | session ClusterRole |
+| Session network | per-session VPC and subnets | get list create update patch delete `vpcs subnets` (kubeovn.io) | ClusterRole (+ policy) |
+| Session network | Multus attachments | `network-attachment-definitions` CRUD | session ClusterRole |
+| vlan-passthru | `ovn-nbctl` in ovn-central | list `pods`, create get `pods/exec` | Role in `kube-system` |
+
+`internal/rbac/rbac_test.go` holds the same inventory as a test (every required call
+allowed, a list of forbidden ones denied, the session ClusterRole covers the vcluster
+chart's Role); `internal/rbac/envtest_test.go` checks it against a real API server
+with the admission policy (`make test-rbac`).
+
+### Before and after
+
+| Permission | Before | After |
+|---|---|---|
+| `escalate` on (cluster)roles | cluster-wide | none |
+| `bind` | any (cluster)role | `clusterroles/lab-orchestrator-session` only |
+| ClusterRoles, ClusterRoleBindings | full CRUD | none |
+| Roles | cluster-wide CRUD | lab namespaces (session ClusterRole) |
+| RoleBindings | cluster-wide CRUD | create get update delete cluster-wide, admission-limited to lab namespaces |
+| Secrets, ConfigMaps, PVCs, ServiceAccounts, Endpoints | cluster-wide CRUD | lab namespaces |
+| `pods/exec` | cluster-wide | lab namespaces, plus `kube-system` (ovn-central, optional) |
+| Pods, Services | cluster-wide CRUD | read cluster-wide (informers), writes in lab namespaces |
+| Deployments, StatefulSets, ReplicaSets, NetworkPolicies, EndpointSlices | cluster-wide CRUD | lab namespaces |
+| PodDisruptionBudgets | cluster-wide CRUD | none (unused) |
+| VMs, VMIs, DataVolumes, NADs | cluster-wide CRUD | lab namespaces |
+| Leases | cluster-wide CRUD | its own namespace |
+| Events | create cluster-wide | lab namespaces and its own namespace |
+| Namespaces | get list watch create patch delete | get create patch delete, admission-limited to its own `ct-vc-*` |
+| Kube-OVN VPCs, subnets | CRUD | CRUD, admission-limited to its own (managed-by label) |
+| Nodes, StorageClasses, RuntimeClasses, TokenReviews, SARs | read / create | unchanged |
+
+### What stays broad, and why
+
+- **RoleBindings cluster-wide (create, update, delete).** Lab namespaces are created by
+  labctl, the gateway or an operator at any time, so the manager must be able to bind
+  its session role in a namespace it has never seen. RBAC cannot restrict by
+  namespace label; the admission policy does: RoleBinding writes only in lab
+  namespaces, and a ClusterRole may be bound only if it is the session ClusterRole,
+  with the manager itself as the only subject. RBAC's escalation check still applies
+  to every other binding (it can grant nothing it does not hold). Without the policy
+  (Kubernetes before 1.30, or the policy not installed) the guard is the manager's
+  own label check only.
+- **Namespaces create, patch, delete.** vcluster needs one namespace per virtual
+  cluster (it refuses to share one). RBAC cannot restrict by name or label; the
+  policy limits the manager to `ct-vc-*` namespaces carrying its managed-by label,
+  enforcing Pod Security baseline or restricted, and it cannot relabel or delete any
+  other namespace.
+- **Pods and Services read cluster-wide.** controller-runtime's informers for
+  `Owns(Pod)` and `Owns(Service)` list and watch all namespaces (filtered to the
+  manager's label in the cache, not in RBAC). This is read-only and excludes Secrets.
+  `--watch-namespace` narrows the informers, but a vcluster's host namespace is
+  outside it, so the read stays cluster-wide.
+- **`pods/exec` in kube-system.** vlan-passthru on lab link switches needs
+  `ovn-nbctl` in Kube-OVN's ovn-central pods, whose names are generated, so the Role
+  grants exec into every pod in that namespace. Drop `ovn_central_role.yaml` and set
+  `--ovn-central=` where 802.1Q on lab links is not needed (tagged frames are then
+  dropped on links), or point `--ovn-central` and the Role at another namespace.
+- **Kube-OVN VPCs and subnets.** They are cluster-scoped. The policy limits writes to
+  the ones carrying the manager's managed-by label, so `ovn-cluster`, `ovn-default`
+  and `join` cannot be changed.
+- **The session ClusterRole itself** contains what the vcluster chart's Role grants
+  (`pods/attach`, `pods/portforward`, `pods/ephemeralcontainers`, ...), because the
+  manager creates that Role through Helm without `escalate` and must hold every rule
+  of it. These verbs apply only in lab namespaces.
+
+### Configuration
+
+| Setting | Default | Effect |
+|---|---|---|
+| `--session-cluster-role` | `lab-orchestrator-session` | the ClusterRole the manager binds in lab namespaces; empty = the manager never binds (the operator grants the session permissions, e.g. a RoleBinding in a single sessions namespace) |
+| `--service-account` | `$POD_NAMESPACE/$SERVICE_ACCOUNT_NAME` (downward API in `config/manager/manager.yaml`) | the subject of those RoleBindings |
+| `--ovn-central` | `kube-system/app=ovn-central` | empty = no vlan-passthru; then drop the Role in kube-system |
+| `deploy/vcluster/values.yaml` `rbac.clusterRole.enabled: false` | | the vcluster chart creates no ClusterRole (with "auto" it adds one for volume snapshots) |
+
+The Helm chart renders the same objects per release: `<release>-cloudtrain-orchestrator-<namespace>`
+(cluster-wide, its `bind` pointed at the release's session role),
+`...-orchestrator-session-<namespace>` (session ClusterRole), the leader-election
+Role, the ovn-central Role (`orchestrator.rbac.ovnCentral`) and the admission policy
+(`orchestrator.rbac.admissionPolicy`), labels the sessions namespace as a lab namespace
+and passes `--session-cluster-role`, `--service-account` and `--ovn-central`.
+
+`deploy/scripts/orchestrator-deploy.sh` gives a separate instance (`ORCH_NAMESPACE`)
+its own `lab-orchestrator-<ns>`, `lab-orchestrator-session-<ns>`, kube-system Role and
+admission policy (matching only its ServiceAccount), so instances on one cluster
+never widen or narrow each other.
+
+### Upgrading from the cluster-wide role
+
+- Label the existing session namespaces (`labs.cloudtrain.dev/lab-namespace=true`)
+  before rolling out the new manager; `labctl` sets the label on the namespaces it
+  creates.
+- vcluster releases installed by an older manager may own a cluster-scoped
+  ClusterRole and ClusterRoleBinding (`vc-<release>-v-<namespace>`). The scoped
+  manager cannot delete them: `helm uninstall` of such a release fails until an
+  operator deletes the two objects. Let those sessions expire under the old manager,
+  or delete the leftovers (`kubectl delete clusterrole,clusterrolebinding -l app=vcluster`
+  after their sessions are gone). Host namespaces created by an older manager get the
+  lab label and their binding the next time the manager touches them.
+
+### What labctl needs
+
+`labctl` runs with the operator's kubeconfig, not the manager's ServiceAccount.
+`labctl verify` and `labctl exam run` create and delete lab namespaces (with the lab
+and Pod Security labels), LabTemplates, LabSessions and ExamSessions, read session
+Secrets (kubeconfigs, SSH keys) and exec into lab pods (the same driver code as the
+manager), and for the leftover check list namespaced objects in the lab namespace plus
+ClusterRoles, ClusterRoleBindings, namespaces, VPCs and subnets cluster-wide.
+`labctl preflight` lists nodes, DaemonSets, Deployments, StorageClasses, ServiceCIDRs
+and subnets, and creates a probe namespace with pods and a session network. In
+practice it runs as a cluster administrator (the verify VM, CI); a dedicated role
+would need all of the above.
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.
-- Orchestrator RBAC scoped down (decision 7 in any-kubernetes.md); the chart uses
-  the generated ClusterRole as is.
 - `el-vm`, `ubuntu-vm` and the tier-A Linux pod images (`el-lab`, `deb-lab`) in CI: they
   need the package-mirror content (see the design below), so a release overlay still
   leaves those refs on their dev names.

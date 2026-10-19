@@ -66,7 +66,10 @@ spec:
         if ! dpkg -s dnsmasq >/dev/null 2>&1; then
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
           apt-get update -q >/dev/null
+          # a service must not start on install: dnsmasq would grab ports 53 and 67 before the learner configures it
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 0755 /usr/sbin/policy-rc.d
           DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq >/dev/null
+          rm -f /usr/sbin/policy-rc.d
         fi
         systemctl disable --now dnsmasq >/dev/null 2>&1 || true
         systemctl reset-failed dnsmasq >/dev/null 2>&1 || true
@@ -169,7 +172,7 @@ spec:
       weight: 1.5
       command: |
         [ "$(systemctl is-enabled dnsmasq 2>/dev/null)" = enabled ] || { echo not-enabled; exit 0; }
-        dnsmasq --test 2>&1 | grep -q 'syntax check OK' || { echo syntax; exit 0; }
+        dnsmasq --test --conf-dir=/etc/dnsmasq.d,.dpkg-dist,.dpkg-old,.dpkg-new 2>&1 | grep -q 'syntax check OK' || { echo syntax; exit 0; }
         c=$(cat /etc/dnsmasq.conf /etc/dnsmasq.d/* 2>/dev/null | grep -v '^[[:space:]]*#')
         echo "$c" | grep -Eq '^dhcp-range=.*10\.62\.1\.100,10\.62\.1\.200' && echo "$c" | grep -Eqi '^dhcp-host=.*{{pmac}}' && echo persistent || echo incomplete
       expect: {match: exact, value: persistent}

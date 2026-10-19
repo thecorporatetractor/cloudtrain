@@ -60,6 +60,19 @@ check "orchestrator --image-pull-secrets" q 'select(.kind == "Deployment" and .m
 render -f "$CHART/examples/values-kind.yaml" --set-file orchestrator.catalog.releaseOverlay="$ROOT/deploy/images/overlays/iac-opentofu.yaml" >"$OUT/overlay.yaml"
 check "release overlay in the catalog" q 'select(.kind == "ConfigMap" and .metadata.name == "ct-cloudtrain-orchestrator-catalog") | .data["20-release.yaml"] | contains("ImageCatalog")' "$OUT/overlay.yaml"
 
+# Least-privilege orchestrator RBAC (docs/deploy.md, Orchestrator RBAC).
+K=$OUT/values-kind.yaml
+check "rbac: no escalate, no wildcards" bash -c "! yq -e 'select(.kind == \"ClusterRole\" or .kind == \"Role\") | .rules[] | select((.verbs | any_c(. == \"escalate\" or test(\"^[*]$\"))) or (.resources | any_c(test(\"^[*]$\"))))' '$K'"
+check "rbac: bind only on the release's session role" q '[select(.kind == "ClusterRole" and .metadata.name == "ct-cloudtrain-orchestrator-cloudtrain") | .rules[] | select(.verbs | any_c(. == "bind"))] | (length == 1 and (.[0].resourceNames | length) == 1 and .[0].resourceNames[0] == "ct-cloudtrain-orchestrator-session-cloudtrain")' "$K"
+check "rbac: no Secrets or pods/exec cluster-wide" bash -c "! yq -e 'select(.kind == \"ClusterRole\" and .metadata.name == \"ct-cloudtrain-orchestrator-cloudtrain\") | .rules[] | select(.resources | any_c(. == \"secrets\" or . == \"pods/exec\"))' '$K'"
+check "rbac: session ClusterRole, not bound by the chart" bash -c "yq -e 'select(.kind == \"ClusterRole\" and .metadata.name == \"ct-cloudtrain-orchestrator-session-cloudtrain\") | .rules[] | select(.resources | any_c(. == \"pods/exec\"))' '$K' && ! yq -e 'select(.kind == \"ClusterRoleBinding\" or .kind == \"RoleBinding\") | select(.roleRef.name == \"ct-cloudtrain-orchestrator-session-cloudtrain\")' '$K'"
+check "rbac: manager flags" q '[select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--session-cluster-role=ct-cloudtrain-orchestrator-session-cloudtrain" or . == "--service-account=cloudtrain/ct-cloudtrain-orchestrator" or . == "--ovn-central=kube-system/app=ovn-central")] | length == 3' "$K"
+check "rbac: leader election Role in the release namespace" q 'select(.kind == "Role" and .metadata.name == "ct-cloudtrain-orchestrator-leader-election") | .rules[0].resources[0] == "leases"' "$K"
+check "rbac: admission policy matches the release's ServiceAccount and session role" bash -c "yq -e 'select(.kind == \"ValidatingAdmissionPolicy\") | .spec.matchConditions[0].expression == \"request.userInfo.username == '\''system:serviceaccount:cloudtrain:ct-cloudtrain-orchestrator'\''\"' '$K' && yq -e 'select(.kind == \"ValidatingAdmissionPolicy\") | .spec.validations[] | select(.expression | contains(\"ct-cloudtrain-orchestrator-session-cloudtrain\"))' '$K' && yq -e 'select(.kind == \"ValidatingAdmissionPolicyBinding\") | .spec.policyName == \"ct-cloudtrain-orchestrator-cloudtrain\"' '$K'"
+check "rbac: sessions namespace is a lab namespace" q 'select(.kind == "Namespace" and .metadata.name == "ct-deploy-sessions") | .metadata.labels["labs.cloudtrain.dev/lab-namespace"] == "true"' "$K"
+render -f "$CHART/examples/values-kind.yaml" --set orchestrator.rbac.ovnCentral.enabled=false --set orchestrator.rbac.admissionPolicy=false >"$OUT/rbac-off.yaml"
+check "rbac: ovn-central off drops the kube-system Role" bash -c "! yq -e 'select(.kind == \"Role\" and .metadata.namespace == \"kube-system\")' '$OUT/rbac-off.yaml' && yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-orchestrator\") | .spec.template.spec.containers[0].args[] | select(. == \"--ovn-central=\")' '$OUT/rbac-off.yaml' && ! grep -q '^kind: ValidatingAdmissionPolicy' '$OUT/rbac-off.yaml'"
+
 # Web runtime config and CSP sources go in as environment variables.
 render -f "$CHART/examples/values-kind.yaml" --set web.runtimeConfig.apiBase=https://api.example.com --set 'web.csp.connectSrc=https://api.example.com wss://api.example.com' >"$OUT/web.yaml"
 check "web CT_API_BASE" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-web") | .spec.template.spec.containers[0].env[] | select(.name == "CT_API_BASE") | .value == "https://api.example.com"' "$OUT/web.yaml"
@@ -74,6 +87,7 @@ refuse "path in apiBase" "apiBase" -f "$CHART/examples/values-kind.yaml" --set w
 refuse "semicolon in CSP" "csp" -f "$CHART/examples/values-kind.yaml" --set 'web.csp.connectSrc=x; script-src *'
 refuse "gatewayAPI without parent" "parentRefs or createGateway" -f "$CHART/examples/values-kind.yaml" --set exposure.type=gatewayAPI
 refuse "bad mirror" "mirrors" -f "$CHART/examples/values-kind.yaml" --set 'orchestrator.images.mirrors[0]=ghcr.io'
+refuse "bad ovn-central selector" "selector" -f "$CHART/examples/values-kind.yaml" --set orchestrator.rbac.ovnCentral.selector=ovn-central
 refuse "unknown value" "additional properties" -f "$CHART/examples/values-kind.yaml" --set gateway.typo=1
 
 # Dev sign-in-as is never set by the chart.

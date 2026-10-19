@@ -23,6 +23,7 @@ import (
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/compile"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/exam"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/rbac"
 )
 
 // Exam defaults.
@@ -68,6 +69,9 @@ type ExamSessionReconciler struct {
 	ProvisionBudget time.Duration
 	GradingGrace    time.Duration
 	StageTimeout    time.Duration
+	// Access, when set, grants the manager its session permissions in the
+	// attempt's namespace (grading execs into the environments).
+	Access SessionNamespaceAccess
 }
 
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=examsessions,verbs=get;list;watch;update;patch
@@ -135,6 +139,14 @@ func (r *ExamSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if !es.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil // owned environments are garbage-collected
+	}
+	// Grading execs into the environments' pods (session permissions).
+	if err := ensureAccess(ctx, r.Access, es.Namespace); err != nil {
+		if errors.Is(err, rbac.ErrNamespaceNotLab) {
+			log.Info("exam session in a namespace without the lab label; waiting", "namespace", es.Namespace, "label", drivers.LabelLabNamespace)
+			return ctrl.Result{RequeueAfter: requeueNamespaceNotLab}, nil
+		}
+		return ctrl.Result{}, err
 	}
 	base := es.DeepCopy()
 	save := func(ctx context.Context) error {

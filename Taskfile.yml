@@ -17,14 +17,14 @@ tasks:
     cmds: [bash deploy/scripts/install-tools.sh]
 
   dev:up:
-    desc: "Create/converge the kind cluster 'cloudtrain-dev' with Kube-OVN, Multus, KubeVirt (KVM), CDI; KIND_PROFILE=managed-cni: cluster 'cloudtrain-mcni' with Cilium primary and Kube-OVN non-primary"
+    desc: "Create/converge the kind cluster 'cloudtrain-dev' with Kube-OVN, Multus, KubeVirt (KVM), CDI; KIND_PROFILE=managed-cni: cluster 'cloudtrain-mcni' with Cilium primary and Kube-OVN non-primary; KIND_PROFILE=managed-cni-calico: cluster 'cloudtrain-calico', Calico VXLAN primary"
     deps: [tools]
     env:
       KIND_PROFILE: '{{.KIND_PROFILE | default "kubeovn-primary"}}'
     cmds: [bash deploy/scripts/dev-up.sh]
 
   dev:down:
-    desc: Delete the kind cluster 'cloudtrain-dev' (KIND_PROFILE=managed-cni - 'cloudtrain-mcni'; leaves every other cluster/container alone)
+    desc: Delete the kind cluster 'cloudtrain-dev' (KIND_PROFILE=managed-cni - 'cloudtrain-mcni', managed-cni-calico - 'cloudtrain-calico'; leaves every other cluster/container alone)
     env:
       KIND_PROFILE: '{{.KIND_PROFILE | default "kubeovn-primary"}}'
     cmds: [bash deploy/scripts/dev-down.sh]
@@ -205,8 +205,9 @@ tasks:
       - pnpm --filter @cloudtrain/lab-schema build
       - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}
       # Lab pods need more than baseline (links: NET_ADMIN, FRR: SYS_ADMIN, ...): enforce privileged
-      # explicitly, audit baseline (drivers.SessionNamespacePodSecurity).
-      - kubectl --context {{.CTX}} label --overwrite namespace {{.NS}} pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/enforce-version=latest pod-security.kubernetes.io/audit=baseline pod-security.kubernetes.io/audit-version=latest >/dev/null
+      # explicitly, audit baseline (drivers.SessionNamespacePodSecurity). The lab label lets the
+      # orchestrator bind its session permissions here (docs/deploy.md, Orchestrator RBAC).
+      - kubectl --context {{.CTX}} label --overwrite namespace {{.NS}} labs.cloudtrain.dev/lab-namespace=true pod-security.kubernetes.io/enforce=privileged pod-security.kubernetes.io/enforce-version=latest pod-security.kubernetes.io/audit=baseline pod-security.kubernetes.io/audit-version=latest >/dev/null
       - pnpm --filter @cloudtrain/gateway dev
 
   dev:web:
@@ -228,7 +229,7 @@ tasks:
     cmds: [bash tools/charts/test.sh]
 
   orchestrator:deploy:
-    desc: 'Build the lab-orchestrator image and deploy CRDs, RBAC and the manager into cloudtrain-dev (CATALOG_OVERLAY=<file> merges a local catalog overlay; KIND_PROFILE=managed-cni deploys into cloudtrain-mcni with --network-mode=secondary)'
+    desc: 'Build the lab-orchestrator image and deploy CRDs, RBAC and the manager into cloudtrain-dev (CATALOG_OVERLAY=<file> merges a local catalog overlay; KIND_PROFILE=managed-cni / managed-cni-calico deploy into cloudtrain-mcni / cloudtrain-calico with --network-mode=secondary)'
     env:
       KIND_PROFILE: '{{.KIND_PROFILE | default "kubeovn-primary"}}'
     cmds: [bash deploy/scripts/orchestrator-deploy.sh]
@@ -237,7 +238,7 @@ tasks:
     desc: 'Run the verifier cycle against the live cluster: task lab:verify -- [--only <lab-id>] [--parallel N] [--keep] <lab dir>...'
     dir: services/lab-orchestrator
     cmds:
-      - go run ./cmd/labctl verify --context kind-{{if eq (.KIND_PROFILE | default "") "managed-cni"}}cloudtrain-mcni{{else}}{{.CLUSTER_NAME}}{{end}} --repo-root {{.ROOT_DIR}} {{.CLI_ARGS}}
+      - go run ./cmd/labctl verify --context kind-{{if eq (.KIND_PROFILE | default "") "managed-cni"}}cloudtrain-mcni{{else if eq (.KIND_PROFILE | default "") "managed-cni-calico"}}cloudtrain-calico{{else}}{{.CLUSTER_NAME}}{{end}} --repo-root {{.ROOT_DIR}} {{.CLI_ARGS}}
 
   curriculum:render:
     desc: 'Regenerate docs/curriculum.md from content/curriculum.yaml'

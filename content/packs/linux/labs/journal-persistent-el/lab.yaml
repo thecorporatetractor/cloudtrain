@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: journal-persistent-el
+  title: Keep the signalling journal across reboots with a size cap
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems, linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [journald, journal, persistence, logs]
+  version: 1
+spec:
+  description: |
+    The journal of **`tr-signal-01`** (`ssh tr-signal-01`; you have `sudo`) lives in
+    memory, so every reboot loses the evidence the signalling team needs.
+
+    1. Make the journal **persistent** (`Storage=persistent`) and cap it at **200 MiB**
+       (`SystemMaxUse=200M`), in a drop-in below `/etc/systemd/journald.conf.d/` or in
+       `journald.conf`.
+    2. Move what the running boot has logged so far onto disk. The log line
+       **`{{marker}}`** was written a moment ago and must be in the persistent journal.
+    3. Write the **one-line command** that shows only the **error-priority** (and worse)
+       messages of the **boot before the current one** to
+       **`/home/learner/answers/prev-boot.txt`**. This host is not rebooted in this
+       exercise, so the file holds the command, not its output.
+  objectives:
+    - Configure persistent journal storage and a size limit for journald
+    - Flush the volatile journal to disk
+    - Select earlier boots and priorities with journalctl
+  params:
+    marker:
+      type: choice
+      values: ["signal-handover-alpha", "signal-handover-bravo"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-signal-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-signal-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        rm -rf /etc/systemd/journald.conf.d /var/log/journal
+        mkdir -p /etc/systemd/journald.conf.d
+        printf '[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf.d/00-volatile.conf
+        systemctl restart systemd-journald
+        sleep 1
+        logger -t tr-signal "{{marker}}"
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/prev-boot.txt
+  checks:
+    - id: storage
+      description: journald is configured for persistent storage
+      type: shell
+      on: tr-signal-01
+      skills: [linux.observability.journal-persistence]
+      weight: 2
+      command: |
+        s=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | sed 's/[#;].*//' | awk -F= '{k=$1; gsub(/[ \t]/, "", k); if (k == "Storage") {v=$2; gsub(/[ \t]/, "", v); r=v}} END {print r}')
+        if [ "$s" = persistent ]; then echo persistent
+        elif { [ -z "$s" ] || [ "$s" = auto ]; } && [ -d /var/log/journal ]; then echo persistent
+        else echo "storage=${s:-unset}"; fi
+      expect: {match: exact, value: persistent}
+    - id: cap
+      description: SystemMaxUse is 200 MiB
+      type: shell
+      on: tr-signal-01
+      skills: [linux.observability.journal-persistence]
+      weight: 1.5
+      command: |
+        v=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | sed 's/[#;].*//' | awk -F= '{k=$1; gsub(/[ \t]/, "", k); if (k == "SystemMaxUse") {x=$2; gsub(/[ \t]/, "", x); r=x}} END {print r}')
+        case "$v" in 200M|200Mi|209715200) echo cap-200M;; *) echo "cap=${v:-unset}";; esac
+      expect: {match: exact, value: cap-200M}
+    - id: on-disk
+      description: The marker line is in the journal files under /var/log/journal
+      type: shell
+      on: tr-signal-01
+      skills: [linux.observability.journal-persistence]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        d=/var/log/journal/$(cat /etc/machine-id)
+        [ -d "$d" ] || { echo "no-directory"; exit 0; }
+        journalctl -D "$d" --no-pager -q -t tr-signal 2>/dev/null | grep -q '{{marker}}' && echo on-disk || echo "not-in-files"
+      expect: {match: exact, value: on-disk}
+    - id: answer
+      description: The answer file holds a journalctl command for the previous boot at error priority
+      type: shell
+      on: tr-signal-01
+      skills: [linux.observability.journal-persistence]
+      weight: 1.5
+      command: |
+        l=$(grep -v '^[[:space:]]*$' /home/learner/answers/prev-boot.txt 2>/dev/null | head -1 | sed 's/^[[:space:]$]*//')
+        echo "$l" | grep -Eq '^(sudo )?journalctl ' || { echo "not-journalctl"; exit 0; }
+        echo "$l" | grep -Eq -- '(-b[ =]?-1|--boot[ =]-1)( |$)' || { echo "no-prev-boot"; exit 0; }
+        echo "$l" | grep -Eq -- '(-p[ =]?(err|3|2|1|0|crit|alert|emerg)|--priority[ =](err|3|2|1|0|crit|alert|emerg))( |$|\.\.)' && echo ok || echo "no-priority"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Where the settings go
+      command: man journald.conf
+      body: "A drop-in file with a [Journal] section keeps your change apart from the packaged defaults. Storage= and SystemMaxUse= are the two keys."
+      cost: 0
+    - title: Moving the volatile journal
+      command: sudo systemctl restart systemd-journald && sudo journalctl --flush
+      body: "journald creates /var/log/journal when it starts with Storage=persistent. journalctl --flush asks it to copy /run/log/journal over to disk."
+      cost: 1
+    - title: Earlier boots
+      command: journalctl --list-boots
+      body: "-b 0 is the current boot, -b -1 the one before. -p err shows err and everything more severe."
+      cost: 1
+  misconceptions:
+    - id: bytes-not-mebibytes
+      description: Writes SystemMaxUse=200 without a unit.
+      feedback: "A bare number is bytes, so the cap is 200 bytes. Append M for mebibytes."
+      expectFail: [cap]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          printf '[Journal]\nStorage=persistent\nSystemMaxUse=200\n' | sudo tee /etc/systemd/journald.conf.d/10-persist.conf >/dev/null
+          sudo rm -f /etc/systemd/journald.conf.d/00-volatile.conf
+          sudo systemctl restart systemd-journald; sudo journalctl --flush
+          echo 'journalctl -b -1 -p err' > /home/learner/answers/prev-boot.txt
+    - id: config-not-applied
+      description: Edits the configuration but never restarts journald or flushes.
+      feedback: "journald reads its configuration at start. Restart it, then flush the runtime journal to disk."
+      expectFail: [on-disk]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' | sudo tee /etc/systemd/journald.conf.d/10-persist.conf >/dev/null
+          sudo rm -f /etc/systemd/journald.conf.d/00-volatile.conf
+          echo 'journalctl -b -1 -p err' > /home/learner/answers/prev-boot.txt
+  solution:
+    explanation: |
+      A drop-in with Storage=persistent and SystemMaxUse=200M replaces the volatile
+      drop-in; restarting journald creates /var/log/journal and journalctl --flush copies
+      the runtime journal onto it. journalctl -b -1 -p err shows the errors of the
+      previous boot.
+    steps:
+      - on: tr-signal-01
+        as: learner
+        run: |
+          set -e
+          sudo rm -f /etc/systemd/journald.conf.d/00-volatile.conf
+          printf '[Journal]\nStorage=persistent\nSystemMaxUse=200M\n' | sudo tee /etc/systemd/journald.conf.d/10-persist.conf >/dev/null
+          sudo systemctl restart systemd-journald
+          sudo journalctl --flush
+          echo 'journalctl -b -1 -p err' > /home/learner/answers/prev-boot.txt
+          journalctl --disk-usage
+    alternatives:
+      - id: directory-method
+        description: Create /var/log/journal (Storage=auto then persists) and set only the cap in the main file.
+        steps:
+          - on: tr-signal-01
+            as: learner
+            run: |
+              set -e
+              sudo rm -f /etc/systemd/journald.conf.d/00-volatile.conf
+              printf '[Journal]\nSystemMaxUse=200M\n' | sudo tee /etc/systemd/journald.conf.d/10-cap.conf >/dev/null
+              sudo mkdir -p /var/log/journal
+              sudo systemd-tmpfiles --create --prefix /var/log/journal
+              sudo systemctl restart systemd-journald
+              sudo journalctl --flush
+              echo 'sudo journalctl --boot=-1 --priority=err' > /home/learner/answers/prev-boot.txt

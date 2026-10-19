@@ -97,6 +97,9 @@ spec:
       description: report-before.txt holds the HIGH+CRITICAL count of printer:1.0
       type: shell
       on: qm-fleet/fleet-cp-1
+      # Trivy reads the buildah image through podman's API (an export of the whole Go
+      # toolchain image for printer:1.0): minutes on a loaded host
+      timeoutSec: 300
       skills: [k8s.security.supply-chain]
       command: |
         want=$(trivy image --offline-scan --skip-db-update --severity HIGH,CRITICAL --format json registry.quillmoor.example/waybill/printer:1.0 2>/dev/null | jq '[.Results[]?.Vulnerabilities[]?] | length')
@@ -123,13 +126,15 @@ spec:
       skills: [k8s.security.image-footprint]
       weight: 2
       command: |
-        b=$(buildah images --json 2>/dev/null | jq '[.[] | select(any(.names[]?; . == "registry.quillmoor.example/waybill/printer:1.1")) | .size] | first // empty')
+        # buildah 1.33 reports .size as a decimal SI string ("9 MB"); numfmt also takes plain bytes
+        b=$(buildah images --json 2>/dev/null | jq -r '[.[] | select(any(.names[]?; . == "registry.quillmoor.example/waybill/printer:1.1")) | .size] | first // empty' | tr -d ' B' | numfmt --from=si 2>/dev/null)
         [ -n "$b" ] && [ "$b" -lt 41943040 ] && echo under-40MB || echo "size ${b:-unknown}"
       expect: {match: exact, value: under-40MB}
     - id: after-report
       description: report-after.txt lists exactly the remaining HIGH/CRITICAL IDs of printer:1.1
       type: shell
       on: qm-fleet/fleet-cp-1
+      timeoutSec: 300   # Trivy reads the buildah image through podman's API
       skills: [k8s.security.supply-chain]
       command: |
         want=$(trivy image --offline-scan --skip-db-update --severity HIGH,CRITICAL --format json registry.quillmoor.example/waybill/printer:1.1 2>/dev/null | jq -r '.Results[]?.Vulnerabilities[]?.VulnerabilityID' | sort -u | paste -sd, -)

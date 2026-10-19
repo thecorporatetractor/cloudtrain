@@ -1,0 +1,187 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fsck-repair-ext4
+  title: Repair the depot logs volume after a power cut
+  domain: linux
+  frameworks: [lfcs:storage, lpic1:devices-filesystems, linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [ext4, fsck, e2fsck, lost+found, repair]
+  version: 1
+spec:
+  description: |
+    After a power cut the ext4 volume for the gate logs on **`depot-logs-1`**
+    (`ssh depot-logs-1`; you have `sudo`) will not mount at **`/depot/logs`** any more
+    (it is in `/etc/fstab` as `PARTLABEL=depot-logs`, the first partition of
+    `/dev/disk/by-id/virtio-ct-data1`).
+
+    1. **Check and repair** the filesystem with the right tool. Do not reformat it.
+    2. Mount it again at `/depot/logs`.
+    3. The repair reconnects {{lost}} gate logs that lost their names into
+       `lost+found`. Restore each one into **`/depot/logs/restored/`** under the name
+       **`<gate>.log`**, where `<gate>` is the identifier on the first line of the file
+       (`gate-log gateNN`). `lost+found` must be empty afterwards.
+  objectives:
+    - Recognise a filesystem that cannot be mounted and repair it with e2fsck
+    - Understand backup superblocks and what ends up in lost+found
+    - Identify and rename recovered files by their content
+  params:
+    lost:
+      type: choice
+      values: ["3", "5"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-logs-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: depot-logs-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        umount /depot/logs 2>/dev/null || true
+        sed -i '\#/depot/logs#d' /etc/fstab
+        wipefs -a /dev/vdc >/dev/null 2>&1 || true
+        parted -s /dev/vdc mklabel gpt mkpart depot-logs ext4 1MiB 401MiB
+        udevadm settle
+        mkfs.ext4 -q -b 4096 -L DEPOT-LOGS /dev/vdc1
+        mkdir -p /depot/logs
+        mount /dev/vdc1 /depot/logs
+        mkdir /depot/logs/gates
+        for n in 01 02 03 04 05 06 07 08; do
+          { echo "gate-log gate$n"; seq 1 300 | awk -v n=$n '{print "event", n, $1, $1 * 7 % 13}'; } > /depot/logs/gates/gate$n.log
+        done
+        (cd /depot/logs/gates && sha256sum gate*.log) > $V/fsck.sha
+        umount /depot/logs
+        k=0; : > $V/fsck.lost
+        for n in 02 05 07 04 08; do
+          k=$((k + 1)); [ $k -le {{lost}} ] || break
+          debugfs -w -R "unlink /gates/gate$n.log" /dev/vdc1 >/dev/null 2>&1
+          echo "gate$n" >> $V/fsck.lost
+        done
+        # smash the primary superblock magic: the mount fails, e2fsck falls back to a backup
+        printf '\000\000' | dd of=/dev/vdc1 bs=1 seek=1080 conv=notrunc 2>/dev/null
+        echo 'PARTLABEL=depot-logs /depot/logs ext4 defaults,nofail 0 2' >> /etc/fstab
+        systemctl daemon-reload
+        ! mount /depot/logs 2>/dev/null
+  checks:
+    - id: mounted
+      description: The volume is mounted again at /depot/logs and marked clean
+      type: shell
+      on: depot-logs-1
+      skills: [linux.storage.repair]
+      weight: 2
+      command: |
+        s=$(findmnt -n -o SOURCE /depot/logs 2>/dev/null); st=$(dumpe2fs -h /dev/vdc1 2>/dev/null | awk -F': +' '/^Filesystem state/ {print $2}')
+        echo "$s $st"
+      expect: {match: exact, value: "/dev/vdc1 clean"}
+    - id: untouched-files
+      description: The gate logs that kept their names are intact
+      type: shell
+      on: depot-logs-1
+      skills: [linux.storage.repair]
+      weight: 1.5
+      command: |
+        cd /depot/logs/gates 2>/dev/null || { echo no-dir; exit 0; }
+        bad=0; while read -r h f; do g=${f%.log}; grep -qx "$g" /var/lib/cloudtrain/fsck.lost && continue; [ "$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)" = "$h" ] || bad=$((bad + 1)); done < /var/lib/cloudtrain/fsck.sha
+        [ $bad = 0 ] && echo intact || echo "damaged=$bad"
+      expect: {match: exact, value: intact}
+    - id: restored
+      description: Every recovered log is in restored/ under its gate name with its original content
+      type: shell
+      on: depot-logs-1
+      skills: [linux.storage.repair]
+      weight: 3
+      command: |
+        bad=0
+        while read -r g; do
+          want=$(awk -v f="$g.log" '$2 == f {print $1}' /var/lib/cloudtrain/fsck.sha)
+          [ -n "$want" ] && [ "$(sha256sum "/depot/logs/restored/$g.log" 2>/dev/null | cut -d' ' -f1)" = "$want" ] || bad=$((bad + 1))
+        done < /var/lib/cloudtrain/fsck.lost
+        [ $bad = 0 ] && echo restored || echo "missing=$bad"
+      expect: {match: exact, value: restored}
+    - id: lost-found-empty
+      description: lost+found holds no recovered entries any more
+      type: shell
+      on: depot-logs-1
+      skills: [linux.storage.repair]
+      weight: 1
+      command: |
+        [ -d /depot/logs/lost+found ] && echo "entries=$(ls -A /depot/logs/lost+found | wc -l)" || echo "entries=nodir"
+      expect: {match: exact, value: "entries=0"}
+  hints:
+    - title: Do not mount, check
+      command: sudo e2fsck -f /dev/vdc1
+      body: "Run the check on the unmounted device. It reports the primary superblock as bad and offers to use a backup; -y answers yes to every repair question."
+      cost: 0
+    - title: What lost+found holds
+      body: "Files whose directory entry was lost are reconnected as #<inode-number> in lost+found. The names are gone, but the content still says which gate wrote them: head -1."
+      cost: 1
+  misconceptions:
+    - id: reformat
+      description: Makes a new filesystem on the partition to get a mount.
+      feedback: "mkfs erases the logs. e2fsck repairs in place: it uses a backup superblock when the primary is damaged."
+      expectFail: [untouched-files, restored]
+      mutation:
+        on: depot-logs-1
+        as: learner
+        run: |
+          sudo mkfs.ext4 -q -F -L DEPOT-LOGS /dev/vdc1
+          sudo mount /dev/vdc1 /depot/logs
+    - id: left-in-lost-found
+      description: Repairs and mounts, but leaves the recovered files in lost+found.
+      feedback: "fsck reconnects orphans but cannot restore their names. Identify each file by its content and move it to restored/ under its gate name."
+      expectFail: [restored, lost-found-empty]
+      mutation:
+        on: depot-logs-1
+        as: learner
+        run: |
+          sudo e2fsck -fy /dev/vdc1 >/dev/null || true
+          sudo mount /depot/logs
+  solution:
+    explanation: |
+      e2fsck -fy on the unmounted partition falls back to a backup superblock, repairs the
+      metadata and reconnects the orphaned inodes into lost+found. After mounting, the first
+      line of each recovered file names its gate; mv it into restored/ under that name.
+    steps:
+      - on: depot-logs-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo e2fsck -fy /dev/vdc1 || [ $? -lt 4 ]
+          sudo mount /depot/logs
+          sudo mkdir -p /depot/logs/restored
+          for f in /depot/logs/lost+found/'#'*; do
+            [ -e "$f" ] || continue
+            g=$(sudo head -1 "$f" | awk '{print $2}')
+            sudo mv "$f" /depot/logs/restored/$g.log
+          done
+          ls /depot/logs/restored
+    alternatives:
+      - id: explicit-backup-superblock
+        description: Name the first backup superblock explicitly (32768 for 4 KiB blocks), and copy then remove from lost+found.
+        steps:
+          - on: depot-logs-1
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo e2fsck -fy -b 32768 /dev/vdc1 || [ $? -lt 4 ]
+              sudo e2fsck -fy /dev/vdc1 || [ $? -lt 4 ]
+              sudo mount /depot/logs
+              sudo mkdir -p /depot/logs/restored
+              for f in /depot/logs/lost+found/'#'*; do
+                g=$(sudo awk 'NR == 1 {print $2; exit}' "$f")
+                sudo cp -p "$f" /depot/logs/restored/$g.log && sudo rm -f "$f"
+              done

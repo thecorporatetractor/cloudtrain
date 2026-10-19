@@ -61,7 +61,7 @@ spec:
         echo "$dev" > $V/nm.dev; echo "$con" > $V/nm.con
         # start clean if a previous run added the extra addresses
         if nmcli -g ipv4.addresses con show "$con" | grep -q 10.40.9.20; then
-          nmcli con mod "$con" -ipv4.addresses 10.40.9.20/24 -ipv6.addresses fd00:40:9::20/64 ipv4.dns "" || true
+          nmcli con mod "$con" -ipv4.addresses 10.40.9.20/24 -ipv6.addresses fd00:40:9::20/64 ipv4.dns "" ipv4.dns-options "" || true
           nmcli device reapply "$dev" || true
         fi
         ip -4 -o addr show dev "$dev" scope global | awk '$4 !~ /^10\.40\.9\./ {print $4; exit}' > $V/nm.addr
@@ -121,6 +121,7 @@ spec:
       weight: 0.5
       command: |
         V=/var/lib/cloudtrain; con=$(cat $V/nm.con); dev=$(cat $V/nm.dev)
+        { nmcli -g ipv4.addresses con show "$con" 2>/dev/null | grep -qF 10.40.9.20 || ip -4 -o addr show dev $dev | grep -qF 10.40.9.20; } || { echo "not-configured"; exit 0; }
         m=$(nmcli -g ipv4.method con show "$con" 2>/dev/null)
         ip -4 -o addr show dev $dev | awk '{print $4}' | grep -qxF "$(cat $V/nm.addr)" || { echo "address-lost"; exit 0; }
         [ "$(ip -4 route show default | awk '{print $3; exit}')" = "$(cat $V/nm.gw)" ] || { echo "gateway-changed"; exit 0; }
@@ -132,7 +133,7 @@ spec:
       body: "A plus sign appends a value to a multi-valued property; without it nmcli replaces the list. Find the connection name with nmcli -g GENERAL.CONNECTION device show eth0."
       cost: 0
     - title: IPv6 and DNS
-      body: "The same +ipv6.addresses works for IPv6, and ipv4.dns takes the server (use +ipv4.dns to keep other servers). IPv6 can stay on its automatic method while carrying a static address; NetworkManager rejects ipv6.addresses when ipv6.method is ignore, disabled or link-local."
+      body: "The same +ipv6.addresses works for IPv6, and ipv4.dns takes the server (use +ipv4.dns to keep other servers). IPv6 can stay on its automatic method while carrying a static address; NetworkManager rejects ipv6.addresses when ipv6.method is ignore, disabled or link-local. An unreachable resolver delays every lookup, so ipv4.dns-options timeout:1,attempts:1 keeps the delay short."
       cost: 1
     - title: Apply without dropping the session
       command: sudo nmcli device reapply eth0
@@ -169,7 +170,7 @@ spec:
         run: |
           set -e
           dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
-          sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}}
+          sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}} ipv4.dns-options timeout:1,attempts:1
           sudo nmcli device reapply "$dev"
           sleep 3
           ip -br addr show dev "$dev"
@@ -182,7 +183,7 @@ spec:
             run: |
               set -e
               dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
-              sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}}
+              sudo nmcli con mod "$con" +ipv4.addresses 10.40.9.20/24 +ipv6.addresses fd00:40:9::20/64 +ipv4.dns {{dns}} ipv4.dns-options timeout:1,attempts:1
               sudo ip addr add 10.40.9.20/24 dev "$dev"
               sudo ip addr add fd00:40:9::20/64 dev "$dev"
               sleep 2

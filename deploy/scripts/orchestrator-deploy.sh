@@ -18,8 +18,8 @@ if [[ -n ${PROVISION_TIMEOUT:-} && ! $PROVISION_TIMEOUT =~ ^([0-9]+(\.[0-9]+)?(h
 fi
 case ${VCLUSTER_POD_SECURITY:-baseline} in baseline|restricted) ;; *) die "VCLUSTER_POD_SECURITY must be baseline or restricted";; esac
 # NETWORK_MODE (primary|secondary) sets --network-mode: secondary for clusters where
-# Kube-OVN is not the primary CNI (KIND_PROFILE=managed-cni defaults to it).
-if [[ -z ${NETWORK_MODE:-} && $KIND_PROFILE == managed-cni ]]; then NETWORK_MODE=secondary; fi
+# Kube-OVN is not the primary CNI (the managed-cni profiles default to it).
+if [[ -z ${NETWORK_MODE:-} && $SECONDARY_PROFILE == 1 ]]; then NETWORK_MODE=secondary; fi
 case ${NETWORK_MODE:-primary} in primary|secondary) ;; *) die "NETWORK_MODE must be primary or secondary";; esac
 
 SVC="$REPO_ROOT/services/lab-orchestrator"
@@ -68,7 +68,10 @@ fi
 # environment LabSessions inherit its labels, so the same manager runs them. A separate instance also gets its own ClusterRole
 # (lab-orchestrator-<ns>), so deploying one branch's manager never rewrites the
 # permissions of another branch's instance. Defaults: cloudtrain-system, all
-# sessions. SKIP_CRDS=1 leaves the
+# sessions. Its session ClusterRole (lab-orchestrator-session-<ns>, bound by the
+# manager in every lab namespace it works in), its Role in kube-system (ovn-central
+# exec) and its ValidatingAdmissionPolicy (matching only its ServiceAccount) are
+# separate too. SKIP_CRDS=1 leaves the
 # cluster's CRDs alone (when other branches' API additions are installed).
 # PROVISION_TIMEOUT (a Go duration, e.g. 40m) sets the manager's
 # --provision-timeout: sessions whose nodes are not ready by then fail. Empty
@@ -80,15 +83,24 @@ fi
 # VCLUSTER_POD_SECURITY (baseline|restricted) sets --vcluster-pod-security.
 # NETWORK_MODE (see above) sets --network-mode; LAB_MTU sets --lab-mtu.
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
+# Cluster-scoped RBAC and admission objects (and the Roles in kube-system) of a
+# separate instance carry its namespace as a suffix.
+SUF=""; [[ $NS != cloudtrain-system ]] && SUF="-$NS"
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
+    | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
-        (select(.kind == "ClusterRole" and strenv(NS) != "cloudtrain-system") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
-        (select(.kind == "ClusterRoleBinding" and strenv(NS) != "cloudtrain-system") | .roleRef.name) = "lab-orchestrator-" + strenv(NS) |
+        (select(.kind == "ClusterRole" or .kind == "Role" or .kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") | .metadata.name) += strenv(SUF) |
+        (select(.kind == "ClusterRole") | .rules[] | select(has("resourceNames")) | .resourceNames) |= map(. + strenv(SUF)) |
+        (select(.kind == "ClusterRoleBinding" or .kind == "RoleBinding") | .roleRef.name) += strenv(SUF) |
         (select(.kind == "ClusterRoleBinding") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
-        (select(.kind == "ClusterRoleBinding") | .subjects[0].namespace) = strenv(NS) |
+        (select(.kind == "RoleBinding") | .metadata.name) += strenv(SUF) |
+        (select(.kind == "ClusterRoleBinding" or .kind == "RoleBinding") | .subjects[0].namespace) = strenv(NS) |
+        (select(.kind == "ValidatingAdmissionPolicyBinding") | .spec.policyName) += strenv(SUF) |
+        (select(.kind == "ValidatingAdmissionPolicy") | .spec.matchConditions[].expression) |= sub("system:serviceaccount:cloudtrain-system:"; "system:serviceaccount:" + strenv(NS) + ":") |
+        (select(.kind == "ValidatingAdmissionPolicy") | .spec.validations[].expression) |= sub("lab-orchestrator-session"; "lab-orchestrator-session" + strenv(SUF)) |
+        (select(.kind == "Deployment" and strenv(SUF) != "") | .spec.template.spec.containers[0].args) += ["--session-cluster-role=lab-orchestrator-session" + strenv(SUF)] |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMG) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--leader-election-id=lab-orchestrator-" + strenv(NS)] |
         (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)] |

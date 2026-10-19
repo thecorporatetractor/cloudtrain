@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nfs-server-exports
+  title: Publish the depot manuals and uploads over NFS
+  domain: linux
+  frameworks: [lpic2:file-sharing, lfcs:storage]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [nfs, exports, exportfs, root_squash]
+  version: 1
+spec:
+  description: |
+    **`depot-nfs-1`** (`ssh depot-nfs-1`; you have `sudo`) is the file server for the
+    depots. NFS packages are installed and the firewall already allows NFS, but nothing is
+    exported yet. A second host, **`tr-nfs-cl`**, is available to test from.
+
+    Export, **for the depot subnet only** (the `/24` that both hosts share on `eth0`, not
+    the world):
+
+    - **`/srv/depot/manuals`** read-only;
+    - **`/srv/depot/uploads`** read-write, with **root squashing** (a root user on a client
+      must not be root on the share).
+
+    The exports and the service must be **persistent** (survive a restart of `nfs-server`
+    and a reboot). Verify from `tr-nfs-cl` by mounting both exports on a scratch directory.
+  objectives:
+    - Write NFS export definitions with client specifications and options
+    - Start and enable the NFS server and apply exports with exportfs
+    - Verify read-only and root-squash behaviour from a client
+  params:
+    sync:
+      type: choice
+      values: [sync, async]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-nfs-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-nfs-cl
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-nfs-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q nfs-utils >/dev/null 2>&1 || dnf -y -q install nfs-utils >/dev/null
+        systemctl disable --now nfs-server >/dev/null 2>&1 || true
+        rm -f /etc/exports.d/*.exports; : > /etc/exports
+        mkdir -p /srv/depot/manuals /srv/depot/uploads
+        echo "Tallowmere depot manuals" > /srv/depot/manuals/README
+        chmod 1777 /srv/depot/uploads
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done; firewall-cmd -q --reload
+    - on: tr-nfs-cl
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q nfs-utils >/dev/null 2>&1 || dnf -y -q install nfs-utils >/dev/null
+        mkdir -p /mnt/t-man /mnt/t-up
+  checks:
+    - id: exports-live
+      description: manuals is exported read-only, uploads read-write with root squashing
+      type: shell
+      on: depot-nfs-1
+      skills: [linux.services.nfs-server]
+      weight: 2
+      command: |
+        o=$(exportfs -v 2>/dev/null | tr '\n' ' ' | sed 's/\t/ /g; s/  */ /g')
+        opt() { echo "$o" | grep -o "$1 [^ ]*([^)]*)" | head -1 | sed 's/.*(//; s/).*//'; }
+        m=$(opt /srv/depot/manuals); u=$(opt /srv/depot/uploads)
+        a=ro; echo ",$m," | grep -q ',ro,' || a=rw
+        b=rw; echo ",$u," | grep -q ',rw,' || b=ro
+        c=root_squash; echo ",$u," | grep -q ',no_root_squash,' && c=no_root_squash
+        [ -n "$m" ] && [ -n "$u" ] && echo "manuals=$a uploads=$b,$c" || echo "not-exported"
+      expect: {match: exact, value: "manuals=ro uploads=rw,root_squash"}
+    - id: subnet-only
+      description: Both exports are limited to the shared depot subnet
+      type: shell
+      on: depot-nfs-1
+      skills: [linux.services.nfs-server]
+      weight: 1.5
+      command: |
+        c=$(getent ahostsv4 tr-nfs-cl | awk 'NR == 1 {print $1}')
+        exportfs -v 2>/dev/null | tr '\n' ' ' | sed 's/\t/ /g; s/  */ /g' | grep -oE '/srv/depot/(manuals|uploads) [^ (]+' | python3 -c '
+        import sys, ipaddress
+        c = ipaddress.ip_address(sys.argv[1]); n = 0
+        for line in sys.stdin:
+            p, spec = line.split()
+            try:
+                net = ipaddress.ip_network(spec, strict=False)
+            except ValueError:
+                print("not-a-network:" + spec); sys.exit(0)
+            if c in net and 16 <= net.prefixlen <= 30: n += 1
+        print("subnet-only" if n == 2 else "wrong:%d" % n)' "$c"
+      expect: {match: exact, value: subnet-only}
+    - id: persistent
+      description: The exports are in /etc/exports(.d) and nfs-server is enabled and active
+      type: shell
+      on: depot-nfs-1
+      skills: [linux.services.nfs-server]
+      weight: 1.5
+      command: |
+        c=$(cat /etc/exports /etc/exports.d/*.exports 2>/dev/null | grep -v '^[[:space:]]*#')
+        echo "$c" | grep -q '^/srv/depot/manuals' && echo "$c" | grep -q '^/srv/depot/uploads' || { echo "not-in-config"; exit 0; }
+        echo "$(systemctl is-enabled nfs-server 2>/dev/null) $(systemctl is-active nfs-server 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+    - id: client-manuals
+      description: From tr-nfs-cl the manuals mount, can be read and cannot be written
+      type: shell
+      on: tr-nfs-cl
+      skills: [linux.services.nfs-server, linux.storage.network-mounts]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        umount /mnt/t-man 2>/dev/null
+        timeout 30 mount -t nfs depot-nfs-1:/srv/depot/manuals /mnt/t-man 2>/dev/null || { echo "mount-failed"; exit 0; }
+        r=$(cat /mnt/t-man/README 2>/dev/null | head -1); touch /mnt/t-man/x 2>/dev/null && w=writable || w=read-only
+        umount /mnt/t-man; echo "$r | $w"
+      expect: {match: exact, value: "Tallowmere depot manuals | read-only"}
+    - id: client-uploads
+      description: From tr-nfs-cl root can write to uploads but the file is owned by nobody
+      type: shell
+      on: tr-nfs-cl
+      skills: [linux.services.nfs-server, linux.storage.network-mounts]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        umount /mnt/t-up 2>/dev/null
+        timeout 30 mount -t nfs depot-nfs-1:/srv/depot/uploads /mnt/t-up 2>/dev/null || { echo "mount-failed"; exit 0; }
+        f=/mnt/t-up/probe-$$; touch $f 2>/dev/null && o=$(stat -c %U $f) || o=cannot-write
+        rm -f $f 2>/dev/null; umount /mnt/t-up; echo "owner=$o"
+      expect: {match: regex, value: '^owner=(nobody|nfsnobody)$'}
+  hints:
+    - title: Export lines
+      body: "/etc/exports (or a file in /etc/exports.d/ ending in .exports) has one line per directory: path client(options). ro/rw and root_squash are options; client can be a CIDR network."
+      cost: 0
+    - title: The subnet
+      command: ip -4 route show dev eth0 scope link
+      body: "The first column is the network in CIDR form. Use it as the client part of both lines."
+      cost: 1
+    - title: Apply and enable
+      command: sudo systemctl enable --now nfs-server && sudo exportfs -rav
+      body: "exportfs -ra re-reads the files; exportfs -v shows what is active with the options the kernel really uses."
+      cost: 1
+  misconceptions:
+    - id: world-and-no-squash
+      description: Exports to everyone and disables root squashing.
+      feedback: "An asterisk exports to every host, and no_root_squash lets a client's root act as root on the server. Use the depot network and keep root_squash."
+      expectFail: [exports-live, subnet-only, client-uploads]
+      mutation:
+        on: depot-nfs-1
+        as: learner
+        run: |
+          printf '/srv/depot/manuals *(ro,sync)\n/srv/depot/uploads *(rw,sync,no_root_squash)\n' | sudo tee /etc/exports.d/depot.exports >/dev/null
+          sudo systemctl enable --now nfs-server; sudo exportfs -ra
+    - id: runtime-only
+      description: Uses exportfs on the command line only and enables nothing.
+      feedback: "exportfs -o adds exports to the running server only. Put them in /etc/exports.d and enable nfs-server so they return after a restart."
+      expectFail: [persistent]
+      mutation:
+        on: depot-nfs-1
+        as: learner
+        run: |
+          net=$(ip -4 -o route show scope link dev eth0 | awk '{print $1; exit}')
+          sudo systemctl start nfs-server
+          sudo exportfs -o ro,{{sync}} $net:/srv/depot/manuals
+          sudo exportfs -o rw,{{sync}},root_squash $net:/srv/depot/uploads
+  solution:
+    explanation: |
+      Two export lines with the depot network as client, ro and rw,root_squash options, in a
+      file below /etc/exports.d; nfs-server is enabled and exportfs -ra applies the lines.
+    steps:
+      - on: depot-nfs-1
+        as: learner
+        run: |
+          set -e
+          net=$(ip -4 -o route show scope link dev eth0 | awk '{print $1; exit}')
+          printf '/srv/depot/manuals %s(ro,{{sync}})\n/srv/depot/uploads %s(rw,{{sync}},root_squash)\n' "$net" "$net" | sudo tee /etc/exports.d/depot.exports >/dev/null
+          sudo systemctl enable --now nfs-server
+          sudo exportfs -ra
+          sudo exportfs -v
+    alternatives:
+      - id: etc-exports
+        description: Put the lines in /etc/exports itself.
+        steps:
+          - on: depot-nfs-1
+            as: learner
+            run: |
+              set -e
+              net=$(ip -4 -o route show scope link dev eth0 | awk '{print $1; exit}')
+              printf '/srv/depot/manuals %s(ro,{{sync}},no_subtree_check)\n/srv/depot/uploads %s(rw,{{sync}},no_subtree_check,root_squash)\n' "$net" "$net" | sudo tee /etc/exports >/dev/null
+              sudo systemctl enable --now nfs-server
+              sudo exportfs -ra

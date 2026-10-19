@@ -1,0 +1,205 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: lvm-snapshot-backup
+  title: Back up the live ledger volume through an LVM snapshot
+  domain: linux
+  frameworks: [lpic2:advanced-storage, lfcs:storage]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [lvm, snapshot, backup, xfs, tar]
+  version: 1
+spec:
+  description: |
+    The fares ledger on **`tr-ledger-1`** (`ssh tr-ledger-1`; you have `sudo`) lives on the
+    XFS volume **`vg-depot/lv-ledger`**, mounted at `/srv/ledger`. The service
+    **`tr-ledger-writer.service`** appends to `/srv/ledger/live.log` all the time and
+    **must not be stopped or restarted**, so the volume cannot be unmounted for a backup.
+
+    1. Take a **snapshot** of `lv-ledger` named **`{{snap}}`** (give it at least 64 MiB
+       of copy-on-write space).
+    2. Mount the snapshot read-only and write a compressed tar archive of its contents
+       (the files, not the directory) to **`/backup/ledger.tar.gz`**.
+    3. Unmount the snapshot and **remove it**: a forgotten snapshot slows the origin
+       and eventually becomes invalid.
+  objectives:
+    - Create and use an LVM snapshot of a mounted volume
+    - Mount a snapshot of an XFS filesystem (duplicate UUID)
+    - Archive from the frozen view while the service keeps writing, then clean up
+  params:
+    snap:
+      type: choice
+      values: [ledger-snap, snap-ledger]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ledger-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ledger-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! lvs vg-depot/lv-ledger >/dev/null 2>&1; then
+          wipefs -a /dev/vdc >/dev/null 2>&1 || true
+          pvcreate -y /dev/vdc >/dev/null; vgcreate vg-depot /dev/vdc >/dev/null
+          lvcreate -y -n lv-ledger -L 400M vg-depot >/dev/null
+          mkfs.xfs -q /dev/vg-depot/lv-ledger
+          mkdir -p /srv/ledger
+          echo '/dev/mapper/vg--depot-lv--ledger /srv/ledger xfs defaults 0 0' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/ledger
+          for i in 1 2 3 4 5; do seq 1 4000 | awk -v i=$i '{print "fare", i, $1, $1 * i % 97}' > /srv/ledger/fares-$i.dat; done
+          (cd /srv/ledger && sha256sum fares-*.dat) > $V/ledger.sha
+        fi
+        mountpoint -q /srv/ledger || mount /srv/ledger
+        mkdir -p /backup; rm -f /backup/ledger.tar.gz
+        printf '%s\n' '#!/bin/bash' 'while :; do echo "$(date +%s) tick" >> /srv/ledger/live.log; sleep 0.5; done' > /usr/local/bin/tr-ledger-writer
+        chmod 0755 /usr/local/bin/tr-ledger-writer
+        systemctl is-active --quiet tr-ledger-writer || systemd-run --unit=tr-ledger-writer --description="Tallowmere ledger writer" /usr/local/bin/tr-ledger-writer >/dev/null
+        sleep 1
+        systemctl show -P MainPID tr-ledger-writer > $V/writer.pid
+        journalctl --flush 2>/dev/null || true
+  checks:
+    - id: archive
+      description: The archive holds the ledger files and the running log, as plain tree contents
+      type: shell
+      on: tr-ledger-1
+      skills: [linux.storage.lvm-advanced, linux.services.backup]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        t=$(mktemp -d); trap 'rm -rf $t' EXIT
+        tar xzf /backup/ledger.tar.gz -C $t 2>/dev/null || { echo "bad-archive"; exit 0; }
+        r=$t; [ -f $r/fares-1.dat ] || r=$(dirname "$(find $t -name fares-1.dat | head -1)" 2>/dev/null)
+        [ "$r" = "$t" ] || { echo "nested-or-missing"; exit 0; }
+        (cd $r && sha256sum -c --quiet /var/lib/cloudtrain/ledger.sha >/dev/null 2>&1) && [ -s $r/live.log ] && echo complete || echo "incomplete"
+      expect: {match: exact, value: complete}
+    - id: via-snapshot
+      description: The archive came from a mounted snapshot, not from the live volume
+      type: shell
+      on: tr-ledger-1
+      skills: [linux.storage.lvm-advanced]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        m=$(lvs --noheadings -o lv_kernel_minor vg-depot/lv-ledger 2>/dev/null | tr -d ' ')
+        n=$(journalctl -k -b --no-pager 2>/dev/null | grep -E 'XFS \(dm-[0-9]+\): Mounting' | grep -vc "dm-$m)")
+        [ "${n:-0}" -ge 1 ] && echo snapshot-mounted || echo "no-second-mount"
+      expect: {match: exact, value: snapshot-mounted}
+    - id: snapshot-removed
+      description: The snapshot is gone and only lv-ledger remains in vg-depot
+      type: shell
+      on: tr-ledger-1
+      skills: [linux.storage.lvm-advanced, linux.storage.lvm]
+      weight: 1.5
+      command: |
+        l=$(lvs --noheadings -o lv_name vg-depot 2>/dev/null | tr -d ' ' | paste -sd,)
+        echo "lvs=$l"
+      expect: {match: exact, value: "lvs=lv-ledger"}
+    - id: writer-untouched
+      description: The ledger writer was never restarted and is still appending
+      type: shell
+      on: tr-ledger-1
+      skills: [linux.services.backup]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        p=$(systemctl show -P MainPID tr-ledger-writer); a=$(wc -l < /srv/ledger/live.log); sleep 2; b=$(wc -l < /srv/ledger/live.log)
+        [ "$p" = "$(cat /var/lib/cloudtrain/writer.pid)" ] && [ "$b" -gt "$a" ] && echo appending || echo "pid=$p growth=$((b - a))"
+      expect: {match: exact, value: appending}
+  hints:
+    - title: Snapshot
+      command: sudo lvcreate -s -n {{snap}} -L 128M vg-depot/lv-ledger
+      body: "-s makes a snapshot of the named origin; -L is the space for blocks that change while it exists."
+      cost: 0
+    - title: Same UUID twice
+      body: "An XFS snapshot carries the origin's UUID, and the kernel refuses to mount two filesystems with the same UUID. Use the nouuid mount option (and ro)."
+      cost: 1
+    - title: Archive and clean up
+      body: "tar czf /backup/ledger.tar.gz -C /mnt/snap . archives the contents. After umount, lvremove vg-depot/{{snap}} drops the snapshot."
+      cost: 1
+  misconceptions:
+    - id: tar-the-live-volume
+      description: Archives /srv/ledger directly and skips the snapshot.
+      feedback: "While the writer runs, a tar of the live tree is not a consistent point in time. Snapshot first, then archive the frozen view."
+      expectFail: [via-snapshot]
+      mutation:
+        on: tr-ledger-1
+        as: learner
+        run: |
+          sudo mkdir -p /backup
+          sudo tar czf /backup/ledger.tar.gz -C /srv/ledger .
+    - id: stops-the-writer
+      description: Stops the service for the backup and starts it again afterwards.
+      feedback: "The service must keep writing. The snapshot is the reason you do not need to stop it."
+      expectFail: [writer-untouched]
+      mutation:
+        on: tr-ledger-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo systemctl stop tr-ledger-writer
+          sudo mkdir -p /backup /mnt/snap
+          sudo lvcreate -y -s -n {{snap}} -L 128M vg-depot/lv-ledger >/dev/null
+          sudo mount -o ro,nouuid /dev/vg-depot/{{snap}} /mnt/snap
+          sudo tar czf /backup/ledger.tar.gz -C /mnt/snap .
+          sudo umount /mnt/snap; sudo lvremove -y vg-depot/{{snap}} >/dev/null
+          sudo systemd-run --unit=tr-ledger-writer /usr/local/bin/tr-ledger-writer >/dev/null
+    - id: snapshot-left-behind
+      description: Makes a correct backup and leaves the snapshot in place.
+      feedback: "Unmount the snapshot and remove it with lvremove once the archive is written."
+      expectFail: [snapshot-removed]
+      mutation:
+        on: tr-ledger-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo mkdir -p /backup /mnt/snap
+          sudo lvcreate -y -s -n {{snap}} -L 128M vg-depot/lv-ledger >/dev/null
+          sudo mount -o ro,nouuid /dev/vg-depot/{{snap}} /mnt/snap
+          sudo tar czf /backup/ledger.tar.gz -C /mnt/snap .
+          sudo umount /mnt/snap
+  solution:
+    explanation: |
+      lvcreate -s makes a copy-on-write snapshot of the mounted origin; the snapshot has the
+      same XFS UUID, so it is mounted read-only with nouuid. tar archives the frozen tree, and
+      umount plus lvremove clean up. The writer is never interrupted.
+    steps:
+      - on: tr-ledger-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo mkdir -p /backup /mnt/snap
+          sudo lvcreate -y -s -n {{snap}} -L 128M vg-depot/lv-ledger
+          sudo mount -o ro,nouuid /dev/vg-depot/{{snap}} /mnt/snap
+          sudo tar czf /backup/ledger.tar.gz -C /mnt/snap .
+          sudo umount /mnt/snap
+          sudo lvremove -y vg-depot/{{snap}}
+          tar tzf /backup/ledger.tar.gz | head
+    alternatives:
+      - id: percent-origin
+        description: Size the snapshot as a percentage of the origin and extract from the bind of a mounted copy with tar -C and a subdirectory-safe form.
+        steps:
+          - on: tr-ledger-1
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo mkdir -p /backup /mnt/snap
+              sudo lvcreate -y -s -n {{snap}} -l 30%ORIGIN vg-depot/lv-ledger
+              sudo mount -t xfs -o ro,nouuid /dev/mapper/vg--depot-{{snap}} /mnt/snap
+              (cd /mnt/snap && sudo tar czf /backup/ledger.tar.gz .)
+              sudo umount /mnt/snap
+              sudo lvremove -f vg-depot/{{snap}}

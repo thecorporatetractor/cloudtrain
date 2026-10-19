@@ -29,7 +29,8 @@
 #                 HTTPRoute through traefik (NodePort 30080), a MetalLB LoadBalancer IP
 #                 reached from the tester in the VPC, a PVC bound by local-path, a Pod
 #                 under RuntimeClass runsc (gVisor kernel), a Falco alert on `kubectl exec`,
-#                 kube-bench runs
+#                 kube-bench runs, csi-hostpath registers, offline Trivy scan (containerd and
+#                 buildah image), cosign verifies only the green parcel-api layout
 #   docker-vm     Docker Engine 29 with the containerd image store, every preloaded image
 #                 listed by `docker images`, offline `docker run`, BuildKit build and
 #                 compose stack, published port reachable, --memory OOM kill (exit 137),
@@ -293,8 +294,8 @@ test_kubeadm-full() {
   kubeadm_single_node "$LAB_K8S_VERSION" | vmrun || return 1
   vmrun <<'EOS' || return 1
 set -e; export KUBECONFIG=/etc/kubernetes/admin.conf
-grep -E '^(ADDONS|GVISOR|KUBE_BENCH)' /etc/cloudtrain-release
-t=$SECONDS; /opt/cloudtrain/bin/addons-install all,falco --wait; echo "ok: addons-install all,falco --wait in $((SECONDS - t))s (offline)"
+grep -E '^(ADDONS|GVISOR|KUBE_BENCH|TRIVY|COSIGN|PODMAN|CSI)' /etc/cloudtrain-release
+t=$SECONDS; /opt/cloudtrain/bin/addons-install all,falco,csi-hostpath --wait; echo "ok: addons-install all,falco,csi-hostpath --wait in $((SECONDS - t))s (offline)"
 for i in $(seq 40); do kubectl top node vm >/dev/null 2>&1 && break; sleep 5; done
 kubectl top node vm && echo "ok: metrics-server (kubectl top node)"
 kubectl get ingressclass,gatewayclass,storageclass
@@ -374,6 +375,14 @@ kubectl -n falco logs ds/falco --since=5m | grep -i '"priority"' | grep -i 'shel
 kubectl -n falco logs ds/falco --since=5m | grep -qi 'shell\|terminal' && echo "ok: Falco alert on kubectl exec"
 kube-bench run --targets master --noremediations 2>/dev/null | grep -E '^== Summary|checks (PASS|FAIL|WARN)' | head -4
 kube-bench version
+n=$(trivy image --image-src containerd --severity CRITICAL --format json docker.io/library/httpd:2.4 2>/dev/null | jq '[.Results[]?.Vulnerabilities[]?] | length')
+echo "ok: trivy offline scan of httpd:2.4 (containerd): $n CRITICAL (DB $(jq -r .UpdatedAt /var/lib/trivy/db/metadata.json))"
+buildah from -q --name probe registry.quillmoor.example/base/static-nonroot:2026.10 >/dev/null
+buildah commit -q --rm probe localhost/probe:1 >/dev/null
+trivy image --format json localhost/probe:1 >/dev/null && echo "ok: trivy reads buildah's storage through podman.socket"
+buildah inspect --type image registry.quillmoor.example/mirror/golang:1.25 >/dev/null && echo "ok: golang:1.25 base image in buildah storage"
+v=$(for c in blue green amber; do cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog --local-image /opt/qm-signing/parcel-api-$c >/dev/null 2>&1 && echo $c; done)
+[ "$v" = green ] && echo "ok: cosign verifies only parcel-api green (offline)"
 EOS
   local ip
   ip=$(k -n "$NS" exec tester -- ssh vm cat /tmp/lb-ip)

@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-boot-mount-network
+  title: Stop the report host waiting minutes for an NFS share at boot
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [nfs, fstab, systemd, boot, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **`tr-report-2`** (`ssh tr-report-2`; you have `sudo`) takes about four minutes to boot
+    whenever the file server **`depot-nfs-1`** is slow or down: its `/etc/fstab` entry for
+    **`depot-nfs-1:/exports/reports`** at **`/srv/reports`** is retried for a long time
+    and the boot waits for it. `/var/log/boot-analysis.txt` has the
+    `systemd-analyze blame` of the last boot.
+
+    Fix the **mount options** of that one fstab line (do not remove the mount or change
+    the server) so that:
+
+    - the share **still mounts** and its files are readable at `/srv/reports`;
+    - the boot **does not fail or stall** for a long time when the server is unreachable:
+      the mount is **not fatal** (`nofail`), it is **ordered after the network**
+      (`_netdev`), and the wait is **bounded**, either by mounting it on first access
+      (`x-systemd.automount`) or by a mount timeout of **60 seconds or less**
+      (`x-systemd.mount-timeout=`), with no long `retry=`.
+
+    The host is not rebooted here: the result is judged from `/etc/fstab` and the units
+    systemd generates from it.
+  objectives:
+    - Read boot delays from systemd-analyze blame
+    - Choose fstab options that make a network mount non-fatal and bounded
+    - Check the generated mount and automount units
+  params:
+    share:
+      type: choice
+      values: [reports, reports-shared]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-nfs-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-report-2
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-nfs-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q nfs-utils >/dev/null 2>&1 || dnf -y -q install nfs-utils >/dev/null
+        mkdir -p /exports/reports; echo "reports share {{share}}" > /exports/reports/README
+        echo '/exports/reports *(ro,sync,no_subtree_check)' > /etc/exports.d/reports.exports
+        systemctl enable --now nfs-server; exportfs -ra
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done; firewall-cmd -q --reload
+    - on: tr-report-2
+      timeoutSec: 240
+      run: |
+        set -eu
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        dpkg -s nfs-common >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -q nfs-common >/dev/null
+        umount /srv/reports 2>/dev/null || true
+        systemctl stop srv-reports.automount 2>/dev/null || true
+        sed -i '\#/srv/reports#d' /etc/fstab
+        mkdir -p /srv/reports
+        echo 'depot-nfs-1:/exports/reports /srv/reports nfs defaults,hard,retry=240 0 0' >> /etc/fstab
+        systemctl daemon-reload; mount /srv/reports
+        printf 'Startup finished in 5.1s (kernel) + 3min 58.2s (userspace) = 4min 3.3s\n3min 57.4s srv-reports.mount\n      4.1s cloud-init.service\n      2.2s networkd.service\n' > /var/log/boot-analysis.txt
+  checks:
+    - id: still-mounts
+      description: The share is mounted (or mounts on access) and its files are readable
+      type: shell
+      on: tr-report-2
+      skills: [linux.storage.network-mounts]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        timeout 40 cat /srv/reports/README 2>/dev/null || echo unreadable
+      expect: {match: exact, value: "reports share {{share}}"}
+    - id: non-fatal
+      description: The fstab line has nofail and _netdev
+      type: shell
+      on: tr-report-2
+      skills: [linux.storage.network-mounts, linux.boot.analysis]
+      weight: 2
+      command: |
+        o=$(findmnt --fstab -n -o OPTIONS /srv/reports 2>/dev/null); n=0
+        echo ",$o," | grep -q ',nofail,' && n=$((n + 1)); echo ",$o," | grep -q ',_netdev,' && n=$((n + 1))
+        echo "flags=$n/2"
+      expect: {match: exact, value: "flags=2/2"}
+    - id: bounded
+      description: The wait is bounded by automount or a mount timeout of 60 seconds or less, with no long retry
+      type: shell
+      on: tr-report-2
+      skills: [linux.boot.analysis]
+      weight: 2.5
+      command: |
+        o=$(findmnt --fstab -n -o OPTIONS /srv/reports 2>/dev/null)
+        r=$(echo "$o" | tr ',' '\n' | sed -n 's/^retry=//p' | head -1)
+        [ -z "$r" ] || [ "$r" -le 1 ] || { echo "retry=$r"; exit 0; }
+        echo ",$o," | grep -q ',x-systemd.automount,' && { echo bounded; exit 0; }
+        t=$(echo "$o" | tr ',' '\n' | sed -n 's/^x-systemd.mount-timeout=//p' | head -1)
+        case "$t" in *min) s=$(( ${t%min} * 60 ));; *s) s=${t%s};; '') s=0;; *) s=$t;; esac
+        [ "$s" -gt 0 ] && [ "$s" -le 60 ] && echo bounded || echo "timeout=${t:-none}"
+      expect: {match: exact, value: bounded}
+    - id: units
+      description: systemd generates the unit for the mount and the fstab parses cleanly
+      type: shell
+      on: tr-report-2
+      skills: [linux.boot.analysis]
+      weight: 1
+      command: |
+        systemctl daemon-reload
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; v=$?
+        m=$(systemd-escape -p --suffix=mount /srv/reports)
+        [ "$(systemctl show -P LoadState "$m")" = loaded ] && { [ $v = 0 ] || [ $v = 64 ]; } && echo generated || echo "verify=$v"
+      expect: {match: exact, value: generated}
+  hints:
+    - title: What the log says
+      command: cat /var/log/boot-analysis.txt
+      body: "srv-reports.mount accounts for almost the whole boot time. The line in /etc/fstab uses defaults,hard,retry=240."
+      cost: 0
+    - title: Option meanings
+      body: "nofail: a failed mount does not fail the boot target. _netdev: wait for the network. x-systemd.automount: mount on first access, boot does not wait. x-systemd.mount-timeout=N: give up after N seconds."
+      cost: 1
+    - title: Apply without a reboot
+      command: sudo umount /srv/reports; sudo systemctl daemon-reload; sudo mount -a
+      body: "If you use x-systemd.automount, start srv-reports.automount (or mount -a) and then read a file to trigger the real mount."
+      cost: 1
+  misconceptions:
+    - id: nofail-only
+      description: Adds only nofail and leaves the long retry in place.
+      feedback: "nofail stops the failure from breaking the boot, but the mount is still retried for four minutes. Bound the wait: automount, a mount timeout, and no long retry."
+      expectFail: [non-fatal, bounded]
+      mutation:
+        on: tr-report-2
+        as: learner
+        run: |
+          sudo sed -i 's#^depot-nfs-1:/exports/reports .*#depot-nfs-1:/exports/reports /srv/reports nfs defaults,hard,retry=240,nofail 0 0#' /etc/fstab
+          sudo systemctl daemon-reload
+    - id: noauto-forgotten-mount
+      description: Adds noauto so it never mounts at boot, and never mounts it afterwards.
+      feedback: "noauto skips the mount at boot but then nothing mounts the share. Use x-systemd.automount so it appears when accessed."
+      expectFail: [still-mounts, non-fatal, bounded]
+      mutation:
+        on: tr-report-2
+        as: learner
+        run: |
+          sudo umount /srv/reports
+          sudo sed -i 's#^depot-nfs-1:/exports/reports .*#depot-nfs-1:/exports/reports /srv/reports nfs defaults,noauto 0 0#' /etc/fstab
+          sudo systemctl daemon-reload
+  solution:
+    explanation: |
+      nofail keeps a failed mount from failing the boot, _netdev orders it after the network,
+      and x-systemd.automount (or a short x-systemd.mount-timeout) bounds the wait; the long
+      retry is removed.
+    steps:
+      - on: tr-report-2
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo umount /srv/reports
+          sudo sed -i 's#^depot-nfs-1:/exports/reports .*#depot-nfs-1:/exports/reports /srv/reports nfs defaults,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=30 0 0#' /etc/fstab
+          sudo systemctl daemon-reload
+          sudo systemctl restart srv-reports.automount
+          cat /srv/reports/README
+    alternatives:
+      - id: mount-timeout
+        description: Keep a normal mount but give it a 30 second timeout and no retry.
+        steps:
+          - on: tr-report-2
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo umount /srv/reports
+              sudo sed -i 's#^depot-nfs-1:/exports/reports .*#depot-nfs-1:/exports/reports /srv/reports nfs defaults,_netdev,nofail,x-systemd.mount-timeout=30s 0 0#' /etc/fstab
+              sudo systemctl daemon-reload
+              sudo mount /srv/reports

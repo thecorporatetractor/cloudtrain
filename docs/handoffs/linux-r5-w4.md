@@ -100,7 +100,19 @@ bond-active-backup, xlf-static-ip-netplan, xlf-bond-config, chrony-timezone-depo
 chrony-server-isolated, wireguard-depot-tunnel, dhcp-server-depot.
 
 ## Review follow-ups
-- nmcli-bond-el: setup now switches an eth0 profile with ipv6.method ignore/disabled/link-local to auto. Confirm the el-vm:10 default ipv6.method on the first remote verify and record it here.
-- chrony-server-isolated: server-persistent only grades that an allow line exists; allow-all expectFail is [outsider-refused].
-- wireguard-depot-tunnel: mutations are a single action, so tr-wg-b cannot be configured too; expectFail stays [config-a] (listed checks fail, others may too).
-- Strict self-review before merge (2026-10-19) fixed: nftables-from-scratch pub-ssh-blocked and rest-dropped now require the positive state first; netem-impaired-link only-depot-link requires netem on depot0; wireguard-depot-tunnel config-a/config-b parse `Key = value` and comma/space separated AllowedIPs. Open minors for the testing round: the "kept" guards (veth-netns-plumbing host-untouched, subnet-plan-depots and fix-routing-asymmetric and static-ip-persistent and xlf-static-ip-netplan eth0-untouched, runtime-routes-two-sites addresses-kept, tcpdump-lost-heartbeats fault-intact, nmcli-bond-el dhcp-kept, firewalld-zones-el default-zone-kept) pass on an untouched setup and should be gated on the lab's main check; fix-routing-asymmetric networkd branch does not tie the route and rule to one table; tcpdump-lost-heartbeats capture check accepts any readable pcap and setup has no tcpdump guard; nftables-from-scratch log-limited matches `limit rate` anywhere; mtu-mismatch-tunnel nft branch greps the raw file; firewall-ticket-api permanent check does not require ssh kept; fix-firewall-blocks-app persistent check; bond-active-backup port profiles lack a controller check; nmcli-bond-el `+ipv4.dns` can stall lookups (set ipv4.dns-priority); chrony-server-isolated outsider-refused accepts a failed probe; dhcp-server-depot dnsmasq starts on install (policy-rc.d) and `dnsmasq --test` misses /etc/dnsmasq.d.
+
+Closed on branch `fix/linux-r5-w4-followups` (still `built`; each changed lab needs a fresh remote verify):
+
+- [x] nmcli-bond-el: the eth0 `ipv6.method` switch is kept; confirm the el-vm:10 default `ipv6.method` on the first remote verify and record it here (open). `dhcp-kept` is gated on the extra address being configured; the solution sets `ipv4.dns-options timeout:1,attempts:1` so an unreachable resolver cannot stall lookups (`ipv4.dns-priority` cannot reorder servers inside one connection, so it was not used).
+- [x] chrony-server-isolated: `outsider-refused` needs the probe to run (namespace and config present), no fatal error text, and either "no suitable source" or the timeout line. The `server-persistent`/`allow all` expectFail notes stay as documented.
+- [x] wireguard-depot-tunnel: unchanged by design (single-action mutations; listed checks fail, others may too).
+- [x] "kept" guards gated on the lab's main change: veth-netns-plumbing host-untouched, subnet-plan-depots / fix-routing-asymmetric / static-ip-persistent / xlf-static-ip-netplan eth0-untouched (and fix-routing-asymmetric eth1-path-kept), runtime-routes-two-sites addresses-kept, tcpdump-lost-heartbeats fault-intact, nmcli-bond-el dhcp-kept, firewalld-zones-el default-zone-kept.
+- [x] fix-routing-asymmetric networkd branch: From, Gateway and one single Table must appear in the same networkd file.
+- [x] tcpdump-lost-heartbeats: setup fails early when tcpdump is missing; the sender-drop capture must be newer than setup and contain only UDP 5140 traffic.
+- [x] nftables-from-scratch: `log-limited` needs `limit rate` before `log prefix "tr-drop: "` on the same rule.
+- [x] mtu-mismatch-tunnel: the nft branch ignores comments and requires the maxseg clamp on a `tun-dep` line.
+- [x] firewall-ticket-api: `permanent` also requires SSH to stay allowed for both client networks (`ssh-lost` otherwise).
+- [x] fix-firewall-blocks-app: `persistent` requires the tablet accept before the 9443 drop (or a negated-source drop), and the 3306 and blocked drops kept.
+- [x] bond-active-backup: port profiles must name the bond as master/controller (by name or UUID).
+- [x] dhcp-server-depot: policy-rc.d blocks the start on install; `dnsmasq --test` includes `/etc/dnsmasq.d`.
+- Earlier self-review (2026-10-19) fixes, kept for the record: nftables-from-scratch pub-ssh-blocked and rest-dropped require the positive state first; netem-impaired-link only-depot-link requires netem on depot0; wireguard-depot-tunnel config-a/config-b parse `Key = value` and comma/space separated AllowedIPs.

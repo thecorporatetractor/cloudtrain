@@ -1,6 +1,6 @@
 # Handoff: Linux round 5 (summary, state as of 2026-10-19)
 
-Per-wave detail stays in `linux-r5-w1.md`, `linux-r5-w2.md` and `linux-r5-w3.md`. The source of truth
+Per-wave detail stays in `linux-r5-w1.md`, `linux-r5-w2.md`, `linux-r5-w3.md` and `linux-r5-w4.md`. The source of truth
 for each lab's state is `status` / `notes` in `content/curriculum.yaml`. Nothing in round 5 was run
 live on the authoring machine (rule of 2026-10-18); every `verified` below was set by the remote
 verify VM batch runner, which re-verifies built labs from origin/main after each merge.
@@ -18,23 +18,24 @@ sim-linux-pro is complete: all five pools hold at least 2x their draw and the ex
 without `--allow-missing` (it is in the CI compile step). Wave 3 also fixed the gateway exam test
 that still assumed sim-linux-pro was coming-soon.
 
-## Unmerged PRs (round 5 is still open: wave 4 and a wave 3 follow-up)
+## Wave 4 and follow-ups (state 2026-10-19)
 
-- PR #143 (`content/linux-r5-w4`, 23 networking labs on VMs, handoff `docs/handoffs/linux-r5-w4.md`
-  on that branch): open, no approval recorded, last pushed 2026-10-18 21:29 UTC (after review
-  round 3 at 643025f; its later commits are review fixes and a curriculum re-render, not yet
-  re-reviewed). The round 3 findings to confirm closed: two major mutation issues in two-VM labs
-  (wireguard-depot-tunnel mutates only tr-wg-a, chrony-server-isolated mutates only the server;
-  in both, more checks fail than the expectFail lists name) and four minor ones
-  (fix-firewall-blocks-app and nftables-from-scratch persistence checks, fix-routing-asymmetric
-  networkd drop-in fallback, iperf-throughput-baseline mtu-one-side mutation). The 23 labs are not
-  on main; do not queue them for verify until it merges.
-- PR #161 (`content/linux-r5-w3-minor`): follow-up to wave 3 (#122). Exact-address hosts pin check
-  in xlp-fix-dns-client (its redundant nsswitch-only misconception is removed; pins-hosts and
-  no-search remain), StartLimitIntervalSec=0 on the broken units
-  (xlp-fix-unit-start, xlp-fix-oom-service), tracer-running check in xpe-incident-disk-pressure,
-  port verified in xlp-fix-permission-denied app-reads. Open; touches lab hashes, so those labs
-  need a re-verify after it merges.
+- Wave 4 is merged as PR #143: 23 networking labs on VMs, all `built`, none run live; handoff
+  `docs/handoffs/linux-r5-w4.md`. Before merge it got a strict self-review that fixed three major
+  defects (nftables-from-scratch negative checks, netem-impaired-link eth0 guard, wireguard-depot-tunnel
+  netdev parser) and added the ip-config skill tag to two checks; the remaining minors are listed in
+  its Review follow-ups. 2 of the 23 are blocked: iperf-throughput-baseline (iperf3 not in the
+  mirrors: add it to `tools/mirrors/packages-*.txt` and rebuild the VM image) and
+  netem-impaired-link (sch_netem lives in linux-modules-extra / kernel-modules-extra, which are not
+  mirrored); both are recorded as BLOCKED in their curriculum notes. The wave 4 labs join the verify queue.
+- PR #161 (wave 3 follow-up) is merged: exact-address hosts pin check in xlp-fix-dns-client (its
+  redundant nsswitch-only misconception is removed; pins-hosts and no-search remain),
+  StartLimitIntervalSec=0 on the broken units (xlp-fix-unit-start, xlp-fix-oom-service),
+  tracer-running check in xpe-incident-disk-pressure, port verified in xlp-fix-permission-denied
+  app-reads. It changed those labs' hashes, so they need a re-verify.
+- Verify-VM follow-ups: fix PRs #176, #178 and #168 and the verified-sync PR #179 are merged; #167
+  (xlf-lvm-grow-fs) and #177 (xlp-netplan-address, in this round's queue) were still open. Trust
+  `status` in `content/curriculum.yaml` for the current queue.
 - PR #114 (containers) and PR #84 (automation) belong to other domains and were not touched.
 
 ## VM verify results since the wave 3 merge
@@ -66,7 +67,7 @@ Merged labs: no lab is blocked on a missing image, Kata or kubeadm. Environment 
 - Not written: el variants of packages-install-from-mirror and package-repo-pinning
   (`python3-dnf-plugin-versionlock` is not mirrored).
 
-Blockers recorded on the unmerged wave 4 branch (apply once it lands): iperf-throughput-baseline is
+Blockers recorded for the merged wave 4 labs: iperf-throughput-baseline is
 image-blocked (iperf3 in neither package list); netem-impaired-link is image-blocked (sch_netem is in
 linux-modules-extra / kernel-modules-extra, not mirrored); kernel modules ip_gre, bridge, 8021q,
 bonding, wireguard assumed present on the VM images.
@@ -81,10 +82,10 @@ bonding, wireguard assumed present on the VM images.
 | kubeadm | none |
 | netdev | none |
 | Kata-blocked | none |
-| image-blocked | none on main (iperf-throughput-baseline and netem-impaired-link are on PR #143) |
+| image-blocked | iperf-throughput-baseline and netem-impaired-link (wave 4, outside the 34 counted here) |
 
 All VM tasks are `workstation` (jumphost:1) plus one VM. By name the queue is 9 pod + 19 ubuntu-vm
-(16 tier B/C learning and pool tasks plus the 3 tier-C xpe tasks) + 6 el-vm = 34.
+(16 tier B/C learning and pool tasks plus the 3 tier-C xpe tasks) + 6 el-vm = 34. The 23 wave 4 labs (21 unblocked) are queued separately; the list is in `linux-r5-w4.md`.
 
 Watch list for the runner: `ip netns` plus `systemd-run -p NetworkNamespacePath` on the ubuntu-vm,
 ufw state after `ufw --force reset`, firewalld zone XML parsing, authselect and pam_faillock via pty

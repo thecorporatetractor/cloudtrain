@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: luks-encrypt-archive
+  title: Encrypt the passenger archive disk and unlock it at boot
+  domain: linux
+  frameworks: [linuxplus:security, lpic2:filesystems]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [luks, cryptsetup, crypttab, encryption, fstab]
+  version: 1
+spec:
+  description: |
+    A new empty disk, **`/dev/disk/by-id/virtio-ct-data1`** (`/dev/vdc`), will hold the
+    passenger-survey archive on **`tr-vault-1`** (`ssh tr-vault-1`; you have `sudo`).
+    Set it up as an encrypted volume:
+
+    1. Format it as **LUKS2** with a **key file** at **`{{keyfile}}`** (random data, readable
+       by root only) as the first key slot.
+    2. Add a second slot with the escrow **passphrase `{{pass}}`**.
+    3. Open it as **`pax-archive`**, create an **ext4** filesystem on the mapping and mount it
+       at **`/srv/pax-archive`**.
+    4. Make it come back **at boot** without anyone typing a passphrase: an entry in
+       `/etc/crypttab` that uses the key file and an entry in `/etc/fstab`
+       (with `nofail`, so a missing disk cannot stop the boot).
+
+    The host is not rebooted here; the boot configuration is checked from the files and
+    from the units that systemd generates from them.
+  objectives:
+    - Create a LUKS2 container with two key slots
+    - Describe the volume in crypttab and fstab
+    - Check that systemd turns the configuration into a cryptsetup unit
+  params:
+    keyfile:
+      type: choice
+      values: [/root/pax-archive.key, /etc/pax-archive.key]
+    pass:
+      type: choice
+      values: [TallowEscrow-71, RailEscrow-42]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-vault-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-vault-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        if ! command -v cryptsetup >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q cryptsetup-bin cryptsetup >/dev/null
+        fi
+        umount /srv/pax-archive 2>/dev/null || true
+        cryptsetup close pax-archive 2>/dev/null || true
+        wipefs -a /dev/vdc >/dev/null
+        rm -f /root/pax-archive.key /etc/pax-archive.key
+        sed -i '/pax-archive/d' /etc/crypttab /etc/fstab 2>/dev/null || true
+        mkdir -p /srv/pax-archive; touch /etc/crypttab
+  checks:
+    - id: luks2-slots
+      description: The disk is LUKS2 with two key slots
+      type: shell
+      on: tr-vault-1
+      skills: [linux.storage.luks]
+      weight: 1.5
+      command: |
+        cryptsetup isLuks /dev/vdc 2>/dev/null || { echo not-luks; exit 0; }
+        v=$(cryptsetup luksDump /dev/vdc | awk '/^Version:/ {print $2}'); n=$(cryptsetup luksDump /dev/vdc | grep -cE '^ +[0-9]+: luks2')
+        echo "v$v slots=$n"
+      expect: {match: exact, value: "v2 slots=2"}
+    - id: both-unlock
+      description: The key file and the passphrase each unlock the volume
+      type: shell
+      on: tr-vault-1
+      skills: [linux.storage.luks]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        k={{keyfile}}
+        [ -s "$k" ] && cryptsetup open --test-passphrase --key-file "$k" /dev/vdc 2>/dev/null && a=key || a=nokey
+        printf %s '{{pass}}' | cryptsetup open --test-passphrase --key-file - /dev/vdc 2>/dev/null && b=pass || b=nopass
+        echo "$a $b"
+      expect: {match: exact, value: "key pass"}
+    - id: keyfile-private
+      description: The key file is random, long enough and readable by root only
+      type: shell
+      on: tr-vault-1
+      skills: [linux.storage.luks]
+      weight: 1
+      command: |
+        k={{keyfile}}; [ -f "$k" ] || { echo missing; exit 0; }
+        echo "$(stat -c '%U %a' "$k") $([ "$(stat -c %s "$k")" -ge 32 ] && echo long || echo short)"
+      expect: {match: regex, value: '^root (400|600) long$'}
+    - id: crypttab
+      description: /etc/crypttab opens the LUKS UUID as pax-archive with the key file and systemd generates its unit
+      type: shell
+      on: tr-vault-1
+      skills: [linux.storage.luks]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        u=$(cryptsetup luksUUID /dev/vdc 2>/dev/null)
+        l=$(grep -v '^[[:space:]]*#' /etc/crypttab | awk '$1 == "pax-archive"')
+        [ -n "$l" ] || { echo "no-entry"; exit 0; }
+        src=$(echo "$l" | awk '{print $2}'); key=$(echo "$l" | awk '{print $3}')
+        case "$src" in "UUID=$u"|/dev/disk/by-uuid/$u|/dev/vdc|/dev/disk/by-id/virtio-ct-data1) ;; *) echo "bad-source=$src"; exit 0;; esac
+        [ "$key" = "{{keyfile}}" ] || { echo "key=$key"; exit 0; }
+        systemctl daemon-reload
+        systemctl cat "$(systemd-escape --template=systemd-cryptsetup@.service pax-archive)" >/dev/null 2>&1 && echo configured || echo "no-unit"
+      expect: {match: exact, value: configured}
+    - id: mounted
+      description: The mapping is mounted at /srv/pax-archive as ext4
+      type: shell
+      on: tr-vault-1
+      skills: [linux.storage.luks, linux.storage.mounts]
+      weight: 1.5
+      command: findmnt -n -o SOURCE,FSTYPE /srv/pax-archive 2>/dev/null | awk '{print $1, $2}'
+      expect: {match: exact, value: "/dev/mapper/pax-archive ext4"}
+    - id: fstab
+      description: fstab mounts the mapping with nofail and parses cleanly
+      type: shell
+      on: tr-vault-1
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        s=$(findmnt --fstab -n -o SOURCE /srv/pax-archive 2>/dev/null); o=$(findmnt --fstab -n -o OPTIONS /srv/pax-archive 2>/dev/null)
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; v=$?
+        case "$s" in /dev/mapper/pax-archive) w=ok;; UUID=*) [ "$(blkid -U "${s#UUID=}")" = /dev/mapper/pax-archive ] && w=ok || w=other;; *) w=other;; esac
+        echo ",$o," | grep -q ',nofail,' && [ $w = ok ] && { [ $v = 0 ] || [ $v = 64 ]; } && echo configured || echo "source=$s opts=$o verify=$v"
+      expect: {match: exact, value: configured}
+  hints:
+    - title: Format and add a slot
+      command: sudo cryptsetup luksFormat --type luks2 --key-file KEYFILE /dev/vdc
+      body: "Create the key file first (head -c 64 /dev/urandom). luksAddKey --key-file KEYFILE /dev/vdc adds the passphrase; it prompts for it, or reads it from a pipe."
+      cost: 1
+    - title: crypttab fields
+      body: "name  source  keyfile  options, for example: pax-archive UUID=<luks-uuid> /path/to/key luks. cryptsetup luksUUID prints the UUID of the container (not the filesystem inside)."
+      cost: 1
+    - title: Does systemd understand it?
+      command: systemctl cat "systemd-cryptsetup@pax\x2darchive.service"
+      body: "systemd-cryptsetup-generator turns each crypttab line into a unit when the manager reloads (systemctl daemon-reload)."
+      cost: 1
+  misconceptions:
+    - id: passphrase-only
+      description: Formats with a passphrase only and points crypttab at nothing.
+      feedback: "An unattended boot needs a key file slot. With none in crypttab the boot would wait for a passphrase at the console."
+      expectFail: [luks2-slots, both-unlock, keyfile-private, crypttab]
+      mutation:
+        on: tr-vault-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          printf %s '{{pass}}' | sudo cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file - /dev/vdc
+          printf %s '{{pass}}' | sudo cryptsetup open --key-file - /dev/vdc pax-archive
+          sudo mkfs.ext4 -q /dev/mapper/pax-archive
+          echo '/dev/mapper/pax-archive /srv/pax-archive ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/pax-archive
+    - id: fstab-only
+      description: Opens and mounts the volume by hand and writes only the fstab line.
+      feedback: "At boot nothing opens the LUKS container, so /dev/mapper/pax-archive does not exist when fstab is processed. crypttab does the opening."
+      expectFail: [crypttab]
+      mutation:
+        on: tr-vault-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo sh -c "head -c 64 /dev/urandom > {{keyfile}}; chmod 0400 {{keyfile}}"
+          sudo cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file {{keyfile}} /dev/vdc
+          printf %s '{{pass}}' | sudo cryptsetup luksAddKey --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file {{keyfile}} /dev/vdc -
+          sudo cryptsetup open --key-file {{keyfile}} /dev/vdc pax-archive
+          sudo mkfs.ext4 -q /dev/mapper/pax-archive
+          echo '/dev/mapper/pax-archive /srv/pax-archive ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/pax-archive
+  solution:
+    explanation: |
+      luksFormat with the key file creates slot 0, luksAddKey adds the escrow passphrase
+      as slot 1, cryptsetup open and mkfs give a mountable mapping, and the crypttab and
+      fstab lines make systemd open and mount it at boot.
+    steps:
+      - on: tr-vault-1
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          sudo sh -c "head -c 64 /dev/urandom > {{keyfile}}; chmod 0400 {{keyfile}}"
+          sudo cryptsetup luksFormat --batch-mode --type luks2 --key-file {{keyfile}} /dev/vdc
+          printf %s '{{pass}}' | sudo cryptsetup luksAddKey --key-file {{keyfile}} /dev/vdc -
+          sudo cryptsetup open --key-file {{keyfile}} /dev/vdc pax-archive
+          sudo mkfs.ext4 -q /dev/mapper/pax-archive
+          echo "pax-archive UUID=$(sudo cryptsetup luksUUID /dev/vdc) {{keyfile}} luks" | sudo tee -a /etc/crypttab >/dev/null
+          echo '/dev/mapper/pax-archive /srv/pax-archive ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/pax-archive
+          findmnt /srv/pax-archive
+    alternatives:
+      - id: by-id-and-fs-uuid
+        description: Reference the disk by its by-id path in crypttab and the filesystem by UUID in fstab.
+        steps:
+          - on: tr-vault-1
+            as: learner
+            timeoutSec: 240
+            run: |
+              set -e
+              sudo sh -c "head -c 64 /dev/urandom > {{keyfile}}; chmod 0600 {{keyfile}}"
+              sudo cryptsetup luksFormat --batch-mode --type luks2 --key-file {{keyfile}} /dev/disk/by-id/virtio-ct-data1
+              printf %s '{{pass}}' | sudo cryptsetup luksAddKey --key-file {{keyfile}} /dev/disk/by-id/virtio-ct-data1 -
+              sudo cryptsetup open --key-file {{keyfile}} /dev/disk/by-id/virtio-ct-data1 pax-archive
+              sudo mkfs.ext4 -q /dev/mapper/pax-archive
+              echo "pax-archive /dev/disk/by-id/virtio-ct-data1 {{keyfile}} luks,discard" | sudo tee -a /etc/crypttab >/dev/null
+              echo "UUID=$(sudo blkid -s UUID -o value /dev/mapper/pax-archive) /srv/pax-archive ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount /srv/pax-archive

@@ -28,6 +28,7 @@ export const ALL_PERMISSIONS: readonly Permission[] = [
   'settings.manage',
   'quota.manage',
   'audit.read',
+  'billing.manage',
   'org.manage',
   'capacity.read',
   'support.access',

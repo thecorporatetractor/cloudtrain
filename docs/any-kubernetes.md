@@ -138,11 +138,11 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 | Where | Assumption | Sev |
 |---|---|---|
 | `Taskfile.yml:180`, `deploy/scripts/orchestrator-deploy.sh:82-100` | CRDs applied with `kubectl apply` from `config/crd` via kustomize + `yq` rewrites; no chart, no upgrade story for CRDs | B |
-| `services/lab-orchestrator/config/rbac/role.yaml:7-24` | ClusterRole: create/delete **secrets, pods, services, serviceaccounts** in every namespace | P (scope it) |
-| `role.yaml:29-36` | create/delete **namespaces** | P |
-| `role.yaml:44-49` | **`pods/exec` cluster-wide** (needed for ovn-central and lab pods) | P |
-| `role.yaml:244-260` | `clusterroles`, `clusterrolebindings` with **`bind` and `escalate`** (vcluster installs): effectively cluster-admin | P (the largest security finding for a shared managed cluster) |
-| `internal/controller/network_rbac.go:6`, `role.yaml` kubeovn.io | cluster-scoped `vpcs`/`subnets` write | portable |
+| `services/lab-orchestrator/config/rbac/role.yaml` | ClusterRole: create/delete **secrets, pods, services, serviceaccounts** in every namespace | done: lab namespaces only (session ClusterRole bound per namespace), [deploy.md](deploy.md#orchestrator-rbac) |
+| `role.yaml` | create/delete **namespaces** | done: admission policy limits it to its own `ct-vc-*` namespaces |
+| `role.yaml` | **`pods/exec` cluster-wide** (needed for ovn-central and lab pods) | done: lab namespaces, plus a Role in ovn-central's namespace (optional) |
+| `role.yaml` | `clusterroles`, `clusterrolebindings` with **`bind` and `escalate`** (vcluster installs): effectively cluster-admin | done: no `escalate`, `bind` only on the session ClusterRole; the vcluster chart installs no cluster-scoped RBAC |
+| `internal/controller/network_rbac.go` | cluster-scoped `vpcs`/`subnets` write | portable; admission policy limits writes to the orchestrator's own |
 
 ### 1.10 Other
 
@@ -161,7 +161,7 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 4. Gateway and web have no deployable form (`gateway/src/config.ts:125-131`, `apps/web/vite.config.ts`).
 5. `/dev/kvm` on every node, no virt node pool (`kind/cluster.yaml:22-27`).
 6. Lab kernel modules loaded on the host by Docker (`host-prep.sh`, `lab-kernel-modules.txt`).
-7. RBAC with `bind`/`escalate` on cluster roles, cluster-wide `pods/exec` and secrets (`role.yaml`).
+7. RBAC with `bind`/`escalate` on cluster roles, cluster-wide `pods/exec` and secrets (`role.yaml`). Done 2026-10-19: [deploy.md, Orchestrator RBAC](deploy.md#orchestrator-rbac).
 8. Privileged `net-init` / `procMount: Unmasked` with no Pod Security labels on session namespaces (`network/pod.go:122-131`).
 9. Storage class `standard` for CDI scratch and `Filesystem` VM disks (`kubevirt/cdi-cr.yaml:33`, `drivers/kubevirt.go:108,145`; fixed, see [storage.md](storage.md)).
 10. Lab content assumes 1400-byte link MTU and fixed `192.168.99/100.0/24` lab CIDRs (`net-fix-mtu-blackhole`, `labnet.go:37-44`).
@@ -293,6 +293,7 @@ unreachable while this was written (AZ move), so no new node experiments were ru
 | Primary CNI | Kube-OVN (primary or non-primary) | Azure CNI (overlay / powered by Cilium); BYO-CNI possible but CNI unsupported by Microsoft [D] ([BYO CNI](https://learn.microsoft.com/en-us/azure/aks/use-byo-cni)) | VPC CNI only supported CNI; alternates allowed with partner support; **Auto Mode forbids alternates** [D] ([alternate CNIs](https://docs.aws.amazon.com/eks/latest/userguide/alternate-cni-plugins.html)) | Dataplane V2 (Cilium); not replaceable [U] | Kube-OVN |
 | Multus | install | install (no official doc) [U] | install; VPC CNI multi-NIC exists for ENIs [D] ([multi NIC](https://docs.aws.amazon.com/eks/latest/userguide/pod-multiple-network-interfaces.html)) | Google documents Multus + ipvlan [D] ([GKE Multus](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/multus-ipvlan-whereabouts)); GKE multi-network is L3 [D] | install |
 | Kube-OVN non-primary | n/a or yes | yes [U; mechanism V on kind + Cilium, section 8] | yes [U; mechanism V, section 8] | yes, Ubuntu nodes [U; mechanism V, section 8] | n/a or yes |
+| Calico primary (kind `managed-cni-calico`) | n/a | BYO-CNI option | alternate CNI option | n/a | n/a; verified on kind only [V, section 10] |
 | Underlay MTU for 1400-byte lab links | port group MTU >= 1600 recommended [V, dev-environment.md] | 1500 [U] | 9001 [U] | default 1460: **set VPC MTU 1500 or 8896** [U] | >= 1500 |
 | NetworkPolicy engine | Kube-OVN | Cilium / Azure NPM | VPC CNI `enableNetworkPolicy` must be on [U] | Dataplane V2 | Kube-OVN |
 | LoadBalancer | NSX / Avi on VKS, else MetalLB or kube-vip [U] | Azure LB | AWS LB Controller (NLB) [U] | native | MetalLB |
@@ -443,7 +444,7 @@ with the run id, and a scheduled janitor deletes anything older than 6 hours.
 | 4 | Node image on managed clusters | provider default (COS, Bottlerocket, Azure Linux, AL2023) / Ubuntu | **Ubuntu** node images for lab pools on every provider (module coverage, userns-capable containerd); provider default for system pools |
 | 5 | Kata | required / optional | **Optional** (RuntimeClass value). AKS Pod Sandboxing where available, kata-deploy elsewhere; tier-A user namespaces remain the default isolation |
 | 6 | Packaging | one chart / platform chart + prereqs chart / operator | **Two charts** (`cloudtrain-prereqs`, `cloudtrain`) + CRDs chart, values profile per provider, `labctl preflight` as the gate and Helm test |
-| 7 | Orchestrator RBAC | keep cluster-wide / scope down | **Scope down** before any shared cluster: namespaced Roles in session and vcluster namespaces created by a small privileged component; drop `escalate`; `pods/exec` only in session namespaces and the ovn-central namespace |
+| 7 | Orchestrator RBAC | keep cluster-wide / scope down | **Scoped down** (done): the manager binds a session ClusterRole to itself per lab namespace (`labs.cloudtrain.dev/lab-namespace=true`; `bind` limited to that role by name), a ValidatingAdmissionPolicy limits its RoleBinding, namespace and Kube-OVN writes; no `escalate`; Secrets and `pods/exec` only in lab namespaces and (optional) the ovn-central namespace. What stays broad and why: [deploy.md](deploy.md#orchestrator-rbac) |
 | 8 | Real-cloud CI | none / on demand / scheduled | **Scheduled weekly per provider + manual trigger**, budget cap in the cloud accounts, everything destroyed by the job (and a janitor on tags) |
 | 9 | Images | GHCR only / per-provider registry | **GHCR as the source** (signed), mirrored into the provider registry by the install guide; catalog overlay generated per release |
 | 10 | Lab content MTU | keep 1400 / derive from cluster | **Keep 1400** as a platform guarantee (preflight enforces it); document the underlay MTU per provider |
@@ -606,3 +607,31 @@ to the CNI. `tools/verify-vm/tune.sh` handled it for `cloudtrain-dev` only;
   belongs in the Helm chart, which does not exist yet.
 - Clabernetes is not built yet. Its VXLAN launchers would sit on the primary
   network, independent of this mode.
+
+## 10. Calico profile on kind (2026-10-19)
+
+`KIND_PROFILE=managed-cni-calico` (`task dev:up KIND_PROFILE=managed-cni-calico`,
+cluster `cloudtrain-calico`) is the second "bring your own CNI" profile. It uses
+the same kind config and secondary mode as `managed-cni`, with Calico v3.33.0
+(VXLAN, pool 10.32.0.0/16, the pinned manifest the golden image uses, edited by
+`deploy/calico/kind.sed`) as the primary CNI. Lab CIDRs stay fixed and
+`--lab-mtu=1400` applies as in the Cilium profile.
+
+Verified on ct-testvm (throwaway cluster `ct-calico`, `--network-mode=secondary`,
+`labctl verify --parallel 1 --grade-timeout 15m`):
+
+| Check | Result |
+|---|---|
+| `labctl preflight --probe` | all checks pass: Calico detected, conflist priority 90, eth0 and link MTU 1400, 1400-byte DF frames across workers on both, API service unreachable from wired pods |
+| `fix-ssh-key-perms` (pod) | pass, 6/6 runs |
+| `etcd-snapshot-restore` (KubeVirt VM) | pass, 8/8 runs |
+| `net-fix-mtu-blackhole` (multi-node network) | 6/7 runs pass; `alternative:tunnel-mtu-only` fails (`upload-arrived`, got 32768). Known lab issue, unrelated to the CNI: the Kube-OVN primary `cloudtrain-dev` batch failed the same way |
+
+MTU: lab pod and VM-path interfaces come up at 1400 (set by Kube-OVN
+`Subnet.spec.mtu`; Calico's own eth0 is smaller because of VXLAN and lab traffic
+never uses it) and pass 1400-byte packets with DF set across nodes.
+
+Known startup race: right after KubeVirt reports Available, the first VMI create
+in `verify-kvm.sh` can fail with `virt-api` webhook "connection refused" while the
+virt-api pods restart. Re-running `task dev:verify-kvm` succeeded. Not shown to
+be Calico-specific.

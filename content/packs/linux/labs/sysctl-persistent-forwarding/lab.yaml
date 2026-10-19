@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: sysctl-persistent-forwarding
+  title: Turn on forwarding and tune swappiness on the gateway, permanently
+  domain: linux
+  frameworks: [lfcs:operations-deployment, linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [sysctl, kernel, forwarding, persistence]
+  version: 1
+spec:
+  description: |
+    **`depot-gw-1`** (`ssh depot-gw-1`; you have `sudo`) routes traffic between two
+    depot networks but forwards nothing yet, and its memory behaviour needs tuning.
+    On this host, **now and across reboots**:
+
+    - enable **IPv4 forwarding** (`net.ipv4.ip_forward = 1`);
+    - set **`vm.swappiness` to {{swap}}**.
+
+    The host already has a hardening file in `/etc/sysctl.d/`; the other parameters in it
+    (for example `kernel.kptr_restrict` and `net.ipv4.conf.all.rp_filter`) must keep their
+    values. Nothing may be rebooted: persistence is judged from the configuration
+    that `systemd-sysctl` would read at boot.
+  objectives:
+    - Change kernel parameters at runtime with sysctl
+    - Persist them in /etc/sysctl.d with the right precedence
+    - Leave unrelated parameters alone
+  params:
+    swap:
+      type: choice
+      values: ["10", "15", "20"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-gw-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-gw-1
+      timeoutSec: 60
+      run: |
+        set -eu
+        rm -f /etc/sysctl.d/*depot-gw*.conf /etc/sysctl.d/*forward*.conf /etc/sysctl.d/*swap*.conf
+        printf '# Tallowmere hardening baseline\nnet.ipv4.ip_forward = 0\nkernel.kptr_restrict = 2\nnet.ipv4.conf.all.rp_filter = 1\n' > /etc/sysctl.d/99-depot-hardening.conf
+        sysctl -q -w net.ipv4.ip_forward=0 vm.swappiness=60 kernel.kptr_restrict=2 net.ipv4.conf.all.rp_filter=1
+  checks:
+    - id: live
+      description: Forwarding is on and swappiness is set in the running kernel
+      type: shell
+      on: depot-gw-1
+      skills: [linux.kernel.sysctl]
+      weight: 1.5
+      command: echo "fwd=$(sysctl -n net.ipv4.ip_forward) swap=$(sysctl -n vm.swappiness)"
+      expect: {match: exact, value: "fwd=1 swap={{swap}}"}
+    - id: persist-forward
+      description: The configuration read at boot ends with ip_forward = 1
+      type: shell
+      on: depot-gw-1
+      skills: [linux.kernel.sysctl]
+      weight: 2
+      command: |
+        systemd-analyze cat-config sysctl.d 2>/dev/null | sed 's/[#;].*//' | awk -F= '{a=$1; gsub(/[ \t]/, "", a); sub(/^-/, "", a); if (a == "net.ipv4.ip_forward") {v=$2; gsub(/[ \t]/, "", v); r=v}} END {print "effective=" r}'
+      expect: {match: exact, value: "effective=1"}
+    - id: persist-swappiness
+      description: The configuration read at boot ends with the swappiness value
+      type: shell
+      on: depot-gw-1
+      skills: [linux.kernel.sysctl]
+      weight: 1.5
+      command: |
+        systemd-analyze cat-config sysctl.d 2>/dev/null | sed 's/[#;].*//' | awk -F= '{a=$1; gsub(/[ \t]/, "", a); sub(/^-/, "", a); if (a == "vm.swappiness") {v=$2; gsub(/[ \t]/, "", v); r=v}} END {print "effective=" r}'
+      expect: {match: exact, value: "effective={{swap}}"}
+    - id: others-intact
+      description: The hardening parameters keep their values, live and in the configuration
+      type: shell
+      on: depot-gw-1
+      skills: [linux.kernel.sysctl]
+      weight: 1
+      command: |
+        eff() { systemd-analyze cat-config sysctl.d 2>/dev/null | sed 's/[#;].*//' | awk -F= -v k="$1" '{a=$1; gsub(/[ \t]/, "", a); if (a == k) {v=$2; gsub(/[ \t]/, "", v); r=v}} END {print r}'; }
+        [ "$(sysctl -n kernel.kptr_restrict)" = 2 ] && [ "$(sysctl -n net.ipv4.conf.all.rp_filter)" = 1 ] && [ "$(eff kernel.kptr_restrict)" = 2 ] && [ "$(eff net.ipv4.conf.all.rp_filter)" = 1 ] && echo intact || echo changed
+      expect: {match: exact, value: intact}
+  hints:
+    - title: Runtime versus boot
+      body: "sysctl -w changes the running kernel only. systemd-sysctl applies every *.conf in /etc/sysctl.d at boot, in file-name order."
+      cost: 0
+    - title: The last value wins
+      command: systemd-analyze cat-config sysctl.d | grep -n ip_forward
+      body: "A parameter set in two files takes the value from the file that sorts last. Look at which files already mention ip_forward."
+      cost: 1
+    - title: Applying without a reboot
+      command: sudo sysctl --system
+      body: "sysctl --system re-reads every config file in boot order; afterwards the running values show what a reboot would give."
+      cost: 1
+  misconceptions:
+    - id: runtime-only
+      description: Uses sysctl -w and stops there.
+      feedback: "sysctl -w is lost at reboot. Put the settings in a file under /etc/sysctl.d."
+      expectFail: [persist-forward, persist-swappiness]
+      mutation:
+        on: depot-gw-1
+        as: learner
+        run: sudo sysctl -w net.ipv4.ip_forward=1 vm.swappiness={{swap}}
+    - id: loses-to-hardening
+      description: Adds a low-numbered file that the hardening file overrides.
+      feedback: "Files apply in lexical order and the last one wins. 99-depot-hardening.conf sets ip_forward = 0 after your file; edit that line or name your file so it sorts after it."
+      expectFail: [live, persist-forward]
+      mutation:
+        on: depot-gw-1
+        as: learner
+        run: |
+          printf 'net.ipv4.ip_forward = 1\nvm.swappiness = {{swap}}\n' | sudo tee /etc/sysctl.d/50-gateway.conf >/dev/null
+          sudo sysctl --system >/dev/null
+    - id: replaces-hardening
+      description: Overwrites the hardening file with only the two new settings.
+      feedback: "The hardening file also carried kernel.kptr_restrict and rp_filter. Change the one line you need instead of replacing the file."
+      expectFail: [others-intact]
+      mutation:
+        on: depot-gw-1
+        as: learner
+        run: |
+          printf 'net.ipv4.ip_forward = 1\nvm.swappiness = {{swap}}\n' | sudo tee /etc/sysctl.d/99-depot-hardening.conf >/dev/null
+          sudo sysctl --system >/dev/null
+          sudo sysctl -w kernel.kptr_restrict=0 >/dev/null
+  solution:
+    explanation: |
+      A new file that sorts after 99-depot-hardening.conf (or an edit of its ip_forward
+      line) makes the boot-time configuration end with ip_forward = 1; sysctl --system
+      applies the whole set now.
+    steps:
+      - on: depot-gw-1
+        as: learner
+        run: |
+          set -e
+          printf 'net.ipv4.ip_forward = 1\nvm.swappiness = {{swap}}\n' | sudo tee /etc/sysctl.d/99-zz-gateway.conf >/dev/null
+          sudo sysctl --system >/dev/null
+          sysctl net.ipv4.ip_forward vm.swappiness
+    alternatives:
+      - id: edit-in-place
+        description: Edit the ip_forward line of the hardening file and add swappiness to a separate file.
+        steps:
+          - on: depot-gw-1
+            as: learner
+            run: |
+              set -e
+              sudo sed -i 's/^net.ipv4.ip_forward = 0/net.ipv4.ip_forward = 1/' /etc/sysctl.d/99-depot-hardening.conf
+              echo 'vm.swappiness = {{swap}}' | sudo tee /etc/sysctl.d/60-memory.conf >/dev/null
+              sudo sysctl --system >/dev/null

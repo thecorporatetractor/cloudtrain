@@ -7,9 +7,17 @@
 #   preloaded images of every add-on (lock/addons.lock)
 #   CKS material: gVisor runsc + containerd runtime handler `runsc`, kube-bench + cfg,
 #   AppArmor sample profiles and audit policies in /opt/cloudtrain/security
+#   supply chain: Trivy (`trivy` wrapper: offline DB in /var/lib/trivy, containerd
+#   namespace k8s.io, buildah images through podman.socket), cosign, base images in
+#   buildah's storage (kubeadm-addons/buildah-images.txt), the signed parcel-api fixture
+#   in /opt/qm-signing (kubeadm-addons/signing)
 source /opt/cloudtrain/build/guest-common.sh
 B=/opt/cloudtrain/build
 grow_root
+# apt from the pinned snapshot again (the base layer was generalized): podman, whose API
+# socket is the only way Trivy reads images in buildah's storage (/var/lib/containers)
+base_setup podman
+systemctl enable podman.socket
 
 # --- add-on manifests + installer ---
 install -d /opt/cloudtrain/addons /opt/cloudtrain/bin
@@ -51,6 +59,59 @@ cp -r /tmp/cfg /etc/kube-bench/cfg; rm -rf /tmp/kube-bench /tmp/cfg
 kube-bench version || true
 install -d /etc/falco/rules.d
 
+# --- supply-chain tools (Apache-2.0; licence texts in /usr/share/doc/<tool>) ---
+install -d /usr/local/libexec/cloudtrain /usr/share/doc/trivy /usr/share/doc/cosign
+install -m 0755 "$B/trivy/trivy" /usr/local/libexec/cloudtrain/trivy
+install -m 0644 "$B/trivy/LICENSE" /usr/share/doc/trivy/LICENSE
+install -m 0755 "$B/cosign" /usr/local/bin/cosign
+install -m 0644 "$B/cosign.LICENSE" /usr/share/doc/cosign/LICENSE
+cosign version 2>&1 | grep -i gitversion
+# Trivy DB, dated (TRIVY_DB_DATE): never updated on the node, lab VMs have no internet.
+# Refresh = new TRIVY_DB_REF/TRIVY_DB_DATE in versions.env and an image rebuild.
+install -d -m 0755 /var/lib/trivy /var/lib/trivy/db
+tar --no-same-owner -xzf "$B/trivy-db.tar.gz" -C /var/lib/trivy/db
+test -s /var/lib/trivy/db/trivy.db
+cat /var/lib/trivy/db/metadata.json; echo
+chmod -R a+rX /var/lib/trivy
+cat > /usr/local/bin/trivy <<'EOF'
+#!/bin/sh
+# CloudTrain: Trivy with the offline vulnerability DB baked into this image (lab VMs have
+# no internet). Only defaults: flags and TRIVY_* variables set by the caller win.
+#   DB          /var/lib/trivy/db, never updated (date: TRIVY_DB_DATE in /etc/cloudtrain-release)
+#   containerd  namespace k8s.io, the kubelet's images (trivy image --image-src containerd ...)
+#   buildah     images in buildah's storage are read through podman's API socket
+: "${TRIVY_SKIP_DB_UPDATE:=true}" "${TRIVY_SKIP_JAVA_DB_UPDATE:=true}" "${TRIVY_SKIP_CHECK_UPDATE:=true}"
+: "${TRIVY_SKIP_VEX_REPO_UPDATE:=true}" "${TRIVY_OFFLINE_SCAN:=true}" "${TRIVY_SKIP_VERSION_CHECK:=true}"
+: "${TRIVY_DISABLE_TELEMETRY:=true}" "${CONTAINERD_NAMESPACE:=k8s.io}" "${TRIVY_PODMAN_HOST:=/run/podman/podman.sock}"
+if [ "$(id -u)" = 0 ]; then
+  : "${TRIVY_CACHE_DIR:=/var/lib/trivy}"
+else
+  # other users: their own scan cache, the shared DB
+  : "${TRIVY_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/trivy}"
+  mkdir -p "$TRIVY_CACHE_DIR" 2>/dev/null || true
+  [ -e "$TRIVY_CACHE_DIR/db" ] || ln -s /var/lib/trivy/db "$TRIVY_CACHE_DIR/db" 2>/dev/null || true
+fi
+export TRIVY_SKIP_DB_UPDATE TRIVY_SKIP_JAVA_DB_UPDATE TRIVY_SKIP_CHECK_UPDATE TRIVY_SKIP_VEX_REPO_UPDATE \
+  TRIVY_OFFLINE_SCAN TRIVY_SKIP_VERSION_CHECK TRIVY_DISABLE_TELEMETRY CONTAINERD_NAMESPACE TRIVY_PODMAN_HOST TRIVY_CACHE_DIR
+exec /usr/local/libexec/cloudtrain/trivy "$@"
+EOF
+chmod 0755 /usr/local/bin/trivy
+trivy --version
+
+# --- base images in buildah's storage (by digest, named as the labs reference them) ---
+while read -r ref name; do
+  [ -n "$ref" ] || continue
+  tagged=${ref%@*}; src=${tagged%:*}@${ref#*@}   # <name>:<tag>@<digest> -> pull <name>@<digest>
+  if [ -n "${DOCKERIO_MIRROR:-}" ] && [ "${src%%/*}" = docker.io ]; then src=$DOCKERIO_MIRROR/${src#docker.io/}; fi
+  for try in 1 2 3; do
+    id=$(buildah pull -q --platform linux/amd64 "docker://$src") && break
+    [ "$try" = 3 ] && { echo "buildah pull failed: $src"; exit 1; }; sleep 5
+  done
+  buildah tag "$id" "$name"
+  buildah inspect --type image "$name" >/dev/null
+done < "$B/buildah-images.txt"
+buildah images
+
 # --- preload add-on images (by digest, named by tag, CRI-managed) ---
 containerd >/tmp/containerd.log 2>&1 &
 CPID=$!
@@ -67,6 +128,8 @@ while read -r ref; do
   ctr -n k8s.io images label "$tagged" io.cri-containerd.image=managed >/dev/null
 done < "$B/addon-images.txt"
 cat "$B/addon-images.txt" >> /opt/cloudtrain/images/images.txt
+# signed-image fixture: /opt/qm-signing + registry.quillmoor.example/parcel/api:{blue,green,amber}
+bash "$B/signing/parcel-api.sh" "$B/signing"
 ctr -n k8s.io images ls -q | grep -v '^sha256:' | sort | tee /opt/cloudtrain/images/IMAGES
 sed 's/@.*//' "$B/addon-images.txt" | sort -u | comm -23 - /opt/cloudtrain/images/IMAGES | tee /tmp/missing
 [ ! -s /tmp/missing ]
@@ -78,12 +141,14 @@ cat >> /etc/cloudtrain-release <<R
 ADDONS=$(cd /opt/cloudtrain/addons && printf '%s\n' * | grep -v SHA256SUMS | paste -sd,)
 GVISOR_RELEASE=${GVISOR_RELEASE}
 KUBE_BENCH_VERSION=${KUBE_BENCH_VERSION}
+TRIVY_VERSION=${TRIVY_VERSION}
+TRIVY_DB_REF=${TRIVY_DB_REF}
+TRIVY_DB_DATE=${TRIVY_DB_DATE}
+COSIGN_VERSION=${COSIGN_VERSION}
+PODMAN_VERSION=$(podman --version | awk '{print $3}')
+CSI_HOSTPATH_VERSION=${CSI_HOSTPATH_VERSION}
 R
 cat /etc/cloudtrain-release
-# generalize (the base image was already generalized; redo what this layer touched)
-apt-get clean || true
-rm -rf /tmp/* /var/tmp/* "$B"
-cloud-init clean --logs --seed || true
-truncate -s 0 /etc/machine-id
-rm -f /var/lib/dbus/machine-id /etc/ssh/ssh_host_*
-fstrim -av || true
+# generalize (the base image was already generalized; redo what this layer touched,
+# including the build-time apt config of base_setup above)
+generalize

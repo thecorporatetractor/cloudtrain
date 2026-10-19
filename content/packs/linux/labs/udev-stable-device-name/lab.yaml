@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: udev-stable-device-name
+  title: Give the depot badge reader a stable device name
+  domain: linux
+  frameworks: [lpic2:kernel]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [udev, rules, devices, serial]
+  version: 1
+spec:
+  description: |
+    Two identical data disks are attached to **`depot-gate-3`** (`ssh depot-gate-3`;
+    you have `sudo`). The badge-reader spool lives on the disk whose **serial number is
+    `ct-data2`**. Kernel names such as `/dev/vdc` and `/dev/vdd` follow probe order and
+    swap when the disks are enumerated differently, which broke the spool service last
+    week.
+
+    Write a **udev rule** in `/etc/udev/rules.d/` so that the disk with serial
+    `ct-data2` always appears as **`/dev/tr-reader`**, owned by group **`{{grp}}`** with
+    mode **`{{mode}}`**. The rule must select the disk by its **serial**, not by its
+    kernel name, and the name must come back when the disk is re-announced to udev
+    (`udevadm trigger --action=add`), without a reboot.
+  objectives:
+    - Read device attributes with udevadm info
+    - Write a udev rule that matches on a serial and sets a symlink, group and mode
+    - Reload the rules and apply them to an existing device
+  params:
+    grp:
+      type: choice
+      values: [dialout, plugdev]
+    mode:
+      type: choice
+      values: ["0660", "0664"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-gate-3
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: depot-gate-3
+      timeoutSec: 60
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        rm -f /etc/udev/rules.d/*reader* /etc/udev/rules.d/*tr-* /dev/tr-reader
+        udevadm control --reload
+        udevadm trigger --action=add /dev/vdd; udevadm settle
+        getent group {{grp}} >/dev/null
+  checks:
+    - id: rule-by-serial
+      description: A rules file names tr-reader and matches the serial ct-data2
+      type: shell
+      on: depot-gate-3
+      skills: [linux.kernel.udev]
+      weight: 2
+      command: |
+        for f in /etc/udev/rules.d/*.rules; do
+          [ -f "$f" ] || continue
+          grep -v '^[[:space:]]*#' "$f" | grep 'tr-reader' | grep -q 'ct-data2' && { grep -v '^[[:space:]]*#' "$f" | grep 'tr-reader' | grep -Eq '(ID_SERIAL(_SHORT)?|\{serial)\}==' && echo serial-rule && exit 0; }
+        done
+        echo no-serial-rule
+      expect: {match: exact, value: serial-rule}
+    - id: owner-mode
+      description: The device node has the group and mode from the ticket
+      type: shell
+      on: depot-gate-3
+      skills: [linux.kernel.udev]
+      weight: 1.5
+      command: |
+        n=$(readlink -f /dev/disk/by-id/virtio-ct-data2); printf '%s %04d\n' "$(stat -c %G $n)" "$(stat -c %a $n)"
+      expect: {match: exact, value: "{{grp}} {{mode}}"}
+    - id: replug
+      description: After the symlink is removed and the disk is re-announced, /dev/tr-reader points at the ct-data2 disk
+      type: shell
+      on: depot-gate-3
+      skills: [linux.kernel.udev]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        rm -f /dev/tr-reader
+        udevadm control --reload; udevadm trigger --action=add /dev/vdd; udevadm settle
+        [ "$(readlink -f /dev/tr-reader 2>/dev/null)" = "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" ] && echo named || echo "link=$(readlink -f /dev/tr-reader 2>/dev/null)"
+      expect: {match: exact, value: named}
+    - id: only-one-disk
+      description: The other data disk was not renamed
+      type: shell
+      on: depot-gate-3
+      skills: [linux.kernel.udev]
+      weight: 1
+      command: |
+        [ "$(readlink -f /dev/tr-reader 2>/dev/null)" != "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" ] && [ "$(stat -c %G /dev/vdc)" = disk ] && echo untouched || echo changed
+      expect: {match: exact, value: untouched}
+  hints:
+    - title: Read the attributes
+      command: udevadm info --query=property --name=/dev/vdd | grep -i serial
+      body: "ID_SERIAL and ID_SERIAL_SHORT carry the serial. udevadm info -a walks the parents; ATTRS{serial} matches a parent's attribute."
+      cost: 0
+    - title: Rule shape
+      body: "SUBSYSTEM==\"block\", ENV{DEVTYPE}==\"disk\", ENV{ID_SERIAL}==\"...\", SYMLINK+=\"tr-reader\", GROUP=\"...\", MODE=\"...\" — one line, == to match and = / += to assign."
+      cost: 2
+    - title: Apply it
+      command: sudo udevadm control --reload && sudo udevadm trigger --action=add /dev/vdd && sudo udevadm settle
+      body: "Rules are read when a device event happens; reload the rule files, then replay the add event for the disk."
+      cost: 1
+  misconceptions:
+    - id: kernel-name
+      description: Matches on the kernel name vdd instead of the serial.
+      feedback: "KERNEL==\"vdd\" breaks as soon as the probe order changes. Match a property that belongs to the disk, such as ID_SERIAL."
+      expectFail: [rule-by-serial]
+      mutation:
+        on: depot-gate-3
+        as: learner
+        run: |
+          echo 'KERNEL=="vdd", SUBSYSTEM=="block", SYMLINK+="tr-reader", GROUP="{{grp}}", MODE="{{mode}}"' | sudo tee /etc/udev/rules.d/90-tr-reader.rules >/dev/null
+          sudo udevadm control --reload; sudo udevadm trigger --action=add /dev/vdd; sudo udevadm settle
+    - id: manual-link
+      description: Creates the symlink and changes the group by hand.
+      feedback: "ln and chgrp only change the running /dev. udev recreates device nodes on every add event, so the name and ownership must come from a rule."
+      expectFail: [rule-by-serial, replug]
+      mutation:
+        on: depot-gate-3
+        as: learner
+        run: |
+          sudo ln -sf /dev/vdd /dev/tr-reader
+          sudo chgrp {{grp}} /dev/vdd; sudo chmod {{mode}} /dev/vdd
+    - id: not-reloaded
+      description: Writes the right rule but never reloads or replays it.
+      feedback: "udev applies a new rule file to devices only when an event fires for them; run udevadm control --reload and udevadm trigger."
+      expectFail: [owner-mode]
+      mutation:
+        on: depot-gate-3
+        as: learner
+        run: |
+          echo 'SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_SERIAL}=="ct-data2", SYMLINK+="tr-reader", GROUP="{{grp}}", MODE="{{mode}}"' | sudo tee /etc/udev/rules.d/90-tr-reader.rules >/dev/null
+  solution:
+    explanation: |
+      udevadm info shows ID_SERIAL=ct-data2 for the disk. A rule in /etc/udev/rules.d
+      matches the whole disk (DEVTYPE disk, so partitions are not renamed) by that
+      property and sets SYMLINK, GROUP and MODE. Reloading and replaying the add event
+      applies it to the existing device.
+    steps:
+      - on: depot-gate-3
+        as: learner
+        run: |
+          set -e
+          udevadm info --query=property --name=/dev/vdd | grep ID_SERIAL
+          echo 'SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_SERIAL}=="ct-data2", SYMLINK+="tr-reader", GROUP="{{grp}}", MODE="{{mode}}"' | sudo tee /etc/udev/rules.d/90-tr-reader.rules >/dev/null
+          sudo udevadm control --reload
+          sudo udevadm trigger --action=add /dev/vdd
+          sudo udevadm settle
+          ls -l /dev/tr-reader
+    alternatives:
+      - id: attrs-serial
+        description: Match the serial attribute on the parent device with ATTRS{serial}.
+        steps:
+          - on: depot-gate-3
+            as: learner
+            run: |
+              set -e
+              echo 'SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTRS{serial}=="ct-data2", SYMLINK+="tr-reader", GROUP="{{grp}}", MODE="{{mode}}"' | sudo tee /etc/udev/rules.d/91-reader.rules >/dev/null
+              sudo udevadm control --reload
+              sudo udevadm trigger --action=add /dev/vdd
+              sudo udevadm settle

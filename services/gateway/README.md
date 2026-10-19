@@ -85,6 +85,7 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 | `CT_SWEEP_INTERVAL_MS` | `60000` | closes attempts whose LabSession expired or vanished |
 | `CT_SITE_CONFIG` | `content/site.yaml` | public website configuration (`cloudtrain.dev/v1 Site`, `docs/website.md`); a deployment mounts its own file here. Invalid = refuses to start |
 | `CT_PUBLIC_RATE_PER_MINUTE` | `120` | requests per minute one client address may make to `/api/public/*` (429 + `Retry-After` beyond) |
+| `CT_BILLING_ENABLED` | off | `1`: Stripe billing in TEST MODE (`docs/billing.md`); needs `STRIPE_SECRET_KEY` (`sk_test_...`, never logged, never committed) and `STRIPE_WEBHOOK_SECRET` (`whsec_...`). `STRIPE_MODE` must be `test`; a live key refuses to start even with billing off |
 
 Relative paths are relative to the repository root.
 
@@ -113,6 +114,7 @@ in `src/authz.ts`).
 | Method + path | |
 |---|---|
 | `GET /health` | no auth; lab count and content issues |
+| `GET /billing/me`, `POST /billing/me/{checkout,portal}`, `GET /billing/org[/events]`, `POST /billing/org/{checkout,portal}`, `POST /billing/webhook` | plans and entitlements, Stripe Checkout and Customer Portal (test mode), signed webhook with idempotent handling (`docs/billing.md`) |
 | `GET /public/site`, `GET /public/catalog`, `GET /public/paths/:id`, `GET /public/exams/:id` | no auth: the website's configuration and the read-only catalog (paths, courses, labs, exam simulations, frameworks) from content/ only, never from the database (no progress, visibility, attempts or exam pool ids). `ETag` + `Cache-Control: public, max-age=300`, rate-limited per client address (`src/routes/public.ts`) |
 | `GET /me` | `Me`: user, active org, memberships, roles, permissions + scoped grants, teams, cohorts, CSRF token |
 | `GET /home` | real recommendations, goal forecast, activity, mastery and assignments due (`source: empty` before any history) |

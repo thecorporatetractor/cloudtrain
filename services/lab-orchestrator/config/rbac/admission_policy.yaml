@@ -1,0 +1,83 @@
+# What RBAC cannot express about the manager's cluster-wide permissions
+# (config/rbac/role.yaml), enforced at admission for its ServiceAccount only:
+#   - namespaces: only the vcluster host namespaces it creates itself (ct-vc-*,
+#     its managed-by label, Pod Security baseline or restricted); it cannot
+#     create, relabel or delete any other namespace;
+#   - rolebindings: only in lab namespaces (labs.cloudtrain.dev/lab-namespace=true);
+#     a ClusterRole may be bound only if it is the session ClusterRole, with the
+#     manager itself as the only subject (vcluster's own Role binding is a Role,
+#     which RBAC already limits to what the manager holds there);
+#   - Kube-OVN VPCs and subnets: only the ones carrying its managed-by label, so
+#     ovn-cluster, ovn-default and join cannot be changed.
+# Needs Kubernetes 1.30+ (ValidatingAdmissionPolicy GA). Per-instance names are
+# rewritten by deploy/scripts/orchestrator-deploy.sh and the Helm chart.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: lab-orchestrator
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [namespaces]
+      - apiGroups: [rbac.authorization.k8s.io]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [rolebindings]
+      - apiGroups: [kubeovn.io]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [vpcs, subnets]
+  matchConditions:
+    - name: lab-orchestrator
+      expression: "request.userInfo.username == 'system:serviceaccount:cloudtrain-system:lab-orchestrator'"
+  variables:
+    - name: obj
+      expression: "request.operation == 'DELETE' ? oldObject : object"
+    - name: labels
+      expression: "has(variables.obj.metadata.labels) ? variables.obj.metadata.labels : {}"
+    - name: managed
+      expression: "variables.labels.exists(k, k == 'app.kubernetes.io/managed-by' && variables.labels[k] == 'cloudtrain-lab-orchestrator')"
+    - name: wasManaged
+      expression: >-
+        request.operation != 'UPDATE' || (has(oldObject.metadata.labels) &&
+        oldObject.metadata.labels.exists(k, k == 'app.kubernetes.io/managed-by' && oldObject.metadata.labels[k] == 'cloudtrain-lab-orchestrator'))
+    - name: labNamespace
+      expression: >-
+        namespaceObject != null && has(namespaceObject.metadata.labels) &&
+        namespaceObject.metadata.labels.exists(k, k == 'labs.cloudtrain.dev/lab-namespace' && namespaceObject.metadata.labels[k] == 'true')
+  validations:
+    - expression: >-
+        request.resource.resource != 'namespaces' ||
+        (variables.managed && variables.wasManaged && variables.obj.metadata.name.startsWith('ct-vc-'))
+      message: the lab-orchestrator may only create, change and delete its own vcluster host namespaces (ct-vc-*, managed-by cloudtrain-lab-orchestrator)
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'namespaces' || request.operation == 'DELETE' ||
+        variables.labels.exists(k, k == 'pod-security.kubernetes.io/enforce' && variables.labels[k] in ['baseline', 'restricted'])
+      message: vcluster host namespaces must enforce Pod Security baseline or restricted
+      reason: Forbidden
+    - expression: "request.resource.resource != 'rolebindings' || variables.labNamespace"
+      message: the lab-orchestrator may only manage RoleBindings in lab namespaces (label labs.cloudtrain.dev/lab-namespace=true)
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'rolebindings' || request.operation == 'DELETE' || object.roleRef.kind != 'ClusterRole' ||
+        (object.roleRef.name == 'lab-orchestrator-session' && has(object.subjects) && size(object.subjects) == 1 &&
+        object.subjects[0].kind == 'ServiceAccount' &&
+        'system:serviceaccount:' + object.subjects[0].namespace + ':' + object.subjects[0].name == request.userInfo.username)
+      message: the lab-orchestrator may bind only its session ClusterRole, to itself
+      reason: Forbidden
+    - expression: "request.resource.group != 'kubeovn.io' || (variables.managed && variables.wasManaged)"
+      message: the lab-orchestrator may only change Kube-OVN VPCs and subnets it created (managed-by cloudtrain-lab-orchestrator)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: lab-orchestrator
+spec:
+  policyName: lab-orchestrator
+  validationActions: [Deny]

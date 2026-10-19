@@ -7,6 +7,7 @@ import * as m0003 from './migrations/0003_exams.js';
 import * as m0004 from './migrations/0004_learner_goals.js';
 import * as m0005 from './migrations/0005_ctf_answers.js';
 import * as m0006 from './migrations/0006_ctf_events.js';
+import * as m0007 from './migrations/0007_billing.js';
 import type { DB } from './schema.js';
 
 export type Db = Kysely<DB>;
@@ -16,7 +17,12 @@ export type Tx = Transaction<DB>;
 pg.types.setTypeParser(20, (v) => Number(v));
 
 export function createDb(connectionString: string, max = 10): Db {
-  return new Kysely<DB>({ dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString, max }) }) });
+  const pool = new pg.Pool({ connectionString, max });
+  // An idle client that loses its connection (server restart, 57P01) emits 'error' on the pool;
+  // with no listener that is an uncaught exception. The pool drops the dead client and the next
+  // query opens a new one, so log and carry on.
+  pool.on('error', (err) => console.error('pg pool: idle client error:', err.message));
+  return new Kysely<DB>({ dialect: new PostgresDialect({ pool }) });
 }
 
 /** The RLS context of one transaction. */
@@ -47,7 +53,7 @@ export function migrationProvider(appRole: string): MigrationProvider {
     up: (db) => mod.up(db, appRole),
     down: (db) => mod.down(db),
   });
-  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006) }) };
+  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007) }) };
 }
 
 /** Applies pending migrations; run as the schema owner. */
