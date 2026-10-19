@@ -67,16 +67,20 @@ export async function createTestDb(): Promise<TestDb> {
       const c = new pg.Client({ connectionString: OWNER_URL });
       await c.connect();
       try {
-        // pool.end() returns before the server backends have exited; FORCE
-        // would then try to terminate the app role's lingering backend, which
-        // the (non-superuser) owner may not do (42501). Retry until they're gone.
+        // pool.end() returns before the server backends have exited. Do NOT use
+        // WITH (FORCE) here: it would terminate a backend that is still closing,
+        // and the server's FATAL 57P01 (admin_shutdown) then reaches a pg client
+        // that is already ending and has no error listener, which vitest reports
+        // as an unhandled error (a green run failing at random). A plain DROP
+        // fails with 55006 while any backend is still attached, so wait for them
+        // to leave on their own.
         for (let attempt = 0; ; attempt++) {
           try {
-            await c.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+            await c.query(`DROP DATABASE IF EXISTS ${name}`);
             break;
           } catch (e) {
             const code = (e as { code?: string }).code;
-            if (attempt >= 50 || (code !== '42501' && code !== '55006')) throw e;
+            if (attempt >= 300 || code !== '55006') throw e;
             await new Promise((r) => setTimeout(r, 100));
           }
         }
