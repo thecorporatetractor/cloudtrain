@@ -564,3 +564,76 @@ SESSION_SELECTOR=labs.cloudtrain.dev/verify=true LOAD_LAB_IMAGES=0 CATALOG_OVERL
 tools/slots/run.sh vm -- bin/labctl verify --context kind-ct-kata --catalog catalog.yaml,catalog-kata.yaml <labs>
 kind delete cluster --name ct-kata                                # done at the end of the spike
 ```
+
+## 10. Phase 1: an opt-in dev profile (2026-10-19)
+
+Phase 1 turns the spike into something reproducible. The orchestrator's
+default does not change: `--tier-runtime-classes` stays unset unless the kata
+profile deploys it.
+
+| Piece | Where |
+|---|---|
+| Lab guest kernel | `tools/images/kata-kernel/`: upstream 6.18.35 (tarball sha256-pinned) + Kata's `config-6.18.35-202` (vendored, sha256-pinned) + `lab.config` (section 4.3's options, plus VLAN-aware bridges, ECMP, `sch_ingress`/flower/gact and VFAT), release `6.18.35-ct1`. `build.sh` fails when `olddefconfig` drops an option or `modules.builtin` drifts from the committed copy |
+| Kernel artifact | `.github/workflows/kata-kernel.yml` (free hosted runner): build and check on PRs; on main, tags and manual runs `oras push` to `ghcr.io/thecorporatetractor/cloudtrain/kata-lab-kernel:<release>`, cosign keyless, SLSA provenance; a published release is never overwritten |
+| Tier-B images | `deb-sys:24.04`, `el-sys:10` (`tools/images/linux-pod/sys/`, catalog `tier: B, systemd: true`): the tier-A image + systemd behind `ct-sysinit` (the `init` leaf cgroup of 4.2, loop/dm/md nodes), sshd, chrony, nftables, LVM/mdadm, kmod, passwordless sudo; the lab kernel's `modules.builtin` under `/lib/modules/6.18.35-ct1`, so `modprobe bonding` and the labs' `modprobe X \|\| grep X.ko modules.builtin` guards succeed |
+| kind profile | `KIND_PROFILE=kata`: `host-prep.sh` loads `vhost_vsock`; `deploy/scripts/kata-up.sh` does the node fixes of 1.3 (dbus from the node image's own Debian snapshot), installs kata-deploy 4.2.0 (chart sha256, image digest; `clh-runtime-rs` only), the lab kernel with its `config.d` drop-in, and runs a probe pod; `orchestrator-deploy.sh` defaults to `B=kata-clh-runtime-rs` |
+| Preflight | `labctl preflight` sandbox section (6.3): RuntimeClasses, tier map, and with `--probe` own kernel, lab features, guest sizing, and with `--systemd-image` systemd boot + exec |
+| Lab variants | `tools/kata/lab-variant.sh`: a tier-B VM lab's `ubuntu-vm`/`el-vm` nodes become `deb-sys`/`el-sys` pods, nothing else changes |
+
+### Reproducible kernel
+
+The toolchain is `UBUNTU_BASE_IMAGE` with packages from `UBUNTU_APT_SNAPSHOT`
+(gcc 13.3.0, binutils 2.42), the tree is at a fixed path, and
+`KBUILD_BUILD_TIMESTAMP/USER/HOST/VERSION` are fixed. Two builds on ct-testvm
+and one on a GitHub-hosted runner gave the same vmlinux,
+`sha256 eef56b76da5b0ac2a69eb7b8a05d9dd2c8e7fdb5ef806f1a44358eef36d47554`.
+That sum is pinned as `KATA_LAB_KERNEL_SHA256`; `build.sh --check` (the
+workflow) and `kata-up.sh` refuse any other. A build takes 5 minutes on
+ct-testvm and 12 minutes on a hosted runner.
+
+### Verification on ct-testvm
+
+This ran in a separate cluster `ct-kata2` (1 control plane + 1 worker, its own
+kubeconfig, `KIND_PROFILE=kata CT_CLUSTER_NAME=ct-kata2`). `cloudtrain-dev`
+and the batch runner were not touched. The host load average was 30-80.
+
+- **dev-up from scratch:** 362 s to a probe pod booting `6.18.35-ct1` in
+  `kata-clh-runtime-rs` (KubeVirt 129 s, CDI 40 s, kata-deploy 71 s). Rerunning
+  it on the existing cluster converges in about 52-91 s.
+- **Preflight** (`--tier-runtime-classes B=kata-clh-runtime-rs --probe`): every
+  sandbox check passes. Own guest kernel `6.18.35-ct1` (node `7.0.0-1014-aws`),
+  dummy, GRE, bond, VLAN, WireGuard, netem and md built in, guest 505 MiB for a
+  512 MiB limit. `cloudtrain/deb-sys:24.04` and `cloudtrain/el-sys:10`
+  (systemd 257, cgroup v2 only) both boot to `running` and accept
+  `kubectl exec`. Without the flag the section warns that no tier is mapped,
+  and exits 0.
+- **`labctl verify --parallel 1 --grade-timeout 15m`**, orchestrator with
+  `--tier-runtime-classes=B=kata-clh-runtime-rs`, on the Kata variants of three
+  tier-B labs (`tools/kata/lab-variant.sh`): 3 labs, 16 runs, 0 failed. Every
+  session was Ready in 20-25 s.
+
+| Lab (Kata variant) | Needs | Runs | Result |
+|---|---|---|---|
+| `systemd-service-lifecycle` | systemd as PID 1, exec | 2 seeds, 3 mutations, 1 alternative | all ok, grades as on the VM (100 / 78 / 67 / 78 / 100) |
+| `netem-impaired-link` | `sch_netem`, `sch_tbf` (`modprobe` in setup) | 2 seeds, 2 mutations, 1 alternative | all ok (100 / 67 / 42 / 100) |
+| `bridge-vlan-namespaces` | VLAN-aware bridge, veth, netns | 2 seeds, 2 mutations, 1 alternative | all ok (100 / 29 / 47 / 100) |
+
+The first run of `bridge-vlan-namespaces` failed with `RTNETLINK answers:
+Operation not supported`, because Kata's config lacks
+`CONFIG_BRIDGE_VLAN_FILTERING`. That option and the other gaps of the same kind
+went into `lab.config` before the run above. The other two labs passed in both
+runs.
+
+- **Flag off** (the default, `TIER_RUNTIME_CLASSES=` deploys the manager without
+  `--tier-runtime-classes`): the unchanged `systemd-service-lifecycle` on its
+  `ubuntu-vm` passed 6/6 runs (2 seeds, 3 mutations, 1 alternative; Ready
+  55-70 s), with the same grades as the Kata variant. The Kata variant fails
+  within 5 s and is never started as a privileged runc pod: `image deb-sys:24.04
+  runs systemd and needs a sandbox runtime for tier "B" ... unsupported`.
+
+Still open from section 8: building deb-sys/el-sys in CI and wiring ssh keys
+into container nodes (1), a nightly verify on the profile (3), the upstream
+issue (4, waits on the owner), `orchestrator.sandboxes`, the `vmFallback`
+rewrite and gateway capacity accounting (5), re-tiering the content (6), and
+the managed-cloud probes (7).
+
