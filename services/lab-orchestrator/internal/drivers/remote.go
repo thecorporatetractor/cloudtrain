@@ -33,10 +33,17 @@ func execOnHost(ctx context.Context, c *ContainerDriver, ref NodeRef, host strin
 	r := req
 	r.Kind, r.Member = ExecShell, ""
 	r.Command = []string{"ssh", "-T", host, shellQuote(req.Command)}
+	var res ExecResult
+	var err error
 	if req.User == labsv1.ActionAsLearner {
-		return c.LearnerExec(ctx, ref, r)
+		res, err = c.LearnerExec(ctx, ref, r)
+	} else {
+		res, err = c.AdminExec(ctx, ref, r)
 	}
-	return c.AdminExec(ctx, ref, r)
+	if err == nil && hostAccessFailed(res) {
+		res.NoHostAccess = true
+	}
+	return res, err
 }
 
 // learnerContextScript runs "$@" with a private copy of the learner's

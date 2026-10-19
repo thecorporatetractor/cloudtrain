@@ -97,6 +97,9 @@ type ExecResult struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
+	// NoHostAccess: the command never ran because ssh could not log in to
+	// the VM-backed host (see hostAccessFailed).
+	NoHostAccess bool
 }
 
 // NodeDriver provisions and operates one kind of topology node. All methods

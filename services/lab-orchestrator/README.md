@@ -43,7 +43,7 @@ an object it did not create (`ErrConflict`).
 | Driver | Backend | What it builds |
 |---|---|---|
 | `container` | Pod + ClusterIP Service (RuntimeClass, e.g. `kata`) | Image from the catalog. The **entry node** gets an admin sidecar, host aliases for every VM host and, with VMs, a second NIC on the lab network. |
-| `vm` | KubeVirt `VirtualMachine` | Catalog image on the lab network, root disk a CDI DataVolume imported from the containerDisk (`--vm-disks=persistent`, default) or the containerDisk itself; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
+| `vm` | KubeVirt `VirtualMachine` | Catalog image on the lab network, root disk a CDI DataVolume imported from the containerDisk (`--vm-disks=persistent`, default) or the containerDisk itself; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, grader access (below), pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
 | `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy and by Pod Security admission on the host namespace (`--vcluster-pod-security`, default `baseline`: privileged, hostPath, host namespaces/ports and extra capabilities are rejected, the virtual pod stays Pending with a sync error; `restricted` violations are audited). Ephemeral containers are refused earlier, inside the virtual cluster: the chart's `experimental.deploy` installs the ValidatingAdmissionPolicy `cloudtrain-ephemeral-pod-security` (same level), because the virtual API server would accept one that the host then refuses, and an ephemeral container can never be removed, so every later one of that Pod would fail to sync too. `kubectl debug` (default profile `general` adds SYS_PTRACE) gets `Forbidden ... use --profile=baseline`. |
 | `k8s-cluster` `kubeadm` | one KubeVirt VM per `cluster.nodes[]` | The orchestrator owns the PKI (CA, bootstrap token, admin/learner client certs, host keys), so kubeconfigs exist before boot. Control plane: `kubeadm init` with the pre-seeded CA, version = the image's kubeadm, CNI via the image's `/opt/cloudtrain/bin/cni-install <podCIDR>` (fallback: bundled Flannel manifest), pod CIDR 10.244.0.0/16. Workers join with a pinned CA hash. Declared taints are exact (`[]` = untainted), labels applied after join, `state: notready` = joined, Ready once, then kubelet stopped and disabled; `state: unjoined` = a prepared host that runs neither init nor join (not registered, no taints or labels) for the learner to join; its role still sizes the VM, so `role: control-plane, state: unjoined` is a further control plane with the control-plane resources (exactly one control plane is not unjoined and runs `kubeadm init`). Ready once every member matches its declared state and CoreDNS is available. |
 | `netdev` | Pod per device (FRR); vrnetlab VMs / Clabernetes later | implemented for FRR (see "Lab network and netdev") |
@@ -51,6 +51,30 @@ an object it did not create (`ErrConflict`).
 Image refs resolve through the image catalog (`--image-catalog`, files or
 directories, later files override earlier ones). An unknown ref, or a ref of
 the wrong kind, fails the node permanently with the list of known refs.
+
+### Grader access to VM hosts (`graderaccess.go`)
+
+Checks, setup steps and mutations reach a VM-backed host as root over ssh from
+the entry node's admin sidecar. So that hardening labs (`PermitRootLogin no`,
+`AllowUsers`/`AllowGroups`, `AuthenticationMethods`, ...) do not lock the grader
+out, cloud-init installs `/etc/ssh/sshd_config.d/00-cloudtrain-grader.conf`, which
+only includes `/etc/ssh/cloudtrain/grader.conf`: a `Match User root Address
+192.168.99.5` block that allows root with the admin key from
+`/etc/ssh/cloudtrain/grader_keys` (not root's `authorized_keys`). sshd ends a Match
+block at the end of its file, so nothing else changes: `sshd -T` (the global
+configuration checks grade) is unaffected, and a root login from 127.0.0.1, from
+another host or with another key follows the learner's policy. Lab authors:
+
+- grade sshd with `sshd -T`, and probe "root is refused" from the host itself
+  (`ssh ... root@127.0.0.1` with a probe key), never from the workstation;
+- setup steps must not delete the two files (`rm sshd_config.d/00-*` does);
+- tell learners in hardening descriptions to keep the file. If the grader's ssh
+  login fails (refused or unreachable), every check on that host fails with
+  "the grader could not log in to this host ..." whatever its expect is.
+
+Ciphers, KEX, MACs, host key algorithms, `ListenAddress`/`Port`, firewalls and
+fail2ban bans of 192.168.99.5 cannot be overridden this way and still lock the
+grader out.
 
 ### Per-session lab network (`labnet.go`)
 
