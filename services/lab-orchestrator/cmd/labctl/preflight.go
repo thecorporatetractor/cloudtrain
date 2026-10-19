@@ -801,7 +801,7 @@ func podEvents(ctx context.Context, c client.Client, pod *corev1.Pod) string {
 }
 
 func readModules(path string) ([]string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}
