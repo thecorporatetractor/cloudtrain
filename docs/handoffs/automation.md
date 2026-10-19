@@ -15,7 +15,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 | Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
 | Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
 | Round 5 wave 3: 12 VM learning labs (incl. the 3 tier-B fundamentals labs) + 9 blocked (network, EE, EDA, timesync) written in PR #126 (none live) | 21 | 0 | 0 |
-| Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 22 built + 1 proposed (blocked) in PR #84 | 12 (PR #84, live labctl verify) | 26 |
+| Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 22 built + 1 proposed (blocked) in PR #84 | 13 (PR #84, live labctl verify) | 26 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
 ov-ansible-cfg-project, ov-adhoc-kernel-census, ov-first-playbook-motd,
@@ -215,7 +215,7 @@ configuration; privilege-scoping parses configuration and inventory as data; the
 fact-gathering stamps the nodes issued. Known platform limit: `ct-ansible recap` (weight-1 rerun checks in every
 Ansible lab) still runs as the learner.
 
-Live verify (labctl verify on ct-testvm, scoped manager): 12 labs passed a full `labctl verify` (both seeds, every misconception and alternative) on 2026-10-19 and are `verified`: ov-automate-archive-evidence, ov-constructed-inventory, ov-custom-facts-tier, ov-custom-filter-plugin, ov-lint-clean-role, ov-migrate-core-219, ov-molecule-role-tests, ov-navigator-run-settings, ov-privilege-scoping, ov-python-module-check-mode, ov-tags-partial-runs, ov-vault-db-credentials. @CI@
+Live verify (labctl verify on ct-testvm, scoped manager): 13 labs passed a full `labctl verify` (both seeds, every misconception and alternative) on 2026-10-19 and are `verified`: ov-automate-archive-evidence, ov-constructed-inventory, ov-custom-facts-tier, ov-custom-filter-plugin, ov-ci-pipeline-lint-test, ov-lint-clean-role, ov-migrate-core-219, ov-molecule-role-tests, ov-navigator-run-settings, ov-privilege-scoping, ov-python-module-check-mode, ov-tags-partial-runs, ov-vault-db-credentials.
 
 Adaptations and blockers:
 - ov-git-push-playbooks, ov-ci-pipeline-lint-test: gitea:1 is not in the catalog; an el-lab pod (ov-git) holds the bare repo (CI: a poller on ov-ctl, /usr/local/lib/ov-ci/runner.py, runs the pipeline file and records runs under /var/ci/runs).
