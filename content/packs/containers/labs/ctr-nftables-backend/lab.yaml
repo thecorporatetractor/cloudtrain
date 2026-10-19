@@ -85,6 +85,11 @@ spec:
         install -d /etc/docker
         [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
         jq '. + {labels: ["site=copperleaf-edge"]}' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        # the engine is restarted several times within a minute (setup, grading, the learner): do not trip systemd's start limit
+        install -d /etc/systemd/system/docker.service.d /etc/systemd/system/docker.socket.d
+        printf '[Unit]\nStartLimitIntervalSec=0\n' > /etc/systemd/system/docker.service.d/10-cl-lab.conf
+        printf '[Unit]\nStartLimitIntervalSec=0\n' > /etc/systemd/system/docker.socket.d/10-cl-lab.conf
+        systemctl daemon-reload
         systemctl restart docker
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         rm -f /etc/systemd/system/cl-edge-nft.service /etc/copperleaf/edge.nft
@@ -93,7 +98,7 @@ spec:
         printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 8080' 'CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]' > "$d/Dockerfile"
         docker build -q -t copperleaf/transcoder-edge:1 "$d" >/dev/null; rm -rf "$d"
         docker rm -f transcoder-edge >/dev/null 2>&1 || true
-        docker run -d --name transcoder-edge --restart unless-stopped -p {{port}}:8080 copperleaf/transcoder-edge:1 >/dev/null
+        docker run -d --init --name transcoder-edge --restart unless-stopped -p {{port}}:8080 copperleaf/transcoder-edge:1 >/dev/null
         cat > /etc/systemd/system/cl-edge-user.service <<'UNIT'
         [Unit]
         Description=Allow the transcoder edge port from the partner range only (iptables)
