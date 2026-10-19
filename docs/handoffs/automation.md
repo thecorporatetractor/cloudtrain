@@ -15,7 +15,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 | Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
 | Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
 | Round 5 wave 3: 12 VM learning labs (incl. the 3 tier-B fundamentals labs) + 9 blocked (network, EE, EDA, timesync) written in PR #126 (none live) | 21 | 0 | 0 |
-| Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 23 written in PR #84 (unmerged, 22 runnable, 1 blocked), none live | 0 | 26 |
+| Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 22 built + 1 proposed (blocked) in PR #84 | @VER@ | 26 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
 ov-ansible-cfg-project, ov-adhoc-kernel-census, ov-first-playbook-motd,
@@ -192,43 +192,33 @@ Verify queue for the testing round: two disjoint `exam run --auto-solve --attemp
 `--no-solve` for `sim-el-automation`, then a per-task `labctl verify` of all 19 tasks and the 2
 `xpe-ansible-*` tasks in the vm slot (one session at a time; four VMs per exam session).
 
-## Round 5, wave 2 (write-only, PR #84 NOT merged)
+## Round 5, wave 2 (PR #84)
 
-PR #84 (`content/automation-r5-w2`, head 520128d): 23 tier-A pod-fleet labs, all `built`
-(none verified, none run live). It was not merged: round-3 review found four majors and the
-branch conflicts with origin/main in `README.md` and `docs/curriculum.md` (so no CI ran). To
-land it: rebase, keep both sides, `node tools/curriculum/render.mjs`, fix the majors below,
-then keep curriculum images in sync with lab.yaml node images and `deploy/images/catalog.yaml`
-(lab-verify now errors otherwise). Static gates passed locally (lab-verify --strict 0 errors,
-render --check clean).
+PR #84 (`content/automation-r5-w2`): 22 tier-A pod-fleet labs `built` plus 1 lab still `proposed`
+(ov-devcontainer-workflow, blocked; its draft lives in `docs/handoffs/automation-drafts/`, outside the pack).
 
-Labs (22 runnable + 1 blocked): ov-automate-archive-evidence, ov-build-publish-collection,
-ov-ci-pipeline-lint-test, ov-collections-offline, ov-constructed-inventory,
-ov-custom-facts-tier, ov-custom-filter-plugin, ov-debug-failing-play, ov-delegate-lb-drain,
-ov-dynamic-inventory-cmdb, ov-git-push-playbooks, ov-lint-clean-role, ov-lookups-filters-ipam,
-ov-migrate-core-219 (runs on ansible-core 2.21; no staged 2.19 needed), ov-molecule-role-tests,
-ov-navigator-run-settings, ov-privilege-scoping, ov-python-module-check-mode,
-ov-register-disk-report, ov-rolling-update-serial, ov-tags-partial-runs, ov-vault-db-credentials;
-blocked: ov-devcontainer-workflow.
+Built (22): ov-automate-archive-evidence, ov-build-publish-collection, ov-ci-pipeline-lint-test,
+ov-collections-offline, ov-constructed-inventory, ov-custom-facts-tier, ov-custom-filter-plugin,
+ov-debug-failing-play, ov-delegate-lb-drain, ov-dynamic-inventory-cmdb, ov-git-push-playbooks,
+ov-lint-clean-role, ov-lookups-filters-ipam, ov-migrate-core-219 (runs on ansible-core 2.21; no staged 2.19
+needed), ov-molecule-role-tests, ov-navigator-run-settings, ov-privilege-scoping, ov-python-module-check-mode,
+ov-register-disk-report, ov-rolling-update-serial, ov-tags-partial-runs, ov-vault-db-credentials.
+Proposed (1, blocked): ov-devcontainer-workflow (needs code-server in `ansible-ctl` and a gateway web-access proxy).
 
-Blockers per lab:
+Grading rule used by these labs (round-4 review of PR #84): no learner code runs in a process that decides a
+verdict. Learner trees are read as the learner into a root-owned archive (bounded; a read that fails fails the
+check) and judged from a copy by `nobody` or by the grading account `ctjudge` (own uid, own SSH key for `ovauto` on
+the nodes, home the learner cannot read). Linting strips every ansible.cfg, Python file, plugin/module/module_utils
+directory and vendored collection first; the CI runner treats such code in a commit as tampering and runs its own
+Molecule verdict as ctjudge with the original scenario; Molecule, module, filter and vault runs use a fixed
+configuration; privilege-scoping parses configuration and inventory as data; the navigator artifact must carry the
+fact-gathering stamps the nodes issued. Known platform limit: `ct-ansible recap` (weight-1 rerun checks in every
+Ansible lab) still runs as the learner.
 
-| Lab | Blocker |
-|---|---|
-| ov-devcontainer-workflow | needs code-server in `ansible-ctl` and a gateway web-access proxy; written otherwise complete (title no longer names VS Code) |
-| ov-register-disk-report | major: grades a rerun with changed=0 and a pct-1 threshold on live `df` values that keep changing; correct learners can fail |
-| ov-build-publish-collection | major: grades a `requirements.yml` the statement never asks for |
-| ov-delegate-lb-drain | major: the no-wait-for-health mutation may not fail `no-failed-requests` (HAProxy re-checks a re-enabled server immediately); haproxy install in a pod is unconfirmed, test it first |
-| all of README/docs conflicts | PR conflicts in `README.md` and `docs/curriculum.md` |
+Live verify (labctl verify on ct-testvm, scoped manager): @LIVE@
 
-Minors: TOCTOU read by the root CI runner, Molecule checks grep log strings, the navigator
-artifact substring check, stale "Galaxy" curriculum title, fixed CMDB site set, lon host name
-vs the site param. The tags lab does not depend on the mirror (it removes the preinstalled
-`tree` package).
-
-Verify queue (all pod slot; no VM, kubeadm, netdev or Kata needs): 22 runnable labs above,
-after the majors are fixed, from origin/main by the batch runner. Kata-blocked: none. Image-blocked:
-ov-devcontainer-workflow (code-server + web proxy).
+Verify queue (pod slot, batch runner from origin/main): the built labs not verified live above.
+Image-blocked: ov-devcontainer-workflow (code-server + web proxy).
 
 ## Round 5, wave 3 (write-only, PR #126)
 
@@ -360,11 +350,10 @@ base build is untested.
 ## Verify queue (testing round, grouped by slot kind)
 
 - **vm slot** (el-vm:10): the 12 VM labs above. Needing reboots: ov-reboot-persistence-fix, ov-async-patching (boot-id). Also: `sim-el-automation` exam runs and per-task verify of the 19 xan + 2 xpe tasks (four VMs per session, one at a time).
-- **pod slot**: the 22 runnable labs of PR #84 (not merged; fix its 4 majors and conflicts first).
+- **pod slot**: the PR #84 built labs not yet verified live (see the wave 2 section).
 - **netdev**, **kubeadm**, **Kata**: none.
 - **image-blocked**: the 8 wave-4 controller/alert labs (not written, awx:24 + gitea:1 + alertmanager); ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-execution-environment-build (Podman VM variant with the registry and EE base images). Unblocked by the 2026-10-19 image rebuild: ov-system-role-timesync and the xan roles timesync/selinux tasks, the 6 `ov-net-*` labs (ov-net-srlinux-interfaces keeps its FRR-only fallback), ov-eda-webhook-rulebook.
 
-Unmerged PRs: #84 (wave 2, 23 pod labs).
 
 ## Next steps
 
@@ -413,14 +402,14 @@ tools/slots/run.sh vm -- services/lab-orchestrator/bin/labctl exam run --context
   --session-label labs.cloudtrain.dev/verify=auto --allow-missing --auto-solve sim-el-automation
 ```
 
-## Round 5 wave 2 (tier-A pod fleets, 23 labs built, none run live)
+## Round 5 wave 2 (tier-A pod fleets, 22 labs built, 1 proposed)
 
 Built, status `built`: ov-navigator-run-settings, ov-git-push-playbooks, ov-tags-partial-runs, ov-custom-facts-tier,
 ov-register-disk-report, ov-vault-db-credentials, ov-collections-offline, ov-automate-archive-evidence,
-ov-devcontainer-workflow, ov-lint-clean-role, ov-molecule-role-tests, ov-debug-failing-play, ov-migrate-core-219,
+ov-lint-clean-role, ov-molecule-role-tests, ov-debug-failing-play, ov-migrate-core-219,
 ov-ci-pipeline-lint-test, ov-constructed-inventory, ov-dynamic-inventory-cmdb, ov-lookups-filters-ipam,
 ov-privilege-scoping, ov-custom-filter-plugin, ov-python-module-check-mode, ov-build-publish-collection,
-ov-rolling-update-serial, ov-delegate-lb-drain. Pack courses added for the matching path modules.
+ov-rolling-update-serial, ov-delegate-lb-drain (22). Proposed, blocked: ov-devcontainer-workflow. Pack courses added for the matching path modules.
 
 Adaptations and blockers:
 - ov-git-push-playbooks, ov-ci-pipeline-lint-test: gitea:1 is not in the catalog; an el-lab pod (ov-git) holds the bare repo (CI: a poller on ov-ctl, /usr/local/lib/ov-ci/runner.py, runs the pipeline file and records runs under /var/ci/runs).
@@ -430,7 +419,7 @@ Adaptations and blockers:
 - ov-delegate-lb-drain: needs haproxy from the el10 mirror in an el-lab pod (own setup step, 600 s; ov-lb1 has cpu 0.5 / 512 MiB); if it does not install, move to VMs.
 - ov-tags-partial-runs: removes the preinstalled tree package (no mirror dependency); the certificate uses openssl, not community.crypto (no python cryptography in the pods).
 
-Verify queue: 22 pod labs on the remote batch runner (labctl verify, two seeds, mutations, alternatives) plus 1 blocked (ov-devcontainer-workflow: status proposed, not in any course or path module and not counted as built; its terminal-only stand-in is kept as a draft in docs/handoffs/automation-drafts/ov-devcontainer-workflow/lab.yaml, outside the pack, until code-server and the web proxy exist).
+Verify queue: the 22 built pod labs not verified live, on the remote batch runner (labctl verify, two seeds, mutations, alternatives), plus 1 blocked (ov-devcontainer-workflow: status proposed, not in any course or path module and not counted as built; its terminal-only stand-in is kept as a draft in docs/handoffs/automation-drafts/ov-devcontainer-workflow/lab.yaml, outside the pack, until code-server and the web proxy exist).
 
 ## Open questions (user)
 
