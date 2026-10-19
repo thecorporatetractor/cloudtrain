@@ -56,13 +56,20 @@ export function registerWaitlistRoutes(app: FastifyInstance, deps: WaitlistDeps)
   if (!deps.store) return;
   const store = deps.store;
   const admin = { config: { permission: 'org.manage' as const, anyOrg: true } };
+  // The admin export is behind platform-admin authorisation; the limiter only bounds a misbehaving client.
+  const adminLimiter = new RateLimiter(60, deps.now);
+  const throttle = (ip: string) => {
+    if (!adminLimiter.take(ip)) throw new HttpError(429, 'Too many requests', { code: 'rate_limited', details: { retryAfterSeconds: adminLimiter.resetIn(ip) } });
+  };
   const limitOf = (q: { limit?: string }) => Math.min(MAX_EXPORT, Math.max(1, Number.parseInt(q.limit ?? '', 10) || MAX_EXPORT));
 
   app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist', admin, async (req) => {
+    throttle(req.ip);
     authorize(req.principal, 'org.manage', { kind: 'platform' });
     return store.list(limitOf(req.query));
   });
   app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist.csv', admin, async (req, reply) => {
+    throttle(req.ip);
     authorize(req.principal, 'org.manage', { kind: 'platform' });
     const { entries } = await store.list(limitOf(req.query));
     return reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', 'attachment; filename="waitlist.csv"').send(waitlistCsv(entries));

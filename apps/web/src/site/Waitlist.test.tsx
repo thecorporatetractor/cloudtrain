@@ -12,7 +12,7 @@ const site = parse(siteYaml) as SiteConfig;
 const cfg = site.waitlist!;
 const noop = () => undefined;
 /** The opening tag of the first `<tag>` that carries `attr` (React does not keep attribute order). */
-const tag = (html: string, name: string, attr: string): string => html.match(new RegExp(`<${name}\\b[^>]*${attr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^>]*>`))?.[0] ?? '';
+const tag = (html: string, name: string, attr: string): string => html.split(`<${name}`).slice(1).map((t) => `<${name}${t.slice(0, t.indexOf('>') + 1)}`).find((t) => t.includes(attr)) ?? '';
 const withQuery = (el: ReactElement) => renderToStaticMarkup(<QueryClientProvider client={new QueryClient()}>{el}</QueryClientProvider>);
 const view = (p: Partial<WaitlistViewProps> = {}) => renderToStaticMarkup(<WaitlistView cfg={cfg} values={emptyWaitlistForm} errors={{}} phase="idle" onChange={noop} onSubmit={noop} {...p} />);
 
