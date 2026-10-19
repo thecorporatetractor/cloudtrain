@@ -1,0 +1,432 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-devcontainer-workflow
+  title: Fix a team playbook's lint findings and push the fix
+  domain: automation
+  frameworks:
+  - ex294-aligned:git-devworkflow
+  difficulty: easy
+  estimatedMinutes: 20
+  tags:
+  - ansible
+  - devcontainer
+  - lint
+  - git
+  version: 1
+spec:
+  description: |
+    The policy database team keeps its playbook in the repository **`git@ov-git:policy-db.git`**, which holds
+    `provision.yml`, an inventory and the dev container definition `.devcontainer/devcontainer.json`.
+
+    The browser editor that normally opens this repository in its dev container is not available in this lab, so
+    do the same work from the control node terminal. Clone the repository to `/home/learner/policy-db` and run
+    `ansible-lint` on `provision.yml`: fix **all** of its findings, without silencing the linter. Run the
+    playbook (it configures `ov-db-1`), then commit the fix on a new branch **`lint-fix`** and push it. Leave
+    `main` and the dev container definition unchanged.
+
+    Running the playbook again must report no changes.
+  objectives:
+  - Read the team's dev container definition and work from the repository
+  - Read and fix linter findings from the terminal
+  - Run a playbook and push the fix on a branch
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    conns:
+      type: int
+      min: 100
+      max: 900
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-git
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-git:eth1
+    - a: ov-ctl:eth2
+      b: ov-db-1:eth1
+  setup:
+  - 'on': ov-git
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-git) a=40 ;; ov-db-1) a=21 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-git)
+          id git >/dev/null 2>&1 || useradd -m -d /srv/git -s /bin/bash -c "Git service" git
+          echo 'git:Ov-boot-{{bootpw}}' | chpasswd
+          install -d -o git -g git /srv/git ;;
+        ov-db-1) mkdir -p /etc/ov ;;
+      esac
+  - 'on': ov-db-1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-git=10.70.0.40 ov-db-1=10.70.0.21
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-git ov-db-1
+      ct-ansible pushkey git Ov-boot-{{bootpw}} ov-git
+      ct-ansible run /home/learner ssh ovauto@ov-git "sudo -n usermod -p '*' git"
+  - 'on': ov-git
+    run: |
+      set -eu
+      cd /srv/git
+      runuser -u git -- sh -eu <<'EOS'
+      if [ ! -d /srv/git/policy-db.git ]; then
+        git init -q --bare -b main /srv/git/policy-db.git
+        t=$(mktemp -d); git -C $t init -q -b main
+        printf '# Orrin and Vale: policy-db\n' > $t/README.md
+        mkdir -p $t/$(dirname provision.yml)
+        cat > $t/provision.yml <<'EOF'
+      - hosts: policy_db
+        become: true
+        tasks:
+          - copy:
+              dest: /etc/ov/policy-db-settings.conf
+              content: |
+                max_connections={{conns}}
+                log_dir=/var/log/ov-policy
+          - file: path=/var/log/ov-policy state=directory
+          - command: chmod 0750 /var/log/ov-policy
+      EOF
+        mkdir -p $t/$(dirname inventory.yml)
+        cat > $t/inventory.yml <<'EOF'
+      policy_db:
+        hosts:
+          ov-db-1:
+      EOF
+        mkdir -p $t/$(dirname ansible.cfg)
+        cat > $t/ansible.cfg <<'EOF'
+      [defaults]
+      inventory = inventory.yml
+      remote_user = ovauto
+      EOF
+        mkdir -p $t/$(dirname .devcontainer/devcontainer.json)
+        cat > $t/.devcontainer/devcontainer.json <<'EOF'
+      {
+        "name": "policy-db automation",
+        "image": "ansible-ctl:2.21",
+        "remoteUser": "learner",
+        "workspaceFolder": "/home/learner/policy-db",
+        "postCreateCommand": "ansible --version",
+        "customizations": { "vscode": { "settings": { "ansible.validation.lint.enabled": true } } }
+      }
+      EOF
+        git -C $t add -A
+        git -C $t -c user.name='O&V platform' -c user.email=platform@orrinvale.example commit -q -m 'Initial commit'
+        git -C $t push -q /srv/git/policy-db.git main
+        rm -rf $t
+      fi
+      EOS
+  checks:
+  - id: fix-pushed
+    description: Branch lint-fix is on the Git server, main and the dev container definition are unchanged
+    type: shell
+    'on': ov-git
+    skills:
+    - automation.devworkflow.git
+    - automation.devworkflow.devcontainer
+    weight: 2
+    command: |
+      g="runuser -u git -- git --git-dir=/srv/git/policy-db.git"
+      $g rev-parse -q --verify refs/heads/lint-fix >/dev/null || { echo no-branch; exit 0; }
+      r=""
+      [ "$($g rev-parse lint-fix:.devcontainer/devcontainer.json 2>/dev/null)" = "$($g rev-parse main:.devcontainer/devcontainer.json)" ] || r="$r devcontainer-changed"
+      [ "$($g rev-list --count main)" = 1 ] || r="$r main-changed"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: lint-clean
+    description: provision.yml on branch lint-fix passes ansible-lint
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.devworkflow.devcontainer
+    weight: 2
+    timeoutSec: 180
+    command: |
+      t=$(ct-ansible run / mktemp -d)
+      ct-ansible run /home/learner git clone -q -b lint-fix git@ov-git:policy-db.git $t/repo 2>/dev/null || { echo no-branch; ct-ansible run / rm -rf $t; exit 0; }
+      # Judged on a copy without .git or any lint configuration or ignore file, with a configuration the grader owns.
+      # The clone is only read as the learner; it is streamed into a directory owned by the unprivileged account nobody
+      # and every later step runs as nobody, so no learner process can touch the judged copy.
+      cfg=$(mktemp); printf -- '---\nskip_list: []\nwarn_list: []\n' > $cfg; chmod 0644 $cfg
+      j=$(mktemp -d); chmod 0755 $j; chown nobody $j
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 "$@"); }
+      clean() { rm -f $cfg; rm -rf $j; ct-ansible run / rm -rf $t; }
+      ct-ansible run $t/repo timeout 60 tar --exclude=./.git -cf - . | N timeout 60 tar -x --no-same-owner --no-same-permissions -f - || { clean; echo copy-failed; exit 0; }
+      N sh -c 'find . -type l -delete; rm -rf .git .ansible-lint .ansible-lint.yml .ansible-lint.yaml .ansible-lint-ignore .config .yamllint .yamllint.yml .yamllint.yaml; find . \( -name ".gitignore" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name ".yamllint*" \) -delete'
+      if [ -n "$(N sh -c 'timeout 30 grep -rIlE "skip_ansible_lint|noqa" . | head -1')" ]; then clean; echo lint-silenced; exit 0; fi
+      # ansible-lint only reads *.yml/*.yaml, so tasks pulled in through include/import from another file would escape it
+      if [ -n "$(N sh -c 'timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1')" ]; then clean; echo lint-silenced; exit 0; fi
+      out=$(N timeout 150 /opt/ansible/bin/ansible-lint -c $cfg --offline -p --nocolor provision.yml 2>&1); rc=$?
+      clean
+      [ $rc = 0 ] && echo clean || echo lint-findings
+    expect:
+      match: exact
+      value: clean
+  - id: lint-not-silenced
+    description: Lint was fixed, not silenced (no noqa, skip tag, lint configuration or ignore file)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.devworkflow.devcontainer
+    weight: 1
+    timeoutSec: 60
+    command: |
+      t=$(ct-ansible run / mktemp -d)
+      ct-ansible run /home/learner git clone -q -b lint-fix git@ov-git:policy-db.git $t/repo 2>/dev/null || { echo no-branch; ct-ansible run / rm -rf $t; exit 0; }
+      if [ -n "$(ct-ansible run $t/repo sh -c 'find . -path ./.git -prune -o \( -name ".ansible-lint*" -o -name "ansible-lint*" -o -path "*/.config/*" -o -name .config \) -print | head -1')" ]; then r=silenced
+      elif ct-ansible run $t/repo timeout 30 grep -rIqsEi --exclude-dir=.git --include=.gitignore 'yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]' . ; then r=silenced
+      elif ct-ansible run / test -e /home/learner/.config/yamllint; then r=silenced
+      elif [ -n "$(ct-ansible run $t/repo sh -c 'timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1')" ]; then r=silenced
+      elif ct-ansible run $t/repo timeout 30 grep -rIqsE --exclude-dir=.git 'skip_ansible_lint|noqa|skip_list|warn_list|skip_tasks|exclude_paths|enable_list' .; then r=silenced; else r=ok; fi
+      ct-ansible run $t/repo test -f provision.yml || r=no-playbook
+      ct-ansible run / rm -rf $t; echo $r
+    expect:
+      match: exact
+      value: ok
+  - id: settings-applied
+    description: ov-db-1 has the policy database settings and the log directory from the playbook
+    type: shell
+    'on': ov-db-1
+    skills:
+    - automation.devworkflow.devcontainer
+    weight: 1
+    command: |
+      f=/etc/ov/policy-db-settings.conf
+      [ "$(cat $f 2>/dev/null)" = "$(printf 'max_connections={{conns}}\nlog_dir=/var/log/ov-policy')" ] || { echo settings; exit 0; }
+      [ "$(stat -c %a /var/log/ov-policy 2>/dev/null)" = 750 ] && echo ok || echo log-dir
+    expect:
+      match: exact
+      value: ok
+  - id: provision-rerun
+    description: provision.yml runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.devworkflow.devcontainer
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/policy-db provision.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: What the linter wants
+    body: 'Run `ansible-lint provision.yml` in the terminal for the full list: play and task names, fully qualified collection names such as `ansible.builtin.copy`, explicit file modes, and modules instead of `command`.'
+    cost: 1
+  - title: Branch and push
+    body: '`git switch -c lint-fix`, commit, then `git push -u origin lint-fix`.'
+    cost: 1
+  misconceptions:
+  - id: noqa-everything
+    description: Silences the findings with noqa comments instead of fixing them.
+    feedback: Fix the findings (names, fully qualified module names, real modules); do not silence them.
+    expectFail:
+    - lint-not-silenced
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~ && rm -rf policy-db && git clone -q git@ov-git:policy-db.git && cd policy-db
+        git config user.name learner && git config user.email learner@orrinvale.example
+        cat > provision.yml <<'EOF'
+        - hosts: policy_db  # noqa name[play]
+          become: true
+          tasks:
+            - copy:  # noqa fqcn[action-core] name[missing]
+                dest: /etc/ov/policy-db-settings.conf
+                content: |
+                  max_connections={{conns}}
+                  log_dir=/var/log/ov-policy
+            - file: path=/var/log/ov-policy state=directory  # noqa fqcn[action-core] name[missing]
+            - command: chmod 0750 /var/log/ov-policy  # noqa command-instead-of-module name[missing] no-changed-when
+        EOF
+        ansible-playbook provision.yml || ansible-playbook provision.yml
+        git switch -q -c lint-fix
+        git add provision.yml
+        git commit -q -m 'Fix lint findings in provision.yml'
+        git push -q -u origin lint-fix
+  - id: fix-stays-local
+    description: Fixes and runs the playbook but never pushes the branch.
+    feedback: The fix has to reach the Git server on a branch named lint-fix.
+    expectFail:
+    - fix-pushed
+    - lint-clean
+    - lint-not-silenced
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~ && rm -rf policy-db && git clone -q git@ov-git:policy-db.git && cd policy-db
+        git config user.name learner && git config user.email learner@orrinvale.example
+        cat > provision.yml <<'EOF'
+        - name: Policy database settings
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Policy settings file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db-settings.conf
+                content: |
+                  max_connections={{conns}}
+                  log_dir=/var/log/ov-policy
+                mode: "0644"
+
+            - name: Policy log directory
+              ansible.builtin.file:
+                path: /var/log/ov-policy
+                state: directory
+                mode: "0750"
+        EOF
+        ansible-playbook provision.yml || ansible-playbook provision.yml
+        git switch -q -c lint-fix
+        git add provision.yml
+        git commit -q -m 'Fix lint findings'
+  - id: fix-on-main
+    description: Commits the fix straight to main.
+    feedback: Work on a branch named lint-fix and leave main alone.
+    expectFail:
+    - fix-pushed
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~ && rm -rf policy-db && git clone -q git@ov-git:policy-db.git && cd policy-db
+        git config user.name learner && git config user.email learner@orrinvale.example
+        cat > provision.yml <<'EOF'
+        - name: Policy database settings
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Policy settings file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db-settings.conf
+                content: |
+                  max_connections={{conns}}
+                  log_dir=/var/log/ov-policy
+                mode: "0644"
+
+            - name: Policy log directory
+              ansible.builtin.file:
+                path: /var/log/ov-policy
+                state: directory
+                mode: "0750"
+        EOF
+        ansible-playbook provision.yml || ansible-playbook provision.yml
+        git add provision.yml
+        git commit -q -m 'Fix lint findings'
+        git push -q origin main
+  solution:
+    explanation: |
+      Lint reports an unnamed play, short module names and a `command` call for something `file` can do. The fix
+      names the play and tasks, uses the fully qualified `ansible.builtin.copy`/`file` modules and sets the directory
+      mode with the `file` module instead of running `chmod`; `copy` also gets an explicit `mode`. The playbook is run
+      from the terminal, committed on a branch `lint-fix` and pushed.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~ && rm -rf policy-db && git clone -q git@ov-git:policy-db.git && cd policy-db
+        git config user.name learner && git config user.email learner@orrinvale.example
+        cat > provision.yml <<'EOF'
+        - name: Policy database settings
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Policy settings file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db-settings.conf
+                content: |
+                  max_connections={{conns}}
+                  log_dir=/var/log/ov-policy
+                mode: "0644"
+
+            - name: Policy log directory
+              ansible.builtin.file:
+                path: /var/log/ov-policy
+                state: directory
+                mode: "0750"
+        EOF
+        ansible-playbook provision.yml || ansible-playbook provision.yml
+        git switch -q -c lint-fix
+        git add provision.yml
+        git commit -q -m 'Fix lint findings in provision.yml'
+        git push -q -u origin lint-fix
+    alternatives:
+    - id: lineinfile-settings
+      description: Writes the settings with lineinfile in a loop instead of copy.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~ && rm -rf policy-db && git clone -q git@ov-git:policy-db.git && cd policy-db
+          git config user.name learner && git config user.email learner@orrinvale.example
+          cat > provision.yml <<'EOF'
+          - name: Policy database settings
+            hosts: policy_db
+            become: true
+            tasks:
+              - name: Policy settings file
+                ansible.builtin.lineinfile:
+                  path: /etc/ov/policy-db-settings.conf
+                  regexp: "^{{ item.key }}="
+                  line: "{{ item.key }}={{ item.value }}"
+                  create: true
+                  mode: "0644"
+                loop:
+                  - { key: max_connections, value: "{{conns}}" }
+                  - { key: log_dir, value: /var/log/ov-policy }
+
+              - name: Policy log directory
+                ansible.builtin.file:
+                  path: /var/log/ov-policy
+                  state: directory
+                  mode: "0750"
+          EOF
+          ansible-playbook provision.yml || ansible-playbook provision.yml
+          git switch -q -c lint-fix
+          git add provision.yml
+          git commit -q -m 'Fix lint findings in provision.yml'
+          git push -q -u origin lint-fix

@@ -1,0 +1,830 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-python-module-check-mode
+  title: Write a module that manages branch printer queues
+  domain: automation
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 45
+  tags:
+  - ansible
+  - modules
+  - python
+  - check-mode
+  - collections
+  version: 1
+spec:
+  description: |
+    Branch printers are configured in **`/etc/ov/printers.conf`**: one line `<queue>=<device>` per queue, sorted by queue
+    name. The project **`/home/learner/printer-modules`** has the skeleton of the collection `orrinvale.claims` and a playbook
+    `printers.yml` that uses a module which does not exist yet.
+
+    Write the Python module **`ov_print_queue`** in the collection (`plugins/modules/`):
+
+    - parameters: `queue` (required), `device` (required when `state=present`), `state` (`present` by default, or `absent`)
+      and `path` (default `/etc/ov/printers.conf`);
+    - `present` adds the queue or updates its device; `absent` removes it; the file stays sorted by queue name;
+    - it reports `changed` only when the file content has to change, is idempotent, **supports check mode** (it predicts the
+      change but never writes) and returns `queues`, the sorted list of queue names the file has afterwards;
+    - it has `DOCUMENTATION`, `EXAMPLES` and `RETURN` so that `ansible-doc orrinvale.claims.ov_print_queue` works.
+
+    Run `printers.yml` (do not edit it); the grader runs it again and expects no changes, and tests the module directly,
+    check mode included.
+  objectives:
+  - Write a custom module with AnsibleModule
+  - Report changed correctly and stay idempotent
+  - Honour check mode without side effects
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    pa:
+      type: int
+      min: 10
+      max: 90
+    pb:
+      type: int
+      min: 91
+      max: 140
+    pc:
+      type: int
+      min: 141
+      max: 199
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-branch-lon-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-branch-lon-gw:eth1
+  setup:
+  - 'on': ov-branch-lon-gw
+    run: |
+      set -eu
+      case $(hostname) in
+        ov-branch-lon-gw) a=61 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      mkdir -p /etc/ov
+      printf 'lon-first=lpd://10.70.9.{{pa}}\nlon-ground=lpd://10.70.9.{{pb}}\n' > /etc/ov/printers.conf
+      chmod 0644 /etc/ov/printers.conf
+      rm -f /var/tmp/printers.orig
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.61
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-branch-lon-gw; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-branch-lon-gw | cut -d' ' -f1) true
+  - 'on': ov-ctl
+    run: |
+      set -eu
+      p=/home/learner/printer-modules
+      c=$p/collections/ansible_collections/orrinvale/claims
+      install -d -o learner -g learner $p $c $c/plugins $c/plugins/modules
+      cat > $c/galaxy.yml <<'EOF'
+      namespace: orrinvale
+      name: claims
+      version: 1.0.0
+      readme: README.md
+      authors: [Orrin and Vale platform team]
+      description: Claims platform content
+      license: [GPL-3.0-or-later]
+      EOF
+      printf '# orrinvale.claims\n' > $c/README.md
+      printf '[defaults]\ninventory = inventory.yml\ncollections_path = ./collections\nremote_user = ovauto\n' > $p/ansible.cfg
+      printf 'branches:\n  hosts:\n    ov-branch-lon-gw:\n' > $p/inventory.yml
+      cat > $p/printers.yml <<'EOF'
+      - name: Branch printer queues
+        hosts: branches
+        become: true
+        tasks:
+          - name: Reception printer
+            orrinvale.claims.ov_print_queue:
+              queue: lon-reception
+              device: lpd://10.70.9.{{pc}}
+              state: present
+
+          - name: Retire the first floor printer
+            orrinvale.claims.ov_print_queue:
+              queue: lon-first
+              state: absent
+      EOF
+      chown -R learner:learner $p
+      sha256sum $p/printers.yml > /var/tmp/.ct-module.sum
+  checks:
+  - id: printers-state
+    description: The branch printers file has the reception queue added and the first floor queue retired
+    type: shell
+    'on': ov-branch-lon-gw
+    skills:
+    - automation.extensibility.modules
+    weight: 2
+    command: |
+      [ "$(cat /etc/ov/printers.conf 2>/dev/null)" = "$(printf 'lon-ground=lpd://10.70.9.{{pb}}\nlon-reception=lpd://10.70.9.{{pc}}')" ] && echo ok || echo wrong
+    expect:
+      match: exact
+      value: ok
+  - id: module-contract
+    description: The module is documented, reports changed correctly, is idempotent and honours check mode (judged with ad-hoc calls on the branch gateway, from the collection's own plugins/modules with a fixed configuration)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.extensibility.modules
+    weight: 4
+    timeoutSec: 300
+    command: |
+      # The collection's modules and module_utils are read as the learner into a root-owned archive and unpacked into a
+      # fresh collection tree for the grading account ctjudge (own uid and key), with a fixed configuration. Every call below
+      # runs as ctjudge from that tree: no project configuration, no controller-side plugin and no learner process is involved.
+      c=/home/learner/printer-modules/collections/ansible_collections/orrinvale/claims
+      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
+      t=$j/collections/ansible_collections/orrinvale/claims
+      install -d $t/plugins $j/home
+      printf '[defaults]\ninventory = %s/inventory.ini\ncollections_path = %s/collections\nremote_user = ovauto\n' $j $j > $j/ansible.cfg
+      printf 'ov-branch-lon-gw\n' > $j/inventory.ini
+      chown -R ctjudge $j
+      ( ulimit -f 8192; ct-ansible run $c/plugins timeout 20 tar -cf - modules $(ct-ansible run $c/plugins sh -c 'test -d module_utils && echo module_utils') > $a 2>/dev/null ) || { echo no-module; exit 0; }
+      runuser -u ctjudge -- timeout 20 tar -x --no-same-owner --no-same-permissions -C $t/plugins -f - < $a 2>/dev/null || { echo no-module; exit 0; }
+      runuser -u ctjudge -- find $t -mindepth 1 \( -type l -o \( -type f ! -name '*.py' \) \) -delete
+      /opt/ansible/bin/python3 -I - "$j" <<'EOF'
+      import atexit, json, os, random, signal, subprocess, sys
+      H = 'ov-branch-lon-gw'
+      # per-attempt names and devices, so a module cannot special-case fixed values
+      sfx = os.urandom(3).hex()
+      T = 'lon-t' + sfx
+      C = 'lon-c' + sfx
+      U1, U2, U3 = ['lpd://10.70.9.%d' % n for n in random.sample(range(100, 250), 3)]
+      D = sys.argv[1]
+      ENV = ['HOME=' + sys.argv[1] + '/home', 'PATH=/opt/ansible/bin:/usr/bin:/bin', 'LANG=C.UTF-8', 'LC_ALL=C.UTF-8',
+             'ANSIBLE_CONFIG=' + D + '/ansible.cfg', 'ANSIBLE_NOCOLOR=1']
+      def run(*a):
+          try:
+              return subprocess.run(['runuser', '-u', 'ctjudge', '--', 'env', '-i'] + ENV + list(a), cwd=D, capture_output=True, text=True, timeout=90)
+          except subprocess.TimeoutExpired:
+              return subprocess.CompletedProcess(a, 124, '', '')
+      # the module is exercised on a scratch copy of the printers file (its path parameter), never on the live file
+      P = '/var/tmp/ct-printers-%s.conf' % sfx
+      def adhoc(args, check=False):
+          args = dict(args, path=P)
+          cmd = ['ansible', H, '-b', '-m', 'orrinvale.claims.ov_print_queue', '-a', json.dumps(args)] + (['-C'] if check else [])
+          r = run(*cmd)
+          out = r.stdout
+          i = out.find('=>')
+          try:
+              return json.loads(out[i + 2:])
+          except Exception:
+              return None
+      def fileq():
+          r = run('ssh', 'ovauto@' + H, 'sudo -n cat ' + P)
+          return r.stdout
+      def lines():
+          return fileq().splitlines()
+      def restore():
+          run('ssh', 'ovauto@' + H, 'sudo -n rm -f ' + P)
+      run('ssh', 'ovauto@' + H, "sudo -n sh -c 'rm -f /var/tmp/ct-printers-*.conf; cp /etc/ov/printers.conf %s'" % P)
+      atexit.register(restore)
+      def on_signal(signum, frame):
+          restore()
+          raise SystemExit(1)
+      for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+          signal.signal(sig, on_signal)
+      def fail(msg):
+          restore(); print(msg); raise SystemExit
+      d = run('ansible-doc', 'orrinvale.claims.ov_print_queue')
+      if d.returncode != 0 or 'queue' not in d.stdout:
+          fail('no-documentation')
+      r = adhoc({'queue': T, 'device': U1})
+      if not r or r.get('changed') is not True or T not in r.get('queues', []):
+          fail('add-not-changed')
+      if T + '=' + U1 not in lines():
+          fail('add-not-written')
+      r = adhoc({'queue': T, 'device': U1})
+      if not r or r.get('changed') is not False:
+          fail('add-not-idempotent')
+      before = fileq()
+      r = adhoc({'queue': C, 'device': U2}, check=True)
+      if not r or r.get('changed') is not True or C not in r.get('queues', []):
+          fail('check-mode-result')
+      if fileq() != before:
+          fail('check-mode-wrote')
+      r = adhoc({'queue': T, 'state': 'absent'}, check=True)
+      if not r or r.get('changed') is not True or fileq() != before:
+          fail('check-mode-remove')
+      r = adhoc({'queue': T, 'device': U3})
+      if not r or r.get('changed') is not True or T + '=' + U3 not in lines():
+          fail('update-not-applied')
+      r = adhoc({'queue': T, 'state': 'absent'})
+      if not r or r.get('changed') is not True or T in r.get('queues', []):
+          fail('remove-not-changed')
+      r = adhoc({'queue': T, 'state': 'absent'})
+      if not r or r.get('changed') is not False:
+          fail('remove-not-idempotent')
+      restore()
+      print('ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: printers-rerun
+    description: printers.yml is unchanged and runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.extensibility.modules
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-module.sum >/dev/null 2>&1 || { echo playbook-edited; exit 0; }
+      ct-ansible recap /home/learner/printer-modules printers.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Skeleton
+    body: A module is a Python file with `from ansible.module_utils.basic import AnsibleModule`, an argument spec, `supports_check_mode=True` and a final `module.exit_json(changed=..., ...)`.
+    cost: 1
+  - title: Check mode
+    body: '`module.check_mode` is true during `--check`: compute the result, return `changed` as if the change happened, and skip the write. `required_if` expresses "device is required when state is present".'
+    cost: 2
+  - title: Trying it
+    body: '`ansible ov-branch-lon-gw -b -m orrinvale.claims.ov_print_queue -a "queue=lon-test device=lpd://10.70.9.200" --check --diff` runs the module without a playbook.'
+    cost: 1
+  misconceptions:
+  - id: ignores-check-mode
+    description: Writes the file even when Ansible runs in check mode.
+    feedback: 'Check mode must predict the change without making it: do not touch the file when module.check_mode is set.'
+    expectFail:
+    - module-contract
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/printer-modules
+        f=collections/ansible_collections/orrinvale/claims/plugins/modules
+        mkdir -p $f
+        cat > $f/ov_print_queue.py <<'EOF'
+        #!/usr/bin/python
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        module: ov_print_queue
+        short_description: Manage branch printer queues
+        description:
+          - Adds, changes or removes one queue entry in the printers file (one C(queue=device) line per queue, sorted by name).
+        options:
+          queue:
+            description: Name of the queue.
+            type: str
+            required: true
+          device:
+            description: Device URI of the queue. Required when O(state=present).
+            type: str
+          state:
+            description: Whether the queue must exist.
+            type: str
+            choices: [present, absent]
+            default: present
+          path:
+            description: The printers file.
+            type: path
+            default: /etc/ov/printers.conf
+        author:
+          - Orrin and Vale platform team
+        '''
+
+        EXAMPLES = r'''
+        - name: Add a queue
+          orrinvale.claims.ov_print_queue:
+            queue: lon-ground
+            device: lpd://10.70.9.12
+        '''
+
+        RETURN = r'''
+        queues:
+          description: Names of all queues in the file after the run (sorted).
+          returned: always
+          type: list
+          elements: str
+        '''
+
+        import os
+
+        from ansible.module_utils.basic import AnsibleModule
+
+
+        def read_queues(path):
+            queues = {}
+            if os.path.exists(path):
+                with open(path) as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line and "=" in line:
+                            name, device = line.split("=", 1)
+                            queues[name] = device
+            return queues
+
+
+        def main():
+            module = AnsibleModule(
+                argument_spec=dict(
+                    queue=dict(type="str", required=True),
+                    device=dict(type="str"),
+                    state=dict(type="str", default="present", choices=["present", "absent"]),
+                    path=dict(type="path", default="/etc/ov/printers.conf"),
+                ),
+                required_if=[("state", "present", ["device"])],
+                supports_check_mode=True,
+            )
+            path = module.params["path"]
+            name = module.params["queue"]
+            queues = read_queues(path)
+            new = dict(queues)
+            if module.params["state"] == "present":
+                new[name] = module.params["device"]
+            else:
+                new.pop(name, None)
+            changed = new != queues
+            if changed:
+                text = "".join("%s=%s\n" % (key, new[key]) for key in sorted(new))
+                with open(path, "w") as handle:
+                    handle.write(text)
+            module.exit_json(changed=changed, queues=sorted(new))
+
+
+        if __name__ == "__main__":
+            main()
+        EOF
+        ansible-playbook printers.yml
+  - id: always-changed
+    description: Rewrites the file and reports changed on every run.
+    feedback: The module must compare the wanted state with the file and report changed only when something differs.
+    expectFail:
+    - module-contract
+    - printers-rerun
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/printer-modules
+        f=collections/ansible_collections/orrinvale/claims/plugins/modules
+        mkdir -p $f
+        cat > $f/ov_print_queue.py <<'EOF'
+        #!/usr/bin/python
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        module: ov_print_queue
+        short_description: Manage branch printer queues
+        description:
+          - Adds, changes or removes one queue entry in the printers file (one C(queue=device) line per queue, sorted by name).
+        options:
+          queue:
+            description: Name of the queue.
+            type: str
+            required: true
+          device:
+            description: Device URI of the queue. Required when O(state=present).
+            type: str
+          state:
+            description: Whether the queue must exist.
+            type: str
+            choices: [present, absent]
+            default: present
+          path:
+            description: The printers file.
+            type: path
+            default: /etc/ov/printers.conf
+        author:
+          - Orrin and Vale platform team
+        '''
+
+        EXAMPLES = r'''
+        - name: Add a queue
+          orrinvale.claims.ov_print_queue:
+            queue: lon-ground
+            device: lpd://10.70.9.12
+        '''
+
+        RETURN = r'''
+        queues:
+          description: Names of all queues in the file after the run (sorted).
+          returned: always
+          type: list
+          elements: str
+        '''
+
+        import os
+
+        from ansible.module_utils.basic import AnsibleModule
+
+
+        def read_queues(path):
+            queues = {}
+            if os.path.exists(path):
+                with open(path) as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line and "=" in line:
+                            name, device = line.split("=", 1)
+                            queues[name] = device
+            return queues
+
+
+        def main():
+            module = AnsibleModule(
+                argument_spec=dict(
+                    queue=dict(type="str", required=True),
+                    device=dict(type="str"),
+                    state=dict(type="str", default="present", choices=["present", "absent"]),
+                    path=dict(type="path", default="/etc/ov/printers.conf"),
+                ),
+                required_if=[("state", "present", ["device"])],
+                supports_check_mode=True,
+            )
+            path = module.params["path"]
+            name = module.params["queue"]
+            queues = read_queues(path)
+            new = dict(queues)
+            if module.params["state"] == "present":
+                new[name] = module.params["device"]
+            else:
+                new.pop(name, None)
+            changed = True
+            if changed and not module.check_mode:
+                text = "".join("%s=%s\n" % (key, new[key]) for key in sorted(new))
+                with open(path, "w") as handle:
+                    handle.write(text)
+            module.exit_json(changed=changed, queues=sorted(new))
+
+
+        if __name__ == "__main__":
+            main()
+        EOF
+        ansible-playbook printers.yml
+  - id: no-queue-list
+    description: Does not return the final list of queues.
+    feedback: The module returns the queue names that exist after the run, in the key queues.
+    expectFail:
+    - module-contract
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/printer-modules
+        f=collections/ansible_collections/orrinvale/claims/plugins/modules
+        mkdir -p $f
+        cat > $f/ov_print_queue.py <<'EOF'
+        #!/usr/bin/python
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        module: ov_print_queue
+        short_description: Manage branch printer queues
+        description:
+          - Adds, changes or removes one queue entry in the printers file (one C(queue=device) line per queue, sorted by name).
+        options:
+          queue:
+            description: Name of the queue.
+            type: str
+            required: true
+          device:
+            description: Device URI of the queue. Required when O(state=present).
+            type: str
+          state:
+            description: Whether the queue must exist.
+            type: str
+            choices: [present, absent]
+            default: present
+          path:
+            description: The printers file.
+            type: path
+            default: /etc/ov/printers.conf
+        author:
+          - Orrin and Vale platform team
+        '''
+
+        EXAMPLES = r'''
+        - name: Add a queue
+          orrinvale.claims.ov_print_queue:
+            queue: lon-ground
+            device: lpd://10.70.9.12
+        '''
+
+        RETURN = r'''
+        queues:
+          description: Names of all queues in the file after the run (sorted).
+          returned: always
+          type: list
+          elements: str
+        '''
+
+        import os
+
+        from ansible.module_utils.basic import AnsibleModule
+
+
+        def read_queues(path):
+            queues = {}
+            if os.path.exists(path):
+                with open(path) as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line and "=" in line:
+                            name, device = line.split("=", 1)
+                            queues[name] = device
+            return queues
+
+
+        def main():
+            module = AnsibleModule(
+                argument_spec=dict(
+                    queue=dict(type="str", required=True),
+                    device=dict(type="str"),
+                    state=dict(type="str", default="present", choices=["present", "absent"]),
+                    path=dict(type="path", default="/etc/ov/printers.conf"),
+                ),
+                required_if=[("state", "present", ["device"])],
+                supports_check_mode=True,
+            )
+            path = module.params["path"]
+            name = module.params["queue"]
+            queues = read_queues(path)
+            new = dict(queues)
+            if module.params["state"] == "present":
+                new[name] = module.params["device"]
+            else:
+                new.pop(name, None)
+            changed = new != queues
+            if changed and not module.check_mode:
+                text = "".join("%s=%s\n" % (key, new[key]) for key in sorted(new))
+                with open(path, "w") as handle:
+                    handle.write(text)
+            module.exit_json(changed=changed)
+
+
+        if __name__ == "__main__":
+            main()
+        EOF
+        ansible-playbook printers.yml
+  solution:
+    explanation: |
+      The module lives in the collection (`plugins/modules/ov_print_queue.py`) with `DOCUMENTATION`, `EXAMPLES` and `RETURN`
+      blocks. It reads the file into a dictionary, computes the wanted dictionary for the requested state, and compares the two:
+      only a difference means `changed`. The file is written (sorted by queue name) only when something differs **and**
+      `module.check_mode` is false; the module declares `supports_check_mode=True` and always returns the sorted list of queues
+      that the file has (or would have, in check mode). `required_if` demands a device for `state=present`.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/printer-modules
+        f=collections/ansible_collections/orrinvale/claims/plugins/modules
+        mkdir -p $f
+        cat > $f/ov_print_queue.py <<'EOF'
+        #!/usr/bin/python
+        # -*- coding: utf-8 -*-
+        from __future__ import absolute_import, division, print_function
+        __metaclass__ = type
+
+        DOCUMENTATION = r'''
+        module: ov_print_queue
+        short_description: Manage branch printer queues
+        description:
+          - Adds, changes or removes one queue entry in the printers file (one C(queue=device) line per queue, sorted by name).
+        options:
+          queue:
+            description: Name of the queue.
+            type: str
+            required: true
+          device:
+            description: Device URI of the queue. Required when O(state=present).
+            type: str
+          state:
+            description: Whether the queue must exist.
+            type: str
+            choices: [present, absent]
+            default: present
+          path:
+            description: The printers file.
+            type: path
+            default: /etc/ov/printers.conf
+        author:
+          - Orrin and Vale platform team
+        '''
+
+        EXAMPLES = r'''
+        - name: Add a queue
+          orrinvale.claims.ov_print_queue:
+            queue: lon-ground
+            device: lpd://10.70.9.12
+        '''
+
+        RETURN = r'''
+        queues:
+          description: Names of all queues in the file after the run (sorted).
+          returned: always
+          type: list
+          elements: str
+        '''
+
+        import os
+
+        from ansible.module_utils.basic import AnsibleModule
+
+
+        def read_queues(path):
+            queues = {}
+            if os.path.exists(path):
+                with open(path) as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line and "=" in line:
+                            name, device = line.split("=", 1)
+                            queues[name] = device
+            return queues
+
+
+        def main():
+            module = AnsibleModule(
+                argument_spec=dict(
+                    queue=dict(type="str", required=True),
+                    device=dict(type="str"),
+                    state=dict(type="str", default="present", choices=["present", "absent"]),
+                    path=dict(type="path", default="/etc/ov/printers.conf"),
+                ),
+                required_if=[("state", "present", ["device"])],
+                supports_check_mode=True,
+            )
+            path = module.params["path"]
+            name = module.params["queue"]
+            queues = read_queues(path)
+            new = dict(queues)
+            if module.params["state"] == "present":
+                new[name] = module.params["device"]
+            else:
+                new.pop(name, None)
+            changed = new != queues
+            if changed and not module.check_mode:
+                text = "".join("%s=%s\n" % (key, new[key]) for key in sorted(new))
+                with open(path, "w") as handle:
+                    handle.write(text)
+            module.exit_json(changed=changed, queues=sorted(new))
+
+
+        if __name__ == "__main__":
+            main()
+        EOF
+        ansible-playbook printers.yml
+    alternatives:
+    - id: compact-reader
+      description: Reads the file with a shorter parser.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/printer-modules
+          f=collections/ansible_collections/orrinvale/claims/plugins/modules
+          mkdir -p $f
+          cat > $f/ov_print_queue.py <<'EOF'
+          #!/usr/bin/python
+          # -*- coding: utf-8 -*-
+          from __future__ import absolute_import, division, print_function
+          __metaclass__ = type
+
+          DOCUMENTATION = r'''
+          module: ov_print_queue
+          short_description: Manage branch printer queues
+          description:
+            - Adds, changes or removes one queue entry in the printers file (one C(queue=device) line per queue, sorted by name).
+          options:
+            queue:
+              description: Name of the queue.
+              type: str
+              required: true
+            device:
+              description: Device URI of the queue. Required when O(state=present).
+              type: str
+            state:
+              description: Whether the queue must exist.
+              type: str
+              choices: [present, absent]
+              default: present
+            path:
+              description: The printers file.
+              type: path
+              default: /etc/ov/printers.conf
+          author:
+            - Orrin and Vale platform team
+          '''
+
+          EXAMPLES = r'''
+          - name: Add a queue
+            orrinvale.claims.ov_print_queue:
+              queue: lon-ground
+              device: lpd://10.70.9.12
+          '''
+
+          RETURN = r'''
+          queues:
+            description: Names of all queues in the file after the run (sorted).
+            returned: always
+            type: list
+            elements: str
+          '''
+
+          import os
+
+          from ansible.module_utils.basic import AnsibleModule
+
+
+          def read_queues(path):
+              if not os.path.exists(path):
+                  return {}
+              with open(path) as handle:
+                  pairs = [line.strip().split("=", 1) for line in handle if "=" in line]
+              return dict((pair[0], pair[1]) for pair in pairs)
+
+
+          def main():
+              module = AnsibleModule(
+                  argument_spec=dict(
+                      queue=dict(type="str", required=True),
+                      device=dict(type="str"),
+                      state=dict(type="str", default="present", choices=["present", "absent"]),
+                      path=dict(type="path", default="/etc/ov/printers.conf"),
+                  ),
+                  required_if=[("state", "present", ["device"])],
+                  supports_check_mode=True,
+              )
+              path = module.params["path"]
+              name = module.params["queue"]
+              queues = read_queues(path)
+              new = dict(queues)
+              if module.params["state"] == "present":
+                  new[name] = module.params["device"]
+              else:
+                  new.pop(name, None)
+              changed = new != queues
+              if changed and not module.check_mode:
+                  text = "".join("%s=%s\n" % (key, new[key]) for key in sorted(new))
+                  with open(path, "w") as handle:
+                      handle.write(text)
+              module.exit_json(changed=changed, queues=sorted(new))
+
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          ansible-playbook printers.yml

@@ -1,0 +1,548 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-build-publish-collection
+  title: Publish the claims platform collection to the team share
+  domain: automation
+  frameworks:
+  - ex374-aligned:collections
+  difficulty: hard
+  estimatedMinutes: 35
+  tags:
+  - ansible
+  - collections
+  - galaxy
+  - publishing
+  version: 1
+spec:
+  description: |
+    The claims platform team keeps a role and a helper module as loose sources in **`/home/learner/claims-src`** (the
+    role `claims_web` and the module `ov_claims_check`). Other teams should consume them as a collection.
+
+    1. Package them as the collection **`orrinvale.claims`**, version **1.2.0** (any working directory you like), and build
+       the tarball with `ansible-galaxy collection build`.
+    2. Publish it: the team's file share accepts uploads over HTTP, `PUT` to
+       `http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz` (there is no Galaxy server in this lab).
+    3. In the fresh project **`/home/learner/claims-fresh`**, list the collection by its share URL in
+       **`requirements.yml`** (`type: url`), install it from that file into the project's own `collections` directory
+       (configure the project to use it), and write **`site.yml`** for the `claims_web`
+       group that applies the role `claims_web` from the collection and then uses the collection's module to check that
+       `/etc/ov/claims-web/web.conf` has the line `port={{port}}`.
+
+    Run `site.yml`; the grader runs it again and expects no changes.
+  objectives:
+  - Package roles and modules as a collection
+  - Build and publish a collection tarball
+  - Consume a published collection by URL in a fresh project
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    port:
+      type: int
+      min: 8000
+      max: 8099
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-share
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-share:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-share) a=42 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-share)
+          install -d /srv/share /srv/share/collections /usr/local/lib/ov-share
+          cat > /usr/local/lib/ov-share/server.py <<'EOF'
+      #!/usr/bin/python3
+      import http.server
+      import os
+      import re
+
+      ROOT = "/srv/share"
+
+
+      class Handler(http.server.SimpleHTTPRequestHandler):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, directory=ROOT, **kwargs)
+
+          def do_PUT(self):
+              # only plain tarball names directly under /collections/ (no sub-directories, no traversal)
+              if not re.fullmatch(r"/collections/[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz", self.path):
+                  self.send_error(403, "uploads go to /collections/<name>.tar.gz")
+                  return
+              size = int(self.headers.get("Content-Length", 0))
+              if size <= 0 or size > 8 * 1024 * 1024:
+                  self.send_error(413, "empty or too large")
+                  return
+              data = self.rfile.read(size)
+              dest = os.path.join(ROOT, self.path.lstrip("/"))
+              if os.path.islink(dest):
+                  self.send_error(403, "not a regular file")
+                  return
+              tmp = dest + ".part"
+              with open(tmp, "wb") as handle:
+                  handle.write(data)
+              os.replace(tmp, dest)
+              self.send_response(201)
+              self.send_header("Content-Length", "0")
+              self.end_headers()
+
+
+      http.server.ThreadingHTTPServer(("0.0.0.0", 8081), Handler).serve_forever()
+      EOF
+          if ! nc -z 127.0.0.1 8081 2>/dev/null; then
+            setsid nohup python3 /usr/local/lib/ov-share/server.py >/var/log/ov-share.log 2>&1 </dev/null &
+            sleep 1
+          fi ;;
+      esac
+      rm -rf /etc/ov/claims-web
+  - 'on': ov-share
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-share=10.70.0.42
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-share
+  - 'on': ov-ctl
+    run: |
+      set -eu
+      s=/home/learner/claims-src
+      install -d -o learner -g learner $s $s/roles/claims_web/tasks $s/roles/claims_web/defaults $s/modules
+      printf -- '---\nclaims_web_port: {{port}}\n' > $s/roles/claims_web/defaults/main.yml
+      cat > $s/roles/claims_web/tasks/main.yml <<'EOF'
+      ---
+      - name: Claims web directory
+        ansible.builtin.file:
+          path: /etc/ov/claims-web
+          state: directory
+          mode: "0755"
+
+      - name: Claims web configuration
+        ansible.builtin.copy:
+          dest: /etc/ov/claims-web/web.conf
+          content: |
+            port={{ claims_web_port }}
+            release=r{{rel}}
+          mode: "0644"
+      EOF
+      cat > $s/modules/ov_claims_check.py <<'EOF'
+      #!/usr/bin/python
+      # -*- coding: utf-8 -*-
+      from __future__ import absolute_import, division, print_function
+      __metaclass__ = type
+
+      DOCUMENTATION = r'''
+      module: ov_claims_check
+      short_description: Check a key in a claims configuration file
+      description:
+        - Fails unless the file contains the line C(key=value).
+      options:
+        path:
+          description: Configuration file.
+          type: path
+          required: true
+        key:
+          description: Key to look for.
+          type: str
+          required: true
+        value:
+          description: Expected value.
+          type: str
+          required: true
+      author:
+        - Orrin and Vale platform team
+      '''
+
+      EXAMPLES = r'''
+      - orrinvale.claims.ov_claims_check:
+          path: /etc/ov/claims-web/web.conf
+          key: port
+          value: "8080"
+      '''
+
+      RETURN = r'''
+      found:
+        description: The matching line.
+        returned: success
+        type: str
+      '''
+
+      from ansible.module_utils.basic import AnsibleModule
+
+
+      def main():
+          module = AnsibleModule(argument_spec=dict(path=dict(type="path", required=True), key=dict(type="str", required=True), value=dict(type="str", required=True)), supports_check_mode=True)
+          want = "%s=%s" % (module.params["key"], module.params["value"])
+          try:
+              with open(module.params["path"]) as handle:
+                  lines = [line.strip() for line in handle]
+          except IOError as exc:
+              module.fail_json(msg="cannot read %s: %s" % (module.params["path"], exc))
+          if want not in lines:
+              module.fail_json(msg="%s not found in %s" % (want, module.params["path"]))
+          module.exit_json(changed=False, found=want)
+
+
+      if __name__ == "__main__":
+          main()
+      EOF
+      cat > $s/README.txt <<'EOF'
+      Sources of the claims platform content: the role claims_web and the helper module ov_claims_check.
+      Package them as the collection orrinvale.claims (version 1.2.0).
+      EOF
+      f=/home/learner/claims-fresh
+      install -d -o learner -g learner $f
+      printf 'claims_web:\n  hosts:\n    ov-claims-web1:\n' > $f/inventory.yml
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $f/ansible.cfg
+      chown -R learner:learner $s $f
+  checks:
+  - id: published-tarball
+    description: The team share holds orrinvale-claims-1.2.0.tar.gz with the role, the module and the right metadata
+    type: shell
+    'on': ov-share
+    skills:
+    - automation.advanced.collection-build
+    weight: 3
+    command: |
+      f=/srv/share/collections/orrinvale-claims-1.2.0.tar.gz
+      [ -f $f ] || { echo no-tarball; exit 0; }
+      r=""
+      l=$(tar -tzf $f 2>/dev/null) || { echo not-a-tarball; exit 0; }
+      for p in MANIFEST.json roles/claims_web/tasks/main.yml roles/claims_web/defaults/main.yml plugins/modules/ov_claims_check.py; do printf '%s\n' "$l" | grep -qx "$p" || r="$r missing:$p"; done
+      tar -xzOf $f MANIFEST.json 2>/dev/null | python3 -c '
+      import json, sys
+      i = json.load(sys.stdin)["collection_info"]
+      print("ok" if (i["namespace"], i["name"], i["version"]) == ("orrinvale", "claims", "1.2.0") else "bad")' | grep -qx ok || r="$r manifest"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: fresh-install
+    description: The fresh project installs the collection from the share into its own collections directory
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.collection-build
+    weight: 2
+    command: |
+      r=""
+      # the learner's files are read as the learner, with a time limit, never by this root shell
+      L() { ct-ansible run /home/learner/claims-fresh timeout 20 "$@"; }
+      L grep -q 'http://ov-share:8081/collections/' requirements.yml 2>/dev/null || r="$r requirements-not-from-share"
+      L grep -q 'ov_claims_check' site.yml 2>/dev/null || r="$r site-without-module"
+      v=$(L sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' collections/ansible_collections/orrinvale/claims/MANIFEST.json 2>/dev/null | head -1)
+      [ "$v" = 1.2.0 ] || r="$r not-installed"
+      L ansible-config dump --only-changed 2>/dev/null | grep COLLECTIONS_PATHS | grep -q 'claims-fresh/collections\|\./collections' || r="$r collections_path"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: claims-web-applied
+    description: ov-claims-web1 has the claims web configuration from the installed role
+    type: shell
+    'on': ov-claims-web1
+    skills:
+    - automation.advanced.collection-build
+    weight: 1
+    command: |
+      [ "$(cat /etc/ov/claims-web/web.conf 2>/dev/null)" = "$(printf 'port={{port}}\nrelease=r{{rel}}')" ] && echo ok || echo wrong
+    expect:
+      match: exact
+      value: ok
+  - id: fresh-rerun
+    description: The fresh project play runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.collection-build
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/claims-fresh site.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Collection layout
+    body: A collection has `galaxy.yml` at its root with `namespace`, `name`, `version`, `readme`, `authors`; roles go under `roles/` and modules under `plugins/modules/`.
+    cost: 1
+  - title: Publishing and installing
+    body: '`curl -T FILE URL` uploads with HTTP PUT. `requirements.yml` can name a tarball URL: `- name: URL` and `type: url`.'
+    cost: 1
+  misconceptions:
+  - id: wrong-version
+    description: Leaves the template version 1.0.0 in galaxy.yml, so the tarball has a different name.
+    feedback: 'The release is 1.2.0: set the version in galaxy.yml before you build.'
+    expectFail:
+    - published-tarball
+    - fresh-install
+    - claims-web-applied
+    - fresh-rerun
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        mkdir -p ~/claims-collection/roles ~/claims-collection/plugins/modules
+        cd ~/claims-collection
+        cat > galaxy.yml <<'EOF'
+        namespace: orrinvale
+        name: claims
+        version: 1.0.0
+        readme: README.md
+        authors:
+          - Orrin and Vale platform team
+        description: Claims platform role and helper module
+        license:
+          - GPL-3.0-or-later
+        EOF
+        printf '# orrinvale.claims\n' > README.md
+        cp -r ~/claims-src/roles/claims_web roles/
+        cp ~/claims-src/modules/ov_claims_check.py plugins/modules/
+        ansible-galaxy collection build --force --output-path ~/claims-dist .
+        curl -fsS -T ~/claims-dist/orrinvale-claims-1.0.0.tar.gz http://ov-share:8081/collections/orrinvale-claims-1.0.0.tar.gz
+        cd ~/claims-fresh
+        printf 'collections_path = ./collections\n' >> ansible.cfg
+        printf 'collections:\n  - name: http://ov-share:8081/collections/orrinvale-claims-1.0.0.tar.gz\n    type: url\n' > requirements.yml
+        ansible-galaxy collection install -r requirements.yml -p ./collections
+  - id: role-left-out
+    description: Packages only the helper module and forgets the role.
+    feedback: The collection has to ship the claims_web role as well as the module.
+    expectFail:
+    - published-tarball
+    - claims-web-applied
+    - fresh-rerun
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        mkdir -p ~/claims-collection/roles ~/claims-collection/plugins/modules
+        cd ~/claims-collection
+        cat > galaxy.yml <<'EOF'
+        namespace: orrinvale
+        name: claims
+        version: 1.2.0
+        readme: README.md
+        authors:
+          - Orrin and Vale platform team
+        description: Claims platform role and helper module
+        license:
+          - GPL-3.0-or-later
+        EOF
+        printf '# orrinvale.claims\n' > README.md
+        cp ~/claims-src/modules/ov_claims_check.py plugins/modules/
+        ansible-galaxy collection build --force --output-path ~/claims-dist .
+        curl -fsS -T ~/claims-dist/orrinvale-claims-1.2.0.tar.gz http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz
+        cd ~/claims-fresh
+        printf 'collections_path = ./collections\n' >> ansible.cfg
+        printf 'collections:\n  - name: http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz\n    type: url\n' > requirements.yml
+        ansible-galaxy collection install -r requirements.yml -p ./collections
+        cat > site.yml <<'EOF'
+        - name: Claims web from the packaged collection
+          hosts: claims_web
+          become: true
+          roles:
+            - orrinvale.claims.claims_web
+          post_tasks:
+            - name: The configuration has the expected port
+              orrinvale.claims.ov_claims_check:
+                path: /etc/ov/claims-web/web.conf
+                key: port
+                value: "{{port}}"
+        EOF
+        ansible-playbook site.yml || true
+  - id: install-from-local-file
+    description: Installs the fresh project from the build directory instead of the published tarball.
+    feedback: 'The point of publishing is that other projects install from the share: use its URL in requirements.yml.'
+    expectFail:
+    - fresh-install
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        mkdir -p ~/claims-collection/roles ~/claims-collection/plugins/modules
+        cd ~/claims-collection
+        cat > galaxy.yml <<'EOF'
+        namespace: orrinvale
+        name: claims
+        version: 1.2.0
+        readme: README.md
+        authors:
+          - Orrin and Vale platform team
+        description: Claims platform role and helper module
+        license:
+          - GPL-3.0-or-later
+        EOF
+        printf '# orrinvale.claims\n' > README.md
+        cp -r ~/claims-src/roles/claims_web roles/
+        cp ~/claims-src/modules/ov_claims_check.py plugins/modules/
+        ansible-galaxy collection build --force --output-path ~/claims-dist .
+        curl -fsS -T ~/claims-dist/orrinvale-claims-1.2.0.tar.gz http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz
+        cd ~/claims-fresh
+        printf 'collections_path = ./collections\n' >> ansible.cfg
+        printf 'collections:\n  - name: /home/learner/claims-dist/orrinvale-claims-1.2.0.tar.gz\n    type: file\n' > requirements.yml
+        ansible-galaxy collection install -r requirements.yml -p ./collections
+        cat > site.yml <<'EOF'
+        - name: Claims web from the packaged collection
+          hosts: claims_web
+          become: true
+          roles:
+            - orrinvale.claims.claims_web
+          post_tasks:
+            - name: The configuration has the expected port
+              orrinvale.claims.ov_claims_check:
+                path: /etc/ov/claims-web/web.conf
+                key: port
+                value: "{{port}}"
+        EOF
+        ansible-playbook site.yml || true
+  solution:
+    explanation: |
+      The collection tree needs a `galaxy.yml` (namespace `orrinvale`, name `claims`, version `1.2.0`), the role under
+      `roles/claims_web` and the module under `plugins/modules/`. `ansible-galaxy collection build` packs it into
+      `orrinvale-claims-1.2.0.tar.gz`. Publishing to the team share is an HTTP upload (`curl -T`, or the `uri` module with
+      `method: PUT`). A fresh project then lists the share URL in `requirements.yml` (`type: url`), installs into its own
+      `collections` directory (and sets `collections_path`) and uses the role and the module by their fully qualified names.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        set -e
+        mkdir -p ~/claims-collection/roles ~/claims-collection/plugins/modules
+        cd ~/claims-collection
+        cat > galaxy.yml <<'EOF'
+        namespace: orrinvale
+        name: claims
+        version: 1.2.0
+        readme: README.md
+        authors:
+          - Orrin and Vale platform team
+        description: Claims platform role and helper module
+        license:
+          - GPL-3.0-or-later
+        EOF
+        printf '# orrinvale.claims\n' > README.md
+        cp -r ~/claims-src/roles/claims_web roles/
+        cp ~/claims-src/modules/ov_claims_check.py plugins/modules/
+        ansible-galaxy collection build --force --output-path ~/claims-dist .
+        curl -fsS -T ~/claims-dist/orrinvale-claims-1.2.0.tar.gz http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz
+        cd ~/claims-fresh
+        printf 'collections_path = ./collections\n' >> ansible.cfg
+        printf 'collections:\n  - name: http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz\n    type: url\n' > requirements.yml
+        ansible-galaxy collection install -r requirements.yml -p ./collections
+        cat > site.yml <<'EOF'
+        - name: Claims web from the packaged collection
+          hosts: claims_web
+          become: true
+          roles:
+            - orrinvale.claims.claims_web
+          post_tasks:
+            - name: The configuration has the expected port
+              orrinvale.claims.ov_claims_check:
+                path: /etc/ov/claims-web/web.conf
+                key: port
+                value: "{{port}}"
+        EOF
+        ansible-playbook site.yml
+    alternatives:
+    - id: publish-with-uri-module
+      description: Uploads the tarball with the uri module from a small playbook.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          mkdir -p ~/claims-collection/roles ~/claims-collection/plugins/modules
+          cd ~/claims-collection
+          cat > galaxy.yml <<'EOF'
+          namespace: orrinvale
+          name: claims
+          version: 1.2.0
+          readme: README.md
+          authors:
+            - Orrin and Vale platform team
+          description: Claims platform role and helper module
+          license:
+            - GPL-3.0-or-later
+          EOF
+          printf '# orrinvale.claims\n' > README.md
+          cp -r ~/claims-src/roles/claims_web roles/
+          cp ~/claims-src/modules/ov_claims_check.py plugins/modules/
+          ansible-galaxy collection build --force --output-path ~/claims-dist .
+          cat > ~/publish.yml <<'EOF'
+          - name: Publish the collection to the team share
+            hosts: localhost
+            gather_facts: false
+            tasks:
+              - name: Upload the tarball
+                ansible.builtin.uri:
+                  url: http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz
+                  method: PUT
+                  src: /home/learner/claims-dist/orrinvale-claims-1.2.0.tar.gz
+                  remote_src: true
+                  status_code: 201
+          EOF
+          cd ~ && ansible-playbook -i localhost, -c local publish.yml
+          cd ~/claims-fresh
+          printf 'collections_path = ./collections\n' >> ansible.cfg
+          printf 'collections:\n  - name: http://ov-share:8081/collections/orrinvale-claims-1.2.0.tar.gz\n    type: url\n' > requirements.yml
+          ansible-galaxy collection install -r requirements.yml -p ./collections
+          cat > site.yml <<'EOF'
+          - name: Claims web from the packaged collection
+            hosts: claims_web
+            become: true
+            roles:
+              - orrinvale.claims.claims_web
+            post_tasks:
+              - name: The configuration has the expected port
+                orrinvale.claims.ov_claims_check:
+                  path: /etc/ov/claims-web/web.conf
+                  key: port
+                  value: "{{port}}"
+          EOF
+          ansible-playbook site.yml

@@ -1,0 +1,747 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-privilege-scoping
+  title: Scope privilege escalation to the tasks that need it
+  domain: automation
+  frameworks:
+  - ex374-aligned:privilege-tags
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - ansible
+  - become
+  - privilege
+  - least-privilege
+  version: 1
+spec:
+  description: |
+    The reporting playbook **`/home/learner/claims-automation/report.yml`** runs everything as root. Security wants it
+    scoped:
+
+    - Only the tasks that need root escalate: removing the legacy `tree` package, writing `/etc/ov/report.conf` (owned by
+      root) and creating `/var/reports` (owned by `ovreport`).
+    - The report `/var/reports/<host>.txt` is written **by the account `ovreport`** itself (the nodes have such an
+      account; your key is installed and it has no sudo rights) and is owned by it. The reporting tasks must not escalate
+      at all.
+
+    The report must keep its three lines (`host=`, `release=` and `written_by=` the name of the account that wrote it).
+    Keep the file name `report.yml`, run it, and expect no changes when it runs again.
+  objectives:
+  - Apply become only to the tasks that need it
+  - Run a play as a different remote user
+  - Verify that a part of a playbook works without escalation
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      id ovreport >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Reporting service" ovreport
+      echo 'ovreport:Ov-boot-{{bootpw}}' | chpasswd
+      mkdir -p /etc/ov
+      rm -rf /var/reports /etc/ov/report.conf
+      rpm -q tree >/dev/null 2>&1 || echo "the tree package is missing from the image" >&2
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2
+      ct-ansible pushkey ovreport Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2
+      for h in ov-claims-web1 ov-claims-web2; do ct-ansible run /home/learner ssh ovauto@$h "sudo -n usermod -p '*' ovreport"; done
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+      cat > $p/report.yml <<'EOF'
+      - name: Claims reporting
+        hosts: claims_web
+        become: true
+        tasks:
+          - name: Retire the legacy tree utility
+            ansible.builtin.dnf:
+              name: tree
+              state: absent
+              disablerepo: "*"
+
+          - name: Reporting configuration
+            ansible.builtin.copy:
+              dest: /etc/ov/report.conf
+              content: "report_dir=/var/reports\n"
+              mode: "0644"
+
+          - name: Report directory
+            ansible.builtin.file:
+              path: /var/reports
+              state: directory
+              owner: ovreport
+              mode: "0755"
+
+          - name: Claims report
+            ansible.builtin.copy:
+              dest: "/var/reports/{{ inventory_hostname }}.txt"
+              content: |
+                host={{ inventory_hostname }}
+                release=r{{rel}}
+                written_by={{ ansible_user_id }}
+              mode: "0644"
+      EOF
+      chown learner:learner $p/report.yml
+  checks:
+  - id: privileged-claimsweb1
+    description: ov-claims-web1 has the legacy package removed, the root-owned configuration and the report directory
+    type: shell
+    'on': ov-claims-web1
+    skills: &a167
+    - automation.advanced.privilege
+    weight: 2
+    command: &chk_privileged-n |
+      r=""
+      rpm -q tree >/dev/null 2>&1 && r="$r package-still-there"
+      [ "$(stat -c '%U:%G %a' /etc/ov/report.conf 2>/dev/null)" = "root:root 644" ] || r="$r config"
+      [ "$(stat -c '%U' /var/reports 2>/dev/null)" = ovreport ] || r="$r report-dir"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: privileged-claimsweb2
+    description: ov-claims-web2 has the legacy package removed, the root-owned configuration and the report directory
+    type: shell
+    'on': ov-claims-web2
+    skills: *a167
+    weight: 2
+    command: *chk_privileged-n
+    expect:
+      match: exact
+      value: ok
+  - id: report-claimsweb1
+    description: ov-claims-web1 has the report written by and owned by ovreport
+    type: shell
+    'on': ov-claims-web1
+    skills: &a208
+    - automation.advanced.privilege
+    weight: 2
+    command: &chk_report-n |
+      f=/var/reports/$(hostname).txt
+      [ "$(cat $f 2>/dev/null)" = "$(printf 'host=%s\nrelease=r{{rel}}\nwritten_by=ovreport' "$(hostname)")" ] || { echo content; exit 0; }
+      [ "$(stat -c '%U:%G' $f)" = "ovreport:ovreport" ] && echo ok || echo owner
+    expect:
+      match: exact
+      value: ok
+  - id: report-claimsweb2
+    description: ov-claims-web2 has the report written by and owned by ovreport
+    type: shell
+    'on': ov-claims-web2
+    skills: *a208
+    weight: 2
+    command: *chk_report-n
+    expect:
+      match: exact
+      value: ok
+  - id: escalation-scope
+    description: Only the package, configuration and report-directory tasks escalate; no task that writes the report does
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.privilege
+    weight: 3
+    timeoutSec: 60
+    command: |
+      # The project is copied (as the learner, into a root-owned archive) into a directory owned by nobody and judged there by
+      # that account. Nothing in it is executed: configuration, inventory and variable files are parsed as data, and any
+      # project code (plugins, modules, scripts, executable inventories) is refused, so no learner code shares the verdict's uid.
+      j=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j $a' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"); }
+      ( ulimit -f 65536; ct-ansible run /home/learner/claims-automation timeout 30 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      N timeout 30 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      N find . -type l -delete
+      N timeout 55 /opt/ansible/bin/python3 -I - <<'EOF'
+      import configparser, os, re, yaml
+      bad = set()
+      BOOL = {'true': True, 'yes': True, 'on': True, '1': True, 'false': False, 'no': False, 'off': False, '0': False}
+      ESC = re.compile(r'^(ansible_)?(become|sudo|su)(_\w+)?$')
+      OKKEYS = ('become', 'become_user', 'become_method')
+      INDIRECT = {'include', 'include_tasks', 'import_tasks', 'include_role', 'import_role', 'roles', 'vars_files',
+                  'include_vars', 'set_fact', 'add_host', 'vars_prompt'}
+      KEYLINE = re.compile(r'(^|[\s,{])["\']?(ansible_)?(become|sudo|su)(_\w+)?["\']?\s*[:=]', re.M)
+
+
+      def textof(path):
+          try:
+              return open(path, errors='replace').read(1048576)
+          except Exception:
+              bad.add('unreadable')
+              return ''
+
+
+      # project code would run inside Ansible: refuse it
+      for root, dirs, files in os.walk('.'):
+          for d in dirs:
+              if d in ('library', 'module_utils', 'plugins', 'collections') or d.endswith('_plugins'):
+                  bad.add('project-code')
+          for f in files:
+              if f.endswith(('.py', '.pyc', '.so', '.sh')) or os.stat(os.path.join(root, f)).st_mode & 0o111:
+                  bad.add('project-code')
+
+      # escalation can also come from configuration, inventory and variable files: read them as data
+      inventory = ['/etc/ansible/hosts']
+      if not os.path.isfile('ansible.cfg'):
+          bad.add('no-project-config')
+      else:
+          cp = configparser.ConfigParser(interpolation=None, strict=False)
+          try:
+              cp.read_string(textof('ansible.cfg'))
+          except Exception:
+              bad.add('config-error')
+          for sec in cp.sections():
+              for k, v in cp.items(sec):
+                  if re.search(r'(^|_)(become|sudo|su)($|_)', k):
+                      bad.add('config-escalation')
+                  if k.endswith('_plugins') or k in ('library', 'module_utils', 'enable_plugins', 'callbacks_enabled', 'callback_whitelist', 'stdout_callback', 'vars_plugins_enabled'):
+                      bad.add('config-code')
+                  if sec == 'defaults' and k in ('inventory', 'hostfile'):
+                      inventory = [x.strip() for x in v.split(',') if x.strip()]
+      files = []
+      for src in inventory:
+          full = os.path.realpath(src)
+          if not full.startswith(os.path.realpath('.') + os.sep):
+              bad.add('inventory-outside-project')
+          elif os.path.isdir(full):
+              files += [os.path.join(r, f) for r, _, fs in os.walk(full) for f in fs]
+          elif os.path.isfile(full):
+              files.append(full)
+          else:
+              bad.add('inventory-missing')
+      for root, _, fs in os.walk('.'):
+          if set(root.split(os.sep)) & {'group_vars', 'host_vars'}:
+              files += [os.path.join(root, f) for f in fs]
+      for f in files:
+          t = textof(f)
+          if '$ANSIBLE_VAULT' in t:
+              bad.add('vaulted-vars')
+          if KEYLINE.search(t):
+              bad.add('inventory-escalation')
+          try:
+              y = yaml.safe_load(t)
+          except Exception:
+              y = None
+          if isinstance(y, dict) and 'plugin' in y:
+              bad.add('inventory-plugin')
+
+
+      def flag(v, default):
+          if v is None:
+              return default
+          if isinstance(v, bool):
+              return v
+          s = str(v).strip().lower()
+          if s in BOOL:
+              return BOOL[s]
+          bad.add('dynamic-become')
+          return True
+
+
+      def scan(node):
+          if isinstance(node, dict):
+              for k, v in node.items():
+                  if str(k).split('.')[-1] in INDIRECT:
+                      bad.add('indirection')
+                  if ESC.match(str(k)) and str(k) not in OKKEYS:
+                      bad.add('indirect-escalation')
+                  scan(v)
+          elif isinstance(node, list):
+              for v in node:
+                  scan(v)
+
+
+      def walk(tasks, inherited, ru=None, cond=False):
+          # yields (task, escalates, remote_user, conditional) with block keywords inherited
+          for t in tasks or []:
+              if not isinstance(t, dict):
+                  bad.add('bad-task')
+                  continue
+              b = flag(t.get('become'), inherited)
+              tv = t.get('vars') if isinstance(t.get('vars'), dict) else {}
+              u = t.get('remote_user') or tv.get('ansible_user') or ru
+              # anything that can turn the task into a no-op counts as conditional
+              tags = t.get('tags') if isinstance(t.get('tags'), list) else [t.get('tags')]
+              c = cond or any(k in t for k in ('when', 'check_mode', 'failed_when', 'ignore_errors', 'ignore_unreachable', 'loop', 'until')) \
+                  or any(str(k).startswith('with_') for k in t) or 'never' in [str(x) for x in tags]
+              if 'block' in t:
+                  for k in ('block', 'rescue', 'always'):
+                      yield from walk(t.get(k), b, u, c)
+              else:
+                  yield t, b, u, c
+
+
+      kinds = set()
+      wb = [False]
+      PKG = {'dnf', 'dnf5', 'yum', 'package'}
+      CONF = {'copy', 'template', 'lineinfile', 'blockinfile'}
+
+
+      def allowed(t):
+          # allowlist: a task may escalate only if it is one of the three privileged tasks (as root)
+          if str(t.get('become_user', 'root')) != 'root':
+              return None
+          for k, v in t.items():
+              m = str(k).split('.')[-1]
+              if m not in PKG | CONF | {'file'}:
+                  continue
+              if isinstance(v, str):
+                  v = dict(x.split('=', 1) for x in v.split() if '=' in x)
+              if not isinstance(v, dict):
+                  return None
+              if m in PKG:
+                  return 'pkg'
+              if m == 'file':
+                  return 'dir' if str(v.get('path', v.get('dest', ''))).rstrip('/') == '/var/reports' and str(v.get('state')) == 'directory' else None
+              return 'conf' if str(v.get('dest', v.get('path', ''))) == '/etc/ov/report.conf' else None
+          return None
+
+
+      def check(path, depth):
+          if depth > 4:
+              bad.add('import-depth')
+              return
+          plays = yaml.safe_load(open(path)) or []
+          if not isinstance(plays, list):
+              bad.add('bad-playbook')
+              return
+          for p in plays:
+              if not isinstance(p, dict):
+                  bad.add('bad-playbook')
+                  continue
+              ref = p.get('import_playbook') or p.get('ansible.builtin.import_playbook')
+              if ref:
+                  full = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(path)), str(ref)))
+                  if os.path.isabs(str(ref)) or not full.startswith(os.path.realpath('.') + os.sep):
+                      bad.add('bad-import')
+                  else:
+                      check(full, depth + 1)
+                  continue
+              scan(p)
+              base = flag(p.get('become'), False)
+              every = []
+              for k in ('pre_tasks', 'tasks', 'post_tasks', 'handlers'):
+                  every += p.get(k) or []
+              pv = p.get('vars') if isinstance(p.get('vars'), dict) else {}
+              # play-level keywords that can make every task a no-op count as conditional too
+              ptags = p.get('tags') if isinstance(p.get('tags'), list) else [p.get('tags')]
+              pcond = any(k in p for k in ('when', 'check_mode', 'ignore_errors', 'ignore_unreachable')) or 'never' in [str(x) for x in ptags]
+              for t, b, ru, cond in walk(every, base, p.get('remote_user') or pv.get('ansible_user'), pcond):
+                  text = yaml.safe_dump(t, width=10 ** 6)
+                  if 'written_by' in text:
+                      # the report task runs unconditionally as ovreport and takes the name from the connection
+                      if re.search(r'written_by=\s*\{\{[^}]*ansible_(user_id|user|facts|env)', text) and str(ru) == 'ovreport' and not cond:
+                          wb[0] = True
+                  if b:
+                      kind = allowed(t)
+                      if kind:
+                          kinds.add(kind)
+                      else:
+                          bad.add('extra-escalation')
+
+
+      check('report.yml', 0)
+      if kinds != {'pkg', 'conf', 'dir'} and not bad:
+          bad.add('privileged-tasks-missing')
+      if not wb[0] and not bad:
+          bad.add('report-task-not-run-as-ovreport')
+      print(' '.join(sorted(bad)) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: report-rerun
+    description: report.yml runs again without changes (the reporting part runs as ovreport with no sudo rights)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.privilege
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/claims-automation report.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Two kinds of work
+    body: A play can set `become` itself, and a different play (or a task or block) can turn it off. `remote_user` at play level chooses the account Ansible connects as.
+    cost: 1
+  - title: Who wrote it?
+    body: 'With `become: false` and `remote_user: ovreport`, the fact `ansible_user_id` is the account that ran the tasks, and files it creates belong to that account.'
+    cost: 1
+  misconceptions:
+  - id: become-user-everything
+    description: Keeps the whole play escalating and only switches the report task to become_user ovreport.
+    feedback: 'The reporting must not need escalation at all: run it as the ovreport account itself, not through sudo.'
+    expectFail:
+    - escalation-scope
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > report.yml <<'EOF'
+        - name: Claims reporting
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Reporting configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/report.conf
+                content: "report_dir=/var/reports\n"
+                mode: "0644"
+
+            - name: Report directory
+              ansible.builtin.file:
+                path: /var/reports
+                state: directory
+                owner: ovreport
+                mode: "0755"
+
+            - name: Claims report
+              become_user: ovreport
+              ansible.builtin.copy:
+                dest: "/var/reports/{{ inventory_hostname }}.txt"
+                content: |
+                  host={{ inventory_hostname }}
+                  release=r{{rel}}
+                  written_by=ovreport
+                mode: "0644"
+        EOF
+        ansible-playbook report.yml || ansible-playbook report.yml
+  - id: owner-only
+    description: Leaves the play as it was and only sets the owner of the report file.
+    feedback: 'Setting the owner is not enough: the report has to be written by ovreport, without escalation.'
+    expectFail:
+    - report-claimsweb1
+    - report-claimsweb2
+    - escalation-scope
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > report.yml <<'EOF'
+        - name: Claims reporting
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Reporting configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/report.conf
+                content: "report_dir=/var/reports\n"
+                mode: "0644"
+
+            - name: Report directory
+              ansible.builtin.file:
+                path: /var/reports
+                state: directory
+                owner: ovreport
+                mode: "0755"
+
+            - name: Claims report
+              ansible.builtin.copy:
+                dest: "/var/reports/{{ inventory_hostname }}.txt"
+                owner: ovreport
+                content: |
+                  host={{ inventory_hostname }}
+                  release=r{{rel}}
+                  written_by={{ ansible_user_id }}
+                mode: "0644"
+        EOF
+        ansible-playbook report.yml || true
+  - id: reporting-with-become
+    description: Runs the reporting play as ovreport but still asks for escalation.
+    feedback: ovreport has no sudo rights, so the reporting play must not escalate.
+    expectFail:
+    - report-claimsweb1
+    - report-claimsweb2
+    - escalation-scope
+    - report-rerun
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > report.yml <<'EOF'
+        - name: Claims reporting prerequisites
+          hosts: claims_web
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Reporting configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/report.conf
+                content: "report_dir=/var/reports\n"
+                mode: "0644"
+
+            - name: Report directory
+              ansible.builtin.file:
+                path: /var/reports
+                state: directory
+                owner: ovreport
+                mode: "0755"
+
+        - name: Claims reporting
+          hosts: claims_web
+          remote_user: ovreport
+          become: true
+          tasks:
+            - name: Claims report
+              ansible.builtin.copy:
+                dest: "/var/reports/{{ inventory_hostname }}.txt"
+                content: |
+                  host={{ inventory_hostname }}
+                  release=r{{rel}}
+                  written_by={{ ansible_user_id }}
+                mode: "0644"
+        EOF
+        ansible-playbook report.yml || true
+  - id: reports-by-hand
+    description: Writes the reports on the nodes by hand (as root, then chown to ovreport) and keeps a report task that never runs (when false).
+    feedback: The report has to be written by the playbook, by a task that runs as ovreport every time.
+    expectFail:
+    - escalation-scope
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > report.yml <<'EOF'
+        - name: Claims reporting prerequisites
+          hosts: claims_web
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Reporting configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/report.conf
+                content: "report_dir=/var/reports\n"
+                mode: "0644"
+
+            - name: Report directory
+              ansible.builtin.file:
+                path: /var/reports
+                state: directory
+                owner: ovreport
+                mode: "0755"
+
+        - name: Claims reporting
+          hosts: claims_web
+          remote_user: ovreport
+          become: false
+          tasks:
+            - name: Claims report
+              when: false
+              ansible.builtin.copy:
+                dest: "/var/reports/{{ inventory_hostname }}.txt"
+                content: |
+                  host={{ inventory_hostname }}
+                  release=r{{rel}}
+                  written_by={{ ansible_user_id }}
+                mode: "0644"
+        EOF
+        ansible-playbook report.yml || true
+        ansible claims_web -b -m ansible.builtin.shell -a 'printf "host=%s\nrelease=r{{rel}}\nwritten_by=ovreport\n" $(hostname) > /var/reports/$(hostname).txt && chown ovreport:ovreport /var/reports/$(hostname).txt'
+  solution:
+    explanation: |
+      The play is split in two. The first play keeps `become: true` for the three tasks that really need root (remove the package,
+      write the root-owned configuration, create the report directory owned by `ovreport`). The second play connects as the
+      `ovreport` account (`remote_user`), has `become: false` and writes the report, so the file is created and owned by
+      `ovreport` and `ansible_user_id` is `ovreport`. The account has no sudo rights, which proves the second play runs without
+      escalation.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        cat > report.yml <<'EOF'
+        - name: Claims reporting prerequisites
+          hosts: claims_web
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Reporting configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/report.conf
+                content: "report_dir=/var/reports\n"
+                mode: "0644"
+
+            - name: Report directory
+              ansible.builtin.file:
+                path: /var/reports
+                state: directory
+                owner: ovreport
+                mode: "0755"
+
+        - name: Claims reporting
+          hosts: claims_web
+          remote_user: ovreport
+          become: false
+          tasks:
+            - name: Claims report
+              ansible.builtin.copy:
+                dest: "/var/reports/{{ inventory_hostname }}.txt"
+                content: |
+                  host={{ inventory_hostname }}
+                  release=r{{rel}}
+                  written_by={{ ansible_user_id }}
+                mode: "0644"
+        EOF
+        ansible-playbook report.yml
+    alternatives:
+    - id: import-playbooks
+      description: Keeps the two parts in separate files imported by report.yml.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > privileged.yml <<'EOF'
+          - name: Claims reporting prerequisites
+            hosts: claims_web
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Retire the legacy tree utility
+                ansible.builtin.dnf:
+                  name: tree
+                  state: absent
+                  disablerepo: "*"
+
+              - name: Reporting configuration
+                ansible.builtin.copy:
+                  dest: /etc/ov/report.conf
+                  content: "report_dir=/var/reports\n"
+                  mode: "0644"
+
+              - name: Report directory
+                ansible.builtin.file:
+                  path: /var/reports
+                  state: directory
+                  owner: ovreport
+                  mode: "0755"
+          EOF
+          cat > reporting.yml <<'EOF'
+          - name: Claims reporting
+            hosts: claims_web
+            remote_user: ovreport
+            become: false
+            tasks:
+              - name: Claims report
+                ansible.builtin.copy:
+                  dest: "/var/reports/{{ inventory_hostname }}.txt"
+                  content: |
+                    host={{ inventory_hostname }}
+                    release=r{{rel}}
+                    written_by={{ ansible_user_id }}
+                  mode: "0644"
+          EOF
+          cat > report.yml <<'EOF'
+          - name: Claims reporting, privileged part
+            import_playbook: privileged.yml
+
+          - name: Claims reporting, as the reporting account
+            import_playbook: reporting.yml
+          EOF
+          ansible-playbook report.yml

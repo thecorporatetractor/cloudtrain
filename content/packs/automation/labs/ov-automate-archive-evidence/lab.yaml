@@ -1,0 +1,424 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-automate-archive-evidence
+  title: Collect audit evidence archives from every host
+  domain: automation
+  frameworks:
+  - ex294-aligned:automate-system-tasks
+  difficulty: easy
+  estimatedMinutes: 15
+  tags:
+  - ansible
+  - archive
+  - fetch
+  - evidence
+  version: 1
+spec:
+  description: |
+    The auditors ask for the configuration and audit log of every host. On each host,
+    `/etc/ov` holds the configuration and `/var/log/ov-audit` the audit trail.
+
+    Write **`/home/learner/claims-automation/evidence.yml`** that, for **all** hosts of the inventory,
+
+    - compresses both directories into one `tar.gz` named **`<host>-evidence-YYYYMMDD.tar.gz`**
+      (today's date) on the node,
+    - fetches it to **`/home/learner/evidence/<host>/`** on the control node, directly in that directory
+      (no copy of the remote path structure), and
+    - removes the archive from the node afterwards.
+
+    The source directories on the nodes stay as they are. Run the playbook once; the grader runs it a
+    second time and expects it to finish without failures.
+  objectives:
+  - Archive several paths into one compressed file
+  - Fetch files from managed nodes to the control node
+  - Clean up temporary artifacts on the nodes
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    tok:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-quote-api1
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth3
+      b: ov-db-1:eth1
+    - a: ov-ctl:eth4
+      b: ov-quote-api1:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      mkdir -p /etc/ov/audit /var/log/ov-audit
+      printf 'host=%s evidence-token={{tok}}\n' "$(hostname)" > /etc/ov/audit/marker.conf
+      printf 'retention_days=2555\n' > /etc/ov/audit/policy.conf
+      printf '%s audit trail token {{tok}} for %s\n' "$(date +%Y-%m-%d)" "$(hostname)" > /var/log/ov-audit/trail.log
+      rm -rf /var/tmp/evidence* /tmp/*evidence*
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-db-1
+    run: *ov-node
+  - 'on': ov-quote-api1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+          claims_db:
+            hosts:
+              ov-db-1:
+      quoting:
+        hosts:
+          ov-quote-api1:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+      install -d -o learner -g learner /home/learner/evidence
+      touch /var/tmp/.ct-evid-start
+  checks:
+  - id: evidence-archives
+    description: The control node holds one dated tar.gz per host, directly in evidence/<host>/, with the configuration and the audit log of that host
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.modules.archives
+    weight: 3
+    command: |
+      r=""
+      # archives are learner-controlled: unpack them as the learner, with a time limit and bounded output
+      L() { ct-ansible run / timeout 30 "$@"; }
+      for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do
+        d=/home/learner/evidence/$h
+        n=$(L sh -c 'ls -A "$1" 2>/dev/null | head -20 | wc -l' sh $d)
+        [ "$n" = 1 ] || { r="$r $h:files=$n"; continue; }
+        f=$(L sh -c 'ls -A "$1" | head -1' sh $d)
+        case $f in $h-evidence-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].tar.gz) ;; *) r="$r $h:name"; continue ;; esac
+        [ "$f" = "$h-evidence-$(date +%Y%m%d).tar.gz" ] || [ "$f" = "$h-evidence-$(date -d yesterday +%Y%m%d).tar.gz" ] || { r="$r $h:date"; continue; }
+        [ "$(L sh -c 'find "$1" -mindepth 1 -type d 2>/dev/null | head -1; echo end-of-list' sh $d)" = end-of-list ] || r="$r $h:nested"
+        l=$(L bash -c 'set -o pipefail; tar -tzf "$1" | head -c 1048576' bash $d/$f 2>/dev/null) || { r="$r $h:not-tar-gz"; continue; }
+        printf '%s\n' "$l" | grep -q 'etc/ov/audit/marker.conf' || r="$r $h:no-config"
+        printf '%s\n' "$l" | grep -q 'var/log/ov-audit/trail.log' || r="$r $h:no-logs"
+        L sh -c 'tar -xzOf "$1" | head -c 4194304' sh $d/$f 2>/dev/null | grep -q "evidence-token={{tok}}" || r="$r $h:content"
+      done
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: cleaned-claimsweb1
+    description: ov-claims-web1 keeps its source files and no evidence archive is left on it
+    type: shell
+    'on': ov-claims-web1
+    skills: &a233
+    - automation.modules.archives
+    weight: 1
+    command: &chk_cleaned-n |
+      r=""
+      [ "$(grep -c evidence-token={{tok}} /etc/ov/audit/marker.conf)" = 1 ] || r="$r source-changed"
+      [ -f /var/log/ov-audit/trail.log ] || r="$r log-removed"
+      n=$(find /tmp /var/tmp /root /home /srv /opt /var/lib -maxdepth 4 -name '*evidence*.tar.gz' 2>/dev/null | wc -l)
+      [ "$n" = 0 ] || r="$r remote-copy"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: cleaned-claimsweb2
+    description: ov-claims-web2 keeps its source files and no evidence archive is left on it
+    type: shell
+    'on': ov-claims-web2
+    skills: *a233
+    weight: 1
+    command: *chk_cleaned-n
+    expect:
+      match: exact
+      value: ok
+  - id: cleaned-db1
+    description: ov-db-1 keeps its source files and no evidence archive is left on it
+    type: shell
+    'on': ov-db-1
+    skills: *a233
+    weight: 1
+    command: *chk_cleaned-n
+    expect:
+      match: exact
+      value: ok
+  - id: cleaned-quoteapi1
+    description: ov-quote-api1 keeps its source files and no evidence archive is left on it
+    type: shell
+    'on': ov-quote-api1
+    skills: *a233
+    weight: 1
+    command: *chk_cleaned-n
+    expect:
+      match: exact
+      value: ok
+  - id: collect-rerun
+    description: evidence.yml runs again without failures (collecting evidence is repeatable)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.modules.archives
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/claims-automation evidence.yml
+    expect:
+      match: regex
+      value: ^changed=[0-9]+ failed=0 unreachable=0$
+  hints:
+  - title: Archiving
+    body: The `community.general.archive` module takes a list in `path`, a `dest` and a `format` (`gz` produces a compressed tar when several paths are given). `ansible_date_time.date` comes from fact gathering.
+    cost: 1
+  - title: Fetching flat
+    body: '`fetch` normally mirrors the remote path under `dest`. With `flat: true` and a `dest` that ends with `/`, the file keeps its own name and lands directly in that directory.'
+    cost: 1
+  misconceptions:
+  - id: nested-fetch
+    description: Fetches without flat, so the archive ends up in a copy of the remote directory tree.
+    feedback: 'The archive must sit directly in evidence/<host>/; fetch with flat: true and a destination ending in a slash.'
+    expectFail:
+    - evidence-archives
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > evidence.yml <<'EOF'
+        - name: Collect audit evidence
+          hosts: all
+          become: true
+          tasks:
+            - name: Evidence archive on the node
+              community.general.archive:
+                path:
+                  - /etc/ov
+                  - /var/log/ov-audit
+                dest: "/var/tmp/{{ inventory_hostname }}-evidence-{{ ansible_date_time.date | replace('-', '') }}.tar.gz"
+                format: gz
+                mode: "0600"
+              register: evidence
+
+            - name: Fetch the archive flat
+              ansible.builtin.fetch:
+                src: "{{ evidence.dest }}"
+                dest: "/home/learner/evidence/{{ inventory_hostname }}/"
+
+            - name: Remove the archive from the node
+              ansible.builtin.file:
+                path: "{{ evidence.dest }}"
+                state: absent
+        EOF
+        ansible-playbook evidence.yml
+  - id: remote-copy-left
+    description: Collects the archives but never removes the copy on the managed node.
+    feedback: Evidence copies must not stay on the nodes; delete the archive after the fetch.
+    expectFail:
+    - cleaned-claimsweb1
+    - cleaned-claimsweb2
+    - cleaned-db1
+    - cleaned-quoteapi1
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > evidence.yml <<'EOF'
+        - name: Collect audit evidence
+          hosts: all
+          become: true
+          tasks:
+            - name: Evidence archive on the node
+              community.general.archive:
+                path:
+                  - /etc/ov
+                  - /var/log/ov-audit
+                dest: "/var/tmp/{{ inventory_hostname }}-evidence-{{ ansible_date_time.date | replace('-', '') }}.tar.gz"
+                format: gz
+                mode: "0600"
+              register: evidence
+
+            - name: Fetch the archive flat
+              ansible.builtin.fetch:
+                src: "{{ evidence.dest }}"
+                dest: "/home/learner/evidence/{{ inventory_hostname }}/"
+                flat: true
+
+        EOF
+        ansible-playbook evidence.yml
+  - id: config-only
+    description: Archives /etc/ov only and misses the audit log directory.
+    feedback: The evidence is the configuration and the audit logs; archive both.
+    expectFail:
+    - evidence-archives
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > evidence.yml <<'EOF'
+        - name: Collect audit evidence
+          hosts: all
+          become: true
+          tasks:
+            - name: Evidence archive on the node
+              community.general.archive:
+                path:
+                  - /etc/ov
+                dest: "/var/tmp/{{ inventory_hostname }}-evidence-{{ ansible_date_time.date | replace('-', '') }}.tar.gz"
+                format: gz
+                mode: "0600"
+              register: evidence
+
+            - name: Fetch the archive flat
+              ansible.builtin.fetch:
+                src: "{{ evidence.dest }}"
+                dest: "/home/learner/evidence/{{ inventory_hostname }}/"
+                flat: true
+
+            - name: Remove the archive from the node
+              ansible.builtin.file:
+                path: "{{ evidence.dest }}"
+                state: absent
+        EOF
+        ansible-playbook evidence.yml
+  solution:
+    explanation: |
+      `community.general.archive` compresses both directories into one dated `tar.gz` on each node (the file name
+      uses the host name and the gathered date). `fetch` with `flat: true` and a destination that ends in a slash
+      stores it directly under `evidence/<host>/`, and a `file` task with `state: absent` removes the copy on the node.
+      Collecting evidence is repeatable, not a no-change convergence: each run takes a new snapshot.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        cat > evidence.yml <<'EOF'
+        - name: Collect audit evidence
+          hosts: all
+          become: true
+          tasks:
+            - name: Evidence archive on the node
+              community.general.archive:
+                path:
+                  - /etc/ov
+                  - /var/log/ov-audit
+                dest: "/var/tmp/{{ inventory_hostname }}-evidence-{{ ansible_date_time.date | replace('-', '') }}.tar.gz"
+                format: gz
+                mode: "0600"
+              register: evidence
+
+            - name: Fetch the archive flat
+              ansible.builtin.fetch:
+                src: "{{ evidence.dest }}"
+                dest: "/home/learner/evidence/{{ inventory_hostname }}/"
+                flat: true
+
+            - name: Remove the archive from the node
+              ansible.builtin.file:
+                path: "{{ evidence.dest }}"
+                state: absent
+        EOF
+        ansible-playbook evidence.yml
+    alternatives:
+    - id: tar-command-and-lookup
+      description: Uses tar through the command module and a date from a lookup instead of the archive module and facts.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > evidence.yml <<'EOF'
+          - name: Collect audit evidence
+            hosts: all
+            become: true
+            vars:
+              stamp: "{{ lookup('pipe', 'date +%Y%m%d') }}"
+              archive_path: "/var/tmp/{{ inventory_hostname }}-evidence-{{ stamp }}.tar.gz"
+            tasks:
+              - name: Evidence archive on the node
+                ansible.builtin.command:
+                  cmd: tar -czf {{ archive_path }} /etc/ov /var/log/ov-audit
+                changed_when: true
+
+              - name: Fetch the archive flat
+                ansible.builtin.fetch:
+                  src: "{{ archive_path }}"
+                  dest: "/home/learner/evidence/{{ inventory_hostname }}/"
+                  flat: true
+
+              - name: Remove the archive from the node
+                ansible.builtin.file:
+                  path: "{{ archive_path }}"
+                  state: absent
+          EOF
+          ansible-playbook evidence.yml

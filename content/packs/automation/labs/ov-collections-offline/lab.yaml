@@ -1,0 +1,458 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-collections-offline
+  title: Install roles and collections from an offline requirements file
+  domain: automation
+  frameworks:
+  - ex294-aligned:roles-collections
+  difficulty: easy
+  estimatedMinutes: 15
+  tags:
+  - ansible
+  - galaxy
+  - collections
+  - roles
+  - requirements
+  version: 1
+spec:
+  description: |
+    The lab network has no internet. The platform team keeps its shared content on a file share
+    (`http://ov-share:8081/`) and listed it in
+    **`/home/learner/claims-automation/requirements.yml`**: one collection and one role.
+
+    - Install both into the project (a `collections` and a `roles` directory inside
+      `/home/learner/claims-automation`) and configure the project so Ansible searches those directories.
+      Do not edit `requirements.yml`.
+    - Write **`stamp.yml`** for the `claims_web` nodes: apply the installed role and use the module of the
+      installed collection to write the line `claims-{{stamp}}` into `/etc/ov/stamp`.
+      (Browse the content with `ansible-doc`.)
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+  - Install roles and collections from a requirements file
+  - Keep installed content in project-local paths
+  - Call a collection module by its fully qualified name
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    tag:
+      type: int
+      min: 100
+      max: 999
+    stamp:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-share
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth3
+      b: ov-share:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-share) a=42 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-share)
+          install -d -o ovauto -g ovauto /srv/share /srv/share/collections /srv/share/roles
+          if ! nc -z 127.0.0.1 8081 2>/dev/null; then
+            setsid nohup python3 -m http.server 8081 --bind 0.0.0.0 --directory /srv/share >/var/log/ov-share.log 2>&1 </dev/null &
+            sleep 1
+          fi ;;
+      esac
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-share
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-share=10.70.0.42
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-share
+  - 'on': ov-ctl
+    timeoutSec: 180
+    run: |
+      set -eu
+      runuser -u learner -- env HOME=/home/learner PATH=$PATH bash -eu <<'EOS'
+      set -eu
+      w=$(mktemp -d)
+      cd $w
+      # collection orrinvale.toolkit 1.4.0 with one module
+      mkdir -p ct/plugins/modules
+      cat > ct/galaxy.yml <<'EOF'
+      namespace: orrinvale
+      name: toolkit
+      version: 1.4.0
+      readme: README.md
+      authors: [Orrin and Vale platform team]
+      description: Small helpers for the claims platform
+      license: [GPL-3.0-or-later]
+      EOF
+      printf '# orrinvale.toolkit\n' > ct/README.md
+      cat > ct/plugins/modules/ov_stamp.py <<'EOF'
+      #!/usr/bin/python
+      # -*- coding: utf-8 -*-
+      from __future__ import absolute_import, division, print_function
+      __metaclass__ = type
+
+      DOCUMENTATION = r'''
+      module: ov_stamp
+      short_description: Write a one-line stamp file
+      description: Writes a single line of text to a file and reports a change only when the content differs.
+      options:
+        path:
+          description: File to write.
+          type: path
+          required: true
+        text:
+          description: Line of text.
+          type: str
+          required: true
+      author:
+        - Orrin and Vale platform team
+      '''
+
+      from ansible.module_utils.basic import AnsibleModule
+
+
+      def main():
+          module = AnsibleModule(argument_spec=dict(path=dict(type='path', required=True), text=dict(type='str', required=True)), supports_check_mode=True)
+          path, text = module.params['path'], module.params['text'] + '\n'
+          try:
+              with open(path) as f:
+                  current = f.read()
+          except IOError:
+              current = None
+          changed = current != text
+          if changed and not module.check_mode:
+              with open(path, 'w') as f:
+                  f.write(text)
+          module.exit_json(changed=changed, path=path)
+
+
+      if __name__ == '__main__':
+          main()
+      EOF
+      ansible-galaxy collection build ct --output-path $w/out >/dev/null
+      # role claims_baseline 2.1.0
+      mkdir -p claims_baseline/tasks claims_baseline/meta
+      cat > claims_baseline/tasks/main.yml <<'EOF'
+      - name: Baseline directory
+        ansible.builtin.file:
+          path: /etc/ov/baseline
+          state: directory
+          mode: "0755"
+
+      - name: Baseline marker
+        ansible.builtin.copy:
+          dest: /etc/ov/baseline/claims
+          content: "baseline {{ claims_baseline_tag | default('r{{tag}}') }}\n"
+          mode: "0644"
+      EOF
+      cat > claims_baseline/meta/main.yml <<'EOF'
+      galaxy_info:
+        author: Orrin and Vale platform team
+        description: Claims node baseline
+        license: GPL-3.0-or-later
+        min_ansible_version: "2.14"
+        platforms:
+          - name: EL
+            versions: [all]
+      dependencies: []
+      EOF
+      tar -czf $w/out/claims_baseline-2.1.0.tar.gz claims_baseline
+      scp -q $w/out/orrinvale-toolkit-1.4.0.tar.gz ovauto@ov-share:/srv/share/collections/
+      scp -q $w/out/claims_baseline-2.1.0.tar.gz ovauto@ov-share:/srv/share/roles/
+      rm -rf $w
+      EOS
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      cat > $p/requirements.yml <<'EOF'
+      # Offline requirements: the lab has no internet, everything comes from the team file share
+      collections:
+        - name: http://ov-share:8081/collections/orrinvale-toolkit-1.4.0.tar.gz
+          type: url
+      roles:
+        - name: claims_baseline
+          src: http://ov-share:8081/roles/claims_baseline-2.1.0.tar.gz
+      EOF
+      chown learner:learner $p/requirements.yml
+      sha256sum $p/requirements.yml > /var/tmp/.ct-offline.sum
+  checks:
+  - id: project-paths
+    description: The project searches its own collections and roles directories
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.reuse.collections
+    weight: 2
+    command: |
+      cd /home/learner/claims-automation
+      d=$(ct-ansible run . ansible-config dump --only-changed 2>/dev/null)
+      r=""
+      printf '%s' "$d" | grep -E 'COLLECTIONS_PATHS' | grep -q '/home/learner/claims-automation/collections\|\./collections' || r="$r collections_path"
+      printf '%s' "$d" | grep -E 'DEFAULT_ROLES_PATH' | grep -q '/home/learner/claims-automation/roles\|\./roles' || r="$r roles_path"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: content-installed
+    description: The collection and the role from the share are installed in the project and requirements.yml is unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.reuse.collections
+    weight: 2
+    command: |
+      cd /home/learner/claims-automation
+      r=""
+      # the learner's files are only read as the learner, with a time and size bound
+      v=$(ct-ansible run . timeout 10 head -c 262144 collections/ansible_collections/orrinvale/toolkit/MANIFEST.json 2>/dev/null | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' | head -1)
+      [ "$v" = 1.4.0 ] || r="$r collection"
+      ct-ansible run . test -f roles/claims_baseline/tasks/main.yml || r="$r role"
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-offline.sum >/dev/null 2>&1 || r="$r requirements-edited"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: applied-claimsweb1
+    description: ov-claims-web1 has the stamp from the collection module and the baseline from the role
+    type: shell
+    'on': ov-claims-web1
+    skills: &a247
+    - automation.reuse.collections
+    command: &chk_applied-n |
+      r=""
+      [ "$(cat /etc/ov/stamp 2>/dev/null)" = "claims-{{stamp}}" ] || r="$r stamp"
+      [ "$(cat /etc/ov/baseline/claims 2>/dev/null)" = "baseline r{{tag}}" ] || r="$r baseline"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: applied-claimsweb2
+    description: ov-claims-web2 has the stamp from the collection module and the baseline from the role
+    type: shell
+    'on': ov-claims-web2
+    skills: *a247
+    command: *chk_applied-n
+    expect:
+      match: exact
+      value: ok
+  - id: stamp-rerun
+    description: stamp.yml runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.reuse.collections
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/claims-automation stamp.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Installing
+    body: '`ansible-galaxy collection install -r requirements.yml -p ./collections` and `ansible-galaxy role install -r requirements.yml -p ./roles` read the matching section of the file.'
+    cost: 1
+  - title: Finding the content
+    body: Set `collections_path` and `roles_path` in the `[defaults]` section of `ansible.cfg`. `ansible-galaxy collection list` shows what Ansible can see; `ansible-doc orrinvale.toolkit.ov_stamp` documents the module.
+    cost: 1
+  misconceptions:
+  - id: install-to-home
+    description: Installs into the default per-user locations and never configures the project paths.
+    feedback: Install into the project (collections and roles directories) and set collections_path and roles_path in ansible.cfg so the project is self-contained.
+    expectFail:
+    - project-paths
+    - content-installed
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        ansible-galaxy collection install -r requirements.yml
+        ansible-galaxy role install -r requirements.yml
+        cat > stamp.yml <<'EOF'
+        - name: Stamp the claims web nodes
+          hosts: claims_web
+          become: true
+          roles:
+            - claims_baseline
+          tasks:
+            - name: Platform stamp
+              orrinvale.toolkit.ov_stamp:
+                path: /etc/ov/stamp
+                text: claims-{{stamp}}
+        EOF
+        ansible-playbook stamp.yml || true
+  - id: collections-only
+    description: Installs the collection but forgets the role from the same requirements file.
+    feedback: requirements.yml lists a role as well as a collection; install both.
+    expectFail:
+    - content-installed
+    - applied-claimsweb1
+    - applied-claimsweb2
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        printf 'collections_path = ./collections\nroles_path = ./roles\n' >> ansible.cfg
+        ansible-galaxy collection install -r requirements.yml -p ./collections
+        cat > stamp.yml <<'EOF'
+        - name: Stamp the claims web nodes
+          hosts: claims_web
+          become: true
+          roles:
+            - claims_baseline
+          tasks:
+            - name: Platform stamp
+              orrinvale.toolkit.ov_stamp:
+                path: /etc/ov/stamp
+                text: claims-{{stamp}}
+        EOF
+        ansible-playbook stamp.yml || true
+  - id: galaxy-names
+    description: Rewrites requirements.yml to ask a public Galaxy for the content by name.
+    feedback: There is no internet; keep requirements.yml pointing at the team file share.
+    expectFail:
+    - content-installed
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        printf 'collections_path = ./collections\nroles_path = ./roles\n' >> ansible.cfg
+        printf 'collections:\n  - name: orrinvale.toolkit\n    version: 1.4.0\nroles:\n  - name: claims_baseline\n' > requirements.yml
+        (ansible-galaxy collection install -r requirements.yml -p ./collections || true)
+        cat > stamp.yml <<'EOF'
+        - name: Stamp the claims web nodes
+          hosts: claims_web
+          become: true
+          roles:
+            - claims_baseline
+          tasks:
+            - name: Platform stamp
+              orrinvale.toolkit.ov_stamp:
+                path: /etc/ov/stamp
+                text: claims-{{stamp}}
+        EOF
+        ansible-playbook stamp.yml || true
+  solution:
+    explanation: |
+      Add `collections_path = ./collections` and `roles_path = ./roles` to `ansible.cfg`, then install the two
+      requirements from the file share into those directories with `ansible-galaxy collection install -r ... -p` and
+      `ansible-galaxy role install -r ... -p`. Roles in a role requirements file are plain tarball URLs, collections
+      use `type: url`. The play then uses the collection module by its fully qualified name and the role by name.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        printf 'collections_path = ./collections\nroles_path = ./roles\n' >> ansible.cfg
+        ansible-galaxy collection install -r requirements.yml -p ./collections
+        ansible-galaxy role install -r requirements.yml -p ./roles
+        cat > stamp.yml <<'EOF'
+        - name: Stamp the claims web nodes
+          hosts: claims_web
+          become: true
+          roles:
+            - claims_baseline
+          tasks:
+            - name: Platform stamp
+              orrinvale.toolkit.ov_stamp:
+                path: /etc/ov/stamp
+                text: claims-{{stamp}}
+        EOF
+        ansible-playbook stamp.yml
+    alternatives:
+    - id: download-then-install
+      description: Downloads the collection tarball with curl and installs it from the local file; the role comes from the requirements file.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          printf 'collections_path = ./collections\nroles_path = ./roles\n' >> ansible.cfg
+          mkdir -p collections roles dl
+          curl -fsS -o dl/orrinvale-toolkit-1.4.0.tar.gz http://ov-share:8081/collections/orrinvale-toolkit-1.4.0.tar.gz
+          ansible-galaxy collection install dl/orrinvale-toolkit-1.4.0.tar.gz -p ./collections
+          ansible-galaxy role install -r requirements.yml -p ./roles
+          cat > stamp.yml <<'EOF'
+          - name: Stamp the claims web nodes
+            hosts: claims_web
+            become: true
+            roles:
+              - claims_baseline
+            tasks:
+              - name: Platform stamp
+                orrinvale.toolkit.ov_stamp:
+                  path: /etc/ov/stamp
+                  text: claims-{{stamp}}
+          EOF
+          ansible-playbook stamp.yml

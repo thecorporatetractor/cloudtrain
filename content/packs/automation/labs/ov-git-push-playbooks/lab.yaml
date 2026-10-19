@@ -1,0 +1,278 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-git-push-playbooks
+  title: Publish the claims playbooks to the team Git server
+  domain: automation
+  frameworks:
+  - ex294-aligned:git-devworkflow
+  - linuxplus:automation-scripting
+  difficulty: easy
+  estimatedMinutes: 15
+  tags:
+  - git
+  - ansible
+  - gitignore
+  version: 1
+spec:
+  description: |
+    The team keeps its automation in a Git repository on the in-lab Git server:
+    **`git@ov-git:claims-automation.git`** (your SSH key is already installed there; the branch
+    `main` holds only a README).
+
+    Your first playbooks are in **`/home/learner/work`**: an inventory, `site.yml` and a directory
+    `artifacts/` with output of earlier runs. Clone the repository to
+    **`/home/learner/claims-automation`**, put `inventory.yml` and `site.yml` in it on a new branch
+    **`onboarding`**, make sure the `artifacts/` directory can never be committed, and push the
+    branch. Leave `main` as it is.
+  objectives:
+  - Clone a repository and work on a branch
+  - Keep generated output out of Git with .gitignore
+  - Push a branch to the team server
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-git
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-git:eth1
+  setup:
+  - 'on': ov-git
+    run: |
+      set -eu
+      case $(hostname) in
+        ov-git) a=40 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      case $(hostname) in
+        ov-git)
+          id git >/dev/null 2>&1 || useradd -m -d /srv/git -s /bin/bash -c "Git service" git
+          echo 'git:Ov-boot-{{bootpw}}' | chpasswd
+          install -d -o git -g git /srv/git ;;
+      esac
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-git=10.70.0.40
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-git
+      ct-ansible pushkey git Ov-boot-{{bootpw}} ov-git
+      ct-ansible run /home/learner ssh ovauto@ov-git "sudo -n usermod -p '*' git"
+  - 'on': ov-git
+    run: |
+      set -eu
+      cd /srv/git
+      runuser -u git -- sh -eu <<'EOS'
+      if [ ! -d /srv/git/claims-automation.git ]; then
+        git init -q --bare -b main /srv/git/claims-automation.git
+        t=$(mktemp -d); git -C $t init -q -b main
+        printf '# Orrin and Vale: claims-automation\n' > $t/README.md
+        git -C $t add -A
+        git -C $t -c user.name='O&V platform' -c user.email=platform@orrinvale.example commit -q -m 'Initial commit'
+        git -C $t push -q /srv/git/claims-automation.git main
+        rm -rf $t
+      fi
+      EOS
+  - 'on': ov-ctl
+    run: |
+      set -eu
+      w=/home/learner/work
+      install -d -o learner -g learner $w $w/artifacts
+      cat > $w/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+          claims_db:
+            hosts:
+              ov-db-1:
+      EOF
+      cat > $w/site.yml <<'EOF'
+      - name: Claims baseline r{{rel}}
+        hosts: claims
+        become: true
+        tasks:
+          - name: Operations banner
+            ansible.builtin.copy:
+              dest: /etc/motd
+              content: "Orrin and Vale claims platform, release r{{rel}}\n"
+              mode: "0644"
+      EOF
+      printf '{"plays": [], "run": %s}\n' {{rel}} > $w/artifacts/site-artifact-old.json
+      chown -R learner:learner $w
+  checks:
+  - id: branch-onboarding
+    description: Branch onboarding exists on the Git server with the inventory and the site playbook
+    type: shell
+    'on': ov-git
+    skills:
+    - automation.devworkflow.git
+    weight: 2
+    command: |
+      g="runuser -u git -- git --git-dir=/srv/git/claims-automation.git"
+      $g rev-parse -q --verify refs/heads/onboarding >/dev/null || { echo no-branch; exit 0; }
+      r=""
+      $g show onboarding:inventory.yml 2>/dev/null | grep -q ov-claims-web1 || r="$r inventory.yml"
+      $g show onboarding:site.yml 2>/dev/null | grep -q 'release r{{rel}}' || r="$r site.yml"
+      echo "${r:-both}"
+    expect:
+      match: exact
+      value: both
+  - id: main-untouched
+    description: The main branch on the server still has only its first commit
+    type: shell
+    'on': ov-git
+    skills:
+    - automation.devworkflow.git
+    command: |
+      g="runuser -u git -- git --git-dir=/srv/git/claims-automation.git"
+      n=$($g rev-list --count main 2>/dev/null)
+      [ "$n" = 1 ] && echo main-intact || echo "main-commits=$n"
+    expect:
+      match: exact
+      value: main-intact
+  - id: artifacts-ignored
+    description: Branch onboarding contains no artifacts and its .gitignore excludes the artifacts directory
+    type: shell
+    'on': ov-git
+    skills:
+    - automation.devworkflow.git
+    weight: 2
+    command: |
+      g="runuser -u git -- git --git-dir=/srv/git/claims-automation.git"
+      $g rev-parse -q --verify refs/heads/onboarding >/dev/null || { echo no-branch; exit 0; }
+      n=$($g ls-tree -r --name-only onboarding | grep -c '^artifacts/')
+      [ "$n" = 0 ] || { echo "artifacts-committed=$n"; exit 0; }
+      t=$(mktemp -d); git -C $t init -q
+      $g show onboarding:.gitignore > $t/.gitignore 2>/dev/null || { echo no-gitignore; rm -rf $t; exit 0; }
+      r=""
+      git -C $t check-ignore -q --no-index artifacts/run.json || r="$r artifacts"
+      git -C $t check-ignore -q --no-index site.yml && r="$r site.yml-ignored"
+      git -C $t check-ignore -q --no-index inventory.yml && r="$r inventory-ignored"
+      rm -rf $t; echo "${r:-ignored}"
+    expect:
+      match: exact
+      value: ignored
+  hints:
+  - title: Branches
+    body: After the clone, `git switch -c onboarding` creates the branch and moves you onto it.
+    cost: 1
+  - title: Ignoring a directory
+    body: A line `artifacts/` in a `.gitignore` file at the top of the repository ignores that directory. Create it before `git add`, and add files by name rather than with `git add -A` if you are unsure.
+    cost: 2
+  misconceptions:
+  - id: push-to-main
+    description: Commits straight to main instead of a feature branch.
+    feedback: The work belongs on a branch named onboarding; main must stay as it was.
+    expectFail:
+    - branch-onboarding
+    - main-untouched
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        set -e
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        cp ~/work/inventory.yml ~/work/site.yml .
+        printf 'artifacts/\n' > .gitignore
+        git add inventory.yml site.yml .gitignore && git commit -q -m 'Add playbooks' && git push -q origin main
+  - id: add-everything
+    description: Adds the whole working directory, artifacts included.
+    feedback: The artifacts directory holds run output and must be ignored before the first commit.
+    expectFail:
+    - artifacts-ignored
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        set -e
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c onboarding
+        cp -r ~/work/. .
+        git add -A && git commit -q -m 'Add playbooks' && git push -q origin onboarding
+  - id: never-pushed
+    description: Commits on a local branch but never pushes it.
+    feedback: The server only knows what you push; push the branch.
+    expectFail:
+    - branch-onboarding
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        set -e
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c onboarding
+        cp ~/work/inventory.yml ~/work/site.yml .
+        printf 'artifacts/\n' > .gitignore
+        git add inventory.yml site.yml .gitignore && git commit -q -m 'Add playbooks'
+  solution:
+    explanation: |
+      Clone the repository, create the branch `onboarding`, copy the two playbooks in, write a `.gitignore` that
+      excludes `artifacts/` before anything is added, commit and push the branch with upstream tracking.
+      `main` stays untouched.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        set -e
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c onboarding
+        cp ~/work/inventory.yml ~/work/site.yml .
+        printf 'artifacts/\n' > .gitignore
+        git add inventory.yml site.yml .gitignore
+        git commit -q -m 'Add inventory and site playbook'
+        git push -q -u origin onboarding
+    alternatives:
+    - id: push-head-refspec
+      description: Adds the files by name and pushes HEAD to the new remote branch name.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git checkout -q -b onboarding
+          install -m 0644 ~/work/inventory.yml ~/work/site.yml .
+          echo '/artifacts/' > .gitignore
+          git add inventory.yml site.yml .gitignore && git commit -q -m 'Onboarding playbooks'
+          git push -q origin HEAD:onboarding

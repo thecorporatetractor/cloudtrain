@@ -1,0 +1,644 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-migrate-core-219
+  title: Fix playbooks that broke on the new templating engine
+  domain: automation
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 30
+  tags:
+  - ansible
+  - migration
+  - templating
+  - conditionals
+  version: 1
+spec:
+  description: |
+    The control node now runs a newer ansible-core, whose templating engine (introduced in 2.19) is much stricter.
+    Three claims playbooks in **`/home/learner/claims-automation`** fail on it: `deploy-release.yml`,
+    `render-tuning.yml` and `capacity.yml`. Typical symptoms are conditionals that "must have a boolean result", Jinja
+    delimiters inside `when`, comparisons between text and numbers, and a `loop` that is not a list.
+
+    Fix the three playbooks so that every task runs as intended on both claims web nodes. The variables in
+    `group_vars/all.yml` come from another team and must stay as they are. Do **not** switch the new checks off (no
+    compatibility setting in the configuration, the environment or your shell profile). Run the playbooks; the grader
+    runs each again and expects no changes.
+  objectives:
+  - Recognise the templating changes of ansible-core 2.19
+  - Write conditionals that evaluate to booleans
+  - Convert registered text output and strings to the types they need
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    rel:
+      type: int
+      min: 100
+      max: 999
+    pool:
+      type: int
+      min: 10
+      max: 60
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      rm -rf /etc/ov/claims-portal
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      install -d -o learner -g learner $p/group_vars
+      cat > $p/group_vars/all.yml <<'EOF'
+      env_name: prod
+      release_enabled: "yes"
+      fast_path: "true"
+      maintenance_mode: "false"
+      shard_ids: "01,02,03"
+      EOF
+      cat > $p/deploy-release.yml <<'EOF'
+      - name: Claims portal release
+        hosts: claims_web
+        become: true
+        tasks:
+          - name: Portal directory
+            ansible.builtin.file:
+              path: /etc/ov/claims-portal
+              state: directory
+              mode: "0755"
+
+          - name: Release marker
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/release
+              content: "release r{{rel}}\n"
+              mode: "0644"
+            when: release_enabled
+
+          - name: Fast path marker
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/fastpath
+              content: "enabled\n"
+              mode: "0644"
+            when: fast_path
+
+          - name: Maintenance banner
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/maintenance
+              content: "claims portal in maintenance\n"
+              mode: "0644"
+            when: maintenance_mode
+      EOF
+      cat > $p/render-tuning.yml <<'EOF'
+      - name: Claims portal tuning
+        hosts: claims_web
+        become: true
+        tasks:
+          - name: Production tuning
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/tuning.conf
+              content: "pool={{pool}}\nprofile=production\n"
+              mode: "0644"
+            when: "{{ env_name }} == 'prod'"
+
+          - name: Test tuning
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/tuning-test.conf
+              content: "pool=2\nprofile=test\n"
+              mode: "0644"
+            when: "'{{ env_name }}' == 'test'"
+      EOF
+      cat > $p/capacity.yml <<'EOF'
+      - name: Claims portal capacity
+        hosts: claims_web
+        become: true
+        tasks:
+          - name: Count the CPUs
+            ansible.builtin.command: nproc
+            register: cpus
+            changed_when: false
+
+          - name: Large node profile
+            ansible.builtin.copy:
+              dest: /etc/ov/claims-portal/profile
+              content: "large\n"
+              mode: "0644"
+            when: cpus.stdout > 0
+
+          - name: Shard markers
+            ansible.builtin.copy:
+              dest: "/etc/ov/claims-portal/shard-{{ item }}"
+              content: "shard {{ item }}\n"
+              mode: "0644"
+            loop: "{{ shard_ids }}"
+      EOF
+      chown -R learner:learner $p
+      sha256sum $p/group_vars/all.yml > /var/tmp/.ct-migrate.sum
+  checks:
+  - id: portal-claimsweb1
+    description: ov-claims-web1 has the files from all three playbooks, with the intended values
+    type: shell
+    'on': ov-claims-web1
+    skills: &a175
+    - automation.advanced.migration-219
+    - automation.control-flow.conditionals
+    weight: 2
+    command: &chk_portal-n |
+      d=/etc/ov/claims-portal
+      r=""
+      [ "$(cat $d/release 2>/dev/null)" = "release r{{rel}}" ] || r="$r release"
+      [ "$(cat $d/fastpath 2>/dev/null)" = enabled ] || r="$r fastpath"
+      [ ! -e $d/maintenance ] || r="$r maintenance-banner"
+      [ "$(cat $d/tuning.conf 2>/dev/null)" = "$(printf 'pool={{pool}}\nprofile=production')" ] || r="$r tuning"
+      [ ! -e $d/tuning-test.conf ] || r="$r test-tuning"
+      [ "$(cat $d/profile 2>/dev/null)" = large ] || r="$r profile"
+      for s in 01 02 03; do [ "$(cat $d/shard-$s 2>/dev/null)" = "shard $s" ] || r="$r shard-$s"; done
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: portal-claimsweb2
+    description: ov-claims-web2 has the files from all three playbooks, with the intended values
+    type: shell
+    'on': ov-claims-web2
+    skills: *a175
+    weight: 2
+    command: *chk_portal-n
+    expect:
+      match: exact
+      value: ok
+  - id: no-escape-hatches
+    description: The group variables are unchanged, no compatibility switch for broken conditionals is set anywhere, and all three playbooks keep their tasks
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.migration-219
+    weight: 2
+    command: |
+      cd /home/learner/claims-automation
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-migrate.sum >/dev/null 2>&1 || { echo group-vars-edited; exit 0; }
+      r=""
+      # The project and the learner's shell and Ansible dotfiles are read as the learner into a root-owned archive (bounded;
+      # a read that fails or is cut short fails the check) and searched by nobody, so no learner process decides anything.
+      j=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j $a' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"); }
+      ( ulimit -f 131072; ct-ansible run /home/learner timeout 60 sh -c 'tar -cf - --exclude=claims-automation/.git claims-automation $(for f in .bashrc .profile .bash_profile .bash_login .ansible.cfg .config .pam_environment; do [ -e "$f" ] && echo "$f"; done)' > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      N timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      N find . -type l -delete
+      if N timeout 30 grep -rIqsi 'allow_broken_conditionals' .; then r="$r escape-hatch-file"; fi
+      for f in deploy-release render-tuning capacity; do N test -s claims-automation/$f.yml || r="$r missing-$f"; done
+      N sh -c "grep -q 'Shard markers' claims-automation/capacity.yml && grep -q 'Production tuning' claims-automation/render-tuning.yml && grep -q 'Fast path marker' claims-automation/deploy-release.yml" 2>/dev/null || r="$r tasks-removed"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: three-playbooks-rerun
+    description: All three playbooks run again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.migration-219
+    weight: 1
+    timeoutSec: 480
+    command: |
+      cd /home/learner/claims-automation
+      for f in deploy-release render-tuning capacity; do
+        t=$(ct-ansible recap /home/learner/claims-automation $f.yml)
+        [ "$t" = "changed=0 failed=0 unreachable=0" ] || { echo "$f:$t"; exit 0; }
+      done
+      echo "changed=0 failed=0 unreachable=0"
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Read the messages
+    body: 'Run each playbook and read the first error. The messages say what is wrong: "Conditionals must have a boolean result", "Template delimiters are not supported in expressions", "must resolve to a list".'
+    cost: 1
+  - title: Typical fixes
+    body: Convert flags with `| bool`, compare against plain expressions (`env_name == 'prod'`), convert module output with `| int` before comparing, and use `.split(',')` (or `| split(',')`) to build a list from a comma separated string.
+    cost: 2
+  misconceptions:
+  - id: compat-switch
+    description: Turns on the compatibility switch for broken conditionals instead of repairing them.
+    feedback: The switch only postpones the problem; fix the conditionals so they are real booleans.
+    expectFail:
+    - no-escape-hatches
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 480
+      run: |
+        cd ~/claims-automation
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\nallow_broken_conditionals = true\n' > ansible.cfg
+        for f in deploy-release render-tuning capacity; do ansible-playbook $f.yml || true; done
+  - id: bool-only
+    description: Converts the string flags with the bool filter but leaves the nested braces and the module output as they are.
+    feedback: 'Two more playbooks still fail: use plain expressions in when, convert module output before comparing and make the loop value a real list.'
+    expectFail:
+    - portal-claimsweb1
+    - portal-claimsweb2
+    - three-playbooks-rerun
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 480
+      run: |
+        cd ~/claims-automation
+        cat > deploy-release.yml <<'EOF'
+        - name: Claims portal release
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Portal directory
+              ansible.builtin.file:
+                path: /etc/ov/claims-portal
+                state: directory
+                mode: "0755"
+
+            - name: Release marker
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/release
+                content: "release r{{rel}}\n"
+                mode: "0644"
+              when: release_enabled | bool
+
+            - name: Fast path marker
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/fastpath
+                content: "enabled\n"
+                mode: "0644"
+              when: fast_path | bool
+
+            - name: Maintenance banner
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/maintenance
+                content: "claims portal in maintenance\n"
+                mode: "0644"
+              when: maintenance_mode | bool
+        EOF
+        cat > render-tuning.yml <<'EOF'
+        - name: Claims portal tuning
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Production tuning
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/tuning.conf
+                content: "pool={{pool}}\nprofile=production\n"
+                mode: "0644"
+              when: "{{ env_name }} == 'prod'"
+
+            - name: Test tuning
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/tuning-test.conf
+                content: "pool=2\nprofile=test\n"
+                mode: "0644"
+              when: "'{{ env_name }}' == 'test'"
+        EOF
+        cat > capacity.yml <<'EOF'
+        - name: Claims portal capacity
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Count the CPUs
+              ansible.builtin.command: nproc
+              register: cpus
+              changed_when: false
+
+            - name: Large node profile
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/profile
+                content: "large\n"
+                mode: "0644"
+              when: cpus.stdout > 0
+
+            - name: Shard markers
+              ansible.builtin.copy:
+                dest: "/etc/ov/claims-portal/shard-{{ item }}"
+                content: "shard {{ item }}\n"
+                mode: "0644"
+              loop: "{{ shard_ids }}"
+        EOF
+        for f in deploy-release render-tuning capacity; do ansible-playbook $f.yml || true; done
+  - id: compare-with-strings
+    description: Compares the text flag with the boolean true and quotes the numbers.
+    feedback: Comparing the text flag with the boolean true does not run the task when the flag is text; use the bool filter to convert real flag text.
+    expectFail:
+    - portal-claimsweb1
+    - portal-claimsweb2
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 480
+      run: |
+        cd ~/claims-automation
+        cat > deploy-release.yml <<'EOF'
+        - name: Claims portal release
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Portal directory
+              ansible.builtin.file:
+                path: /etc/ov/claims-portal
+                state: directory
+                mode: "0755"
+
+            - name: Release marker
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/release
+                content: "release r{{rel}}\n"
+                mode: "0644"
+              when: release_enabled | bool
+
+            - name: Fast path marker
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/fastpath
+                content: "enabled\n"
+                mode: "0644"
+              when: fast_path == true
+
+            - name: Maintenance banner
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/maintenance
+                content: "claims portal in maintenance\n"
+                mode: "0644"
+              when: maintenance_mode | bool
+        EOF
+        cat > render-tuning.yml <<'EOF'
+        - name: Claims portal tuning
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Production tuning
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/tuning.conf
+                content: "pool={{pool}}\nprofile=production\n"
+                mode: "0644"
+              when: env_name == 'prod'
+
+            - name: Test tuning
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/tuning-test.conf
+                content: "pool=2\nprofile=test\n"
+                mode: "0644"
+              when: env_name == 'test'
+        EOF
+        cat > capacity.yml <<'EOF'
+        - name: Claims portal capacity
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Count the CPUs
+              ansible.builtin.command: nproc
+              register: cpus
+              changed_when: false
+
+            - name: Large node profile
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/profile
+                content: "large\n"
+                mode: "0644"
+              when: cpus.stdout | int > 0
+
+            - name: Shard markers
+              ansible.builtin.copy:
+                dest: "/etc/ov/claims-portal/shard-{{ item }}"
+                content: "shard {{ item }}\n"
+                mode: "0644"
+              loop: "{{ shard_ids.split(',') }}"
+        EOF
+        for f in deploy-release render-tuning capacity; do ansible-playbook $f.yml || true; done
+  solution:
+    explanation: |
+      Since ansible-core 2.19 a conditional must evaluate to a real boolean, templates are no longer nested in `when`,
+      and strings are no longer converted implicitly. The flags in `group_vars` are text (`"yes"`, `"true"`, `"false"`), so
+      `when: flag | bool` converts them. `when: "{{ env_name }} == 'prod'"` becomes the plain expression
+      `env_name == 'prod'`. The `nproc` result is a string, so it is converted with `| int` before it is compared, and the
+      comma separated shard list is split into a real list for `loop`. No compatibility switch is set.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 480
+      run: |
+        set -e
+        cd ~/claims-automation
+        cat > deploy-release.yml <<'EOF'
+        - name: Claims portal release
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Portal directory
+              ansible.builtin.file:
+                path: /etc/ov/claims-portal
+                state: directory
+                mode: "0755"
+
+            - name: Release marker
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/release
+                content: "release r{{rel}}\n"
+                mode: "0644"
+              when: release_enabled | bool
+
+            - name: Fast path marker
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/fastpath
+                content: "enabled\n"
+                mode: "0644"
+              when: fast_path | bool
+
+            - name: Maintenance banner
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/maintenance
+                content: "claims portal in maintenance\n"
+                mode: "0644"
+              when: maintenance_mode | bool
+        EOF
+        cat > render-tuning.yml <<'EOF'
+        - name: Claims portal tuning
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Production tuning
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/tuning.conf
+                content: "pool={{pool}}\nprofile=production\n"
+                mode: "0644"
+              when: env_name == 'prod'
+
+            - name: Test tuning
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/tuning-test.conf
+                content: "pool=2\nprofile=test\n"
+                mode: "0644"
+              when: env_name == 'test'
+        EOF
+        cat > capacity.yml <<'EOF'
+        - name: Claims portal capacity
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Count the CPUs
+              ansible.builtin.command: nproc
+              register: cpus
+              changed_when: false
+
+            - name: Large node profile
+              ansible.builtin.copy:
+                dest: /etc/ov/claims-portal/profile
+                content: "large\n"
+                mode: "0644"
+              when: cpus.stdout | int > 0
+
+            - name: Shard markers
+              ansible.builtin.copy:
+                dest: "/etc/ov/claims-portal/shard-{{ item }}"
+                content: "shard {{ item }}\n"
+                mode: "0644"
+              loop: "{{ shard_ids.split(',') }}"
+        EOF
+        for f in deploy-release render-tuning capacity; do ansible-playbook $f.yml; done
+    alternatives:
+    - id: explicit-string-tests
+      description: Tests the flag text explicitly instead of converting with bool and uses the split filter.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 480
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > deploy-release.yml <<'EOF'
+          - name: Claims portal release
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Portal directory
+                ansible.builtin.file:
+                  path: /etc/ov/claims-portal
+                  state: directory
+                  mode: "0755"
+
+              - name: Release marker
+                ansible.builtin.copy:
+                  dest: /etc/ov/claims-portal/release
+                  content: "release r{{rel}}\n"
+                  mode: "0644"
+                when: release_enabled in ['yes', 'true']
+
+              - name: Fast path marker
+                ansible.builtin.copy:
+                  dest: /etc/ov/claims-portal/fastpath
+                  content: "enabled\n"
+                  mode: "0644"
+                when: fast_path == 'true'
+
+              - name: Maintenance banner
+                ansible.builtin.copy:
+                  dest: /etc/ov/claims-portal/maintenance
+                  content: "claims portal in maintenance\n"
+                  mode: "0644"
+                when: maintenance_mode == 'true'
+          EOF
+          cat > render-tuning.yml <<'EOF'
+          - name: Claims portal tuning
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Production tuning
+                ansible.builtin.copy:
+                  dest: /etc/ov/claims-portal/tuning.conf
+                  content: "pool={{pool}}\nprofile=production\n"
+                  mode: "0644"
+                when: env_name == 'prod'
+
+              - name: Test tuning
+                ansible.builtin.copy:
+                  dest: /etc/ov/claims-portal/tuning-test.conf
+                  content: "pool=2\nprofile=test\n"
+                  mode: "0644"
+                when: env_name == 'test'
+          EOF
+          cat > capacity.yml <<'EOF'
+          - name: Claims portal capacity
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Count the CPUs
+                ansible.builtin.command: nproc
+                register: cpus
+                changed_when: false
+
+              - name: Large node profile
+                ansible.builtin.copy:
+                  dest: /etc/ov/claims-portal/profile
+                  content: "large\n"
+                  mode: "0644"
+                when: cpus.stdout | int > 0
+
+              - name: Shard markers
+                ansible.builtin.copy:
+                  dest: "/etc/ov/claims-portal/shard-{{ item }}"
+                  content: "shard {{ item }}\n"
+                  mode: "0644"
+                loop: "{{ shard_ids | split(',') }}"
+          EOF
+          for f in deploy-release render-tuning capacity; do ansible-playbook $f.yml; done

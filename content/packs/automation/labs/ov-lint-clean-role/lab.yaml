@@ -1,0 +1,647 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-lint-clean-role
+  title: Bring the branch gateway role to a clean lint profile
+  domain: automation
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 25
+  tags:
+  - ansible
+  - lint
+  - roles
+  - quality
+  version: 1
+spec:
+  description: |
+    The role **`branch_gateway`** in **`/home/learner/branch-automation/roles`** configures the branch office
+    gateways, but `ansible-lint --profile production` reports a long list of findings: unnamed tasks, short module
+    names, risky file permissions, shell commands where modules exist, an ignored error and placeholder metadata.
+
+    Fix the role (its tasks and `meta/main.yml`) until
+
+    ```
+    ansible-lint --profile production
+    ```
+
+    passes in the project directory, **without** silencing rules: no `noqa` comments, no lint configuration that
+    skips or downgrades rules. Do not edit `defaults/main.yml`, the template or `site.yml`. The role must still
+    produce the same result on the gateway (configuration, resolver list, protected secrets directory, locked key
+    file and the legacy marker). Apply it with `site.yml`; the grader runs it again and expects no changes.
+  objectives:
+  - Read ansible-lint findings and map them to fixes
+  - Prefer modules over shell and command
+  - Fix findings without silencing rules or changing behaviour
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    site:
+      type: choice
+      values:
+      - lon
+      - leeds
+      - york
+    uplink:
+      type: int
+      min: 50
+      max: 900
+    tok:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-branch-lon-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-branch-lon-gw:eth1
+  setup:
+  - 'on': ov-branch-lon-gw
+    run: |
+      set -eu
+      case $(hostname) in
+        ov-branch-lon-gw) a=61 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      rm -rf /etc/ov/branch-gw
+      mkdir -p /etc/ov/branch-gw/secrets
+      echo "key-{{tok}}" > /etc/ov/branch-gw/secrets/key
+      chmod 0644 /etc/ov/branch-gw/secrets/key
+      chmod 0755 /etc/ov/branch-gw/secrets
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.61
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-branch-lon-gw; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-branch-lon-gw | cut -d' ' -f1) true
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/branch-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      branch_gateways:
+        hosts:
+          ov-branch-lon-gw:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      r=$p/roles/branch_gateway
+      install -d -o learner -g learner $r $r/tasks $r/meta $r/defaults $r/templates
+      cat > $p/site.yml <<'EOF'
+      - name: Branch gateway baseline
+        hosts: branch_gateways
+        become: true
+        roles:
+          - role: branch_gateway
+      EOF
+      cat > $r/defaults/main.yml <<'EOF'
+      ---
+      branch_gateway_site: {{site}}
+      branch_gateway_uplink_mbit: {{uplink}}
+      branch_gateway_dns:
+        - 10.70.0.53
+        - 10.70.0.54
+      EOF
+      cat > $r/templates/gateway.conf.j2 <<'EOF'
+      # managed by Ansible
+      site={{ branch_gateway_site }}
+      uplink_mbit={{ branch_gateway_uplink_mbit }}
+      EOF
+      cat > $r/tasks/main.yml <<'EOF'
+      ---
+      - file: path=/etc/ov/branch-gw state=directory
+      - name: install gateway config
+        template:
+          src: gateway.conf.j2
+          dest: /etc/ov/branch-gw/gateway.conf
+      - copy:
+          dest: /etc/ov/branch-gw/resolvers.conf
+          content: "{{ branch_gateway_dns | map('regex_replace', '^', 'nameserver ') | join('\n') }}\n"
+      - name: Restrict the secrets directory
+        shell: mkdir -p /etc/ov/branch-gw/secrets && chmod 0700 /etc/ov/branch-gw/secrets
+      - name: Lock the gateway key file
+        command: chmod 0600 /etc/ov/branch-gw/secrets/key
+        ignore_errors: yes
+      - name: Legacy marker
+        lineinfile:
+          path: /etc/ov/branch-gw/legacy
+          line: "retired=yes"
+          create: yes
+          mode: 0644
+      EOF
+      cat > $r/meta/main.yml <<'EOF'
+      galaxy_info:
+        author: your name
+        description: your role description
+        company: your company (optional)
+        license: license (GPL-2.0-or-later, MIT, etc)
+        min_ansible_version: 2.1
+        galaxy_tags: []
+      dependencies: []
+      EOF
+      chown -R learner:learner $p
+      cat $r/defaults/main.yml $r/templates/gateway.conf.j2 $p/site.yml | sha256sum > /var/tmp/.ct-lint.sum
+      # the supplied files, for the graded run of the role
+      rm -rf /var/lib/ct-lint; install -d -m 0700 /var/lib/ct-lint
+      cp $p/site.yml /var/lib/ct-lint/site.yml; cp $r/defaults/main.yml /var/lib/ct-lint/defaults.yml; cp $r/templates/gateway.conf.j2 /var/lib/ct-lint/gateway.conf.j2
+      # the graded run of the role, shared by lint-production and gateway-state (root-owned, prints ok or a reason)
+      cat > /var/lib/ct-lint/judge-role.sh <<'JUDGE'
+      # The role is judged by what it does, not by what is already on the gateway: its tasks and metadata are copied as
+      # the learner (into a root-owned archive) next to the supplied playbook, defaults and template, the gateway is put
+      # back into its starting state, and the grading account ctjudge (own uid, own key, fresh home) applies the copy with
+      # a fixed configuration. Project code, lookups, delegation and connection variables are refused.
+      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
+      ( ulimit -f 65536; ct-ansible run /home/learner/branch-automation/roles/branch_gateway timeout 30 tar -cf - tasks meta $(ct-ansible run /home/learner/branch-automation/roles/branch_gateway sh -c 'for d in handlers vars; do [ -d $d ] && echo $d; done') > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      r=$j/p/roles/branch_gateway
+      install -d $j/home $r/defaults $r/templates
+      cp /var/lib/ct-lint/site.yml $j/p/site.yml; cp /var/lib/ct-lint/defaults.yml $r/defaults/main.yml; cp /var/lib/ct-lint/gateway.conf.j2 $r/templates/gateway.conf.j2
+      printf '[defaults]\ninventory = %s/p/inventory.ini\nremote_user = ovauto\nretry_files_enabled = false\n' $j > $j/p/ansible.cfg
+      printf 'ov-branch-lon-gw\n[branch_gateways]\nov-branch-lon-gw\n' > $j/p/inventory.ini
+      chown -R ctjudge $j
+      runuser -u ctjudge -- timeout 30 tar -x --no-same-owner --no-same-permissions -C $r -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      cd $j/p
+      # the role may not pull in other roles (a dependency outside the copy would bring its own tasks and code)
+      deps=$(runuser -u ctjudge -- env -i PATH=/usr/bin:/bin /opt/ansible/bin/python3 -I -c 'import yaml,sys
+      try:
+          d = yaml.safe_load(open("roles/branch_gateway/meta/main.yml")) or {}
+          print("ok" if isinstance(d, dict) and not d.get("dependencies") else "dependencies")
+      except Exception:
+          print("meta-unreadable")' 2>/dev/null)
+      [ "$deps" = ok ] || { echo "${deps:-meta-unreadable}"; exit 0; }
+      [ -z "$(find roles \( -type l -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
+      ! grep -rIEqi '(^|[^a-z0-9_])(lookup|query)([^a-z0-9_]|$)|[{%(,|=[:space:]]q([^a-z0-9_]|$)|with_[a-z]|(^|[^a-z0-9_])ansible_[a-z_]*[[:space:]]*[:=]|proxycommand|(^|[[:space:]-])(connection|delegate_to|local_action|environment)[[:space:]]*:|(include|import)_(tasks|role|playbook|vars)|vars_files' roles || { echo not-allowed; exit 0; }
+      S() { runuser -u ctjudge -- env -i HOME=$j/home PATH=/usr/bin:/bin timeout 30 ssh ovauto@ov-branch-lon-gw "$1" 2>/dev/null; }
+      S "sudo -n sh -c 'rm -rf /etc/ov/branch-gw && mkdir -p /etc/ov/branch-gw/secrets && echo key-{{tok}} > /etc/ov/branch-gw/secrets/key && chmod 0644 /etc/ov/branch-gw/secrets/key && chmod 0755 /etc/ov/branch-gw /etc/ov/branch-gw/secrets'" || { echo reset-failed; exit 0; }
+      runuser -u ctjudge -- env -i HOME=$j/home PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_CONFIG=$j/p/ansible.cfg ANSIBLE_NOCOLOR=1 timeout 140 ansible-playbook site.yml >/dev/null 2>&1 || { echo role-run-failed; exit 0; }
+      # nothing the role run started may outlive it (it shares the grading account with the read-back below)
+      pkill -KILL -u ctjudge 2>/dev/null; sleep 1
+      st=$(S "sudo -n sh -c 'd=/etc/ov/branch-gw; stat -c %a \$d \$d/secrets \$d/secrets/key \$d/gateway.conf \$d/resolvers.conf \$d/legacy; cat \$d/gateway.conf; echo --; cat \$d/resolvers.conf; echo --; cat \$d/legacy; echo --; cat \$d/secrets/key'"); src=$?
+      want=$(printf '755\n700\n600\n644\n644\n644\n# managed by Ansible\nsite={{site}}\nuplink_mbit={{uplink}}\n--\nnameserver 10.70.0.53\nnameserver 10.70.0.54\n--\nretired=yes\n--\nkey-{{tok}}')
+      [ $src = 0 ] || { echo readback-failed; exit 0; }
+      [ "$st" = "$want" ] && echo ok || echo state-differs
+      JUDGE
+      chmod 0700 /var/lib/ct-lint/judge-role.sh
+  checks:
+  - id: lint-production
+    description: The project passes ansible-lint at the production profile (judged on a copy without lint configuration, ansible.cfg or project code) and the role still configures the gateway when the grader applies it
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.lint
+    weight: 3
+    timeoutSec: 295
+    command: |
+      # The learner's tree is only read as the learner. It is streamed (without .git) into a directory owned by the
+      # unprivileged account nobody, and every later step runs as nobody, so no learner process can touch the judged copy.
+      # The linter's home and configuration are separate root-made directories, never the copy.
+      cfg=$(mktemp); printf -- '---\nprofile: production\nskip_list: []\nwarn_list: []\n' > $cfg; chmod 0644 $cfg
+      j=$(mktemp -d); h=$(mktemp -d); chmod 0755 $j; chmod 0700 $h; chown nobody $j $h
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$h PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 "$@"); }
+      a=$(mktemp); clean() { rm -f $cfg $a; rm -rf $j $h; }
+      # the archive is written by the learner's tar into a root-owned file (size-capped); a tar that fails or is cut short fails the check
+      ( ulimit -f 131072; ct-ansible run /home/learner/branch-automation timeout 60 tar --exclude=./.git --exclude=./.ansible -cf - . > $a 2>/dev/null ) || { clean; echo copy-failed; exit 0; }
+      N timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { clean; echo copy-failed; exit 0; }
+      # ansible-lint drops every path a .gitignore matches, so the judged copy has no ignore file or lint configuration at any depth
+      # hidden directories (.git, .config, ansible-lint's .ansible cache) go first, so nothing a tool wrote there is judged
+      N sh -c 'find . -type l -delete; find . -mindepth 1 -type d -name ".*" -prune -exec rm -rf {} +; find . \( -name ".gitignore" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name ".yamllint*" \) -delete'
+      if [ "$(N sh -c 'grep -rIlE "skip_ansible_lint|noqa" . | head -1')" != "" ]; then clean; echo silenced; exit 0; fi
+      # ansible-lint only reads *.yml/*.yaml, so tasks hidden in other files or pulled in through include/import would escape it;
+      # lookups would run commands while the linter loads the playbooks
+      if [ -n "$(N sh -c 'find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:|(^|[^a-zA-Z0-9_])(lookup|query|q)[[:space:]]*\(|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)" . | head -1')" ]; then clean; echo hidden-tasks; exit 0; fi
+      # No learner code is ever loaded by the linter: every ansible.cfg, Python file, plugin, module and module_utils
+      # directory and vendored collection is removed, hidden directories too, and only YAML and Jinja files remain
+      N sh -c 'find . -mindepth 1 -type d \( -name ".*" -o -name library -o -name module_utils -o -name plugins -o -name "*_plugins" -o -name collections \) -prune -exec rm -rf {} +; find . -type f ! \( -name "*.yml" -o -name "*.yaml" -o -name "*.j2" \) -delete'
+      # role dependencies would make the linter load roles (and their code) from outside the copy
+      d=$(N timeout 30 /opt/ansible/bin/python3 -I -c 'import yaml, glob
+      bad = False
+      for f in glob.glob("roles/*/meta/main.y*ml"):
+          try:
+              m = yaml.safe_load(open(f)) or {}
+              bad = bad or not isinstance(m, dict) or bool(m.get("dependencies"))
+          except Exception:
+              bad = True
+      print("dependencies" if bad else "ok")' 2>/dev/null)
+      [ "$d" = ok ] || { clean; echo "${d:-dependencies}"; exit 0; }
+      out=$(N timeout 120 /opt/ansible/bin/ansible-lint -c $cfg --profile production -q --offline 2>&1); rc=$?
+      pkill -KILL -u nobody 2>/dev/null
+      n=$(printf '%s\n' "$out" | grep -c ':[0-9]')
+      clean
+      [ "$rc" = 0 ] || { echo "findings=$n"; exit 0; }
+      # a clean report only counts for a role that still does its job (an emptied role lints clean too)
+      g=$(sh /var/lib/ct-lint/judge-role.sh)
+      [ "$g" = ok ] && echo clean || echo "role-$g"
+    expect:
+      match: exact
+      value: clean
+  - id: lint-not-silenced
+    description: Nothing is silenced (no noqa, skip or warn lists) and the supplied defaults, template and site playbook are unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.lint
+    weight: 2
+    command: |
+      # The learner's tree is only read as the learner, streamed into a copy owned by nobody; the verdict is computed from
+      # that copy by nobody and this root shell, never by a learner process. A failed copy fails the check.
+      j=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j $a' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"); }
+      ( ulimit -f 131072; ct-ansible run /home/learner/branch-automation timeout 60 tar --exclude=./.git --exclude=./.ansible -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      N timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      N find . -type l -delete
+      # lint configuration under a .config directory is silencing; every other hidden directory (.git, ansible-lint's
+      # .ansible cache) is dropped before the searches below, so nothing a tool wrote there is judged
+      [ -z "$(N find . -path '*/.config/*' -iname '*lint*' | head -1)" ] || { echo silenced; exit 0; }
+      N sh -c 'find . -mindepth 1 -type d -name ".*" -prune -exec rm -rf {} +'
+      # a global yamllint configuration in the learner's home (the listing must end with the marker, or it was cut short)
+      y=$(ct-ansible run /home/learner timeout 20 sh -c 'find .config -maxdepth 2 -iname "*yamllint*" 2>/dev/null | head -1; echo end-of-list')
+      [ "$y" = end-of-list ] || { echo silenced; exit 0; }
+      r=$(N timeout 60 sh -c '
+        if [ -n "$(find . \( -name ".yamllint*" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -path "*/.config/*" \) | head -1)" ]; then echo silenced; exit 0; fi
+        if grep -rIqsEi --include=.gitignore "yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]" . ; then echo silenced; exit 0; fi
+        if grep -rIqsE "skip_ansible_lint|noqa|skip_list|warn_list|skip_tasks|exclude_paths|enable_list" . ; then echo silenced; exit 0; fi
+        if [ -n "$(find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1)" ]; then echo silenced; exit 0; fi
+        echo clean')
+      [ "$r" = clean ] || { echo silenced; exit 0; }
+      [ "$(N cat roles/branch_gateway/defaults/main.yml roles/branch_gateway/templates/gateway.conf.j2 site.yml | sha256sum)" = "$(cat /var/tmp/.ct-lint.sum)" ] && echo ok || echo supplied-files-changed
+    expect:
+      match: exact
+      value: ok
+  - id: gateway-state
+    description: The fixed role, applied by the grader to a gateway reset to its starting state, produces the configuration, resolver list, protected secrets directory, locked key and legacy marker
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.lint
+    weight: 2
+    timeoutSec: 280
+    command: |
+      # The role is judged by what it does, not by what is already on the gateway: its tasks, handlers, vars and metadata
+      # are copied as the learner (into a root-owned archive) next to the supplied playbook, defaults and template, the
+      # gateway is put back into its starting state, and the grading account ctjudge (own uid, own key, fresh home)
+      # applies the copy with a fixed configuration. Project code, role dependencies, lookups, delegation and connection
+      # variables are refused. The script was written by setup (/var/lib/ct-lint/judge-role.sh).
+      sh /var/lib/ct-lint/judge-role.sh
+    expect:
+      match: exact
+      value: ok
+  - id: site-rerun
+    description: site.yml runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.lint
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/branch-automation site.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Reading the report
+    body: '`ansible-lint --profile production -p` prints one line per finding with the rule id (`fqcn`, `name`, `risky-file-permissions`, `no-changed-when`, `meta-incorrect`, ...). `ansible-lint --list-rules` explains each rule.'
+    cost: 1
+  - title: Shell and command
+    body: 'Creating a directory with a mode is `ansible.builtin.file` with `state: directory` and `mode`. A command that only changes the mode of an existing file is the `file` module with `mode` too.'
+    cost: 2
+  misconceptions:
+  - id: skip-the-rules
+    description: Adds a lint configuration that skips the failing rules.
+    feedback: Silencing rules is not fixing them; the production profile has to pass without skip lists.
+    expectFail:
+    - lint-production
+    - lint-not-silenced
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        printf 'skip_list:\n  - fqcn\n  - name\n  - risky-file-permissions\n  - no-changed-when\n  - ignore-errors\n  - yaml\n  - meta-incorrect\n  - schema\n  - no-free-form\n' > .ansible-lint
+        ansible-playbook site.yml || true
+  - id: hide-with-gitignore
+    description: Adds a .gitignore that hides the roles directory and the playbook from the linter, with one clean dummy playbook.
+    feedback: A .gitignore that hides files from ansible-lint is silencing, not fixing; the judged copy ignores it and the findings stay.
+    expectFail:
+    - lint-production
+    - lint-not-silenced
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        printf 'roles/\nsite.yml\n.gitignore\n' > .gitignore
+        printf -- '---\n- name: Dummy\n  hosts: localhost\n  gather_facts: false\n  tasks:\n    - name: Nothing\n      ansible.builtin.debug:\n        msg: ok\n' > dummy.yml
+        ansible-playbook site.yml || true
+  - id: exit-early-plugin
+    description: Leaves the role as it is and adds a project filter plugin that ends the Python process with exit code 0 as soon as it is loaded.
+    feedback: A plugin that stops the linter is not a fix; the role is judged without any project code and its findings stay.
+    expectFail:
+    - lint-production
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        mkdir -p filter_plugins roles/branch_gateway/filter_plugins
+        printf 'import os\nos._exit(0)\n' > filter_plugins/quiet.py
+        cp filter_plugins/quiet.py roles/branch_gateway/filter_plugins/quiet.py
+        ansible-lint --profile production -q || true
+  - id: config-points-at-plugin
+    description: Leaves the role as it is and points ansible.cfg (and home ansible.cfg files) at a world-readable plugin directory outside the project that ends the linter with exit code 0.
+    feedback: Configuration that loads code into the linter is not a fix; the role is judged with a fixed configuration and its findings stay.
+    expectFail:
+    - lint-production
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        mkdir -p /tmp/lint-shim
+        printf 'import os\nos._exit(0)\n' > /tmp/lint-shim/quiet.py
+        chmod -R a+rX /tmp/lint-shim
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\nfilter_plugins = /tmp/lint-shim\n' > ansible.cfg
+        cp ansible.cfg .ansible.cfg
+        cp ansible.cfg ~/.ansible.cfg
+        ansible-lint --profile production -q || true
+  - id: half-fixed
+    description: Names the tasks and uses FQCNs but leaves the file modes, the shell command and the metadata as they were.
+    feedback: 'Production needs more than names: explicit file permissions, no shell where a module exists and real role metadata.'
+    expectFail:
+    - lint-production
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+        ---
+        - name: Gateway configuration directory
+          ansible.builtin.file: path=/etc/ov/branch-gw state=directory
+        - name: Install gateway config
+          ansible.builtin.template:
+            src: gateway.conf.j2
+            dest: /etc/ov/branch-gw/gateway.conf
+        - name: Resolver list
+          ansible.builtin.copy:
+            dest: /etc/ov/branch-gw/resolvers.conf
+            content: "{{ branch_gateway_dns | map('regex_replace', '^', 'nameserver ') | join('\n') }}\n"
+        - name: Restrict the secrets directory
+          ansible.builtin.shell: mkdir -p /etc/ov/branch-gw/secrets && chmod 0700 /etc/ov/branch-gw/secrets
+        - name: Lock the gateway key file
+          ansible.builtin.command: chmod 0600 /etc/ov/branch-gw/secrets/key
+          ignore_errors: yes
+        - name: Legacy marker
+          ansible.builtin.lineinfile:
+            path: /etc/ov/branch-gw/legacy
+            line: "retired=yes"
+            create: yes
+            mode: 0644
+        EOF
+        ansible-playbook site.yml || true
+  - id: run-then-trim
+    description: Runs the original site.yml once (so the gateway is right), then cuts the role down to one lint-clean task and fills in the metadata.
+    feedback: The role is judged by applying it to a gateway in its starting state; it has to keep doing everything it did.
+    expectFail:
+    - gateway-state
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 180
+      run: |
+        cd ~/branch-automation
+        ansible-playbook site.yml || true
+        cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+        ---
+        - name: Gateway configuration directory
+          ansible.builtin.file:
+            path: /etc/ov/branch-gw
+            state: directory
+            mode: "0755"
+        EOF
+        cat > roles/branch_gateway/meta/main.yml <<'EOF'
+        galaxy_info:
+          author: Orrin and Vale platform team
+          description: Branch office gateway baseline
+          license: GPL-3.0-or-later
+          min_ansible_version: "2.14"
+          galaxy_tags: []
+          platforms:
+            - name: EL
+              versions: [all]
+        dependencies: []
+        EOF
+        ansible-playbook site.yml || true
+  - id: delete-the-noise
+    description: Removes the tasks that the linter complains about.
+    feedback: 'The role must keep doing what it did: configuration, resolvers, protected secrets directory, locked key and marker.'
+    expectFail:
+    - gateway-state
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        # start from a gateway the original role never touched (grading already ran the original site.yml once)
+        ansible branch_gateways -b -m ansible.builtin.file -a 'path=/etc/ov/branch-gw state=absent' || true
+        cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+        ---
+        - name: Gateway configuration directory
+          ansible.builtin.file:
+            path: /etc/ov/branch-gw
+            state: directory
+            mode: "0755"
+
+        - name: Install gateway config
+          ansible.builtin.template:
+            src: gateway.conf.j2
+            dest: /etc/ov/branch-gw/gateway.conf
+            mode: "0644"
+        EOF
+        cat > roles/branch_gateway/meta/main.yml <<'EOF'
+        galaxy_info:
+          author: Orrin and Vale platform team
+          description: Branch office gateway baseline
+          license: GPL-3.0-or-later
+          min_ansible_version: "2.14"
+          galaxy_tags: []
+          platforms:
+            - name: EL
+              versions: [all]
+        dependencies: []
+        EOF
+        ansible-playbook site.yml || true
+  solution:
+    explanation: |
+      Every finding has a real fix: tasks get names (starting with a capital letter) and fully qualified module names;
+      `copy`, `template`, `file` and `lineinfile` get an explicit quoted `mode`; `shell`/`command` calls become the `file`
+      module with `state: directory` and `mode`, so they need no `changed_when` and the failing `ignore_errors` is not
+      needed; `yes` becomes `true`; and the role metadata gets real author, description and licence. The behaviour is
+      unchanged, which the second run (no changes) shows.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/branch-automation
+        cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+        ---
+        - name: Gateway configuration directory
+          ansible.builtin.file:
+            path: /etc/ov/branch-gw
+            state: directory
+            mode: "0755"
+
+        - name: Install gateway config
+          ansible.builtin.template:
+            src: gateway.conf.j2
+            dest: /etc/ov/branch-gw/gateway.conf
+            mode: "0644"
+
+        - name: Resolver list
+          ansible.builtin.copy:
+            dest: /etc/ov/branch-gw/resolvers.conf
+            content: "{{ branch_gateway_dns | map('regex_replace', '^', 'nameserver ') | join('\n') }}\n"
+            mode: "0644"
+
+        - name: Restrict the secrets directory
+          ansible.builtin.file:
+            path: /etc/ov/branch-gw/secrets
+            state: directory
+            mode: "0700"
+
+        - name: Lock the gateway key file
+          ansible.builtin.file:
+            path: /etc/ov/branch-gw/secrets/key
+            mode: "0600"
+
+        - name: Legacy marker
+          ansible.builtin.lineinfile:
+            path: /etc/ov/branch-gw/legacy
+            line: "retired=yes"
+            create: true
+            mode: "0644"
+        EOF
+        cat > roles/branch_gateway/meta/main.yml <<'EOF'
+        galaxy_info:
+          author: Orrin and Vale platform team
+          description: Branch office gateway baseline
+          license: GPL-3.0-or-later
+          min_ansible_version: "2.14"
+          galaxy_tags: []
+          platforms:
+            - name: EL
+              versions: [all]
+        dependencies: []
+        EOF
+        ansible-playbook site.yml
+    alternatives:
+    - id: symbolic-modes
+      description: Uses symbolic file modes (u=rw,go=) instead of octal strings, and runs ansible-lint itself before grading.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-automation
+          cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+          ---
+          - name: Gateway configuration directory
+            ansible.builtin.file:
+              path: /etc/ov/branch-gw
+              state: directory
+              mode: "0755"
+
+          - name: Install gateway config
+            ansible.builtin.template:
+              src: gateway.conf.j2
+              dest: /etc/ov/branch-gw/gateway.conf
+              mode: "0644"
+
+          - name: Resolver list
+            ansible.builtin.copy:
+              dest: /etc/ov/branch-gw/resolvers.conf
+              content: "{{ branch_gateway_dns | map('regex_replace', '^', 'nameserver ') | join('\n') }}\n"
+              mode: "0644"
+
+          - name: Restrict the secrets directory
+            ansible.builtin.file:
+              path: /etc/ov/branch-gw/secrets
+              state: directory
+              mode: u=rwx,go=
+
+          - name: Lock the gateway key file
+            ansible.builtin.file:
+              path: /etc/ov/branch-gw/secrets/key
+              mode: u=rw,go=
+
+          - name: Legacy marker
+            ansible.builtin.lineinfile:
+              path: /etc/ov/branch-gw/legacy
+              line: "retired=yes"
+              create: true
+              mode: "0644"
+          EOF
+          cat > roles/branch_gateway/meta/main.yml <<'EOF'
+          galaxy_info:
+            author: Orrin and Vale platform team
+            description: Branch office gateway baseline
+            license: GPL-3.0-or-later
+            min_ansible_version: "2.14"
+            galaxy_tags: []
+            platforms:
+              - name: EL
+                versions: [all]
+          dependencies: []
+          EOF
+          ansible-playbook site.yml
+          ansible-lint --profile production

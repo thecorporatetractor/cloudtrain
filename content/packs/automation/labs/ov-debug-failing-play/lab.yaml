@@ -1,0 +1,284 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-debug-failing-play
+  title: Find why the quoting API deploy fails on one host only
+  domain: automation
+  frameworks:
+  - ex294-aligned:plays-errors
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - ansible
+  - debugging
+  - variables
+  - host_vars
+  version: 1
+spec:
+  description: |
+    The quoting API deploy in **`/home/learner/quote-api-deploy`** works on `ov-quote-api1` but fails on
+    `ov-quote-api2` with an undefined variable. Find out why and fix it **at the source** so that
+    `ansible-playbook deploy.yml` succeeds on both hosts, each with its own configured worker count.
+
+    Do not change the play, the template or the group variables, and do not paper over the problem with a
+    default value, a limit or ignoring errors. Run the playbook; the grader runs it again and expects no changes.
+  objectives:
+  - Read a failing task with increased verbosity
+  - Inspect the variables a host really has
+  - Fix data at its source instead of masking the failure
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    port:
+      type: int
+      min: 8100
+      max: 8199
+    rel:
+      type: int
+      min: 100
+      max: 999
+    w1:
+      type: int
+      min: 2
+      max: 5
+    w2:
+      type: int
+      min: 6
+      max: 9
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-quote-api1
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-quote-api2
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-quote-api1:eth1
+    - a: ov-ctl:eth2
+      b: ov-quote-api2:eth1
+  setup:
+  - 'on': ov-quote-api1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-quote-api1) a=31 ;; ov-quote-api2) a=32 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      rm -rf /etc/ov/quote-api
+  - 'on': ov-quote-api2
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-quote-api1=10.70.0.31 ov-quote-api2=10.70.0.32
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-quote-api1 ov-quote-api2
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/quote-api-deploy
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      quote_api:
+        hosts:
+          ov-quote-api1:
+          ov-quote-api2:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      install -d -o learner -g learner $p/group_vars $p/host_vars $p/templates
+      cat > $p/deploy.yml <<'EOF'
+      - name: Deploy the quoting API
+        hosts: quote_api
+        become: true
+        tasks:
+          - name: API configuration directory
+            ansible.builtin.file:
+              path: /etc/ov/quote-api
+              state: directory
+              mode: "0755"
+
+          - name: API configuration
+            ansible.builtin.template:
+              src: api.conf.j2
+              dest: /etc/ov/quote-api/api.conf
+              mode: "0644"
+
+          - name: Release marker
+            ansible.builtin.copy:
+              dest: /etc/ov/quote-api/release
+              content: "{{ api_release }}\n"
+              mode: "0644"
+      EOF
+      cat > $p/templates/api.conf.j2 <<'EOF'
+      # quoting API, managed by Ansible
+      port={{ api_port }}
+      workers={{ api_workers }}
+      log_level={{ api_log_level }}
+      EOF
+      cat > $p/group_vars/quote_api.yml <<'EOF'
+      api_port: {{port}}
+      api_log_level: info
+      api_release: q{{rel}}
+      EOF
+      cat > $p/host_vars/ov-quote-api1.yml <<'EOF'
+      api_workers: {{w1}}
+      EOF
+      cat > $p/host_vars/ov-quote-api2.yml <<'EOF'
+      api_wokers: {{w2}}
+      EOF
+      chown -R learner:learner $p
+      sha256sum $p/deploy.yml $p/templates/api.conf.j2 $p/group_vars/quote_api.yml $p/host_vars/ov-quote-api1.yml > /var/tmp/.ct-debug.sum
+  checks:
+  - id: api-conf-api1
+    description: ov-quote-api1 has the API configuration
+    type: shell
+    'on': ov-quote-api1
+    skills:
+    - automation.quality.debugging
+    - automation.data.variables
+    weight: 1
+    command: |
+      [ "$(cat /etc/ov/quote-api/api.conf 2>/dev/null)" = "$(printf '# quoting API, managed by Ansible\nport={{port}}\nworkers={{w1}}\nlog_level=info')" ] && [ "$(cat /etc/ov/quote-api/release 2>/dev/null)" = "q{{rel}}" ] && echo ok || echo wrong
+    expect:
+      match: exact
+      value: ok
+  - id: api-conf-api2
+    description: ov-quote-api2 has the API configuration with its own worker count
+    type: shell
+    'on': ov-quote-api2
+    skills:
+    - automation.quality.debugging
+    - automation.data.variables
+    weight: 3
+    command: |
+      [ "$(cat /etc/ov/quote-api/api.conf 2>/dev/null)" = "$(printf '# quoting API, managed by Ansible\nport={{port}}\nworkers={{w2}}\nlog_level=info')" ] && [ "$(cat /etc/ov/quote-api/release 2>/dev/null)" = "q{{rel}}" ] && echo ok || echo wrong
+    expect:
+      match: exact
+      value: ok
+  - id: fixed-at-the-source
+    description: The play, the template, the group variables and the other host are unchanged; the variable file of ov-quote-api2 is corrected
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.variables
+    weight: 2
+    command: |
+      cd /home/learner/quote-api-deploy
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-debug.sum >/dev/null 2>&1 || { echo supplied-files-changed; exit 0; }
+      ct-ansible run . timeout 10 sh -c "head -c 65536 host_vars/ov-quote-api2.yml > /dev/null && grep -qE '^api_workers: *{{w2}} *\$' host_vars/ov-quote-api2.yml && ! grep -q 'api_wokers' host_vars/ov-quote-api2.yml" 2>/dev/null && echo ok || echo host-vars-not-fixed
+    expect:
+      match: exact
+      value: ok
+  - id: deploy-rerun
+    description: deploy.yml succeeds on all hosts and runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.debugging
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible recap /home/learner/quote-api-deploy deploy.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: More detail
+    body: '`ansible-playbook deploy.yml -v` shows the exact error for the failing host; `--limit ov-quote-api2` runs only that host. On a failed task you can also enable the task debugger with `ANSIBLE_ENABLE_TASK_DEBUGGER=True`.'
+    cost: 1
+  - title: What does the host have?
+    body: '`ansible-inventory --host ov-quote-api2` prints every variable the inventory gives that host (compare with `ov-quote-api1`).'
+    cost: 1
+  misconceptions:
+  - id: default-in-template
+    description: Hides the problem with a default filter in the template.
+    feedback: A default makes the play pass but gives ov-quote-api2 the wrong worker count; fix the misspelled variable instead.
+    expectFail:
+    - api-conf-api2
+    - fixed-at-the-source
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/quote-api-deploy
+        sed -i 's/{{ api_workers }}/{{ api_workers | default(1) }}/' templates/api.conf.j2
+        ansible-playbook deploy.yml
+  - id: group-default
+    description: Adds a group-wide worker count so the missing variable stops failing.
+    feedback: A group default hides the typo and gives the second host the wrong value; correct the host variable file.
+    expectFail:
+    - api-conf-api2
+    - fixed-at-the-source
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/quote-api-deploy
+        printf 'api_workers: 2\n' >> group_vars/quote_api.yml
+        ansible-playbook deploy.yml
+  - id: skip-the-host
+    description: Limits the deploy to the host that works.
+    feedback: Every quote API node needs the configuration; find the real cause on the failing host.
+    expectFail:
+    - api-conf-api2
+    - fixed-at-the-source
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/quote-api-deploy
+        ansible-playbook deploy.yml --limit ov-quote-api1
+  solution:
+    explanation: |
+      The failing task is the template: `-v` (or the task debugger) shows `'api_workers' is undefined` for
+      `ov-quote-api2` only. `ansible-inventory --host ov-quote-api2` lists the variables the host actually has, and shows
+      `api_wokers` in place of `api_workers`. Fixing the spelling in `host_vars/ov-quote-api2.yml` makes the play pass on
+      both hosts without touching the play, the template or the group variables.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/quote-api-deploy
+        sed -i 's/^api_wokers:/api_workers:/' host_vars/ov-quote-api2.yml
+        ansible-playbook deploy.yml
+    alternatives:
+    - id: rewrite-host-vars
+      description: Rewrites the host variable file instead of editing it in place.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/quote-api-deploy
+          printf 'api_workers: {{w2}}\n' > host_vars/ov-quote-api2.yml
+          ansible-playbook deploy.yml

@@ -1,0 +1,421 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-lookups-filters-ipam
+  title: Plan branch subnets with lookups and network filters
+  domain: automation
+  frameworks:
+  - ex374-aligned:data-transform
+  difficulty: hard
+  estimatedMinutes: 30
+  tags:
+  - ansible
+  - lookups
+  - filters
+  - ipam
+  - networking
+  version: 1
+spec:
+  description: |
+    The network team keeps the branch offices in **`/home/learner/branch-plan/branches.csv`** (`branch,prefix`).
+    Write **`ipam.yml`** (it runs on the control node only) that reads the file and, in
+    **`/home/learner/branch-plan/host_vars/<branch>.yml`**, writes one variable file per branch with
+
+    - `branch_prefix`: the prefix as written in the CSV,
+    - `branch_gateway`: the **first usable** address of the prefix,
+    - `branch_dhcp_start`: the address **10** above the network address, and
+    - `branch_dhcp_end`: the address **5** below the broadcast address.
+
+    One row of the CSV overlaps an earlier row. A branch whose prefix overlaps the prefix of a branch **earlier in the
+    file** is rejected: it gets no variable file and its name is written to **`rejected.txt`** (one name per line).
+
+    Do not change the CSV. Run the playbook; the grader runs it again and expects no changes.
+  objectives:
+  - Read structured data with a lookup and a filter
+  - Compute addresses with the network filters
+  - Validate input and reject conflicting rows
+  params:
+    net:
+      type: int
+      min: 10
+      max: 40
+    clash:
+      type: choice
+      values:
+      - leeds
+      - lon
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+  setup:
+  - 'on': ov-ctl
+    run: |
+      set -eu
+      p=/home/learner/branch-plan
+      install -d -o learner -g learner $p $p/host_vars
+      case {{clash}} in
+        leeds) d=10.{{net}}.1.64/26 ;;
+        lon)   d=10.{{net}}.0.128/25 ;;
+      esac
+      cat > $p/branches.csv <<EOF
+      branch,prefix
+      lon,10.{{net}}.0.0/24
+      leeds,10.{{net}}.1.0/24
+      york,10.{{net}}.2.0/25
+      bath,10.{{net}}.2.128/25
+      derry,$d
+      cork,10.{{net}}.3.0/24
+      EOF
+      printf 'localhost ansible_connection=local\n' > $p/inventory.ini
+      printf '[defaults]\ninventory = inventory.ini\nhost_key_checking = false\n' > $p/ansible.cfg
+      chown -R learner:learner $p
+      sha256sum $p/branches.csv > /var/tmp/.ct-ipam.sum
+  checks:
+  - id: ipam-values
+    description: Every accepted branch has a variable file with its prefix, first usable gateway and the DHCP range
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.filters
+    - automation.data.lookups
+    weight: 3
+    command: |
+      # The expected rows come from the lab parameters, never from the learner's CSV. The learner's output is copied
+      # (as the learner) into a directory owned by nobody and judged there by a process of that account.
+      j=$(mktemp -d); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@"); }
+      ct-ansible run /home/learner/branch-plan timeout 30 tar -cf - host_vars rejected.txt 2>/dev/null | N timeout 30 tar -x --no-same-owner --no-same-permissions -f - 2>/dev/null
+      N find . -type l -delete
+      N timeout 60 /opt/ansible/bin/python3 -I - <<'EOF'
+      import ipaddress, yaml
+      rows = [('lon', '10.{{net}}.0.0/24'), ('leeds', '10.{{net}}.1.0/24'), ('york', '10.{{net}}.2.0/25'), ('bath', '10.{{net}}.2.128/25'),
+              ('derry', '10.{{net}}.1.64/26' if '{{clash}}' == 'leeds' else '10.{{net}}.0.128/25'), ('cork', '10.{{net}}.3.0/24')]
+      accepted = []
+      for b, p in rows:
+          n = ipaddress.ip_network(p)
+          if not any(n.overlaps(q) for _, q in accepted):
+              accepted.append((b, n))
+      bad = []
+      for b, n in accepted:
+          try:
+              d = yaml.safe_load(open('host_vars/%s.yml' % b))
+              assert isinstance(d, dict)
+          except Exception:
+              bad.append(b + ':missing'); continue
+          want = {'branch_prefix': str(n), 'branch_gateway': str(n.network_address + 1), 'branch_dhcp_start': str(n.network_address + 10), 'branch_dhcp_end': str(n.broadcast_address - 5)}
+          for k, w in want.items():
+              if str(d.get(k)) != w:
+                  bad.append('%s:%s' % (b, k))
+      print(' '.join(bad) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: ipam-rejects
+    description: Only non-overlapping branches have a variable file and rejected.txt names the rejected ones
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.filters
+    weight: 3
+    command: |
+      # The expected rows come from the lab parameters, never from the learner's CSV. The learner's output is copied
+      # (as the learner) into a directory owned by nobody and judged there by a process of that account.
+      j=$(mktemp -d); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@"); }
+      ct-ansible run /home/learner/branch-plan timeout 30 tar -cf - host_vars rejected.txt 2>/dev/null | N timeout 30 tar -x --no-same-owner --no-same-permissions -f - 2>/dev/null
+      N find . -type l -delete
+      N timeout 60 /opt/ansible/bin/python3 -I - <<'EOF'
+      import os, ipaddress
+      rows = [('lon', '10.{{net}}.0.0/24'), ('leeds', '10.{{net}}.1.0/24'), ('york', '10.{{net}}.2.0/25'), ('bath', '10.{{net}}.2.128/25'),
+              ('derry', '10.{{net}}.1.64/26' if '{{clash}}' == 'leeds' else '10.{{net}}.0.128/25'), ('cork', '10.{{net}}.3.0/24')]
+      accepted, rejected = [], []
+      for b, p in rows:
+          n = ipaddress.ip_network(p)
+          if any(n.overlaps(q) for _, q in accepted):
+              rejected.append(b)
+          else:
+              accepted.append((b, n))
+      try:
+          files = sorted(f[:-4] for f in os.listdir('host_vars') if f.endswith('.yml'))
+      except Exception:
+          files = None
+      r = []
+      if files != sorted(b for b, _ in accepted): r.append('files=' + ','.join(files or []))
+      try:
+          got = sorted(x.strip() for x in open('rejected.txt').read().split() if x.strip())
+      except Exception:
+          got = None
+      if got != sorted(rejected): r.append('rejected.txt')
+      print(' '.join(r) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: ipam-rerun
+    description: ipam.yml runs again without changes and the CSV is unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.lookups
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-ipam.sum >/dev/null 2>&1 || { echo csv-edited; exit 0; }
+      ct-ansible recap /home/learner/branch-plan ipam.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Reading the CSV
+    body: '`lookup(''ansible.builtin.file'', ''branches.csv'') | community.general.from_csv` returns a list of dictionaries (the first line names the keys). The `community.general.read_csv` module does the same as a task.'
+    cost: 1
+  - title: Network arithmetic
+    body: '`ansible.utils.ipaddr(''N'')` returns the Nth address of a network (negative values count from the end); `ansible.utils.ipaddr(''address'')` drops the prefix length. The tests `ansible.utils.subnet_of` and `ansible.utils.supernet_of` compare two prefixes.'
+    cost: 2
+  misconceptions:
+  - id: no-overlap-check
+    description: Writes a variable file for every row without comparing prefixes.
+    feedback: 'Two branches must never share address space: reject the later row whose prefix overlaps an earlier one.'
+    expectFail:
+    - ipam-rejects
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/branch-plan
+        cat > ipam.yml <<'EOF'
+        - name: Branch address plan
+          hosts: localhost
+          gather_facts: false
+          vars:
+            rows: "{{ lookup('ansible.builtin.file', 'branches.csv') | community.general.from_csv }}"
+          tasks:
+            - name: Accept branches whose prefix overlaps no earlier one
+              ansible.builtin.set_fact:
+                accepted: "{{ accepted | default([]) + [item] }}"
+              loop: "{{ rows }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Branch variables
+              ansible.builtin.copy:
+                dest: "host_vars/{{ item.branch }}.yml"
+                content: |
+                  branch_prefix: {{ item.prefix }}
+                  branch_gateway: {{ item.prefix | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_start: {{ item.prefix | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_end: {{ item.prefix | ansible.utils.ipaddr('-6') | ansible.utils.ipaddr('address') }}
+                mode: "0644"
+              loop: "{{ accepted }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Rejected branches
+              ansible.builtin.copy:
+                dest: rejected.txt
+                content: "{{ rows | map(attribute='branch') | difference(accepted | map(attribute='branch')) | join('\n') }}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook ipam.yml
+  - id: network-as-gateway
+    description: Uses the network address itself as the gateway.
+    feedback: The gateway is the first usable address of the prefix, not the network address.
+    expectFail:
+    - ipam-values
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/branch-plan
+        cat > ipam.yml <<'EOF'
+        - name: Branch address plan
+          hosts: localhost
+          gather_facts: false
+          vars:
+            rows: "{{ lookup('ansible.builtin.file', 'branches.csv') | community.general.from_csv }}"
+          tasks:
+            - name: Accept branches whose prefix overlaps no earlier one
+              ansible.builtin.set_fact:
+                accepted: "{{ accepted | default([]) + [item] }}"
+              when:
+                - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.subnet_of', item.prefix) | list | length == 0
+                - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.supernet_of', item.prefix) | list | length == 0
+              loop: "{{ rows }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Branch variables
+              ansible.builtin.copy:
+                dest: "host_vars/{{ item.branch }}.yml"
+                content: |
+                  branch_prefix: {{ item.prefix }}
+                  branch_gateway: {{ item.prefix | ansible.utils.ipaddr('network') }}
+                  branch_dhcp_start: {{ item.prefix | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_end: {{ item.prefix | ansible.utils.ipaddr('-6') | ansible.utils.ipaddr('address') }}
+                mode: "0644"
+              loop: "{{ accepted }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Rejected branches
+              ansible.builtin.copy:
+                dest: rejected.txt
+                content: "{{ rows | map(attribute='branch') | difference(accepted | map(attribute='branch')) | join('\n') }}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook ipam.yml
+  - id: last-row-wins
+    description: Processes the rows in reverse, so an earlier branch loses against a later one.
+    feedback: The row that comes first in the CSV keeps its prefix; the later overlapping row is rejected.
+    expectFail:
+    - ipam-rejects
+    - ipam-values
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/branch-plan
+        cat > ipam.yml <<'EOF'
+        - name: Branch address plan
+          hosts: localhost
+          gather_facts: false
+          vars:
+            rows: "{{ lookup('ansible.builtin.file', 'branches.csv') | community.general.from_csv }}"
+          tasks:
+            - name: Accept branches whose prefix overlaps no earlier one
+              ansible.builtin.set_fact:
+                accepted: "{{ accepted | default([]) + [item] }}"
+              when:
+                - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.subnet_of', item.prefix) | list | length == 0
+                - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.supernet_of', item.prefix) | list | length == 0
+              loop: "{{ rows | reverse | list }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Branch variables
+              ansible.builtin.copy:
+                dest: "host_vars/{{ item.branch }}.yml"
+                content: |
+                  branch_prefix: {{ item.prefix }}
+                  branch_gateway: {{ item.prefix | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_start: {{ item.prefix | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_end: {{ item.prefix | ansible.utils.ipaddr('-6') | ansible.utils.ipaddr('address') }}
+                mode: "0644"
+              loop: "{{ accepted }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Rejected branches
+              ansible.builtin.copy:
+                dest: rejected.txt
+                content: "{{ rows | map(attribute='branch') | difference(accepted | map(attribute='branch')) | join('\n') }}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook ipam.yml
+  solution:
+    explanation: |
+      The CSV is read with the `file` lookup and parsed by the `from_csv` filter. An accumulating `set_fact` keeps a branch only
+      when its prefix is neither inside nor around the prefixes already accepted (`subnet_of` / `supernet_of` tests), so the
+      later of two overlapping rows is rejected. For each accepted branch `ipaddr('1')` gives the first usable address,
+      `ipaddr('10')` the DHCP start and `ipaddr('-6')` the address five below the broadcast; `ipaddr('address')` strips the prefix
+      length. The rejected branch names are written to `rejected.txt`.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/branch-plan
+        cat > ipam.yml <<'EOF'
+        - name: Branch address plan
+          hosts: localhost
+          gather_facts: false
+          vars:
+            rows: "{{ lookup('ansible.builtin.file', 'branches.csv') | community.general.from_csv }}"
+          tasks:
+            - name: Accept branches whose prefix overlaps no earlier one
+              ansible.builtin.set_fact:
+                accepted: "{{ accepted | default([]) + [item] }}"
+              when:
+                - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.subnet_of', item.prefix) | list | length == 0
+                - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.supernet_of', item.prefix) | list | length == 0
+              loop: "{{ rows }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Branch variables
+              ansible.builtin.copy:
+                dest: "host_vars/{{ item.branch }}.yml"
+                content: |
+                  branch_prefix: {{ item.prefix }}
+                  branch_gateway: {{ item.prefix | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_start: {{ item.prefix | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }}
+                  branch_dhcp_end: {{ item.prefix | ansible.utils.ipaddr('-6') | ansible.utils.ipaddr('address') }}
+                mode: "0644"
+              loop: "{{ accepted }}"
+              loop_control:
+                label: "{{ item.branch }}"
+
+            - name: Rejected branches
+              ansible.builtin.copy:
+                dest: rejected.txt
+                content: "{{ rows | map(attribute='branch') | difference(accepted | map(attribute='branch')) | join('\n') }}\n"
+                mode: "0644"
+        EOF
+        ansible-playbook ipam.yml
+    alternatives:
+    - id: ipmath
+      description: Computes the addresses with ipmath from the network and broadcast address.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-plan
+          cat > ipam.yml <<'EOF'
+          - name: Branch address plan
+            hosts: localhost
+            gather_facts: false
+            vars:
+              rows: "{{ lookup('ansible.builtin.file', 'branches.csv') | community.general.from_csv }}"
+            tasks:
+              - name: Accept branches whose prefix overlaps no earlier one
+                ansible.builtin.set_fact:
+                  accepted: "{{ accepted | default([]) + [item] }}"
+                when:
+                  - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.subnet_of', item.prefix) | list | length == 0
+                  - accepted | default([]) | map(attribute='prefix') | select('ansible.utils.supernet_of', item.prefix) | list | length == 0
+                loop: "{{ rows }}"
+                loop_control:
+                  label: "{{ item.branch }}"
+
+              - name: Branch variables
+                ansible.builtin.copy:
+                  dest: "host_vars/{{ item.branch }}.yml"
+                  content: |
+                    branch_prefix: {{ item.prefix }}
+                    branch_gateway: {{ item.prefix | ansible.utils.ipaddr('network') | ansible.utils.ipmath(1) }}
+                    branch_dhcp_start: {{ item.prefix | ansible.utils.ipaddr('network') | ansible.utils.ipmath(10) }}
+                    branch_dhcp_end: {{ item.prefix | ansible.utils.ipaddr('broadcast') | ansible.utils.ipmath(-5) }}
+                  mode: "0644"
+                loop: "{{ accepted }}"
+                loop_control:
+                  label: "{{ item.branch }}"
+
+              - name: Rejected branches
+                ansible.builtin.copy:
+                  dest: rejected.txt
+                  content: "{{ rows | map(attribute='branch') | difference(accepted | map(attribute='branch')) | join('\n') }}\n"
+                  mode: "0644"
+          EOF
+          ansible-playbook ipam.yml

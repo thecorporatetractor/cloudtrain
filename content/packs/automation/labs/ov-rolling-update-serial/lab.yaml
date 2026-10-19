@@ -1,0 +1,480 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-rolling-update-serial
+  title: Stop a bad rollout before it reaches every branch
+  domain: automation
+  frameworks:
+  - ex374-aligned:delegation
+  difficulty: medium
+  estimatedMinutes: 25
+  tags:
+  - ansible
+  - serial
+  - rolling-update
+  - error-handling
+  version: 1
+spec:
+  description: |
+    The branch agent on the six branch gateways (group `branches` in **`/home/learner/branch-automation`**, in the
+    order lon, leeds, york, bath, derry, cork) must go from version 1.0 to the version in `vars/release.yml`. The supplied
+    **`upgrade-tasks.yml`** has the three steps for one branch: stage the new version, run the agent self test, install it.
+
+    Write **`branch-upgrade.yml`** that rolls this out in batches of **1**, then **2**, then **25 percent** of the group per
+    batch, and stops the whole rollout when any host fails (`max_fail_percentage: 0`). One of the branches in the second
+    batch has a defect that makes its self test fail: the rollout must end failed there, and the branches of the later
+    batches must not be touched at all.
+
+    Run it. The run is *expected* to end with a failure; the grader runs it a second time and expects it to change nothing
+    and fail at the same place. Do not edit the supplied files.
+  objectives:
+  - Roll out in growing batches with serial
+  - Stop a rollout at the first failure with max_fail_percentage
+  - Reason about what a partially failed batch leaves behind
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    minor:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-branch-lon-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-branch-leeds-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-branch-york-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-branch-bath-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-branch-derry-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-branch-cork-gw
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-branch-lon-gw:eth1
+    - a: ov-ctl:eth2
+      b: ov-branch-leeds-gw:eth1
+    - a: ov-ctl:eth3
+      b: ov-branch-york-gw:eth1
+    - a: ov-ctl:eth4
+      b: ov-branch-bath-gw:eth1
+    - a: ov-ctl:eth5
+      b: ov-branch-derry-gw:eth1
+    - a: ov-ctl:eth6
+      b: ov-branch-cork-gw:eth1
+  setup:
+  - 'on': ov-branch-lon-gw
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-branch-lon-gw) a=61 ;; ov-branch-leeds-gw) a=62 ;; ov-branch-york-gw) a=63 ;; ov-branch-bath-gw) a=64 ;; ov-branch-derry-gw) a=65 ;; ov-branch-cork-gw) a=66 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      rm -rf /opt/ov-branch /etc/ov/branch
+      mkdir -p /opt/ov-branch /etc/ov/branch
+      echo 1.0 > /opt/ov-branch/VERSION
+      cat > /usr/local/sbin/ov-branch-selftest <<'EOF'
+      #!/bin/sh
+      # self test of the staged branch agent: fails on a blocked branch
+      if [ -e /etc/ov/branch/upgrade-blocked ]; then
+        echo "branch $(hostname): staged agent failed its self test" >&2
+        exit 1
+      fi
+      exit 0
+      EOF
+      chmod 0755 /usr/local/sbin/ov-branch-selftest
+      case $(hostname) in ov-branch-york-gw) touch /etc/ov/branch/upgrade-blocked ;; esac
+  - 'on': ov-branch-leeds-gw
+    run: *ov-node
+  - 'on': ov-branch-york-gw
+    run: *ov-node
+  - 'on': ov-branch-bath-gw
+    run: *ov-node
+  - 'on': ov-branch-derry-gw
+    run: *ov-node
+  - 'on': ov-branch-cork-gw
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.61 ov-branch-leeds-gw=10.70.0.62 ov-branch-york-gw=10.70.0.63 ov-branch-bath-gw=10.70.0.64 ov-branch-derry-gw=10.70.0.65 ov-branch-cork-gw=10.70.0.66
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-leeds-gw ov-branch-york-gw ov-branch-bath-gw ov-branch-derry-gw ov-branch-cork-gw
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/branch-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      branches:
+        hosts:
+          ov-branch-lon-gw:
+          ov-branch-leeds-gw:
+          ov-branch-york-gw:
+          ov-branch-bath-gw:
+          ov-branch-derry-gw:
+          ov-branch-cork-gw:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+      cat > $p/upgrade-tasks.yml <<'EOF'
+      - name: Stage the new agent version
+        ansible.builtin.copy:
+          dest: /opt/ov-branch/next-VERSION
+          content: "{{ branch_agent_version }}\n"
+          mode: "0644"
+
+      - name: Agent self test
+        ansible.builtin.command: /usr/local/sbin/ov-branch-selftest
+        changed_when: false
+
+      - name: Install the new agent version
+        ansible.builtin.copy:
+          src: /opt/ov-branch/next-VERSION
+          dest: /opt/ov-branch/VERSION
+          remote_src: true
+          mode: "0644"
+      EOF
+      install -d -o learner -g learner $p/vars
+      printf 'branch_agent_version: "2.{{minor}}"\n' > $p/vars/release.yml
+      chown -R learner:learner $p
+      sha256sum $p/upgrade-tasks.yml $p/vars/release.yml > /var/tmp/.ct-rolling.sum
+  checks:
+  - id: state-branchlongw
+    description: ov-branch-lon-gw has the agent version a correctly staged rollout leaves on it
+    type: shell
+    'on': ov-branch-lon-gw
+    skills: &a255
+    - automation.advanced.rolling
+    weight: 1
+    command: &chk_state-n |
+      v=$(cat /opt/ov-branch/VERSION 2>/dev/null)
+      case $(hostname) in
+        ov-branch-lon-gw) want=2.{{minor}} ;;
+        *) want=1.0 ;;
+      esac
+      r=""
+      [ "$v" = "$want" ] || r="$r version=$v"
+      case $(hostname) in
+        ov-branch-bath-gw|ov-branch-derry-gw|ov-branch-cork-gw) [ ! -e /opt/ov-branch/next-VERSION ] || r="$r touched" ;;
+      esac
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: state-branchleedsgw
+    description: ov-branch-leeds-gw has the agent version a correctly staged rollout leaves on it
+    type: shell
+    'on': ov-branch-leeds-gw
+    skills: *a255
+    weight: 1
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: state-branchyorkgw
+    description: ov-branch-york-gw has the agent version a correctly staged rollout leaves on it
+    type: shell
+    'on': ov-branch-york-gw
+    skills: *a255
+    weight: 1
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: state-branchbathgw
+    description: ov-branch-bath-gw has the agent version a correctly staged rollout leaves on it
+    type: shell
+    'on': ov-branch-bath-gw
+    skills: *a255
+    weight: 1
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: state-branchderrygw
+    description: ov-branch-derry-gw has the agent version a correctly staged rollout leaves on it
+    type: shell
+    'on': ov-branch-derry-gw
+    skills: *a255
+    weight: 1
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: state-branchcorkgw
+    description: ov-branch-cork-gw has the agent version a correctly staged rollout leaves on it
+    type: shell
+    'on': ov-branch-cork-gw
+    skills: *a255
+    weight: 1
+    command: *chk_state-n
+    expect:
+      match: exact
+      value: ok
+  - id: rollout-config
+    description: branch-upgrade.yml rolls out in batches of 1, 2 and 25 percent and stops on any failure; the supplied files are unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.rolling
+    - automation.control-flow.error-handling
+    weight: 3
+    command: |
+      # reads learner-controlled files: run as the learner, with a time limit
+      L() { ct-ansible run /home/learner/branch-automation timeout 30 "$@"; }
+      L sha256sum -c --quiet /var/tmp/.ct-rolling.sum >/dev/null 2>&1 || { echo supplied-files-changed; exit 0; }
+      # the playbook is read as the learner (bounded) into a copy; the verdict is computed by an unprivileged account
+      snap=$(mktemp); trap 'rm -f "$snap"' EXIT; chmod 0644 "$snap"
+      L timeout 10 head -c 262145 branch-upgrade.yml > "$snap" 2>/dev/null
+      runuser -u nobody -- env -i HOME=/nonexistent PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 timeout 30 /opt/ansible/bin/python3 -I - "$snap" <<'EOF'
+      import os, sys, yaml
+      try:
+          if os.path.getsize(sys.argv[1]) > 262144: raise ValueError('large')
+          plays = yaml.safe_load(open(sys.argv[1]))
+          assert isinstance(plays, list) and all(isinstance(q, dict) for q in plays)
+      except Exception:
+          print('no-playbook'); raise SystemExit
+      r = []
+      ok = False
+      for p in plays:
+          s = p.get('serial')
+          if isinstance(s, list) and [str(x) for x in s] == ['1', '2', '25%']:
+              ok = True
+              if str(p.get('max_fail_percentage')) != '0':
+                  r.append('max_fail_percentage')
+      if not ok:
+          r.append('serial')
+      print(' '.join(r) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: rollout-fails-again
+    description: Running the rollout again changes nothing and ends failed at the same branch
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.control-flow.error-handling
+    weight: 2
+    timeoutSec: 300
+    command: |
+      ct-ansible recap /home/learner/branch-automation branch-upgrade.yml
+    expect:
+      match: exact
+      value: changed=0 failed=1 unreachable=0
+  hints:
+  - title: Batches
+    body: '`serial` can be a list of numbers and percentages; the last entry repeats for the remaining hosts. `import_tasks` includes a task file in a play.'
+    cost: 1
+  - title: Lock-step
+    body: Within a batch every host runs a task before any host starts the next one. If a host fails and `max_fail_percentage` is 0, the play stops before the next task, so tasks after the failing step never run for that batch.
+    cost: 2
+  misconceptions:
+  - id: constant-batches-of-one
+    description: Updates one branch at a time throughout.
+    feedback: The rollout widens in steps (1, then 2, then a quarter), so a failure in the second batch stops hosts that a one-by-one rollout would already have upgraded.
+    expectFail:
+    - state-branchleedsgw
+    - rollout-config
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        cd ~/branch-automation
+        cat > branch-upgrade.yml <<'EOF'
+        - name: Roll out the branch agent
+          hosts: branches
+          become: true
+          serial: 1
+          max_fail_percentage: 0
+          vars_files: [vars/release.yml]
+          tasks:
+            - name: Upgrade steps
+              ansible.builtin.import_tasks: upgrade-tasks.yml
+        EOF
+        ansible-playbook branch-upgrade.yml || true
+  - id: failures-tolerated
+    description: Uses the batch sizes but leaves out max_fail_percentage, so the rollout carries on after the failure.
+    feedback: 'Without max_fail_percentage: 0 the play continues with the healthy hosts and the later batches; set it so the first failure ends the run.'
+    expectFail:
+    - state-branchleedsgw
+    - state-branchbathgw
+    - rollout-config
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        cd ~/branch-automation
+        cat > branch-upgrade.yml <<'EOF'
+        - name: Roll out the branch agent
+          hosts: branches
+          become: true
+          serial:
+            - 1
+            - 2
+            - "25%"
+          vars_files: [vars/release.yml]
+          tasks:
+            - name: Upgrade steps
+              ansible.builtin.import_tasks: upgrade-tasks.yml
+        EOF
+        ansible-playbook branch-upgrade.yml || true
+  - id: self-test-ignored
+    description: Ignores the self test result.
+    feedback: 'The self test is the gate: its failure has to fail the host, not be ignored.'
+    expectFail:
+    - state-branchleedsgw
+    - state-branchyorkgw
+    - rollout-fails-again
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        cd ~/branch-automation
+        cat > upgrade-tasks.yml <<'EOF'
+        - name: Stage the new agent version
+          ansible.builtin.copy:
+            dest: /opt/ov-branch/next-VERSION
+            content: "{{ branch_agent_version }}\n"
+            mode: "0644"
+
+        - name: Agent self test
+          ansible.builtin.command: /usr/local/sbin/ov-branch-selftest
+          changed_when: false
+          ignore_errors: true
+
+        - name: Install the new agent version
+          ansible.builtin.copy:
+            src: /opt/ov-branch/next-VERSION
+            dest: /opt/ov-branch/VERSION
+            remote_src: true
+            mode: "0644"
+        EOF
+        cat > branch-upgrade.yml <<'EOF'
+        - name: Roll out the branch agent
+          hosts: branches
+          become: true
+          serial:
+            - 1
+            - 2
+            - "25%"
+          max_fail_percentage: 0
+          vars_files: [vars/release.yml]
+          tasks:
+            - name: Upgrade steps
+              ansible.builtin.import_tasks: upgrade-tasks.yml
+        EOF
+        ansible-playbook branch-upgrade.yml || true
+  solution:
+    explanation: |
+      `serial` accepts a list: the first batch has one host (the pilot branch), the second two hosts, then 25 percent of the
+      fleet for every following batch. `max_fail_percentage: 0` ends the play as soon as any host of a batch fails, so the
+      hosts of later batches are never touched. The staged agent on `ov-branch-york-gw` fails its self test; at that moment the
+      other host of the same batch (`leeds`) has only staged the file, so it keeps the old version, and `lon` (the pilot) is the
+      only branch on the new version. The run ends failed, and running it again fails at the same place without changes.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        set -e
+        cd ~/branch-automation
+        cat > branch-upgrade.yml <<'EOF'
+        - name: Roll out the branch agent
+          hosts: branches
+          become: true
+          serial:
+            - 1
+            - 2
+            - "25%"
+          max_fail_percentage: 0
+          vars_files: [vars/release.yml]
+          tasks:
+            - name: Upgrade steps
+              ansible.builtin.import_tasks: upgrade-tasks.yml
+        EOF
+        ansible-playbook branch-upgrade.yml || true
+    alternatives:
+    - id: inline-tasks
+      description: Writes the upgrade tasks inline and spells the batch list and the failure limit differently.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/branch-automation
+          cat > branch-upgrade.yml <<'EOF'
+          - name: Roll out the branch agent
+            hosts: branches
+            become: true
+            serial: [1, 2, 25%]
+            max_fail_percentage: "0"
+            vars_files:
+              - vars/release.yml
+            tasks:
+              - name: Stage the new agent version
+                ansible.builtin.copy:
+                  dest: /opt/ov-branch/next-VERSION
+                  content: "{{ branch_agent_version }}\n"
+                  mode: "0644"
+
+              - name: Agent self test
+                ansible.builtin.command: /usr/local/sbin/ov-branch-selftest
+                changed_when: false
+
+              - name: Install the new agent version
+                ansible.builtin.copy:
+                  src: /opt/ov-branch/next-VERSION
+                  dest: /opt/ov-branch/VERSION
+                  remote_src: true
+                  mode: "0644"
+          EOF
+          ansible-playbook branch-upgrade.yml || true

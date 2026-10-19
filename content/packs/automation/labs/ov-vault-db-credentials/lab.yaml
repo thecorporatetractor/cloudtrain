@@ -1,0 +1,531 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-vault-db-credentials
+  title: Keep the policy database password in an encrypted vars file
+  domain: automation
+  frameworks:
+  - ex294-aligned:templates-vault
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - ansible
+  - vault
+  - no_log
+  - secrets
+  version: 1
+spec:
+  description: |
+    The policy database nodes (`policy_db` group in **`/home/learner/policy-db`**, hosts `ov-db-1` and
+    `ov-db-2`) need an application login. The DBA left the password in
+    **`/home/learner/handoff/policy-db-password.txt`** (outside the project) and the team's vault
+    password for environment `prod` is in **`/home/learner/.ov-vault/prod`**.
+
+    - Store the password as the variable `vault_db_password` in an encrypted file or value under
+      **`group_vars/policy_db/`**, using vault ID **`prod`** and that password file. The password must
+      not appear in plain text in the project. Configure the project so that `ansible-playbook` finds
+      the password file without extra options, and keep that file outside the project.
+    - Write **`db-login.yml`**: it creates the system account `ovpolicy` (no login shell, no home) and
+      **`/etc/ov/policy-db/credentials`** (mode 0600, owner `ovpolicy`) with the lines
+      `DB_USER=ovpolicy` and `DB_PASSWORD=<the password>`. The secret must not show up in any output, not
+      even with `-vv`.
+
+    Run the playbook; the grader runs it again and expects no changes.
+  objectives:
+  - Encrypt a value with a named vault ID
+  - Use a vault password file outside the repository
+  - Handle secrets in tasks without leaking them (no_log)
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    dbpw:
+      type: int
+      min: 100000
+      max: 999999
+    vaultpw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-db-1:eth1
+    - a: ov-ctl:eth2
+      b: ov-db-2:eth1
+  setup:
+  - 'on': ov-db-1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-db-1) a=21 ;; ov-db-2) a=22 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      id ovpolicy >/dev/null 2>&1 && userdel -r ovpolicy >/dev/null 2>&1 || true
+      rm -rf /etc/ov/policy-db
+  - 'on': ov-db-2
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-db-1=10.70.0.21 ov-db-2=10.70.0.22
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-db-1 ov-db-2
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-db-1 ov-db-2; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-db-1 ov-db-2 | cut -d' ' -f1) true
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/policy-db
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      policy_db:
+        hosts:
+          ov-db-1:
+          ov-db-2:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      install -d -m 0700 -o learner -g learner /home/learner/handoff
+      printf 'Ov-db-{{dbpw}}\n' > /home/learner/handoff/policy-db-password.txt
+      chown learner:learner /home/learner/handoff/policy-db-password.txt
+      install -d -m 0700 -o learner -g learner /home/learner/.ov-vault
+      printf 'Ov-vault-{{vaultpw}}\n' > /home/learner/.ov-vault/prod
+      chmod 0600 /home/learner/.ov-vault/prod
+      chown learner:learner /home/learner/.ov-vault/prod
+  checks:
+  - id: vault-prod-id
+    description: The password lives in a vault-encrypted group_vars entry with vault ID prod and decrypts to the handed-over value; it is not stored in plain text anywhere in the project
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.content.vault
+    weight: 3
+    timeoutSec: 120
+    command: |
+      # the learner's project is read as the learner, with a time limit, never by this root shell
+      L() { ct-ansible run /home/learner/policy-db timeout 60 "$@"; }
+      L grep -rqs 'ANSIBLE_VAULT;1.2;AES256;prod' group_vars || { echo no-prod-vault; exit 0; }
+      v=$(L ansible ov-db-1 -c local -m ansible.builtin.debug -a var=vault_db_password 2>/dev/null | sed -n 's/.*"vault_db_password": "\(.*\)".*/\1/p')
+      [ "$v" = "Ov-db-{{dbpw}}" ] || { echo wrong-value; exit 0; }
+      # a search for something that must be absent runs on a copy (read as the learner into a root-owned archive and
+      # searched by nobody): a learner process that is stopped or cut short cannot turn it into a pass
+      sj=$(mktemp -d); sa=$(mktemp); chmod 0755 $sj; chown nobody $sj
+      ( ulimit -f 131072; ct-ansible run /home/learner/policy-db timeout 60 tar --exclude=./.git -cf - . > $sa 2>/dev/null ) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $sa 2>/dev/null) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- find . -type l -delete)
+      (cd $sj && runuser -u nobody -- grep -rIqs 'Ov-db-{{dbpw}}' .) && { rm -rf $sj $sa; echo plaintext-in-project; exit 0; }
+      rm -rf $sj $sa
+      # The value must come from a vault blob labelled prod: group_vars is copied (as the learner) into a directory owned by
+      # nobody and decrypted there with the known vault password, and the variable has to be defined by such a file
+      j=$(mktemp -d); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j' EXIT
+      L tar -cf - group_vars 2>/dev/null | (cd $j && runuser -u nobody -- tar -x --no-same-owner --no-same-permissions -f - 2>/dev/null)
+      (cd $j && runuser -u nobody -- find . -type l -delete)
+      w=$(cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 timeout 40 /opt/ansible/bin/python3 -I - <<'EOS'
+      import os, yaml
+      from ansible.parsing.vault import VaultLib, VaultSecret
+      vl = VaultLib([('prod', VaultSecret(b'Ov-vault-{{vaultpw}}'))])
+      class L(yaml.SafeLoader):
+          pass
+      L.add_constructor('!vault', lambda l, n: ('vault', l.construct_scalar(n)))
+      found = False
+      for root, _, files in os.walk('group_vars'):
+          for f in files:
+              path = os.path.join(root, f)
+              try:
+                  if os.path.getsize(path) > 262144:
+                      continue
+                  raw = open(path).read()
+                  if 'ANSIBLE_VAULT;1.2;AES256;prod' not in raw:
+                      continue
+                  whole = raw.lstrip().startswith('$ANSIBLE_VAULT')
+                  if whole:
+                      raw = vl.decrypt(raw.encode()).decode()
+                  data = yaml.load(raw, L)
+                  v = data.get('vault_db_password') if isinstance(data, dict) else None
+                  if isinstance(v, tuple):
+                      v = vl.decrypt(v[1].encode()).decode()
+                  elif not whole:
+                      v = None
+                  if v is not None and str(v).strip() == 'Ov-db-{{dbpw}}':
+                      found = True
+              except Exception:
+                  pass
+      print('ok' if found else 'not-from-vault')
+      EOS
+      )
+      [ "$w" = ok ] || { echo not-from-vault; exit 0; }
+      echo ok
+    expect:
+      match: exact
+      value: ok
+  - id: vault-password-file
+    description: The vault password file stays outside the project, unchanged, and the project is configured to use it
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.content.vault
+    - automation.data.variables
+    weight: 2
+    command: |
+      f=/home/learner/.ov-vault/prod
+      L() { ct-ansible run /home/learner/policy-db timeout 60 "$@"; }
+      [ "$(L head -c 256 $f)" = "Ov-vault-{{vaultpw}}" ] || { echo password-file-changed; exit 0; }
+      [ "$(L stat -c %a $f)" = 600 ] || { echo mode; exit 0; }
+      # a search for something that must be absent runs on a copy (read as the learner into a root-owned archive and
+      # searched by nobody): a learner process that is stopped or cut short cannot turn it into a pass
+      sj=$(mktemp -d); sa=$(mktemp); chmod 0755 $sj; chown nobody $sj
+      ( ulimit -f 131072; ct-ansible run /home/learner/policy-db timeout 60 tar --exclude=./.git -cf - . > $sa 2>/dev/null ) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $sa 2>/dev/null) || { rm -rf $sj $sa; echo copy-failed; exit 0; }
+      (cd $sj && runuser -u nobody -- find . -type l -delete)
+      (cd $sj && runuser -u nobody -- grep -rIqs 'Ov-vault-{{vaultpw}}' .) && { rm -rf $sj $sa; echo password-in-project; exit 0; }
+      rm -rf $sj $sa
+      cfg=$(L ansible-config dump --only-changed 2>/dev/null)
+      printf '%s\n' "$cfg" | grep -q 'DEFAULT_VAULT_IDENTITY_LIST' || printf '%s\n' "$cfg" | grep 'DEFAULT_VAULT_PASSWORD_FILE' | grep -q '\.ov-vault/prod' || { echo not-configured; exit 0; }
+      echo ok
+    expect:
+      match: exact
+      value: ok
+  - id: login-db1
+    description: ov-db-1 has the credentials file for the policy application login
+    type: shell
+    'on': ov-db-1
+    skills: &a222
+    - automation.content.vault
+    weight: 2
+    command: &chk_login-n |
+      f=/etc/ov/policy-db/credentials
+      [ -f $f ] || { echo no-file; exit 0; }
+      r=""
+      [ "$(stat -c '%a %U' $f)" = "600 ovpolicy" ] || r="$r perms"
+      [ "$(cat $f)" = "$(printf 'DB_USER=ovpolicy\nDB_PASSWORD=Ov-db-{{dbpw}}')" ] || r="$r content"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: login-db2
+    description: ov-db-2 has the credentials file for the policy application login
+    type: shell
+    'on': ov-db-2
+    skills: *a222
+    weight: 2
+    command: *chk_login-n
+    expect:
+      match: exact
+      value: ok
+  - id: no-secret-in-output
+    description: A verbose run of db-login.yml (also one that has to repair the file, with diff output) shows the secret nowhere; a second run reports no changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.content.vault
+    weight: 2
+    timeoutSec: 240
+    command: |
+      # The project is copied as the learner (bounded, into a root-owned archive) and run from that copy by the grading
+      # account ctjudge (own uid and key; the vault password comes from the lab, not from the learner's files). A project
+      # with code (plugins, modules, Python files) or configuration that loads callbacks or plugins is refused, so only
+      # stock Ansible prints the output that is searched for the secret.
+      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
+      install -d $j/p $j/home/.ov-vault
+      printf 'Ov-vault-{{vaultpw}}\n' > $j/home/.ov-vault/prod; chmod 0600 $j/home/.ov-vault/prod
+      chown -R ctjudge $j
+      ( ulimit -f 65536; ct-ansible run /home/learner/policy-db timeout 30 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      runuser -u ctjudge -- timeout 30 tar -x --no-same-owner --no-same-permissions -C $j/p -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      [ -z "$(cd $j/p && find . \( -type l -o -type f -perm /111 ! -name '*.yml' ! -name '*.yaml' -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name plugins -o -name collections -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
+      ! grep -qiE '^[[:space:]]*([a-z_]*_plugins|library|module_utils|callbacks_enabled|callback_whitelist|stdout_callback|vars_plugins_enabled|enable_plugins|strategy|collections_paths?|[a-z_]*ssh[a-z_]*|[a-z_]*executable)[[:space:]]*[=:]' $j/p/ansible.cfg 2>/dev/null || { echo config-loads-code; exit 0; }
+      ! grep -rIqiE '(^|[^a-z0-9_])ansible_[a-z_]*(ssh|exe|connection|port|host|shell|args)[a-z_]*[[:space:]]*[:=]|proxycommand|ssh_args|ssh_executable|(^|[[:space:]-])connection[[:space:]]*:|(^|[^a-z0-9_])(lookup|query)([^a-z0-9_]|$)|[{%(,|=[:space:]]q([^a-z0-9_]|$)|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|config)|(^|[[:space:]-])(delegate_to|local_action)[[:space:]]*:' $j/p || { echo not-allowed; exit 0; }
+      J() { (cd $j/p && runuser -u ctjudge -- env -i HOME=$j/home PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+        ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_RETRY_FILES_ENABLED=0 ANSIBLE_INVENTORY_ENABLED=host_list,yaml,ini \
+        ANSIBLE_VAULT_IDENTITY_LIST=prod@$j/home/.ov-vault/prod ANSIBLE_VAULT_PASSWORD_FILE=$j/home/.ov-vault/prod \
+        timeout 100 ansible-playbook db-login.yml "$@" 2>&1); }
+      # make the credentials file differ once, so a run that changes it would print the difference
+      runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin timeout 30 ssh ovauto@ov-db-1 "sudo -n sh -c 'echo junk >> /etc/ov/policy-db/credentials'" >/dev/null 2>&1
+      probe=$(J --diff -vv); prc=$?
+      printf '%s' "$probe" | grep -q 'Ov-db-{{dbpw}}' && { echo leak; exit 0; }
+      [ $prc = 0 ] || { echo "run-failed"; exit 0; }
+      out=$(J -vv); orc=$?
+      printf '%s' "$out" | grep -q 'Ov-db-{{dbpw}}' && { echo leak; exit 0; }
+      [ $orc = 0 ] || { echo "run-failed"; exit 0; }
+      [ "$(printf '%s\n' "$out" | grep -c '^PLAY RECAP')" = 1 ] || { echo error; exit 0; }
+      printf '%s\n' "$out" | awk '/^PLAY RECAP/ {r=1; next}
+        r && /^[a-z0-9.-]+ +: ok=[0-9]+ +changed=[0-9]+ +unreachable=[0-9]+ +failed=[0-9]+/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "changed") c += kv[2]; if (kv[1] == "failed") f += kv[2]; if (kv[1] == "unreachable") u += kv[2] } n++ }
+        END { if (n == 2) printf "changed=%d failed=%d unreachable=%d\n", c, f, u; else print "error" }'
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Encrypting one value
+    body: '`ansible-vault encrypt_string --vault-id LABEL@FILE ''value'' --name variable_name` prints a snippet you can save as a vars file. `vault_identity_list = LABEL@FILE` in the `[defaults]` section of `ansible.cfg` supplies the same pair for every run.'
+    cost: 1
+  - title: Keeping the secret out of logs
+    body: '`no_log: true` on a task hides its arguments and results in all output, including `-v` runs. Tasks that only use the variable through another variable need it too.'
+    cost: 1
+  misconceptions:
+  - id: default-vault-id
+    description: Encrypts with the password file but without a vault ID, so the data has no label.
+    feedback: The secret must carry vault ID prod; pass --vault-id prod@<file> when encrypting.
+    expectFail:
+    - vault-prod-id
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/policy-db
+        mkdir -p group_vars/policy_db
+        ansible-vault encrypt_string --vault-password-file ~/.ov-vault/prod "$(cat ~/handoff/policy-db-password.txt)" --name vault_db_password > group_vars/policy_db/vault.yml
+        printf 'db_user: ovpolicy\ndb_password: "{{ vault_db_password }}"\n' > group_vars/policy_db/vars.yml
+        printf 'vault_password_file = ~/.ov-vault/prod\n' >> ansible.cfg
+        cat > db-login.yml <<'EOF'
+        - name: Policy database application login
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Application account
+              ansible.builtin.user:
+                name: "{{ db_user }}"
+                system: true
+                shell: /sbin/nologin
+                create_home: false
+
+            - name: Configuration directory
+              ansible.builtin.file:
+                path: /etc/ov/policy-db
+                state: directory
+                mode: "0755"
+
+            - name: Credentials file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db/credentials
+                content: |
+                  DB_USER={{ db_user }}
+                  DB_PASSWORD={{ db_password }}
+                owner: "{{ db_user }}"
+                mode: "0600"
+              no_log: true
+        EOF
+        ansible-playbook db-login.yml || ansible-playbook db-login.yml
+  - id: password-file-in-project
+    description: Copies the vault password into the project directory to make runs convenient.
+    feedback: The vault password must stay outside the repository; keep it in ~/.ov-vault and point the configuration at it.
+    expectFail:
+    - vault-password-file
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/policy-db
+        cp ~/.ov-vault/prod .vault-pass
+        mkdir -p group_vars/policy_db
+        ansible-vault encrypt_string --vault-id prod@.vault-pass "$(cat ~/handoff/policy-db-password.txt)" --name vault_db_password > group_vars/policy_db/vault.yml
+        printf 'db_user: ovpolicy\ndb_password: "{{ vault_db_password }}"\n' > group_vars/policy_db/vars.yml
+        printf 'vault_identity_list = prod@.vault-pass\n' >> ansible.cfg
+        cat > db-login.yml <<'EOF'
+        - name: Policy database application login
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Application account
+              ansible.builtin.user:
+                name: "{{ db_user }}"
+                system: true
+                shell: /sbin/nologin
+                create_home: false
+
+            - name: Configuration directory
+              ansible.builtin.file:
+                path: /etc/ov/policy-db
+                state: directory
+                mode: "0755"
+
+            - name: Credentials file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db/credentials
+                content: |
+                  DB_USER={{ db_user }}
+                  DB_PASSWORD={{ db_password }}
+                owner: "{{ db_user }}"
+                mode: "0600"
+              no_log: true
+        EOF
+        ansible-playbook db-login.yml || ansible-playbook db-login.yml
+  - id: secret-in-log
+    description: Writes the credentials file correctly but forgets no_log, so the value is printed in verbose output.
+    feedback: 'A task that handles the secret must not print it: set no_log on it.'
+    expectFail:
+    - no-secret-in-output
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/policy-db
+        mkdir -p group_vars/policy_db
+        ansible-vault encrypt_string --vault-id prod@~/.ov-vault/prod "$(cat ~/handoff/policy-db-password.txt)" --name vault_db_password > group_vars/policy_db/vault.yml
+        printf 'db_user: ovpolicy\ndb_password: "{{ vault_db_password }}"\n' > group_vars/policy_db/vars.yml
+        printf 'vault_identity_list = prod@~/.ov-vault/prod\n' >> ansible.cfg
+        cat > db-login.yml <<'EOF'
+        - name: Policy database application login
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Application account
+              ansible.builtin.user:
+                name: "{{ db_user }}"
+                system: true
+                shell: /sbin/nologin
+                create_home: false
+
+            - name: Configuration directory
+              ansible.builtin.file:
+                path: /etc/ov/policy-db
+                state: directory
+                mode: "0755"
+
+            - name: Credentials file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db/credentials
+                content: |
+                  DB_USER={{ db_user }}
+                  DB_PASSWORD={{ db_password }}
+                owner: "{{ db_user }}"
+                mode: "0600"
+        EOF
+        ansible-playbook db-login.yml || ansible-playbook db-login.yml
+  solution:
+    explanation: |
+      `ansible-vault encrypt_string --vault-id prod@~/.ov-vault/prod` encrypts the handed-over password into
+      `group_vars/policy_db/vault.yml` under the name `vault_db_password`; a plain `vars.yml` next to it maps it to
+      `db_password`. `vault_identity_list` in `ansible.cfg` makes every run use the password file outside the
+      project. The playbook creates the system account and the 0600 credentials file with `no_log: true`, so neither
+      the changed output nor `-vv` shows the secret.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/policy-db
+        mkdir -p group_vars/policy_db
+        ansible-vault encrypt_string --vault-id prod@~/.ov-vault/prod "$(cat ~/handoff/policy-db-password.txt)" --name vault_db_password > group_vars/policy_db/vault.yml
+        printf 'db_user: ovpolicy\ndb_password: "{{ vault_db_password }}"\n' > group_vars/policy_db/vars.yml
+        printf 'vault_identity_list = prod@~/.ov-vault/prod\n' >> ansible.cfg
+        cat > db-login.yml <<'EOF'
+        - name: Policy database application login
+          hosts: policy_db
+          become: true
+          tasks:
+            - name: Application account
+              ansible.builtin.user:
+                name: "{{ db_user }}"
+                system: true
+                shell: /sbin/nologin
+                create_home: false
+
+            - name: Configuration directory
+              ansible.builtin.file:
+                path: /etc/ov/policy-db
+                state: directory
+                mode: "0755"
+
+            - name: Credentials file
+              ansible.builtin.copy:
+                dest: /etc/ov/policy-db/credentials
+                content: |
+                  DB_USER={{ db_user }}
+                  DB_PASSWORD={{ db_password }}
+                owner: "{{ db_user }}"
+                mode: "0600"
+              no_log: true
+        EOF
+        ansible-playbook db-login.yml || ansible-playbook db-login.yml
+    alternatives:
+    - id: whole-file-vault-and-template
+      description: Encrypts the whole variable file with ansible-vault encrypt and renders the credentials from a template.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/policy-db
+          mkdir -p group_vars/policy_db templates
+          printf 'vault_db_password: %s\n' "$(cat ~/handoff/policy-db-password.txt)" > group_vars/policy_db/vault.yml
+          ansible-vault encrypt --vault-id prod@~/.ov-vault/prod group_vars/policy_db/vault.yml
+          printf 'db_user: ovpolicy\ndb_password: "{{ vault_db_password }}"\n' > group_vars/policy_db/vars.yml
+          printf 'vault_identity_list = prod@~/.ov-vault/prod\n' >> ansible.cfg
+          printf 'DB_USER={{ db_user }}\nDB_PASSWORD={{ db_password }}\n' > templates/credentials.j2
+          cat > db-login.yml <<'EOF'
+          - name: Policy database application login
+            hosts: policy_db
+            become: true
+            tasks:
+              - name: Application account
+                ansible.builtin.user:
+                  name: "{{ db_user }}"
+                  system: true
+                  shell: /sbin/nologin
+                  create_home: false
+
+              - name: Configuration directory
+                ansible.builtin.file:
+                  path: /etc/ov/policy-db
+                  state: directory
+                  mode: "0755"
+
+              - name: Credentials file
+                ansible.builtin.template:
+                  src: credentials.j2
+                  dest: /etc/ov/policy-db/credentials
+                  owner: "{{ db_user }}"
+                  mode: "0600"
+                no_log: true
+          EOF
+          ansible-playbook db-login.yml || ansible-playbook db-login.yml

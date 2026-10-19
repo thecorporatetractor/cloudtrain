@@ -1,0 +1,477 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-register-disk-report
+  title: Build a disk usage report from registered results
+  domain: automation
+  frameworks:
+  - ex294-aligned:plays-errors
+  - ex294-aligned:templates-vault
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - ansible
+  - register
+  - templates
+  - delegation
+  version: 1
+spec:
+  description: |
+    Capacity planning wants one CSV of disk usage across the fleet. In
+    **`/home/learner/claims-automation`** (inventory with all four hosts) write
+    **`disk-report.yml`** which collects the mounted filesystems of every host with `df` and writes
+    **`/home/learner/reports/disk.csv`** on the control node:
+
+    - header line `host,mount,used_percent,flag`;
+    - one row per mounted filesystem per host, `used_percent` a whole number without the percent sign;
+    - `flag` is `HIGH` when the percent is greater than `disk_warn_percent` from
+      `vars/policy.yml` (do not edit that file), otherwise `ok`.
+
+    Run the playbook; the grader runs it again and expects no changes. The directory
+    `/home/learner/reports` exists.
+  objectives:
+  - Register command output and parse it per host
+  - Combine results of several hosts in one report
+  - Write a file on the control node from a play over managed nodes
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-claims-web1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-claims-web2
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-db-1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-quote-api1
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-claims-web1:eth1
+    - a: ov-ctl:eth2
+      b: ov-claims-web2:eth1
+    - a: ov-ctl:eth3
+      b: ov-db-1:eth1
+    - a: ov-ctl:eth4
+      b: ov-quote-api1:eth1
+  setup:
+  - 'on': ov-claims-web1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+  - 'on': ov-claims-web2
+    run: *ov-node
+  - 'on': ov-db-1
+    run: *ov-node
+  - 'on': ov-quote-api1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+      pct=$(ct-ansible run /home/learner ssh ovauto@ov-claims-web1 "df -P / | awk 'NR==2 {sub(/%/,\"\",\$5); print \$5}'")
+      thr=$((pct > 1 ? pct - 1 : 0))
+      [ "$thr" -le 79 ] || thr=79   # keep the threshold below the old 80 percent rule where the disk allows it
+      echo "$thr" > /var/tmp/.ct-disk-threshold
+  - 'on': ov-ctl
+    run: |
+      p=/home/learner/claims-automation
+      install -d -o learner -g learner $p
+      cat > $p/inventory.yml <<'EOF'
+      claims:
+        children:
+          claims_web:
+            hosts:
+              ov-claims-web1:
+              ov-claims-web2:
+          claims_db:
+            hosts:
+              ov-db-1:
+      quoting:
+        hosts:
+          ov-quote-api1:
+      EOF
+      printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+      chown learner:learner $p/inventory.yml $p/ansible.cfg
+
+      install -d -o learner -g learner $p/vars /home/learner/reports
+      printf '# disk report policy\ndisk_warn_percent: %s\n' "$(cat /var/tmp/.ct-disk-threshold)" > $p/vars/policy.yml
+      chown learner:learner $p/vars/policy.yml
+      sha256sum $p/vars/policy.yml > /var/tmp/.ct-disk.sum
+  checks:
+  - id: csv-structure
+    description: reports/disk.csv has the agreed header and rows for all four hosts
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.register
+    weight: 2
+    command: |
+      f=/home/learner/reports/disk.csv
+      [ -f "$f" ] || { echo no-file; exit 0; }
+      # read the learner's file as the learner, with a time and size bound, into a root-owned copy
+      snap=$(mktemp); trap 'rm -f "$snap"' EXIT
+      ct-ansible run /home/learner timeout 10 head -c 1048576 reports/disk.csv > "$snap" 2>/dev/null
+      /opt/ansible/bin/python3 -I - "$snap" <<'EOF'
+      import csv, sys, re
+      rows = list(csv.reader(open(sys.argv[1])))
+      if not rows or rows[0] != ['host', 'mount', 'used_percent', 'flag']:
+          print('header'); raise SystemExit
+      hosts = {'ov-claims-web1', 'ov-claims-web2', 'ov-db-1', 'ov-quote-api1'}
+      seen = set(); bad = []
+      for r in rows[1:]:
+          if len(r) != 4: bad.append('columns'); continue
+          h, m, p, fl = r
+          seen.add(h)
+          if h not in hosts or not m.startswith('/') or not re.fullmatch(r'\d{1,3}', p): bad.append('row')
+          if (h, m) == (None, None): pass
+      miss = hosts - seen
+      if miss: bad.append('hosts:' + ','.join(sorted(miss)))
+      print(' '.join(sorted(set(bad))) or 'ok')
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: csv-flags
+    description: The flag column of every row matches its percent against the configured threshold, and both flagged and unflagged rows exist
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.register
+    - automation.content.templates
+    weight: 2
+    command: |
+      f=/home/learner/reports/disk.csv
+      [ -f "$f" ] || { echo no-file; exit 0; }
+      # read the learner's file as the learner, with a time and size bound, into a root-owned copy
+      snap=$(mktemp); trap 'rm -f "$snap"' EXIT
+      ct-ansible run /home/learner timeout 10 head -c 1048576 reports/disk.csv > "$snap" 2>/dev/null
+      thr=$(cat /var/tmp/.ct-disk-threshold)   # root-owned copy of the agreed threshold (policy.yml is hash-checked in report-rerun)
+      /opt/ansible/bin/python3 -I - "$snap" "$thr" <<'EOF'
+      import csv, sys
+      rows = list(csv.reader(open(sys.argv[1])))[1:]
+      thr = int(sys.argv[2])
+      bad = 0; high = 0; low = 0
+      for r in rows:
+          if len(r) != 4 or not r[2].isdigit(): bad += 1; continue
+          want = 'HIGH' if int(r[2]) > thr else 'ok'
+          if r[3] != want: bad += 1
+          high += want == 'HIGH'; low += want == 'ok'
+      print('ok' if rows and not bad and high and low else 'bad=%d high=%d low=%d' % (bad, high, low))
+      EOF
+    expect:
+      match: exact
+      value: ok
+  - id: csv-from-df
+    description: Every row is a real mount of its host and its percent agrees with df on that host
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.data.register
+    weight: 2
+    timeoutSec: 120
+    command: |
+      f=/home/learner/reports/disk.csv
+      [ -f "$f" ] || { echo no-file; exit 0; }
+      # read the learner's file as the learner, with a time and size bound, into a root-owned copy
+      snap=$(mktemp); trap 'rm -f "$snap"' EXIT
+      ct-ansible run /home/learner timeout 10 head -c 1048576 reports/disk.csv > "$snap" 2>/dev/null
+      r=$(for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do
+        live=$(ct-ansible run /home/learner timeout 30 ssh ovauto@$h "df -P | awk 'NR>1 {sub(/%/,\"\",\$5); print \$6, \$5}'")
+        [ "$(grep -c "^$h," "$snap")" -gt 0 ] || echo "$h:no-rows"
+        grep "^$h," "$snap" | while IFS=, read -r hh m p fl; do
+          lp=$(printf '%s\n' "$live" | awk -v m="$m" '$1==m {print $2}')
+          [ -n "$lp" ] || { echo "$h:$m:not-a-mount"; continue; }
+          # p comes from the learner's CSV: only 1-3 digits ever reach the arithmetic
+          case $p in ''|*[!0-9]*|????*) echo "$h:$m:percent"; continue ;; esac
+          case $lp in ''|*[!0-9]*|????*) echo "$h:$m:percent"; continue ;; esac
+          d=$((p - lp)); [ $d -lt 0 ] && d=$((-d))
+          [ $d -le 3 ] || echo "$h:$m:percent"
+        done
+        # completeness: every mounted filesystem of the host has a row
+        printf '%s\n' "$live" | while read -r lm lpc; do
+          [ -n "$lm" ] || continue
+          awk -F, -v h="$h" -v m="$lm" '$1==h && $2==m {f=1} END {exit !f}' "$snap" || echo "$h:$lm:missing-row"
+        done
+      done | head -3 | tr '\n' ' ')
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: report-rerun
+    description: disk-report.yml runs again without changes
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.advanced.delegation
+    weight: 1
+    timeoutSec: 240
+    command: |
+      ct-ansible run /home/learner timeout 10 sha256sum -c --quiet /var/tmp/.ct-disk.sum >/dev/null 2>&1 || { echo policy-edited; exit 0; }
+      ct-ansible recap /home/learner/claims-automation disk-report.yml
+    expect:
+      match: exact
+      value: changed=0 failed=0 unreachable=0
+  hints:
+  - title: Registered output
+    body: '`register` stores the command result per host; `stdout_lines` is a list of output lines. `split()` on a line gives the columns of `df -P`.'
+    cost: 1
+  - title: Seeing every host
+    body: '`hostvars[host]` reaches variables other hosts set (for example with `set_fact`). A play on `localhost` can loop over `groups[''all'']`; alternatively delegate a task to `localhost` from the host loop.'
+    cost: 2
+  misconceptions:
+  - id: fixed-threshold
+    description: Hard-codes the 80 percent from the old runbook instead of using the configured threshold.
+    feedback: The flag must follow disk_warn_percent from the policy file, not a number typed into the template.
+    expectFail:
+    - csv-flags
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        mkdir -p templates
+        cat > templates/disk.csv.j2 <<'EOF'
+        host,mount,used_percent,flag
+        {% for h in groups['all'] %}
+        {% for r in hostvars[h].disk_rows %}
+        {{ h }},{{ r.mount }},{{ r.percent }},{{ 'HIGH' if r.percent > 80 else 'ok' }}
+        {% endfor %}
+        {% endfor %}
+        EOF
+        cat > disk-report.yml <<'EOF'
+        - name: Collect disk usage
+          hosts: all
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk usage per mount
+              ansible.builtin.command: df -P
+              register: df_out
+              changed_when: false
+
+            - name: Parse the df table
+              ansible.builtin.set_fact:
+                disk_rows: >-
+                  {{ disk_rows | default([]) + [{'mount': item.split()[5], 'percent': item.split()[4] | replace('%', '') | int}] }}
+              loop: "{{ df_out.stdout_lines[1:] }}"
+
+        - name: Write the report on the control node
+          hosts: localhost
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk report
+              ansible.builtin.template:
+                src: disk.csv.j2
+                dest: /home/learner/reports/disk.csv
+                mode: "0644"
+        EOF
+        ansible-playbook disk-report.yml
+  - id: header-only-report
+    description: Writes the header but never the per-host rows (no results are collected across hosts).
+    feedback: The report needs a row per mount of every host, built from the registered results of all hosts.
+    expectFail:
+    - csv-structure
+    - csv-flags
+    - csv-from-df
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        mkdir -p templates
+        cat > templates/disk.csv.j2 <<'EOF'
+        host,mount,used_percent,flag
+        {% for h in groups['all'] %}
+        {% for r in hostvars[h].disk_rows %}
+        {{ h }},{{ r.mount }},{{ r.percent }},{{ 'HIGH' if r.percent > disk_warn_percent else 'ok' }}
+        {% endfor %}
+        {% endfor %}
+        EOF
+        cat > disk-report.yml <<'EOF'
+        - name: Collect disk usage
+          hosts: all
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk usage per mount
+              ansible.builtin.command: df -P
+              register: df_out
+              changed_when: false
+
+            - name: Parse the df table
+              ansible.builtin.set_fact:
+                disk_rows: >-
+                  {{ disk_rows | default([]) + [{'mount': item.split()[5], 'percent': item.split()[4] | replace('%', '') | int}] }}
+              loop: "{{ df_out.stdout_lines[1:] }}"
+
+        - name: Write the report on the control node
+          hosts: localhost
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk report
+              ansible.builtin.copy:
+                content: "host,mount,used_percent,flag\n"
+                dest: /home/learner/reports/disk.csv
+                mode: "0644"
+        EOF
+        ansible-playbook disk-report.yml
+  - id: report-stays-remote
+    description: Writes the output on every managed node instead of one file on the control node.
+    feedback: The report belongs in /home/learner/reports/disk.csv on the control node; collect the results there.
+    expectFail:
+    - csv-structure
+    - csv-flags
+    - csv-from-df
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > disk-report.yml <<'EOF'
+        - name: Disk report written on each host
+          hosts: all
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk usage per mount
+              ansible.builtin.command: df -P
+              register: df_out
+              changed_when: false
+            - name: Report on the node
+              ansible.builtin.copy:
+                content: "{{ df_out.stdout }}\n"
+                dest: /tmp/disk.csv
+                mode: "0644"
+        EOF
+        ansible-playbook disk-report.yml
+  solution:
+    explanation: |
+      One play runs `df -P` on every host and registers the output; a task turns the table into a list of
+      mounts with their percent (stored with `set_fact`, so each host keeps its own list in `hostvars`). A second
+      play on `localhost` renders a template that loops over all hosts and their rows and sets the flag by comparing
+      the percent with `disk_warn_percent` from the policy file. The template task is idempotent.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        set -e
+        cd ~/claims-automation
+        mkdir -p templates
+        cat > templates/disk.csv.j2 <<'EOF'
+        host,mount,used_percent,flag
+        {% for h in groups['all'] %}
+        {% for r in hostvars[h].disk_rows %}
+        {{ h }},{{ r.mount }},{{ r.percent }},{{ 'HIGH' if r.percent > disk_warn_percent else 'ok' }}
+        {% endfor %}
+        {% endfor %}
+        EOF
+        cat > disk-report.yml <<'EOF'
+        - name: Collect disk usage
+          hosts: all
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk usage per mount
+              ansible.builtin.command: df -P
+              register: df_out
+              changed_when: false
+
+            - name: Parse the df table
+              ansible.builtin.set_fact:
+                disk_rows: >-
+                  {{ disk_rows | default([]) + [{'mount': item.split()[5], 'percent': item.split()[4] | replace('%', '') | int}] }}
+              loop: "{{ df_out.stdout_lines[1:] }}"
+
+        - name: Write the report on the control node
+          hosts: localhost
+          gather_facts: false
+          vars_files: [vars/policy.yml]
+          tasks:
+            - name: Disk report
+              ansible.builtin.template:
+                src: disk.csv.j2
+                dest: /home/learner/reports/disk.csv
+                mode: "0644"
+        EOF
+        ansible-playbook disk-report.yml
+    alternatives:
+    - id: delegated-lineinfile
+      description: One play; every host writes its own report lines to the control node with delegate_to and lineinfile.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          rm -f /home/learner/reports/disk.csv
+          printf 'host,mount,used_percent,flag\n' > /home/learner/reports/disk.csv
+          cat > disk-report.yml <<'EOF'
+          - name: Collect and report disk usage
+            hosts: all
+            gather_facts: false
+            vars_files: [vars/policy.yml]
+            tasks:
+              - name: Mounted filesystems with percent used
+                ansible.builtin.command: df --output=target,pcent
+                register: df_out
+                changed_when: false
+
+              - name: Report line per mount
+                ansible.builtin.lineinfile:
+                  path: /home/learner/reports/disk.csv
+                  regexp: "^{{ inventory_hostname }},{{ item.split()[0] | regex_escape }},"
+                  line: "{{ inventory_hostname }},{{ item.split()[0] }},{{ item.split()[1] | replace('%', '') }},{{ 'HIGH' if (item.split()[1] | replace('%', '') | int) > disk_warn_percent else 'ok' }}"
+                  create: true
+                  mode: "0644"
+                loop: "{{ df_out.stdout_lines[1:] }}"
+                delegate_to: localhost
+                throttle: 1
+          EOF
+          ansible-playbook disk-report.yml

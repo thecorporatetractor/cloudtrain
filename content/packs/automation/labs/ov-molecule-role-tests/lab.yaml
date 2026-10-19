@@ -1,0 +1,769 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-molecule-role-tests
+  title: Add scenario tests to the audit agent role
+  domain: automation
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 35
+  tags:
+  - ansible
+  - molecule
+  - testing
+  - roles
+  version: 1
+spec:
+  description: |
+    The role **`audit_agent`** in **`/home/learner/audit-roles/roles/audit_agent`** installs a small audit agent
+    (configuration owned by root, mode 0644, plus a background agent process whose pid is in
+    `/run/ov-audit-agent.pid`). It has no tests yet.
+
+    Add a Molecule scenario **`default`** to the role (`molecule/default/`) that
+
+    - uses the default driver against the two test nodes that already exist, **`ov-test-el1`** and
+      **`ov-test-deb1`** (log in as `ovauto`; Molecule must not create or destroy anything),
+    - converges the role on both nodes, passes the idempotence step, and
+    - **verifies** that the configuration file is owned by root with mode 0644 and that the agent process is
+      running. The verification must really fail when either is wrong.
+
+    `molecule test` must pass for the role. Do not change the role itself.
+
+    The grader runs your scenario itself, as a separate account, on a copy of the role as supplied. It reads
+    `molecule.yml`, `converge.yml`, `verify.yml` (and `prepare.yml`, `side_effect.yml`, `cleanup.yml` if present) and
+    accepts only what this task needs: the default driver, the two nodes as platforms (with groups), inventory
+    variables for the login (`ansible_user`, become settings, `ansible_python_interpreter`, `ansible_host` with the
+    nodes' own addresses), the Ansible verifier, and playbooks that use modules on the nodes and the role by name.
+    Lookups, local or delegated tasks, included task or variable files, plugins and configuration overrides
+    (`config_options`, a custom test sequence) are refused.
+  objectives:
+  - Write a Molecule scenario for an existing role
+  - Use the default driver with preprovisioned nodes
+  - Write verification that fails when the state is wrong
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    interval:
+      type: int
+      min: 10
+      max: 90
+  topology:
+    entry: ov-ctl
+    nodes:
+    - name: ov-ctl
+      driver: container
+      image: ansible-ctl:2.21
+      access:
+      - shell
+    - name: ov-test-el1
+      driver: container
+      image: el-lab:10
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    - name: ov-test-deb1
+      driver: container
+      image: deb-lab:24.04
+      resources:
+        cpu: 0.2
+        memoryMiB: 256
+    links:
+    - a: ov-ctl:eth1
+      b: ov-test-el1:eth1
+    - a: ov-ctl:eth2
+      b: ov-test-deb1:eth1
+  setup:
+  - 'on': ov-test-el1
+    run: &ov-node |
+      set -eu
+      case $(hostname) in
+        ov-test-el1) a=71 ;; ov-test-deb1) a=72 ;;
+        *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+      esac
+      ip link set eth1 up
+      ip addr replace 10.70.0.$a/24 dev eth1
+      id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+      echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+      printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+      chmod 0440 /etc/sudoers.d/ovauto
+      ssh-keygen -A >/dev/null 2>&1
+      mkdir -p /run/sshd
+      pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      [ -f /run/ov-audit-agent.pid ] && kill "$(cat /run/ov-audit-agent.pid)" 2>/dev/null || true
+      rm -f /run/ov-audit-agent.pid /etc/ov/audit-agent.conf /usr/local/sbin/ov-audit-agent
+  - 'on': ov-test-deb1
+    run: *ov-node
+  - 'on': ov-ctl
+    timeoutSec: 300
+    run: |
+      set -eu
+      ct-fleet-net 10.70.0.10/24 ov-test-el1=10.70.0.71 ov-test-deb1=10.70.0.72
+      ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-test-el1 ov-test-deb1
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-test-el1 ov-test-deb1; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-test-el1 ov-test-deb1 | cut -d' ' -f1) true
+  - 'on': ov-ctl
+    run: |2
+
+      set -eu
+      p=/home/learner/audit-roles
+      r=$p/roles/audit_agent
+      install -d -o learner -g learner $p $p/roles $r $r/tasks $r/defaults $r/files $r/templates $r/meta
+      printf -- '---\naudit_agent_interval: {{interval}}\n' > $r/defaults/main.yml
+      printf 'interval={{ audit_agent_interval }}\n' > $r/templates/audit-agent.conf.j2
+      cat > $r/files/ov-audit-agent <<'EOF'
+      #!/bin/sh
+      # Orrin and Vale audit agent: writes a heartbeat every few seconds
+      echo $$ > /run/ov-audit-agent.pid
+      while :; do
+        date +%s >> /var/log/ov-audit-agent.log
+        sleep 5
+      done
+      EOF
+      cat > $r/tasks/main.yml <<'EOF'
+      ---
+      - name: Agent configuration directory
+        ansible.builtin.file:
+          path: /etc/ov
+          state: directory
+          mode: "0755"
+
+      - name: Agent configuration
+        ansible.builtin.template:
+          src: audit-agent.conf.j2
+          dest: /etc/ov/audit-agent.conf
+          owner: root
+          group: root
+          mode: "0644"
+
+      - name: Agent program
+        ansible.builtin.copy:
+          src: ov-audit-agent
+          dest: /usr/local/sbin/ov-audit-agent
+          owner: root
+          group: root
+          mode: "0755"
+
+      - name: Start the agent
+        ansible.builtin.shell: setsid nohup /usr/local/sbin/ov-audit-agent >/dev/null 2>&1 </dev/null &
+        args:
+          creates: /run/ov-audit-agent.pid
+
+      - name: Wait for the agent to register
+        ansible.builtin.wait_for:
+          path: /run/ov-audit-agent.pid
+          timeout: 15
+      EOF
+      cat > $r/meta/main.yml <<'EOF'
+      galaxy_info:
+        namespace: orrinvale
+        role_name: audit_agent
+        author: Orrin and Vale platform team
+        description: Audit agent for branch and claims hosts
+        license: GPL-3.0-or-later
+        min_ansible_version: "2.14"
+        platforms:
+          - name: EL
+            versions: [all]
+      dependencies: []
+      EOF
+      chown -R learner:learner $p
+      cat $r/tasks/main.yml $r/defaults/main.yml $r/templates/audit-agent.conf.j2 $r/files/ov-audit-agent | sha256sum > /var/tmp/.ct-molecule.sum
+      # the role as supplied, for the graded Molecule run
+      rm -rf /var/lib/ct-molecule; install -d -m 0700 /var/lib/ct-molecule
+      cp -r $r /var/lib/ct-molecule/audit_agent; chown -R root:root /var/lib/ct-molecule
+  checks:
+  - id: node-testel1
+    description: ov-test-el1 has the agent configuration and a running agent
+    type: shell
+    'on': ov-test-el1
+    skills: &a166
+    - automation.quality.molecule
+    weight: 1
+    command: &chk_node-n |
+      r=""
+      [ "$(stat -c '%U:%G %a' /etc/ov/audit-agent.conf 2>/dev/null)" = "root:root 644" ] || r="$r config"
+      grep -qx 'interval={{interval}}' /etc/ov/audit-agent.conf 2>/dev/null || r="$r interval"
+      kill -0 "$(cat /run/ov-audit-agent.pid 2>/dev/null)" 2>/dev/null || r="$r agent-not-running"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: node-testdeb1
+    description: ov-test-deb1 has the agent configuration and a running agent
+    type: shell
+    'on': ov-test-deb1
+    skills: *a166
+    weight: 1
+    command: *chk_node-n
+    expect:
+      match: exact
+      value: ok
+  - id: scenario-files
+    description: The default scenario has a molecule.yml naming both test nodes, a converge playbook for the role and a verify playbook with assertions; the role itself is unchanged
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.molecule
+    weight: 2
+    command: |
+      d=/home/learner/audit-roles/roles/audit_agent
+      s=$d/molecule/default
+      r=""
+      # learner-controlled files are read as the learner, with a time limit, never by this root shell
+      L() { ct-ansible run / timeout 20 "$@"; }
+      L test -f $s/molecule.yml && L test -f $s/converge.yml && L test -f $s/verify.yml || { echo missing-scenario-files; exit 0; }
+      for n in ov-test-el1 ov-test-deb1; do L grep -q "$n" $s/molecule.yml || r="$r $n"; done
+      L grep -qE 'audit_agent' $s/converge.yml || r="$r converge-role"
+      L grep -q 'assert' $s/verify.yml || r="$r no-assert"
+      got=$(L sh -c 'cat "$1/tasks/main.yml" "$1/defaults/main.yml" "$1/templates/audit-agent.conf.j2" "$1/files/ov-audit-agent" | sha256sum' sh $d)
+      [ "$got" = "$(cat /var/tmp/.ct-molecule.sum)" ] || r="$r role-changed"
+      echo "${r:-ok}"
+    expect:
+      match: exact
+      value: ok
+  - id: molecule-cycle
+    description: molecule test passes (converge, idempotence, verify) and the verification fails when the config owner, the config mode or the agent is wrong (graded on a copy with the supplied role, by a separate account)
+    type: shell
+    'on': ov-ctl
+    skills:
+    - automation.quality.molecule
+    weight: 4
+    timeoutSec: 600
+    command: |
+      # Graded on a copy, by the grading account ctjudge (own uid, own key, a home the learner cannot read): the role as
+      # supplied plus the scenario's playbooks, read as the learner. The scenario may only use the default driver, the two
+      # test nodes and Ansible inventory variables for the login; no plugins, configuration overrides, lookups, local or
+      # delegated tasks, so no learner code runs on the control node and nothing outside the copy feeds the verdict.
+      d=/home/learner/audit-roles/roles/audit_agent
+      w=$(mktemp -d); chmod 0700 $w; trap 'rm -rf $w' EXIT
+      cp -r /var/lib/ct-molecule/audit_agent $w/audit_agent
+      install -d $w/in $w/home $w/audit_agent/molecule/default
+      chown -R ctjudge:ctjudge $w
+      J() { (cd $w/audit_agent && runuser -u ctjudge -- env -i HOME=$w/home PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 TERM=dumb "$@"); }
+      S() { runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin ssh ovauto@$1 "$2" >/dev/null 2>&1; }
+      ( ulimit -f 8192; ct-ansible run $d/molecule/default timeout 20 tar -cf - . > $w/in.tar 2>/dev/null ) || { echo no-scenario; exit 0; }
+      runuser -u ctjudge -- timeout 20 tar -x --no-same-owner --no-same-permissions -C $w/in -f - < $w/in.tar 2>/dev/null || { echo no-scenario; exit 0; }
+      for f in molecule converge verify prepare side_effect cleanup; do
+        if [ -f $w/in/$f.yml ] && [ ! -L $w/in/$f.yml ]; then cp $w/in/$f.yml $w/audit_agent/molecule/default/$f.yml; fi
+      done
+      rm -rf $w/in $w/in.tar; chown -R ctjudge:ctjudge $w/audit_agent $w/home
+      v=$(J timeout 30 /opt/ansible/bin/python3 -I - molecule/default <<'EOF'
+      import os, re, sys, yaml
+      S = sys.argv[1]
+      bad = set()
+      NODES = {'ov-test-el1', 'ov-test-deb1'}
+      LOGIN = {'ansible_user', 'ansible_become', 'ansible_become_method', 'ansible_become_user', 'ansible_python_interpreter'}
+      SAFE_LOOPS = {'items', 'list', 'dict', 'together', 'nested', 'sequence', 'subelements', 'indexed_items', 'flattened', 'random_choice'}
+      NOKEYS = {'delegate_to', 'local_action', 'connection', 'vars_files', 'include_vars', 'include_tasks', 'import_tasks',
+                'import_playbook', 'include', 'script', 'fetch', 'add_host', 'group_by', 'vars_prompt', 'module_defaults'}
+      # any use of the lookup functions inside a template, called or not (aliases, (lookup)(...), lookup.__call__)
+      LOOKUP = re.compile(r'(^|[^A-Za-z0-9_])(lookup|query|q)([^A-Za-z0-9_]|$)')
+      HOSTS = {'ov-test-el1': '10.70.0.71', 'ov-test-deb1': '10.70.0.72'}
+
+
+      def load(f):
+          p = os.path.join(S, f)
+          if not os.path.exists(p):
+              return None
+          try:
+              return yaml.safe_load(open(p))
+          except Exception:
+              bad.add('yaml-' + f)
+
+
+      def only(d, keys, what):
+          if not isinstance(d, dict) or set(d) - keys:
+              bad.add(what)
+              return {}
+          return d
+
+
+      m = load('molecule.yml')
+      if not isinstance(m, dict):
+          bad.add('molecule.yml')
+          m = {}
+      only(m, {'driver', 'platforms', 'provisioner', 'verifier', 'scenario', 'dependency', 'role_name_check', 'prerun'}, 'molecule-keys')
+      drv = only(m.get('driver') or {}, {'name', 'options'}, 'driver')
+      if drv.get('name', 'default') != 'default' or only(drv.get('options') or {}, {'managed'}, 'driver').get('managed', False) is not False:
+          bad.add('driver')
+      for pl in m.get('platforms') or []:
+          if only(pl, {'name', 'groups', 'children'}, 'platforms').get('name') not in NODES:
+              bad.add('platforms')
+      prov = only(m.get('provisioner') or {}, {'name', 'inventory', 'log'}, 'provisioner')
+      if prov.get('name', 'ansible') != 'ansible':
+          bad.add('provisioner')
+      inv = only(prov.get('inventory') or {}, {'group_vars', 'host_vars'}, 'inventory')
+      for scope in inv.values():
+          for hv in (scope or {}).values() if isinstance(scope, dict) else [None]:
+              if not isinstance(hv, dict):
+                  bad.add('inventory')
+                  continue
+              for k, v in hv.items():
+                  if str(k) == 'ansible_host' and str(v) in HOSTS.values():
+                      continue
+                  if str(k).startswith('ansible_') and str(k) not in LOGIN:
+                      bad.add('inventory-' + str(k))
+                  if '{' in str(v) or not isinstance(v, (str, int, bool)):
+                      bad.add('inventory-value')
+                  if str(k) == 'ansible_user' and v != 'ovauto':
+                      bad.add('inventory-user')
+      ver = only(m.get('verifier') or {}, {'name', 'enabled'}, 'verifier')
+      if ver.get('name', 'ansible') != 'ansible':
+          bad.add('verifier')
+      sc = only(m.get('scenario') or {}, {'name'}, 'scenario')
+      dep = only(m.get('dependency') or {}, {'name', 'enabled'}, 'dependency')
+      if dep.get('name', 'galaxy') != 'galaxy':
+          bad.add('dependency')
+
+
+      RAW = {'when', 'that', 'failed_when', 'changed_when', 'until'}
+
+
+      def walk(node, raw=False):
+          # templates ({{ }}, {% %}) and the bare expressions of conditions and assertions are searched for lookups
+          if isinstance(node, dict):
+              for k, v in node.items():
+                  key = str(k).split('.')[-1]
+                  if key in NOKEYS or str(k).startswith('ansible_') or (key.startswith('with_') and key[5:] not in SAFE_LOOPS):
+                      bad.add('not-allowed-' + key)
+                  if key in ('include_role', 'import_role'):
+                      if not isinstance(v, dict) or v.get('name') not in ('orrinvale.audit_agent', 'audit_agent') or set(v) - {'name'}:
+                          bad.add('role-' + key)
+                  if key == 'roles':
+                      for r in v or []:
+                          if (r.get('role', r.get('name')) if isinstance(r, dict) else r) not in ('orrinvale.audit_agent', 'audit_agent'):
+                              bad.add('roles')
+                  if key == 'hosts' and re.search(r'localhost|127\.|ov-ctl', str(v)):
+                      bad.add('local-play')
+                  # files the controller reads for a node (copy, template, unarchive, assemble) must come from the scenario
+                  if key in ('copy', 'template', 'unarchive', 'assemble'):
+                      src = v.get('src', '') if isinstance(v, dict) else ' '.join(x[4:] for x in str(v).split() if x.startswith('src='))
+                      if v.get('remote_src') not in (True, 'true', 'yes') if isinstance(v, dict) else True:
+                          if str(src).startswith('/') or '..' in str(src) or '{' in str(src):
+                              bad.add('src-outside')
+                  if not (key == 'name' and isinstance(v, str)):
+                      walk(v, key in RAW)
+          elif isinstance(node, list):
+              for v in node:
+                  walk(v, raw)
+          elif isinstance(node, str) and (raw or '{{' in node or '{%' in node) and LOOKUP.search(node):
+              bad.add('lookup')
+
+
+      for f in ('converge.yml', 'verify.yml', 'prepare.yml', 'side_effect.yml', 'cleanup.yml'):
+          walk(load(f))
+      print('ok' if not bad else 'scenario-not-allowed:' + ','.join(sorted(bad)))
+      EOF
+      )
+      [ "$v" = ok ] || { echo "${v:-scenario-not-allowed}"; exit 0; }
+      killed=""
+      heal() {
+        S ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf; sudo -n chmod 0644 /etc/ov/audit-agent.conf'
+        [ -z "$killed" ] || J molecule converge >/dev/null 2>&1
+        rm -rf $w
+      }
+      trap heal EXIT
+      out=$(J timeout 420 molecule test 2>&1); rc=$?
+      [ $rc = 0 ] || { echo "molecule-test-failed"; exit 0; }
+      printf '%s' "$out" | grep -q 'idempotence: Executed: Successful' || { echo no-idempotence-step; exit 0; }
+      printf '%s' "$out" | grep -q 'verify: Executed: Successful' || { echo no-verify-step; exit 0; }
+      # the verification must notice a wrong owner
+      S ov-test-el1 'sudo -n chown nobody /etc/ov/audit-agent.conf'
+      J timeout 120 molecule verify >/dev/null 2>&1 && { S ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf'; echo verify-ignores-owner; exit 0; }
+      S ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf'
+      # positive control: on the healed state the verification must pass again (a verify that fails on every later run proves nothing)
+      J timeout 120 molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
+      # a wrong mode
+      S ov-test-el1 'sudo -n chmod 0600 /etc/ov/audit-agent.conf'
+      J timeout 120 molecule verify >/dev/null 2>&1 && { S ov-test-el1 'sudo -n chmod 0644 /etc/ov/audit-agent.conf'; echo verify-ignores-mode; exit 0; }
+      S ov-test-el1 'sudo -n chmod 0644 /etc/ov/audit-agent.conf'
+      J timeout 120 molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
+      # and a stopped agent
+      killed=1
+      S ov-test-deb1 'sudo -n sh -c "kill \$(cat /run/ov-audit-agent.pid); rm -f /run/ov-audit-agent.pid"'
+      J timeout 120 molecule verify >/dev/null 2>&1 && { echo verify-ignores-agent; exit 0; }
+      J timeout 180 molecule converge >/dev/null 2>&1 && killed=""
+      [ -z "$killed" ] || { echo converge-failed; exit 0; }
+      J timeout 120 molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
+      echo ok
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Unmanaged nodes
+    body: 'The default driver with `driver.options.managed: false` creates nothing: list the nodes under `platforms` (give them a `groups` entry to put them in a group) and set `ansible_user` under `provisioner.inventory.group_vars`.'
+    cost: 1
+  - title: Role name and verify
+    body: 'Molecule exposes the role under its fully qualified name `<namespace>.<role_name>` from `meta/main.yml`. `verify.yml` is an ordinary playbook: gather facts with `stat`, then `assert`.'
+    cost: 2
+  - title: Is the agent running?
+    body: The pid file holds the agent process id. `kill -0 PID` succeeds only for a live process.
+    cost: 1
+  misconceptions:
+  - id: verify-asserts-nothing
+    description: Writes a verify playbook whose assertion is always true.
+    feedback: A verification that cannot fail proves nothing; assert the owner of the configuration and that the agent process is alive.
+    expectFail:
+    - molecule-cycle
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 600
+      run: |
+        cd ~/audit-roles/roles/audit_agent
+        mkdir -p molecule/default
+        cat > molecule/default/molecule.yml <<'EOF'
+        ---
+        driver:
+          name: default
+          options:
+            managed: false
+        platforms:
+          - name: ov-test-el1
+            groups: [audit_nodes]
+          - name: ov-test-deb1
+            groups: [audit_nodes]
+        provisioner:
+          name: ansible
+          inventory:
+            group_vars:
+              all:
+                ansible_user: ovauto
+        verifier:
+          name: ansible
+        EOF
+        cat > molecule/default/converge.yml <<'EOF'
+        ---
+        - name: Converge
+          hosts: audit_nodes
+          become: true
+          tasks:
+            - name: Apply the audit agent role
+              ansible.builtin.include_role:
+                name: orrinvale.audit_agent
+        EOF
+        cat > molecule/default/verify.yml <<'EOF'
+        ---
+        - name: Verify
+          hosts: audit_nodes
+          gather_facts: false
+          tasks:
+            - name: Nothing to see
+              ansible.builtin.assert:
+                that: true
+        EOF
+        molecule test || true
+  - id: converge-not-idempotent
+    description: Adds a command task to the converge play that reports a change on every run.
+    feedback: The idempotence step reruns converge and fails when anything changes; give the command a changed_when or use a module.
+    expectFail:
+    - molecule-cycle
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 600
+      run: |
+        cd ~/audit-roles/roles/audit_agent
+        mkdir -p molecule/default
+        cat > molecule/default/molecule.yml <<'EOF'
+        ---
+        driver:
+          name: default
+          options:
+            managed: false
+        platforms:
+          - name: ov-test-el1
+            groups: [audit_nodes]
+          - name: ov-test-deb1
+            groups: [audit_nodes]
+        provisioner:
+          name: ansible
+          inventory:
+            group_vars:
+              all:
+                ansible_user: ovauto
+        verifier:
+          name: ansible
+        EOF
+        cat > molecule/default/converge.yml <<'EOF'
+        ---
+        - name: Converge
+          hosts: audit_nodes
+          become: true
+          tasks:
+            - name: Apply the audit agent role
+              ansible.builtin.include_role:
+                name: orrinvale.audit_agent
+            - name: Stamp the run
+              ansible.builtin.command: touch /etc/ov/molecule-stamp
+        EOF
+        cat > molecule/default/verify.yml <<'EOF'
+        ---
+        - name: Verify
+          hosts: audit_nodes
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Agent configuration
+              ansible.builtin.stat:
+                path: /etc/ov/audit-agent.conf
+              register: conf
+
+            - name: Agent process id
+              ansible.builtin.slurp:
+                src: /run/ov-audit-agent.pid
+              register: agent_pid
+              failed_when: false
+
+            - name: Agent liveness
+              ansible.builtin.command: kill -0 {{ agent_pid.content | default('eA==') | b64decode | trim }}
+              register: alive
+              changed_when: false
+              failed_when: false
+
+            - name: The configuration is owned by root and the agent runs
+              ansible.builtin.assert:
+                that:
+                  - conf.stat.exists
+                  - conf.stat.pw_name == 'root'
+                  - conf.stat.mode == '0644'
+                  - alive.rc == 0
+        EOF
+        molecule test || true
+  - id: one-test-node
+    description: Lists only one of the two test nodes in the scenario.
+    feedback: The scenario has to cover both test nodes (an Enterprise Linux and a Debian family host).
+    expectFail:
+    - scenario-files
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 600
+      run: |
+        cd ~/audit-roles/roles/audit_agent
+        mkdir -p molecule/default
+        cat > molecule/default/molecule.yml <<'EOF'
+        ---
+        driver:
+          name: default
+          options:
+            managed: false
+        platforms:
+          - name: ov-test-el1
+            groups: [audit_nodes]
+        provisioner:
+          name: ansible
+          inventory:
+            group_vars:
+              all:
+                ansible_user: ovauto
+        verifier:
+          name: ansible
+        EOF
+        cat > molecule/default/converge.yml <<'EOF'
+        ---
+        - name: Converge
+          hosts: audit_nodes
+          become: true
+          tasks:
+            - name: Apply the audit agent role
+              ansible.builtin.include_role:
+                name: orrinvale.audit_agent
+        EOF
+        cat > molecule/default/verify.yml <<'EOF'
+        ---
+        - name: Verify
+          hosts: audit_nodes
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Agent configuration
+              ansible.builtin.stat:
+                path: /etc/ov/audit-agent.conf
+              register: conf
+
+            - name: Agent process id
+              ansible.builtin.slurp:
+                src: /run/ov-audit-agent.pid
+              register: agent_pid
+              failed_when: false
+
+            - name: Agent liveness
+              ansible.builtin.command: kill -0 {{ agent_pid.content | default('eA==') | b64decode | trim }}
+              register: alive
+              changed_when: false
+              failed_when: false
+
+            - name: The configuration is owned by root and the agent runs
+              ansible.builtin.assert:
+                that:
+                  - conf.stat.exists
+                  - conf.stat.pw_name == 'root'
+                  - conf.stat.mode == '0644'
+                  - alive.rc == 0
+        EOF
+        molecule test || true
+  solution:
+    explanation: |
+      The scenario uses Molecule's default driver in unmanaged mode: `molecule.yml` lists the two preprovisioned test
+      nodes as platforms (so they appear in the inventory) and tells Ansible to log in as `ovauto`. `converge.yml` applies
+      the role under its fully qualified name (`orrinvale.audit_agent`, from the role metadata), and `verify.yml`
+      asserts that the configuration is a root-owned file with mode 0644 and that the process from the pid file is alive.
+      `molecule test` runs syntax, converge, idempotence (a second converge must change nothing) and verify.
+    steps:
+    - 'on': ov-ctl
+      as: learner
+      timeoutSec: 600
+      run: |
+        set -e
+        cd ~/audit-roles/roles/audit_agent
+        mkdir -p molecule/default
+        cat > molecule/default/molecule.yml <<'EOF'
+        ---
+        driver:
+          name: default
+          options:
+            managed: false
+        platforms:
+          - name: ov-test-el1
+            groups: [audit_nodes]
+          - name: ov-test-deb1
+            groups: [audit_nodes]
+        provisioner:
+          name: ansible
+          inventory:
+            group_vars:
+              all:
+                ansible_user: ovauto
+        verifier:
+          name: ansible
+        EOF
+        cat > molecule/default/converge.yml <<'EOF'
+        ---
+        - name: Converge
+          hosts: audit_nodes
+          become: true
+          tasks:
+            - name: Apply the audit agent role
+              ansible.builtin.include_role:
+                name: orrinvale.audit_agent
+        EOF
+        cat > molecule/default/verify.yml <<'EOF'
+        ---
+        - name: Verify
+          hosts: audit_nodes
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Agent configuration
+              ansible.builtin.stat:
+                path: /etc/ov/audit-agent.conf
+              register: conf
+
+            - name: Agent process id
+              ansible.builtin.slurp:
+                src: /run/ov-audit-agent.pid
+              register: agent_pid
+              failed_when: false
+
+            - name: Agent liveness
+              ansible.builtin.command: kill -0 {{ agent_pid.content | default('eA==') | b64decode | trim }}
+              register: alive
+              changed_when: false
+              failed_when: false
+
+            - name: The configuration is owned by root and the agent runs
+              ansible.builtin.assert:
+                that:
+                  - conf.stat.exists
+                  - conf.stat.pw_name == 'root'
+                  - conf.stat.mode == '0644'
+                  - alive.rc == 0
+        EOF
+        molecule test
+    alternatives:
+    - id: shell-liveness
+      description: Checks the agent with a shell kill -0 instead of reading the pid file with slurp.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/audit-roles/roles/audit_agent
+          mkdir -p molecule/default
+          cat > molecule/default/molecule.yml <<'EOF'
+          ---
+          driver:
+            name: default
+            options:
+              managed: false
+          platforms:
+            - name: ov-test-el1
+              groups: [audit_nodes]
+            - name: ov-test-deb1
+              groups: [audit_nodes]
+          provisioner:
+            name: ansible
+            inventory:
+              group_vars:
+                all:
+                  ansible_user: ovauto
+          verifier:
+            name: ansible
+          EOF
+          cat > molecule/default/converge.yml <<'EOF'
+          ---
+          - name: Converge
+            hosts: audit_nodes
+            become: true
+            tasks:
+              - name: Apply the audit agent role
+                ansible.builtin.include_role:
+                  name: orrinvale.audit_agent
+          EOF
+          cat > molecule/default/verify.yml <<'EOF'
+          ---
+          - name: Verify
+            hosts: audit_nodes
+            become: true
+            gather_facts: false
+            tasks:
+              - name: Agent configuration
+                ansible.builtin.stat:
+                  path: /etc/ov/audit-agent.conf
+                register: conf
+
+              - name: Agent liveness through the pid file
+                ansible.builtin.shell: kill -0 "$(cat /run/ov-audit-agent.pid)"
+                register: alive
+                changed_when: false
+                failed_when: false
+
+              - name: The configuration is owned by root and the agent runs
+                ansible.builtin.assert:
+                  that:
+                    - conf.stat.exists
+                    - conf.stat.pw_name == 'root'
+                    - conf.stat.mode == '0644'
+                    - alive.rc == 0
+          EOF
+          molecule test
