@@ -32,7 +32,7 @@ spec:
 
     Test from the client with
     `sudo ip netns exec rtr-b curl --interface 10.66.9.20 -m 5 http://10.66.2.5:8085/`.
-    `eth0` and the default route of the host must not change.
+    The management interface (the one carrying the default route) and the default route of the host must not change.
   objectives:
     - Recognise an asymmetric path from a capture or from ip route get
     - Add a routing table and a rule that selects it by source address
@@ -63,7 +63,9 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
-        [ "$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" = eth0 ] || { echo "this lab expects the management NIC to be eth0 (default route is on $(ip -4 route show default | head -1))" >&2; exit 1; }
+        # remember which interface carries the default route (eth0 or a predictable name such as enp1s0)
+        ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1)}}' | sort -u | paste -sd, > /var/lib/tr-mgmt-if
+        grep -q . /var/lib/tr-mgmt-if
         systemctl stop tr-signal-api.service 2>/dev/null || true
         for n in rtr-a rtr-b; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
         for l in eth1 eth2; do ip link del $l 2>/dev/null || true; done
@@ -147,15 +149,16 @@ spec:
         EOP
       expect: {match: exact, value: persistent}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the management interface
       type: shell
       on: tr-net-01
       skills: [linux.net.troubleshooting]
       weight: 0.5
       command: |
         [ "$(ip route get 10.66.9.20 from 10.66.2.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1)" = "dev eth2" ] || { echo not-fixed; exit 0; }
-        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+        cur=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        [ -n "$cur" ] && [ "$cur" = "$(cat /var/lib/tr-mgmt-if 2>/dev/null)" ] && echo ok
+      expect: {match: exact, value: ok}
   hints:
     - title: Follow the packets
       command: sudo ip netns exec rtr-a tcpdump -ni eth1p
