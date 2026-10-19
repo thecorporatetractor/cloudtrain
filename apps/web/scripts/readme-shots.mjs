@@ -4,7 +4,7 @@
 //   node apps/web/scripts/readme-shots.mjs [--base http://localhost:5199] [--chromium /usr/bin/chromium]
 //
 // Output: docs/images/*.png at the repository root. The screenshots the public
-// website shows (content/site.yaml `screenshots`) are copied to apps/web/public/site/.
+// website shows (apps/web/public/site/) come from scripts/site-shots.mjs.
 //
 // Real mode (a VITE_API_MODE=real dev server in front of a gateway): pass a
 // Playwright storageState from deploy/scripts/dev-signin-as.mjs and an output
@@ -12,7 +12,7 @@
 // started, personas are ignored, the mock-fixture waitFor texts are best effort):
 //
 //   node apps/web/scripts/readme-shots.mjs --base http://localhost:5197 --storage /tmp/me.json --out /tmp/shots
-import { copyFile, mkdir } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
@@ -198,14 +198,6 @@ try {
     await open(s.page, '/', 'Next best lab');
     await shot(s.page, `home-${theme}`);
     await s.ctx.close();
-  }
-  // Website screenshots (content/site.yaml `screenshots`, served from apps/web/public/site/).
-  if (!storage) {
-    const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public/site');
-    await mkdir(siteDir, { recursive: true });
-    for (const name of ['workspace', 'skills', 'exam-results', 'team']) {
-      await copyFile(path.join(out, `${name}.png`), path.join(siteDir, `${name}.png`)).catch((e) => console.log('note: site copy skipped', name, e.message));
-    }
   }
 } catch (e) {
   console.log('FAILED', e.message);

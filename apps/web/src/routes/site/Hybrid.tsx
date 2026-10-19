@@ -13,9 +13,10 @@ import { Home } from '@/routes/Home';
 const Landing = lazy(() => import('./Landing').then((m) => ({ default: m.Landing })));
 const PublicCatalog = lazy(() => import('./PublicCatalog').then((m) => ({ default: m.PublicCatalog })));
 
+/** Viewport-tall, so the footer stays below the fold and nothing shifts when the page arrives. */
 function fallback() {
   return (
-    <div className="site-container site-page">
+    <div className="site-container site-page site-pending">
       <PageSkeleton />
     </div>
   );

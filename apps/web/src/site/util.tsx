@@ -1,9 +1,11 @@
 import { Link } from '@tanstack/react-router';
-import { BarChart3, Boxes, Check, Cloud, Eye, Flag, GraduationCap, Lock, Network, Route, Server, Shield, Sparkles, TerminalSquare, Timer, Users, type LucideProps } from 'lucide-react';
+import { BarChart3, Boxes, Building2, Check, Cloud, Eye, Flag, GraduationCap, Layers, Lock, Network, Route, Server, Shield, Sparkles, Target, TerminalSquare, Timer, UserRound, Users, type LucideProps } from 'lucide-react';
 import { useEffect, type ReactNode } from 'react';
 import { isInternalHref } from '@/api/public';
-import type { SiteFeatureIcon, SiteLink } from '@/api/types';
+import type { SiteFeatureIcon, SiteFigure, SiteLink } from '@/api/types';
 import { useBrandName } from '@/components/brand';
+import { useTheme } from '@/lib/theme';
+import { cn } from '@/lib/utils';
 
 /** Sets the document title for the public pages: "Page · Brand" (or just the brand). */
 export function useDocumentTitle(page?: string) {
@@ -18,7 +20,7 @@ export function useDocumentTitle(page?: string) {
 }
 
 /** A configured link: an in-app `<Link>` for paths, `<a>` for URLs (new tab for http(s) unless told otherwise). */
-export function SiteAnchor({ to, external, className, children, ...rest }: { to: string; external?: boolean; className?: string; children: ReactNode; 'aria-label'?: string; onClick?: () => void }) {
+export function SiteAnchor({ to, external, className, children, ...rest }: { to: string; external?: boolean; className?: string; children: ReactNode; 'aria-label'?: string; 'aria-current'?: 'page' | 'location'; onClick?: () => void }) {
   if (isInternalHref(to)) {
     const [path, hash] = to.split('#');
     return (
@@ -54,6 +56,10 @@ const ICONS: Record<SiteFeatureIcon, (p: LucideProps) => ReactNode> = {
   cloud: (p) => <Cloud {...p} />,
   route: (p) => <Route {...p} />,
   eye: (p) => <Eye {...p} />,
+  user: (p) => <UserRound {...p} />,
+  building: (p) => <Building2 {...p} />,
+  target: (p) => <Target {...p} />,
+  layers: (p) => <Layers {...p} />,
 };
 
 export function FeatureIcon({ icon, size = 18 }: { icon: SiteFeatureIcon; size?: number }) {
@@ -70,5 +76,30 @@ export function Paragraphs({ text, className }: { text: string[]; className?: st
         </p>
       ))}
     </>
+  );
+}
+
+/**
+ * A real product screenshot in a window frame. The dark image serves the dark
+ * theme, `imageLight` the light and cream themes. `priority` marks the hero
+ * image (loaded eagerly, high fetch priority); everything else is lazy. The
+ * intrinsic size (default 1440×900, the capture size of scripts/site-shots.mjs)
+ * reserves the space so the page does not shift when the image arrives.
+ */
+export function SiteShot({ figure, priority, className, sizes }: { figure: SiteFigure; priority?: boolean; className?: string; sizes?: string }) {
+  const { theme } = useTheme();
+  const src = theme === 'dark' ? figure.image : (figure.imageLight ?? figure.image);
+  return (
+    <figure className={cn('site-shot', className)}>
+      <img
+        src={src}
+        alt={figure.alt}
+        width={figure.width ?? 1440}
+        height={figure.height ?? 900}
+        sizes={sizes}
+        decoding="async"
+        {...(priority ? { fetchPriority: 'high' as const } : { loading: 'lazy' as const })}
+      />
+    </figure>
   );
 }

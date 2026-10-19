@@ -46,7 +46,7 @@ test("plan cross-checks: duplicate lookup keys, priced free plans, per-seat indi
 test("schema errors, unknown routes, missing screenshots and a weak notice are reported", async () => {
   const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
   doc.footer.columns[0].links.push({ label: "Nowhere", to: "/nowhere" });
-  doc.screenshots = [{ image: "/site/does-not-exist.png", alt: "x" }];
+  doc.showcase = [{ title: "x", body: "y", figure: { image: "/site/does-not-exist.png", alt: "x" } }];
   doc.legal.alignmentNotice = "We love every vendor.";
   doc.highlightDomains = ["linux"];
   doc.bogus = 1;
@@ -64,6 +64,7 @@ test("schema errors, unknown routes, missing screenshots and a weak notice are r
   const messages = findings.map((f) => f.message);
   assert.ok(messages.some((m) => m.includes("'/nowhere' is not a website route")));
   assert.ok(messages.some((m) => m.includes("does-not-exist.png")));
+  assert.ok(messages.some((m) => m.includes("'/nowhere' is not a website route")));
   assert.ok(messages.some((m) => m.includes("not affiliated")));
   assert.ok(messages.some((m) => m.includes("highlighted domain 'linux'")));
 });

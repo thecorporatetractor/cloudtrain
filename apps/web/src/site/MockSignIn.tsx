@@ -25,7 +25,7 @@ export function MockSignIn() {
   if (isRealApi || me.isSuccess || !personas.data?.length) return null;
   return (
     <div className="site-mock" role="note" aria-label="Mock mode">
-      <span className="xs subtle row" style={{ gap: 6 }}>
+      <span className="site-meta row" style={{ gap: 6 }}>
         <UserRound size={12} aria-hidden /> Mock mode: sign in as a sample persona
       </span>
       <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
