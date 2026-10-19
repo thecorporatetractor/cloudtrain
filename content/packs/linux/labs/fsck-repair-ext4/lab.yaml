@@ -125,7 +125,7 @@ spec:
       body: "Run the check on the unmounted device. It reports the primary superblock as bad and offers to use a backup; -y answers yes to every repair question."
       cost: 0
     - title: What lost+found holds
-      body: "Files whose directory entry was lost are reconnected as #<inode-number> in lost+found. The names are gone, but the content still says which gate wrote them: head -1."
+      body: "Files whose directory entry was lost are reconnected as #<inode-number> in lost+found. The names are gone, but the content still says which gate wrote them: head -1. lost+found is readable by root only, so use sudo (a glob such as lost+found/* is expanded by your own shell: run it inside sudo sh -c)."
       cost: 1
   misconceptions:
     - id: reformat
@@ -162,11 +162,12 @@ spec:
           sudo e2fsck -fy /dev/vdc1 || [ $? -lt 4 ]
           sudo mount /depot/logs
           sudo mkdir -p /depot/logs/restored
-          for f in /depot/logs/lost+found/'#'*; do
+          # lost+found is root-only (0700): expand the glob inside a root shell
+          sudo sh -c 'for f in /depot/logs/lost+found/\#*; do
             [ -e "$f" ] || continue
-            g=$(sudo head -1 "$f" | awk '{print $2}')
-            sudo mv "$f" /depot/logs/restored/$g.log
-          done
+            g=$(head -1 "$f" | awk "{print \$2}")
+            mv "$f" /depot/logs/restored/$g.log
+          done'
           ls /depot/logs/restored
     alternatives:
       - id: explicit-backup-superblock
@@ -181,7 +182,8 @@ spec:
               sudo e2fsck -fy /dev/vdc1 || [ $? -lt 4 ]
               sudo mount /depot/logs
               sudo mkdir -p /depot/logs/restored
-              for f in /depot/logs/lost+found/'#'*; do
-                g=$(sudo awk 'NR == 1 {print $2; exit}' "$f")
-                sudo cp -p "$f" /depot/logs/restored/$g.log && sudo rm -f "$f"
-              done
+              sudo sh -c 'for f in /depot/logs/lost+found/\#*; do
+                [ -e "$f" ] || continue
+                g=$(awk "NR == 1 {print \$2; exit}" "$f")
+                cp -p "$f" /depot/logs/restored/$g.log && rm -f "$f"
+              done'
