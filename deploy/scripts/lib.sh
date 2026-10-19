@@ -165,7 +165,29 @@ node_arch() {
 #    --platform <node arch>` piped into `ctr images import` (no --all-platforms); then
 #    `crictl pull` inside the node (public images only).
 # KIND_LOAD_VERBOSE=1 logs when nothing needs loading.
+# Every node is then pinned (pin_image) so kubelet image GC cannot evict the local-only image.
 load_image() {
+  local img=$1; shift
+  _load_image "$img" "$@" || return
+  pin_image "$img" "$@"
+}
+
+# pin_image <image> <node...>: label the image io.cri-containerd.pinned=pinned in containerd's
+# k8s.io namespace on each node. The CRI plugin excludes pinned images from kubelet image GC,
+# which otherwise deletes loaded images (imagePullPolicy IfNotPresent, not pullable) at the
+# imageGCHighThresholdPercent disk mark. Idempotent (re-labelling is a no-op); a failure only
+# warns, it never fails the load.
+pin_image() {
+  local img=$1 node fqn; shift
+  fqn=$(image_fqn "$img")
+  for node in "$@"; do
+    docker exec "$node" ctr -n k8s.io images label "$fqn" io.cri-containerd.pinned=pinned >/dev/null 2>&1 \
+      || warn "could not pin $img on $node (kubelet image GC may delete it)"
+  done
+  return 0
+}
+
+_load_image() {
   local img=$1 id node arch todo=() rd; shift
   id=$(docker image inspect -f '{{.Id}}' "$img") || return 1
   # A RepoDigest (pulled images, and local builds with the containerd image store) is the

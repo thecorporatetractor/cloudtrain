@@ -39,6 +39,7 @@ want published && ( timed pull-published bash -c "$(declare -f pull_pub); REV=$R
     docker tag motoserver/moto:5.2.3@sha256:91fd602a21f49cf9eb82fdf474015a3c131d40104c8297ea6a2ca920708ae32c motoserver/moto:5.2.3" &&
   timed load-published bash -c 'bash tools/images/load.sh jumphost ansible-ctl iac-ws-tofu workloads &&
     bash tools/images/load.sh etcd-host iac-ws-terraform &&
-    for t in cloudtrain/frr:10 cloudtrain/nettools:1 cloudtrain/netsvc:1 motoserver/moto:5.2.3; do kind load docker-image --name cloudtrain-dev "$t" >/dev/null || exit 1; done' ) & pids+=($!)
+    source deploy/scripts/lib.sh
+    for t in cloudtrain/frr:10 cloudtrain/nettools:1 cloudtrain/netsvc:1 motoserver/moto:5.2.3; do load_image "$t" $(kind get nodes --name cloudtrain-dev) || exit 1; done' ) & pids+=($!)
 rc=0; for p in "${pids[@]}"; do wait "$p" || rc=1; done
 echo "ALL DONE rc=$rc $(date +%T)" | tee -a "$OUT/times.tsv"
