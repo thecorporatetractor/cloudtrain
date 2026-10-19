@@ -36,7 +36,7 @@ R
 dnf -y --setopt=install_weak_deps=False install \
   qemu-guest-agent firewalld audit policycoreutils-python-utils setools-console chrony rsyslog \
   lvm2 mdadm parted xfsprogs e2fsprogs dosfstools nfs-utils cryptsetup \
-  bash-completion man-db man-pages vim-enhanced nano less tmux tar rsync lsof strace \
+  bash-completion man-db man-pages vim-enhanced nano less tmux tar bzip2 rsync lsof strace \
   bind-utils tcpdump nmap-ncat curl wget sudo cronie at tuned cloud-utils-growpart
 systemctl enable qemu-guest-agent firewalld auditd chronyd || true
 # SELinux enforcing, targeted (the cloud image default; asserted here)
