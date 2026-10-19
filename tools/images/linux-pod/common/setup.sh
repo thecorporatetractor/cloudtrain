@@ -5,7 +5,7 @@ family=$1 mirror=$2 tini_v=$3 tini_sha=$4
 here=/tmp/common
 
 # PID 1: tini reaps orphans (process labs create zombies on purpose), then cloudtrain-init.
-curl -fsSL -o /usr/local/sbin/tini "https://github.com/krallin/tini/releases/download/${tini_v}/tini-static-amd64"
+curl --retry 5 --retry-connrefused -fsSL -o /usr/local/sbin/tini "https://github.com/krallin/tini/releases/download/${tini_v}/tini-static-amd64"
 echo "${tini_sha}  /usr/local/sbin/tini" | sha256sum -c -
 chmod 0755 /usr/local/sbin/tini
 install -m 0755 "$here/cloudtrain-init" /usr/local/sbin/cloudtrain-init

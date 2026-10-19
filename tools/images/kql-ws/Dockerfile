@@ -27,7 +27,8 @@ ARG RUN_TESTS=1
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
+ && apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN test -n "$KUSTOLOCO_COMMIT" && test -n "$KUSTO_LANGUAGE_COMMIT" \
  && git init -q kusto-loco && git -C kusto-loco fetch -q --depth 1 https://github.com/NeilMacMullen/kusto-loco.git "$KUSTOLOCO_COMMIT" \
@@ -74,6 +75,7 @@ ARG AZURE_SENTINEL_LICENSE_SHA256
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3008
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
  && apt-get -o Acquire::ForceIPv4=true update && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends --snapshot "$UBUNTU_APT_SNAPSHOT" python3 curl \
@@ -82,11 +84,11 @@ COPY sample-data/ /build/sample-data/
 COPY loggen/ /opt/cloudtrain/loggen/
 RUN set -eu; base="https://raw.githubusercontent.com/Azure/Azure-Sentinel/${AZURE_SENTINEL_COMMIT}"; \
     mkdir -p /build/src /out/doc; \
-    curl -fsSL -o /out/doc/azure-sentinel-LICENSE "$base/LICENSE"; \
+    curl --retry 5 --retry-connrefused -fsSL -o /out/doc/azure-sentinel-LICENSE "$base/LICENSE"; \
     echo "${AZURE_SENTINEL_LICENSE_SHA256}  /out/doc/azure-sentinel-LICENSE" | sha256sum -c - >/dev/null; \
     grep -v '^#' /build/sample-data/sources.lock | grep . | while read -r _ _ _ path; do \
       mkdir -p "/build/src/$(dirname "$path")"; \
-      curl -fsSL -o "/build/src/$path" "$base/Sample%20Data/${path// /%20}"; \
+      curl --retry 5 --retry-connrefused -fsSL -o "/build/src/$path" "$base/Sample%20Data/${path// /%20}"; \
     done; \
     python3 -I /build/sample-data/import.py /build/src /out/datasets/sentinel-sample /build/sample-data/sources.lock
 # the generator's own tests, then a fixed demo dataset (seed "demo") for `kql` outside a lab
@@ -110,6 +112,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # so no invariant globalization), fontconfig + DejaVu for chart rendering, and the shell tools.
 # hadolint ignore=DL3008
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
  && apt-get -o Acquire::ForceIPv4=true update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \

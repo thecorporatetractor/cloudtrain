@@ -39,6 +39,7 @@ grow_root() {
 # Boot-time hygiene for lab VMs (no snaps, no background apt runs fighting for dpkg),
 # apt from the pinned Ubuntu snapshot, and the base packages every image needs.
 base_setup() {
+  printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' > /etc/apt/apt.conf.d/80-retries
   apt-get purge -y snapd unattended-upgrades || true
   systemctl mask apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service
   # The libguestfs appliance (user-mode net) has no IPv6 route; force IPv4 during the build.
@@ -82,7 +83,7 @@ restore_ubuntu_sources() {
 # fetch_key <url> <expected fingerprint> <dest .gpg>: refuse a key with another fingerprint.
 fetch_key() {
   local tmp fpr; tmp=$(mktemp)
-  curl -fsSL "$1" -o "$tmp"
+  curl --retry 5 --retry-connrefused -fsSL "$1" -o "$tmp"
   fpr=$(gpg --show-keys --with-colons "$tmp" | awk -F: '/^fpr/{print $10; exit}')
   [ "$fpr" = "$2" ] || { echo "GPG key $1 has fingerprint '$fpr', expected '$2'"; exit 1; }
   gpg --dearmor --yes -o "$3" "$tmp"

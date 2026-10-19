@@ -105,13 +105,13 @@ elif [[ $GUEST == el-vm ]]; then
   BASE="$CACHE/$ALMA_CLOUD_IMAGE"; BASE_LABEL="${ALMA_CLOUD_IMAGE%.x86_64.qcow2}"
   if ! echo "${ALMA_CLOUD_IMAGE_SHA256}  $BASE" | sha256sum -c --status 2>/dev/null; then
     log "downloading $ALMA_CLOUD_IMAGE"
-    curl -fSL --retry 3 -o "$BASE" "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/$ALMA_CLOUD_IMAGE" \
-      || curl -fSL --retry 3 -o "$BASE" "https://vault.almalinux.org/${ALMA_RELEASE}/cloud/x86_64/images/$ALMA_CLOUD_IMAGE"
+    curl -fSL --retry 5 --retry-connrefused -o "$BASE" "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/$ALMA_CLOUD_IMAGE" \
+      || curl -fSL --retry 5 --retry-connrefused -o "$BASE" "https://vault.almalinux.org/${ALMA_RELEASE}/cloud/x86_64/images/$ALMA_CLOUD_IMAGE"
     echo "${ALMA_CLOUD_IMAGE_SHA256}  $BASE" | sha256sum -c - || die "checksum mismatch for $BASE"
   fi
 elif ! echo "${UBUNTU_IMAGE_SHA256}  $BASE" | sha256sum -c --status 2>/dev/null; then
   log "downloading Ubuntu ${UBUNTU_RELEASE} cloud image ${UBUNTU_SERIAL}"
-  curl -fSL --retry 3 -o "$BASE" \
+  curl -fSL --retry 5 --retry-connrefused -o "$BASE" \
     "https://cloud-images.ubuntu.com/releases/${UBUNTU_RELEASE}/release-${UBUNTU_SERIAL}/ubuntu-24.04-server-cloudimg-amd64.img"
   echo "${UBUNTU_IMAGE_SHA256}  $BASE" | sha256sum -c - || die "checksum mismatch for $BASE"
 fi
@@ -143,8 +143,8 @@ lock_check() {
 kubeadm_images() {
   local v=$1 bin="$CACHE/kubeadm-$1"
   if [[ ! -x $bin ]]; then
-    curl -fsSL -o "$bin.tmp" "https://dl.k8s.io/release/$v/bin/linux/amd64/kubeadm"
-    echo "$(curl -fsSL "https://dl.k8s.io/release/$v/bin/linux/amd64/kubeadm.sha256")  $bin.tmp" | sha256sum -c - >/dev/null \
+    curl --retry 5 --retry-connrefused -fsSL -o "$bin.tmp" "https://dl.k8s.io/release/$v/bin/linux/amd64/kubeadm"
+    echo "$(curl --retry 5 --retry-connrefused -fsSL "https://dl.k8s.io/release/$v/bin/linux/amd64/kubeadm.sha256")  $bin.tmp" | sha256sum -c - >/dev/null \
       || die "kubeadm $v checksum mismatch"
     chmod +x "$bin.tmp" && mv "$bin.tmp" "$bin"
   fi
@@ -208,14 +208,14 @@ fetch_trivy_db() {
   local dest=$1 repo=${TRIVY_DB_REF%@*} digest=${TRIVY_DB_REF#*@} host path token manifest layer
   host=${repo%%/*}; path=${repo#*/}
   if [[ -s $dest && -s $dest.layer ]] && echo "$(cat "$dest.layer")  $dest" | sha256sum -c --status; then return 0; fi
-  token=$(curl -fsSL "https://$host/token?scope=repository:$path:pull" | jq -r .token) || die "no registry token for $repo"
-  manifest=$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+  token=$(curl --retry 5 --retry-connrefused -fsSL "https://$host/token?scope=repository:$path:pull" | jq -r .token) || die "no registry token for $repo"
+  manifest=$(curl --retry 5 --retry-connrefused -fsSL -H "Authorization: Bearer $token" -H "Accept: application/vnd.oci.image.manifest.v1+json" \
     "https://$host/v2/$path/manifests/$digest") || die "cannot fetch $TRIVY_DB_REF"
   [[ "sha256:$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" == "$digest" ]] || die "$TRIVY_DB_REF: manifest digest mismatch"
   layer=$(jq -r '.layers[] | select(.mediaType == "application/vnd.aquasec.trivy.db.layer.v1.tar+gzip") | .digest' <<<"$manifest")
   [[ $layer == sha256:* ]] || die "$TRIVY_DB_REF has no Trivy DB layer"
   log "downloading Trivy DB ${TRIVY_DB_DATE} ($layer)"
-  curl -fSL --retry 3 -H "Authorization: Bearer $token" -o "$dest.tmp" "https://$host/v2/$path/blobs/$layer" || die "Trivy DB download failed"
+  curl -fSL --retry 5 --retry-connrefused -H "Authorization: Bearer $token" -o "$dest.tmp" "https://$host/v2/$path/blobs/$layer" || die "Trivy DB download failed"
   echo "${layer#sha256:}  $dest.tmp" | sha256sum -c --status || die "Trivy DB layer sha256 mismatch"
   mv "$dest.tmp" "$dest"; echo "${layer#sha256:}" > "$dest.layer"
 }

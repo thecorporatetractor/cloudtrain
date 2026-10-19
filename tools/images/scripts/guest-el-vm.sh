@@ -33,6 +33,7 @@ enabled=1
 gpgcheck=1
 gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
 R
+printf 'retries=10\ntimeout=30\n' >> /etc/dnf/dnf.conf
 dnf -y --setopt=install_weak_deps=False install \
   qemu-guest-agent firewalld audit policycoreutils-python-utils setools-console chrony rsyslog \
   lvm2 mdadm parted xfsprogs e2fsprogs dosfstools nfs-utils cryptsetup \
