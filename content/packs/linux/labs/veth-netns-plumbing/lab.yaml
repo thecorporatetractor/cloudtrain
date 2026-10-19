@@ -32,7 +32,7 @@ spec:
     - `tr-net-01` **forwards** packets between the two networks and **NATs** the sandbox
       subnet **10.200.0.0/24** so the mirror sees the uplink address.
 
-    Do not touch `eth0`, the default route of `tr-net-01` or the interface `tt-up`.
+    Do not touch the management interface (shown by `ip route show default`), the default route of `tr-net-01` or the interface `tt-up`.
   objectives:
     - Create a namespace and connect it to the host with a veth pair
     - Address both ends and add a default route inside the namespace
@@ -60,7 +60,10 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
-        [ "$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" = eth0 ] || { echo "this lab expects the management NIC to be eth0 (default route is on $(ip -4 route show default | head -1))" >&2; exit 1; }
+        # remember the management interface (the one carrying the default route; eth0, enp1s0, ... depending on the image)
+        mgmt=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        [ -n "$mgmt" ] || { echo "no default route on this host" >&2; exit 1; }
+        echo "$mgmt" > /var/lib/cloudtrain/mgmt-if
         systemctl stop tr-mirror.service 2>/dev/null || true
         for n in tt-sandbox tt-mirror; do ip netns del $n 2>/dev/null || true; done
         for l in tt-host tt-up; do ip link del $l 2>/dev/null || true; done
@@ -135,8 +138,8 @@ spec:
         ip -n tt-sandbox -o -4 addr show scope global 2>/dev/null | grep -q '10.200.0.2/24' || { echo "not-configured"; exit 0; }
         a=$(ip -o -4 addr show dev tt-up | awk '{print $4}')
         d=$(ip -4 route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
-        echo "$a $d"
-      expect: {match: exact, value: "10.201.0.1/24 eth0"}
+        [ -n "$d" ] && [ "$d" = "$(cat /var/lib/cloudtrain/mgmt-if 2>/dev/null)" ] && [ "$a" = "10.201.0.1/24" ] && echo ok || echo "$a $d"
+      expect: {match: exact, value: ok}
   hints:
     - title: Two ends, two homes
       body: "A veth pair is a virtual cable: create it on the host with ip link add ... type veth peer name ..., then move one end into the namespace with ip link set <end> netns tt-sandbox."
