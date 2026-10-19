@@ -312,17 +312,21 @@ spec:
                   scan(v)
 
 
-      def walk(tasks, inherited):
+      def walk(tasks, inherited, ru=None, cond=False):
+          # yields (task, escalates, remote_user, conditional) with block keywords inherited
           for t in tasks or []:
               if not isinstance(t, dict):
                   bad.add('bad-task')
                   continue
               b = flag(t.get('become'), inherited)
+              tv = t.get('vars') if isinstance(t.get('vars'), dict) else {}
+              u = t.get('remote_user') or tv.get('ansible_user') or ru
+              c = cond or 'when' in t
               if 'block' in t:
                   for k in ('block', 'rescue', 'always'):
-                      yield from walk(t.get(k), b)
+                      yield from walk(t.get(k), b, u, c)
               else:
-                  yield t, b
+                  yield t, b, u, c
 
 
       kinds = set()
@@ -376,10 +380,12 @@ spec:
               every = []
               for k in ('pre_tasks', 'tasks', 'post_tasks', 'handlers'):
                   every += p.get(k) or []
-              for t, b in walk(every, base):
+              pv = p.get('vars') if isinstance(p.get('vars'), dict) else {}
+              for t, b, ru, cond in walk(every, base, p.get('remote_user') or pv.get('ansible_user')):
                   text = yaml.safe_dump(t, width=10 ** 6)
                   if 'written_by' in text:
-                      if re.search(r'written_by=\s*\{\{[^}]*ansible_(user_id|user|facts)', text):
+                      # the report task runs unconditionally as ovreport and takes the name from the connection
+                      if re.search(r'written_by=\s*\{\{[^}]*ansible_(user_id|user|facts|env)', text) and str(ru) == 'ovreport' and not cond:
                           wb[0] = True
                   if b:
                       kind = allowed(t)
@@ -393,7 +399,7 @@ spec:
       if kinds != {'pkg', 'conf', 'dir'} and not bad:
           bad.add('privileged-tasks-missing')
       if not wb[0] and not bad:
-          bad.add('written_by-not-from-ansible_user_id')
+          bad.add('report-task-not-run-as-ovreport')
       print(' '.join(sorted(bad)) or 'ok')
       EOF
     expect:
@@ -568,6 +574,59 @@ spec:
                 mode: "0644"
         EOF
         ansible-playbook report.yml || true
+  - id: reports-by-hand
+    description: Writes the reports on the nodes by hand (as root, then chown to ovreport) and keeps a report task that never runs (when false).
+    feedback: The report has to be written by the playbook, by a task that runs as ovreport every time.
+    expectFail:
+    - escalation-scope
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        cat > report.yml <<'EOF'
+        - name: Claims reporting prerequisites
+          hosts: claims_web
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Retire the legacy tree utility
+              ansible.builtin.dnf:
+                name: tree
+                state: absent
+                disablerepo: "*"
+
+            - name: Reporting configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/report.conf
+                content: "report_dir=/var/reports\n"
+                mode: "0644"
+
+            - name: Report directory
+              ansible.builtin.file:
+                path: /var/reports
+                state: directory
+                owner: ovreport
+                mode: "0755"
+
+        - name: Claims reporting
+          hosts: claims_web
+          remote_user: ovreport
+          become: false
+          tasks:
+            - name: Claims report
+              when: false
+              ansible.builtin.copy:
+                dest: "/var/reports/{{ inventory_hostname }}.txt"
+                content: |
+                  host={{ inventory_hostname }}
+                  release=r{{rel}}
+                  written_by={{ ansible_user_id }}
+                mode: "0644"
+        EOF
+        ansible-playbook report.yml || true
+        ansible claims_web -b -m ansible.builtin.shell -a 'printf "host=%s\nrelease=r{{rel}}\nwritten_by=ovreport\n" $(hostname) > /var/reports/$(hostname).txt && chown ovreport:ovreport /var/reports/$(hostname).txt'
   solution:
     explanation: |
       The play is split in two. The first play keeps `become: true` for the three tasks that really need root (remove the package,

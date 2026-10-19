@@ -158,7 +158,7 @@ spec:
       match: exact
       value: ok
   - id: report-masked
-    description: The report shows every policy number masked and no full number
+    description: The report, rendered through orrinvale.claims.mask_policy in the template, shows every policy number masked and no full number
     type: shell
     'on': ov-ctl
     skills:
@@ -168,8 +168,11 @@ spec:
       f=/home/learner/claims-collection/out/claims-report.txt
       [ -f $f ] || { echo no-report; exit 0; }
       # read the learner's file as the learner, with a time and size bound, into a root-owned copy
-      snap=$(mktemp); trap 'rm -f "$snap"' EXIT
+      snap=$(mktemp); tpl=$(mktemp); trap 'rm -f "$snap" "$tpl"' EXIT
       ct-ansible run /home/learner/claims-collection timeout 10 head -c 65536 out/claims-report.txt > "$snap" 2>/dev/null
+      # the report has to come from the collection filter: the template must call it by its full name
+      ct-ansible run /home/learner/claims-collection timeout 10 head -c 65536 templates/claims-report.txt.j2 > "$tpl" 2>/dev/null || { echo no-template; exit 0; }
+      grep -qE '\|[[:space:]]*orrinvale\.claims\.mask_policy' "$tpl" || { echo template-without-filter; exit 0; }
       /opt/ansible/bin/python3 -I - "$snap" <<'EOF'
       import sys
       t = open(sys.argv[1]).read().strip().split('\n')
@@ -194,6 +197,7 @@ spec:
       t=$(ct-ansible run /home/learner/claims-collection timeout 10 bash -c 'ls -t dist/orrinvale-claims-*.tar.gz 2>/dev/null | head -1')
       [ -n "$t" ] || { echo no-tarball; exit 0; }
       l=$(ct-ansible run /home/learner/claims-collection timeout 30 bash -c 'set -o pipefail; tar -tzf "$1" | head -c 1048576' bash "$t" 2>/dev/null)
+      printf '%s\n' "$l" | grep -qx 'MANIFEST.json' && printf '%s\n' "$l" | grep -qx 'FILES.json' || { echo not-a-collection-build; exit 0; }
       printf '%s\n' "$l" | grep -qx 'plugins/filter/mask_policy.py' && echo ok || echo filter-not-in-build
     expect:
       match: exact

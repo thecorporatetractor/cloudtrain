@@ -100,15 +100,24 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-db-1=10.70.0.21 ov-db-2=10.70.0.22
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-db-1 ov-db-2
-      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
-      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
-      chmod 0700 /var/lib/ctjudge
-      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
-      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
-      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
-      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
       k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
-      for h in ov-db-1 ov-db-2; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
+      for h in ov-db-1 ov-db-2; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-db-1 ov-db-2 | cut -d' ' -f1) true
   - 'on': ov-ctl
     run: |
       p=/home/learner/policy-db
@@ -268,10 +277,11 @@ spec:
       chown -R ctjudge $j
       ( ulimit -f 65536; ct-ansible run /home/learner/policy-db timeout 30 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
       runuser -u ctjudge -- timeout 30 tar -x --no-same-owner --no-same-permissions -C $j/p -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
-      [ -z "$(cd $j/p && find . \( -type l -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name plugins -o -name collections -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
-      ! grep -qiE '^[[:space:]]*([a-z_]*_plugins|library|module_utils|callbacks_enabled|callback_whitelist|stdout_callback|vars_plugins_enabled|enable_plugins|strategy|collections_paths?)[[:space:]]*[=:]' $j/p/ansible.cfg 2>/dev/null || { echo config-loads-code; exit 0; }
+      [ -z "$(cd $j/p && find . \( -type l -o -type f -perm /111 -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name plugins -o -name collections -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
+      ! grep -qiE '^[[:space:]]*([a-z_]*_plugins|library|module_utils|callbacks_enabled|callback_whitelist|stdout_callback|vars_plugins_enabled|enable_plugins|strategy|collections_paths?|[a-z_]*ssh[a-z_]*|[a-z_]*executable)[[:space:]]*[=:]' $j/p/ansible.cfg 2>/dev/null || { echo config-loads-code; exit 0; }
+      ! grep -rIqiE '(^|[^a-z0-9_])ansible_[a-z_]*(ssh|exe|connection|port|host|shell|args)[a-z_]*[[:space:]]*[:=]|proxycommand|ssh_args|ssh_executable|(^|[[:space:]-])connection[[:space:]]*:|(^|[^a-z0-9_])(lookup|query)([^a-z0-9_]|$)|[{%(,|=[:space:]]q([^a-z0-9_]|$)|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|config)|(^|[[:space:]-])(delegate_to|local_action)[[:space:]]*:' $j/p || { echo not-allowed; exit 0; }
       J() { (cd $j/p && runuser -u ctjudge -- env -i HOME=$j/home PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-        ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_RETRY_FILES_ENABLED=0 \
+        ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_RETRY_FILES_ENABLED=0 ANSIBLE_INVENTORY_ENABLED=host_list,yaml,ini \
         ANSIBLE_VAULT_IDENTITY_LIST=prod@$j/home/.ov-vault/prod ANSIBLE_VAULT_PASSWORD_FILE=$j/home/.ov-vault/prod \
         timeout 100 ansible-playbook db-login.yml "$@" 2>&1); }
       # make the credentials file differ once, so a run that changes it would print the difference

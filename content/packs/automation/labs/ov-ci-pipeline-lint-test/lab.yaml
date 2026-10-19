@@ -363,7 +363,10 @@ spec:
       # collections, any Python file, and lookups (which run commands while playbooks load) make the commit "tampered"
       if find . \( -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o -name '*.pth' \) | grep -q .; then exit 3; fi
       if find . -type d \( -name library -o -name module_utils -o -name plugins -o -name '*_plugins' -o -name collections \) | grep -q .; then exit 3; fi
-      if grep -rIEq '(^|[^a-zA-Z0-9_])(lookup|query|q)[[:space:]]*\(|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)' .; then exit 3; fi
+      if grep -rIEq --include='*.yml' --include='*.yaml' --include='*.j2' '(^|[^a-zA-Z0-9_])(lookup|query)([^a-zA-Z0-9_]|$)|[{%(,|=[:space:]]q([^a-zA-Z0-9_]|$)|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)' .; then exit 3; fi
+      # connection variables and keywords would run programs on the control node (the Molecule scenario is replaced by
+      # the original one for the runner's own run, so it is not searched)
+      if grep -rIEqi --exclude-dir=molecule --include='*.yml' --include='*.yaml' --include='*.j2' '(^|[^a-z0-9_])ansible_[a-z_]*[[:space:]]*[:=]|proxycommand|(^|[[:space:]-])(connection|delegate_to|local_action)[[:space:]]*:' .; then exit 3; fi
       # the commit's own ansible.cfg files and hidden directories are not used for the verdict
       find . -name ansible.cfg -delete
       find . -mindepth 1 -type d -name '.*' -prune -exec rm -rf {} +
@@ -410,13 +413,14 @@ spec:
       # repository was created with, and `molecule test` runs there. A learner process cannot reach that copy or that run.
       JUDGE_MOL = 'ctjudge' if USER else ''
       PRISTINE_SCENARIO = '/usr/local/lib/ov-ci/pristine-molecule'
-      MOL_ENV = {'HOME': '/var/lib/ctjudge', 'USER': 'ctjudge', 'LOGNAME': 'ctjudge', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+      MOL_ENV = {'HOME': '@HOME@', 'USER': 'ctjudge', 'LOGNAME': 'ctjudge', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
                  'PATH': '/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin', 'ANSIBLE_NOCOLOR': '1', 'TERM': 'dumb'}
 
 
       def judge_molecule(repo, sha, mol):
           gitenv = ' '.join('%s=%s' % (k, shlex.quote(v)) for k, v in ENV.items())
-          molenv = ' '.join('%s=%s' % (k, shlex.quote(v)) for k, v in MOL_ENV.items())
+          # a fresh home for every run, so nothing one run leaves behind reaches the next
+          molenv = ' '.join('%s=%s' % (k, shlex.quote(v.replace('@HOME@', os.path.join(mol, 'home')))) for k, v in MOL_ENV.items())
           if JUDGE_MOL:
               arch = 'runuser -u %s -- env -i %s ' % (USER, gitenv)
               as_judge = 'runuser -u %s -- env -i %s ' % (JUDGE_MOL, molenv)
@@ -474,6 +478,9 @@ spec:
               os.chmod(work, 0o700)
               os.chmod(judge, 0o755)
               os.chmod(mol, 0o700)
+              os.makedirs(os.path.join(mol, 'home'), exist_ok=True)
+              if USER:
+                  shutil.chown(os.path.join(mol, 'home'), JUDGE_MOL)
               rc, out = run('git clone -q %s repo && cd repo && git checkout -q %s && git rev-list --first-parent -50 %s' % (REPO, sha, sha), cwd=work)
               if rc != 0:
                   record(n, ref, sha, [], [], 'error', 'checkout failed')
@@ -552,15 +559,24 @@ spec:
       chmod 0755 /usr/local/lib/ov-ci/runner.py
       printf -- '---\nskip_list: []\nwarn_list: []\n' > /usr/local/lib/ov-ci/ansible-lint.yml
       chmod 0644 /usr/local/lib/ov-ci/ansible-lint.yml
-      # grading account for the runner's own Molecule run: separate uid, own key for ovauto on the test node
-      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
-      chmod 0700 /var/lib/ctjudge
-      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
-      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
-      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
-      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
       k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
-      ct-ansible run /home/learner ssh ovauto@ov-test-el1 "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      for h in ov-test-el1; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-test-el1 | cut -d' ' -f1) true
       # the scenario the repository was created with, for that run
       t=$(mktemp -d); chown learner $t
       ct-ansible run $t git clone -q git@ov-git:claims-automation.git repo
@@ -627,6 +643,8 @@ spec:
 
       def segments(cmd):
           # simple commands joined by && only: no pipes, ;, ||, background, redirects or substitutions
+          # (a block scalar step ends with a newline, which is not part of the command)
+          cmd = cmd.strip()
           if re.search(r'[|;<>`$(){}&\\\n]', cmd.replace('&&', '')):
               return None
           try:
@@ -660,6 +678,9 @@ spec:
                       a = args[i]
                       if a == '--profile' and i + 1 < len(args):
                           i += 2
+                          continue
+                      if a.startswith('--profile='):
+                          i += 1
                           continue
                       if a in LINT_FLAGS or not a.startswith('-'):
                           i += 1
@@ -716,6 +737,8 @@ spec:
 
       def segments(cmd):
           # simple commands joined by && only: no pipes, ;, ||, background, redirects or substitutions
+          # (a block scalar step ends with a newline, which is not part of the command)
+          cmd = cmd.strip()
           if re.search(r'[|;<>`$(){}&\\\n]', cmd.replace('&&', '')):
               return None
           try:
@@ -749,6 +772,9 @@ spec:
                       a = args[i]
                       if a == '--profile' and i + 1 < len(args):
                           i += 2
+                          continue
+                      if a.startswith('--profile='):
+                          i += 1
                           continue
                       if a in LINT_FLAGS or not a.startswith('-'):
                           i += 1
@@ -1049,6 +1075,49 @@ spec:
           EOF
           git add -A
           git commit -q -m 'Add pipeline with the basic profile'
+          git push -q -u origin ci
+          wait_runs 1
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 180 ]; do sleep 3; i=$((i+1)); done; }
+          head -n -2 roles/audit_agent/tasks/main.yml > /tmp/tasks.new && cat /tmp/tasks.new > roles/audit_agent/tasks/main.yml
+          git commit -qam 'Drop the unnamed task'
+          git push -q origin ci
+          wait_runs 2
+    - id: block-steps
+      description: Writes the steps as block scalars and selects the profile with --profile=basic.
+      steps:
+      - 'on': ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q -c ci
+          wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 180 ]; do sleep 3; i=$((i+1)); done; }
+          cat > .ov-ci.yml <<'EOF'
+          steps:
+            - name: syntax
+              run: |
+                ansible-playbook --syntax-check site.yml
+            - name: lint
+              run: |
+                ansible-lint --profile=basic
+            - name: molecule
+              run: cd roles/audit_agent && molecule test
+              timeout: 420
+          EOF
+          cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+          - ansible.builtin.shell: echo audit agent ready
+          EOF
+          git add -A
+          git commit -q -m 'Add pipeline (block steps)'
           git push -q -u origin ci
           wait_runs 1
       - 'on': ov-ctl

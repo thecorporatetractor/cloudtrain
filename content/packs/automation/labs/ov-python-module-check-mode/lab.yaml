@@ -96,15 +96,24 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.61
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw
-      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
-      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
-      chmod 0700 /var/lib/ctjudge
-      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
-      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
-      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
-      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
       k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
-      for h in ov-branch-lon-gw; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
+      for h in ov-branch-lon-gw; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-branch-lon-gw | cut -d' ' -f1) true
   - 'on': ov-ctl
     run: |
       set -eu
@@ -169,7 +178,7 @@ spec:
       c=/home/learner/printer-modules/collections/ansible_collections/orrinvale/claims
       j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
       t=$j/collections/ansible_collections/orrinvale/claims
-      install -d $t/plugins
+      install -d $t/plugins $j/home
       printf '[defaults]\ninventory = %s/inventory.ini\ncollections_path = %s/collections\nremote_user = ovauto\n' $j $j > $j/ansible.cfg
       printf 'ov-branch-lon-gw\n' > $j/inventory.ini
       chown -R ctjudge $j
@@ -185,14 +194,17 @@ spec:
       C = 'lon-c' + sfx
       U1, U2, U3 = ['lpd://10.70.9.%d' % n for n in random.sample(range(100, 250), 3)]
       D = sys.argv[1]
-      ENV = ['HOME=/var/lib/ctjudge', 'PATH=/opt/ansible/bin:/usr/bin:/bin', 'LANG=C.UTF-8', 'LC_ALL=C.UTF-8',
+      ENV = ['HOME=' + sys.argv[1] + '/home', 'PATH=/opt/ansible/bin:/usr/bin:/bin', 'LANG=C.UTF-8', 'LC_ALL=C.UTF-8',
              'ANSIBLE_CONFIG=' + D + '/ansible.cfg', 'ANSIBLE_NOCOLOR=1']
       def run(*a):
           try:
               return subprocess.run(['runuser', '-u', 'ctjudge', '--', 'env', '-i'] + ENV + list(a), cwd=D, capture_output=True, text=True, timeout=90)
           except subprocess.TimeoutExpired:
               return subprocess.CompletedProcess(a, 124, '', '')
+      # the module is exercised on a scratch copy of the printers file (its path parameter), never on the live file
+      P = '/var/tmp/ct-printers-%s.conf' % sfx
       def adhoc(args, check=False):
+          args = dict(args, path=P)
           cmd = ['ansible', H, '-b', '-m', 'orrinvale.claims.ov_print_queue', '-a', json.dumps(args)] + (['-C'] if check else [])
           r = run(*cmd)
           out = r.stdout
@@ -202,13 +214,13 @@ spec:
           except Exception:
               return None
       def fileq():
-          r = run('ssh', 'ovauto@' + H, 'sudo -n cat /etc/ov/printers.conf')
+          r = run('ssh', 'ovauto@' + H, 'sudo -n cat ' + P)
           return r.stdout
+      def lines():
+          return fileq().splitlines()
       def restore():
-          run('ssh', 'ovauto@' + H, "sudo -n sh -c '[ -f /var/tmp/printers.orig ] && cp /var/tmp/printers.orig /etc/ov/printers.conf && rm -f /var/tmp/printers.orig; true'")
-      # a grader killed earlier leaves the saved original behind (it is never overwritten): put it back first
-      restore()
-      run('ssh', 'ovauto@' + H, "sudo -n sh -c '[ -f /var/tmp/printers.orig ] || cp /etc/ov/printers.conf /var/tmp/printers.orig'")
+          run('ssh', 'ovauto@' + H, 'sudo -n rm -f ' + P)
+      run('ssh', 'ovauto@' + H, "sudo -n sh -c 'rm -f /var/tmp/ct-printers-*.conf; cp /etc/ov/printers.conf %s'" % P)
       atexit.register(restore)
       def on_signal(signum, frame):
           restore()
@@ -223,7 +235,7 @@ spec:
       r = adhoc({'queue': T, 'device': U1})
       if not r or r.get('changed') is not True or T not in r.get('queues', []):
           fail('add-not-changed')
-      if T + '=' + U1 + '\n' not in fileq():
+      if T + '=' + U1 not in lines():
           fail('add-not-written')
       r = adhoc({'queue': T, 'device': U1})
       if not r or r.get('changed') is not False:
@@ -238,7 +250,7 @@ spec:
       if not r or r.get('changed') is not True or fileq() != before:
           fail('check-mode-remove')
       r = adhoc({'queue': T, 'device': U3})
-      if not r or r.get('changed') is not True or T + '=' + U3 + '\n' not in fileq():
+      if not r or r.get('changed') is not True or T + '=' + U3 not in lines():
           fail('update-not-applied')
       r = adhoc({'queue': T, 'state': 'absent'})
       if not r or r.get('changed') is not True or T in r.get('queues', []):

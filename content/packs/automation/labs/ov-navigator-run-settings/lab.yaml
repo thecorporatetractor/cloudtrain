@@ -102,15 +102,24 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2
-      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
-      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
-      chmod 0700 /var/lib/ctjudge
-      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
-      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
-      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
-      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
       k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
-      for h in ov-claims-web1 ov-claims-web2; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
+      for h in ov-claims-web1 ov-claims-web2; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-claims-web1 ov-claims-web2 | cut -d' ' -f1) true
   - 'on': ov-ctl
     run: |
       p=/home/learner/claims-automation
@@ -190,13 +199,15 @@ spec:
     'on': ov-ctl
     skills:
     - automation.devworkflow.navigator
-    weight: 2
+    weight: 1
     timeoutSec: 120
     command: |
       # Each artifact is copied as the learner (bounded) into a root-owned file and parsed by nobody. It must be a real
       # navigator artifact of a site.yml run: navigator's own fields, the per-host task events of both web nodes and a clean
       # recap in its stdout, and the run stamps that fact gathering issued on each node (the nodes log every stamp they
-      # hand out, and the grading account ctjudge reads those logs). A hand-written JSON file has none of these stamps.
+      # hand out, and the grading account ctjudge reads those logs). A hand-written JSON file has none of these stamps
+      # unless the learner gathers facts some other way and copies them in; that residual gap is why this check weighs 1
+      # (the settings file is graded on its own in navigator-config).
       d=/home/learner/claims-automation/artifacts
       s=$(mktemp); trap 'rm -f $s' EXIT; chmod 0644 $s
       S() { runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin timeout 30 ssh ovauto@$1 "$2" 2>/dev/null; }

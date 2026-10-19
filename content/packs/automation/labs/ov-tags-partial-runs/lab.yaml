@@ -207,16 +207,18 @@ spec:
       # The project is copied as the learner into a root-owned archive and listed by nobody from that copy, with an empty
       # home; project code, configuration that loads plugins and lookups are refused, so only stock Ansible lists the tasks.
       j=$(mktemp -d); h=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chmod 0700 $h; chown nobody $j $h; trap 'rm -rf $j $h $a' EXIT
-      N() { (cd $j && runuser -u nobody -- env -i HOME=$h PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 "$@"); }
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$h PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 ANSIBLE_INVENTORY_ENABLED=host_list,yaml,ini "$@"); }
       ( ulimit -f 65536; ct-ansible run /home/learner/claims-automation timeout 30 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
       N timeout 30 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
-      [ -z "$(N find . \( -type l -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name plugins -o -name collections -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
-      ! N grep -qiE '^[[:space:]]*([a-z_]*_plugins|library|module_utils|callbacks_enabled|callback_whitelist|stdout_callback|vars_plugins_enabled|enable_plugins|strategy)[[:space:]]*[=:]' ansible.cfg 2>/dev/null || { echo config-loads-code; exit 0; }
-      ! N grep -rIqE '(^|[^a-zA-Z0-9_])(lookup|query|q)[[:space:]]*\(|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)' . || { echo lookups; exit 0; }
+      [ -z "$(N find . \( -type l -o -type f -perm /111 -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name plugins -o -name collections -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
+      ! N grep -qiE '^[[:space:]]*([a-z_]*_plugins|library|module_utils|callbacks_enabled|callback_whitelist|stdout_callback|vars_plugins_enabled|enable_plugins|strategy|[a-z_]*ssh[a-z_]*|[a-z_]*executable)[[:space:]]*[=:]' ansible.cfg 2>/dev/null || { echo config-loads-code; exit 0; }
+      ! N grep -rIqiE '(^|[^a-z0-9_])ansible_[a-z_]*(ssh|exe|connection|port|host|shell|args)[a-z_]*[[:space:]]*[:=]|proxycommand|ssh_args|ssh_executable|(^|[[:space:]-])connection[[:space:]]*:' . || { echo connection-settings; exit 0; }
+      ! N grep -rIqE '(^|[^a-zA-Z0-9_])(lookup|query)([^a-zA-Z0-9_]|$)|[{%(,|=[:space:]]q([^a-zA-Z0-9_]|$)|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)' . || { echo lookups; exit 0; }
       # the task names are compared with the ones setup wrote: nothing renamed, removed or added
       names() { sed -n 's/^      \(.*\)\tTAGS:.*/\1/p' | sort; }
-      all=$(N timeout 60 ansible-playbook site.yml --list-tasks 2>/dev/null | names)
-      sel=$(N timeout 60 ansible-playbook site.yml --list-tasks --tags cert 2>/dev/null | names)
+      N timeout 60 ansible-playbook site.yml --list-tasks > $h.all 2>/dev/null || { rm -f $h.all; echo list-failed; exit 0; }
+      N timeout 60 ansible-playbook site.yml --list-tasks --tags cert > $h.sel 2>/dev/null || { rm -f $h.all $h.sel; echo list-failed; exit 0; }
+      all=$(names < $h.all); sel=$(names < $h.sel); rm -f $h.all $h.sel
       want_all=$(printf '%s\n' 'Retire the legacy tree utility' 'Portal banner' 'Portal certificate expiry' 'Portal certificate renewal' 'Portal certificate key permissions' | sort)
       want_sel=$(printf '%s\n' 'Portal certificate expiry' 'Portal certificate renewal' 'Portal certificate key permissions' | sort)
       [ "$all" = "$want_all" ] || { echo "tasks-changed"; exit 0; }

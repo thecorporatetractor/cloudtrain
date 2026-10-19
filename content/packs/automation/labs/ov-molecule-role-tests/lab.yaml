@@ -28,6 +28,14 @@ spec:
       running. The verification must really fail when either is wrong.
 
     `molecule test` must pass for the role. Do not change the role itself.
+
+    The grader runs your scenario itself, as a separate account, on a copy of the role as supplied. It reads
+    `molecule.yml`, `converge.yml`, `verify.yml` (and `prepare.yml`, `side_effect.yml`, `cleanup.yml` if present) and
+    accepts only what this task needs: the default driver, the two nodes as platforms (with groups), inventory
+    variables for the login (`ansible_user`, become settings, `ansible_python_interpreter`, `ansible_host` with the
+    nodes' own addresses), the Ansible verifier, and playbooks that use modules on the nodes and the role by name.
+    Lookups, local or delegated tasks, included task or variable files, plugins and configuration overrides
+    (`config_options`, a custom test sequence) are refused.
   objectives:
   - Write a Molecule scenario for an existing role
   - Use the default driver with preprovisioned nodes
@@ -93,15 +101,24 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-test-el1=10.70.0.71 ov-test-deb1=10.70.0.72
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-test-el1 ov-test-deb1
-      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
-      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
-      chmod 0700 /var/lib/ctjudge
-      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
-      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
-      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
-      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner.
+      # Its home, key, ssh configuration and known hosts are root-owned (it can read the key, write nothing), and every
+      # graded run gets a fresh HOME, so nothing one run does can carry over into the next.
+      id ctjudge >/dev/null 2>&1 || useradd -r -M -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      install -d -m 0755 -o root -g root /var/lib/ctjudge
+      install -d -m 0750 -o root -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      chown root:ctjudge /var/lib/ctjudge/.ssh/id_ed25519; chmod 0640 /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking yes\n  BatchMode yes\n  UserKnownHostsFile /var/lib/ctjudge/.ssh/known_hosts\n  IdentityFile /var/lib/ctjudge/.ssh/id_ed25519\n' > /var/lib/ctjudge/.ssh/config
+      chmod 0644 /var/lib/ctjudge/.ssh/config
+      : > /var/lib/ctjudge/.ssh/known_hosts
       k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
-      for h in ov-test-el1 ov-test-deb1; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
+      for h in ov-test-el1 ov-test-deb1; do
+        ssh-keyscan -t ed25519,ecdsa,rsa $h 2>/dev/null >> /var/lib/ctjudge/.ssh/known_hosts
+        ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      done
+      chmod 0644 /var/lib/ctjudge/.ssh/known_hosts
+      runuser -u ctjudge -- env -i HOME=/tmp PATH=/usr/bin:/bin ssh ovauto@$(echo ov-test-el1 ov-test-deb1 | cut -d' ' -f1) true
   - 'on': ov-ctl
     run: |2
 
@@ -238,16 +255,16 @@ spec:
       d=/home/learner/audit-roles/roles/audit_agent
       w=$(mktemp -d); chmod 0700 $w; trap 'rm -rf $w' EXIT
       cp -r /var/lib/ct-molecule/audit_agent $w/audit_agent
-      install -d $w/in $w/audit_agent/molecule/default
+      install -d $w/in $w/home $w/audit_agent/molecule/default
       chown -R ctjudge:ctjudge $w
-      J() { (cd $w/audit_agent && runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 TERM=dumb "$@"); }
+      J() { (cd $w/audit_agent && runuser -u ctjudge -- env -i HOME=$w/home PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 TERM=dumb "$@"); }
       S() { runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin ssh ovauto@$1 "$2" >/dev/null 2>&1; }
       ( ulimit -f 8192; ct-ansible run $d/molecule/default timeout 20 tar -cf - . > $w/in.tar 2>/dev/null ) || { echo no-scenario; exit 0; }
       runuser -u ctjudge -- timeout 20 tar -x --no-same-owner --no-same-permissions -C $w/in -f - < $w/in.tar 2>/dev/null || { echo no-scenario; exit 0; }
       for f in molecule converge verify prepare side_effect cleanup; do
         if [ -f $w/in/$f.yml ] && [ ! -L $w/in/$f.yml ]; then cp $w/in/$f.yml $w/audit_agent/molecule/default/$f.yml; fi
       done
-      rm -rf $w/in $w/in.tar; chown -R ctjudge:ctjudge $w/audit_agent
+      rm -rf $w/in $w/in.tar; chown -R ctjudge:ctjudge $w/audit_agent $w/home
       v=$(J timeout 30 /opt/ansible/bin/python3 -I - molecule/default <<'EOF'
       import os, re, sys, yaml
       S = sys.argv[1]
@@ -257,7 +274,9 @@ spec:
       SAFE_LOOPS = {'items', 'list', 'dict', 'together', 'nested', 'sequence', 'subelements', 'indexed_items', 'flattened', 'random_choice'}
       NOKEYS = {'delegate_to', 'local_action', 'connection', 'vars_files', 'include_vars', 'include_tasks', 'import_tasks',
                 'import_playbook', 'include', 'script', 'fetch', 'add_host', 'group_by', 'vars_prompt', 'module_defaults'}
-      LOOKUP = re.compile(r'(^|[^A-Za-z0-9_])(lookup|query|q)\s*\(')
+      # any use of the lookup functions inside a template, called or not (aliases, (lookup)(...), lookup.__call__)
+      LOOKUP = re.compile(r'(^|[^A-Za-z0-9_])(lookup|query|q)([^A-Za-z0-9_]|$)')
+      HOSTS = {'ov-test-el1': '10.70.0.71', 'ov-test-deb1': '10.70.0.72'}
 
 
       def load(f):
@@ -298,14 +317,18 @@ spec:
                   bad.add('inventory')
                   continue
               for k, v in hv.items():
+                  if str(k) == 'ansible_host' and str(v) in HOSTS.values():
+                      continue
                   if str(k).startswith('ansible_') and str(k) not in LOGIN:
                       bad.add('inventory-' + str(k))
+                  if '{' in str(v) or not isinstance(v, (str, int, bool)):
+                      bad.add('inventory-value')
                   if str(k) == 'ansible_user' and v != 'ovauto':
                       bad.add('inventory-user')
       ver = only(m.get('verifier') or {}, {'name', 'enabled'}, 'verifier')
       if ver.get('name', 'ansible') != 'ansible':
           bad.add('verifier')
-      sc = only(m.get('scenario') or {}, {'name', 'test_sequence', 'converge_sequence', 'check_sequence', 'destroy_sequence', 'create_sequence'}, 'scenario')
+      sc = only(m.get('scenario') or {}, {'name'}, 'scenario')
       dep = only(m.get('dependency') or {}, {'name', 'enabled'}, 'dependency')
       if dep.get('name', 'galaxy') != 'galaxy':
           bad.add('dependency')
@@ -332,11 +355,13 @@ spec:
                       if v.get('remote_src') not in (True, 'true', 'yes') if isinstance(v, dict) else True:
                           if str(src).startswith('/') or '..' in str(src) or '{' in str(src):
                               bad.add('src-outside')
-                  walk(v)
+                  if not (key == 'name' and isinstance(v, str)):
+                      walk(v)
           elif isinstance(node, list):
               for v in node:
                   walk(v)
           elif isinstance(node, str) and LOOKUP.search(node):
+              # every string except task and play names: conditions and assertions are templates without braces
               bad.add('lookup')
 
 
