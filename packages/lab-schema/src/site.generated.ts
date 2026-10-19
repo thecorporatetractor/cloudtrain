@@ -1315,6 +1315,104 @@ export interface Site {
     primaryCta?: Cta;
     secondaryCta?: Cta;
   };
+  /**
+   * Early-access waitlist: a call-to-action section with a short form on the landing page (POST /api/public/waitlist). Entries are stored in the gateway database; no email is sent. The consent checkbox links to the privacy page (legal.privacy).
+   */
+  waitlist?: {
+    /**
+     * Show the waitlist section. Off: no form, and the gateway refuses submissions.
+     */
+    enabled: boolean;
+    eyebrow?: string;
+    title?: string;
+    body?: string;
+    /**
+     * Label of the submit button.
+     */
+    submitLabel?: string;
+    emailLabel?: string;
+    /**
+     * Text of the consent checkbox, before the link to the privacy page.
+     */
+    consentLabel?: string;
+    /**
+     * Text of the link to the privacy page inside the consent label.
+     */
+    privacyLinkLabel?: string;
+    /**
+     * Small print under the form.
+     */
+    note?: string;
+    successTitle?: string;
+    successBody?: string;
+    duplicateTitle?: string;
+    duplicateBody?: string;
+    /**
+     * Shown when the submission fails for a reason other than a field error.
+     */
+    errorMessage?: string;
+    /**
+     * Optional fields next to the email address.
+     */
+    fields?: {
+      organisation?: {
+        /**
+         * Show the field.
+         */
+        enabled?: boolean;
+        /**
+         * The visitor must fill it in.
+         */
+        required?: boolean;
+        label?: string;
+        placeholder?: string;
+      };
+      role?: {
+        /**
+         * Show the field.
+         */
+        enabled?: boolean;
+        /**
+         * The visitor must fill it in.
+         */
+        required?: boolean;
+        label?: string;
+        placeholder?: string;
+        /**
+         * Choices for a select; absent means free text.
+         *
+         * @maxItems 12
+         */
+        options?:
+          | []
+          | [string]
+          | [string, string]
+          | [string, string, string]
+          | [string, string, string, string]
+          | [string, string, string, string, string]
+          | [string, string, string, string, string, string]
+          | [string, string, string, string, string, string, string]
+          | [string, string, string, string, string, string, string, string]
+          | [string, string, string, string, string, string, string, string, string]
+          | [string, string, string, string, string, string, string, string, string, string]
+          | [string, string, string, string, string, string, string, string, string, string, string]
+          | [string, string, string, string, string, string, string, string, string, string, string, string];
+      };
+      interest?: {
+        /**
+         * Show the field.
+         */
+        enabled?: boolean;
+        /**
+         * The visitor must fill it in.
+         */
+        required?: boolean;
+        label?: string;
+        enterpriseLabel?: string;
+        individualLabel?: string;
+      };
+    };
+  };
 }
 /**
  * This interface was referenced by `Site`'s JSON-Schema

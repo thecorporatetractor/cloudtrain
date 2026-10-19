@@ -16,7 +16,7 @@ on it comes from one configuration file.
 | `/catalog/exams/:id` | An exam simulation: format, rules, objectives and weights, report contents, retake policy. Never the pool task ids | Same page, "Open in the app" |
 | `/pricing` | Pricing: the configured plans as cards with a monthly/yearly switch, an entitlement comparison, the placeholder note, the plan FAQ group and the alignment notice | Same; plan calls to action go to the billing pages |
 | `/about`, `/faq`, `/contact` | Configured copy | Same |
-| `/legal/terms`, `/legal/privacy` | Legal placeholders, marked as such until reviewed | Same |
+| `/legal/terms`, `/legal/privacy` | Legal placeholders, marked as such until reviewed. The privacy notice describes the waitlist processing | Same |
 | `/sign-in` | Identity-first sign-in (unchanged) | Redirects to `returnTo` |
 
 "Start lab" in the public catalog links to `/sign-in?returnTo=/labs/<id>`; after the
@@ -38,6 +38,7 @@ visibility, pins, attempts, retake state or exam pool ids.
 | `GET /api/public/catalog` | `PublicCatalog`: domains with counts, paths and courses, labs, exam simulations, frameworks, skill names |
 | `GET /api/public/paths/:id` | `PublicPathDetail`: sections (courses of a pack path), labs in order, related paths |
 | `GET /api/public/exams/:id` | `PublicExamDetail`: objectives with weights and pool sizes, rules, report contents |
+| `POST /api/public/waitlist` | Early-access signup (see "Early-access waitlist"); the one public route that writes |
 
 Responses carry `ETag` (304 on `If-None-Match`) and `Cache-Control: public, max-age=300,
 stale-while-revalidate=600`, and are rate-limited per client address (`CT_PUBLIC_RATE_PER_MINUTE`,
@@ -98,6 +99,11 @@ mock-mode captures (dark and light, WebP) that `apps/web/scripts/site-shots.mjs`
 | `pricing.headline`, `pricing.intro`, `pricing.placeholderNote`, `pricing.contactCta`, `pricing.faqGroup` | | Pricing page copy; `placeholderNote` is shown while any price is a placeholder; `faqGroup` names the FAQ group listed under the plans |
 | `plans` | | See below |
 | `closing.title`, `closing.body`, `closing.primaryCta`, `closing.secondaryCta` | | The closing call to action on the landing page; the buttons default to the hero's |
+| `waitlist.enabled` | when `waitlist` is present | Shows the waitlist section on the landing page (`#waitlist`) and lets the gateway accept submissions; off removes both |
+| `waitlist.eyebrow`, `title`, `body`, `note`, `submitLabel`, `emailLabel` | | Section copy and button/field labels (defaults in `apps/web/src/site/Waitlist.tsx`) |
+| `waitlist.consentLabel`, `privacyLinkLabel` | | Consent checkbox: the text before the link, and the link text; the link always opens `/legal/privacy` in a new tab |
+| `waitlist.successTitle`, `successBody`, `duplicateTitle`, `duplicateBody`, `errorMessage` | | The two outcome states and the failure message |
+| `waitlist.fields.{organisation,role,interest}` | | `{ enabled?, required?, label? }` each (default: shown, optional). `role.options[]` turns the role into a select whose choices the gateway enforces; `organisation.placeholder`, `role.placeholder`; `interest.enterpriseLabel`, `interest.individualLabel` (the stored values are always `enterprise` and `individual`) |
 
 ### Plans
 
@@ -130,6 +136,38 @@ Internal links (`to` starting with `/`) must be website routes; `lab-verify --st
 and fails CI otherwise. Validate locally with
 `node tools/lab-verify/bin/lab-verify.mjs --strict`.
 
+## Early-access waitlist
+
+A section on the landing page (between "who it is for" and the questions, anchored `#waitlist`,
+linked from the footer) with a short form: email, optional organisation, role and interest
+(`enterprise` or `individual`), and a consent checkbox that links to the privacy notice. The
+privacy text is `legal.privacy` in `content/site.yaml`, which carries a waitlist section;
+`lab-verify` fails when the waitlist is on and the notice does not mention it. Copy, the optional
+fields, their labels and the role choices are all `waitlist.*` in the same file; `enabled: false`
+removes the section and the gateway answers 404.
+
+The form posts JSON to `POST /api/public/waitlist` (on `apiBase` of `runtime-config.js`, so a
+separately hosted site can point at the gateway), without cookies. The page shows field errors
+next to their controls (focus moves to the first), a status message for success and one for an
+address that is already on the list, a failure message, and a rate-limit message.
+
+| Concern | How |
+|---|---|
+| Validation | `services/gateway/src/waitlist/validate.ts`, driven by the `waitlist` configuration (hand written like the rest of the gateway; no schema library). Email format and length, optional fields trimmed and length-limited, role must be one of `role.options` when set, `interest` is `enterprise` or `individual`, `consent` must be `true`. Body limit 8 KiB. 422 `invalid` with `details.fields` |
+| Spam | Per client address (`CT_TRUST_PROXY` decides what that is): `CT_WAITLIST_RATE_PER_HOUR` (default 10) in memory, every attempt counts, 429 with `Retry-After`. A hidden `website` field (honeypot): when filled the answer looks like a success and nothing is stored. No CAPTCHA and no third-party service |
+| Storage | Table `waitlist_entries` (migration `0008_waitlist`): email as typed, optional organisation, role and interest, `consent_at`, `created_at`. Unique on `lower(email)`; a second submission, in any case, answers `duplicate` and changes nothing. The client address is not stored. Row-level security: the app role may INSERT anywhere, read and delete only in the platform context |
+| Admin | `GET /api/platform/waitlist` (JSON) and `GET /api/platform/waitlist.csv` for platform admins (`org.manage`). Nothing is emailed; exporting the list is the only way it leaves the database |
+
+Tests: `services/gateway/test/waitlist.test.ts` (validation, duplicates, honeypot, rate limit,
+admin access, CSV, static export), `waitlist-pg.test.ts` (unique index, RLS, export through real
+principals), `apps/web/src/lib/waitlist.test.ts` and `apps/web/src/site/Waitlist.test.tsx` (field
+rules, the request, the rendered markup for each state).
+
+## Static deployment
+
+The public site can be built as plain static files (`pnpm --filter web build:site`) and hosted
+anywhere, with only the waitlist form calling the gateway. See [deploy-website.md](deploy-website.md).
+
 ## Content rules
 
 Framework names (CKA, RHCSA, CCNA, ...) appear only as "X-aligned" badges and in the
@@ -142,7 +180,8 @@ footer repeats `legal.alignmentNotice` on every page.
 `apps/web/scripts/platform-shots.mjs` captures `landing` (+ `-phone`, `-tablet`, light and
 cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cream),
 `catalog-path-public`, `catalog-exam-public`, `pricing` (+ `-yearly`, `-phone`, light and
-cream), `about`, `faq`, `contact`, `legal-terms` and `site-signed-in`; `readme-shots.mjs`
+cream), `waitlist` (+ `-filled`, `-errors`, `-success`, `-duplicate`, `-phone`, light and cream),
+`about`, `faq`, `contact`, `legal-terms`, `legal-privacy` and `site-signed-in`; `readme-shots.mjs`
 adds `docs/images/landing.png`, `catalog-public.png`, `catalog-path-public.png` and
 `pricing.png`. `apps/web/scripts/site-shots.mjs` captures the screenshots the website itself
 shows (`apps/web/public/site/*.webp`: the workspace after a validation run, the topology and

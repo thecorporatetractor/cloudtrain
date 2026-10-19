@@ -8,13 +8,15 @@ import { DomainIcon } from '@/components/domain';
 import { PageSkeleton } from '@/components/ui';
 import { MockSignIn } from '@/site/MockSignIn';
 import { FeatureIcon, SiteAnchor, SiteShot, useDocumentTitle } from '@/site/util';
+import { WaitlistSection } from '@/site/Waitlist';
 
 /**
  * The landing page for visitors (`/` while signed out). Sections, in order: the
  * hero with a real product preview, the six domains with live counts from the
  * public catalog, how a lab works, the three differentiators (plus the secondary
  * capabilities), the product showcase, who the platform is for, the featured
- * questions and the closing call to action. Every word comes from the site
+ * questions and the closing call to action (the early-access waitlist, when
+ * enabled, sits between who it is for and the questions). Every word comes from the site
  * configuration (content/site.yaml); every figure from the catalog API.
  */
 export function Landing() {
@@ -47,6 +49,7 @@ export function Landing() {
       {(s.differentiators?.length || s.features.length) > 0 && <Differentiators site={s} />}
       {s.showcase && s.showcase.length > 0 && <Showcase site={s} />}
       {s.audiences && s.audiences.length > 0 && <Audiences site={s} />}
+      <WaitlistSection site={s} />
       {featured.length > 0 && <Trust items={featured} />}
       <ClosingCta site={s} />
     </>

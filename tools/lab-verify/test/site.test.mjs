@@ -68,3 +68,24 @@ test("schema errors, unknown routes, missing screenshots and a weak notice are r
   assert.ok(messages.some((m) => m.includes("not affiliated")));
   assert.ok(messages.some((m) => m.includes("highlighted domain 'linux'")));
 });
+
+test("an enabled waitlist needs a privacy notice that describes it, and required fields stay enabled", async () => {
+  const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
+  assert.ok(doc.waitlist.enabled);
+  doc.legal.privacy.sections = doc.legal.privacy.sections.filter((s) => !/waitlist/i.test(s.title));
+  doc.waitlist.fields.interest = { required: true, enabled: false };
+  const dir = await mkdtemp(path.join(tmpdir(), "site-"));
+  const file = path.join(dir, "site.yaml");
+  await writeFile(file, YAML.stringify(doc));
+  const findings = [];
+  await checkSite(file, { domainsWithLabs: domains, repoRoot }, findings);
+  const messages = findings.filter((f) => f.level === "error").map((f) => f.message);
+  assert.ok(messages.some((m) => m.includes("does not describe it")), messages.join("\n"));
+  assert.ok(messages.some((m) => m.includes("a required field cannot be disabled")), messages.join("\n"));
+  // Turning the waitlist off lifts the privacy requirement.
+  doc.waitlist = { enabled: false };
+  await writeFile(file, YAML.stringify(doc));
+  findings.length = 0;
+  await checkSite(file, { domainsWithLabs: domains, repoRoot }, findings);
+  assert.deepEqual(findings.filter((f) => f.level === "error"), []);
+});

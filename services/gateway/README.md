@@ -86,6 +86,7 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 | `CT_SITE_CONFIG` | `content/site.yaml` | public website configuration (`cloudtrain.dev/v1 Site`, `docs/website.md`); a deployment mounts its own file here. Invalid = refuses to start |
 | `CT_PUBLIC_RATE_PER_MINUTE` | `120` | requests per minute one client address may make to `/api/public/*` (429 + `Retry-After` beyond) |
 | `CT_BILLING_ENABLED` | off | `1`: Stripe billing in TEST MODE (`docs/billing.md`); needs `STRIPE_SECRET_KEY` (`sk_test_...`, never logged, never committed) and `STRIPE_WEBHOOK_SECRET` (`whsec_...`). `STRIPE_MODE` must be `test`; a live key refuses to start even with billing off |
+| `CT_WAITLIST_RATE_PER_HOUR` | `10` | early-access waitlist submissions one client address may make per hour (`POST /api/public/waitlist`, 429 + `Retry-After` beyond). A website on another origin must be listed in `CT_CORS_ORIGINS` |
 
 Relative paths are relative to the repository root.
 

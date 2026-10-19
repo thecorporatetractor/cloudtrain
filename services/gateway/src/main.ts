@@ -25,6 +25,7 @@ import { ExamService } from './exams/service.js';
 import { loadSiteConfig } from './site/config.js';
 import { BillingService } from './billing/service.js';
 import { StripeApi, maskKey } from './billing/stripe.js';
+import { PgWaitlistStore } from './waitlist/store.js';
 
 async function main() {
   const config = loadConfig();
@@ -112,7 +113,7 @@ async function main() {
     events,
     logger: { level: config.logLevel },
     devImpersonate: config.devImpersonate,
-    site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute },
+    site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute, waitlist: { store: new PgWaitlistStore(db), perHour: config.waitlistRatePerHour } },
     trustProxy: config.trustProxy,
     corsOrigins: config.corsOrigins,
     readiness: { postgres: () => sql`SELECT 1`.execute(db) },
