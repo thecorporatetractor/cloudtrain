@@ -42,7 +42,8 @@ Include ` + GraderMatch + `
 // graderMatch overrides, for the grader's login only, every Match-able
 // keyword a hardening task can use to refuse it. Ciphers, KEX, MACs and host
 // key algorithms cannot be set in a Match block; the admin client negotiates
-// any modern set.
+// any modern set. Only keywords whose "none" really unsets them: RevokedKeys
+// none is read as a file named "none" and refuses every key.
 const graderMatch = `# CloudTrain platform management access (see ` + GraderDropIn + `).
 Match User root Address ` + EntryIP + `
 	PermitRootLogin prohibit-password
@@ -52,7 +53,6 @@ Match User root Address ` + EntryIP + `
 	PubkeyAuthOptions none
 	AuthorizedKeysFile ` + GraderKeyFile + `
 	AuthorizedKeysCommand none
-	RevokedKeys none
 	AllowUsers root
 	AllowGroups root
 	DenyUsers ct-grader-none

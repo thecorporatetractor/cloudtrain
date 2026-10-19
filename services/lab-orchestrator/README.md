@@ -74,7 +74,8 @@ another host or with another key follows the learner's policy. Lab authors:
 
 Ciphers, KEX, MACs, host key algorithms, `ListenAddress`/`Port`, firewalls and
 fail2ban bans of 192.168.99.5 cannot be overridden this way and still lock the
-grader out.
+grader out (OpenSSH 9.8+ `PerSourcePenalties` also delays it for a few seconds after
+failed logins from the workstation).
 
 ### Per-session lab network (`labnet.go`)
 
