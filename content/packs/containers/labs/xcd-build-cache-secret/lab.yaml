@@ -210,24 +210,38 @@ spec:
         echo "leaks=$(leaks copperleaf/pricing:2.0 'cl-pkg-{{tok}}')"
       expect: {match: exact, value: "leaks=0"}
     - id: secret-and-cache
-      description: With only the pkgtoken secret, adding one requirement downloads exactly one package
+      description: With only the pkgtoken secret, the dependencies come from the index once, and adding one requirement downloads only that package
       type: shell
       timeoutSec: 300
       on: cl-docker-01
       skills: [containers.buildkit.mounts, containers.buildkit.secrets]
       weight: 3
+      # Idempotent across grading passes (initial, after the reboot): BuildKit's cache
+      # mounts are pruned first and a fresh comment in requirements.txt defeats the layer
+      # cache (--no-cache would bypass cache mounts too), so the warm build must download
+      # the three packages from the index (with the secret only: the token file is not in
+      # the copied context) and the probe build exactly the one it adds.
       command: |
-        d=$(mktemp -d); cp -a /home/learner/exam/pricing/. "$d/"
+        d=$(mktemp -d); cp -a /home/learner/exam/pricing/. "$d/"; rm -f "$d/pkgtoken.txt"
         [ -f "$d/requirements.txt" ] || { echo no-requirements; rm -rf "$d"; exit 0; }
+        grep -rqF 'cl-pkg-{{tok}}' "$d" && { echo token-in-context; rm -rf "$d"; exit 0; }
         sec="--secret id=pkgtoken,src=/home/learner/exam/pricing/pkgtoken.txt"
+        log=/srv/exam/build-cache-secret/pypi.log
+        fetched() { tail -n +"$(($1 + 1))" "$log" | grep '\.tar\.gz' | sed 's|^GET /simple/\([^/]*\)/.*|\1|' | sort | tr '\n' ' '; }
+        printf '\n# ct-probe %s\n' "$(date +%s%N)" >> "$d/requirements.txt"
+        docker builder prune -af --filter type=exec.cachemount >/dev/null 2>&1
+        n=$(wc -l < "$log")
         docker build -q $sec -t ct-probe/pricing:warm "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
+        warm=$(fetched "$n")
         echo 'ledger-sync==1.0.0' >> "$d/requirements.txt"
-        before=$(grep -c '\.tar\.gz' /srv/exam/build-cache-secret/pypi.log || true)
+        n=$(wc -l < "$log")
         docker build -q $sec -t ct-probe/pricing:probe "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
-        after=$(grep -c '\.tar\.gz' /srv/exam/build-cache-secret/pypi.log || true)
+        probe=$(fetched "$n")
+        banner=$(docker run --rm ct-probe/pricing:probe 2>&1 | tail -n 1)
         rm -rf "$d"; docker rmi -f ct-probe/pricing:warm ct-probe/pricing:probe >/dev/null 2>&1
-        echo "fetched-$((after - before))"
-      expect: {match: exact, value: "fetched-1"}
+        [ "$banner" = "pricing 2.0 ready" ] || { echo probe-image-broken; exit 0; }
+        echo "warm=[${warm}] probe=[${probe}]"
+      expect: {match: exact, value: "warm=[fx-feed ratecalc tax-tables ] probe=[ledger-sync ]"}
   misconceptions:
     - id: arg-token
       description: Keeps the token as a build argument and only adds the cache mount.
