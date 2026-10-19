@@ -17,6 +17,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # archive first (https to snapshot.ubuntu.com needs it); everything else comes from
 # the pinned snapshot.
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
  && apt-get -o Acquire::ForceIPv4=true update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
@@ -29,16 +30,16 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
 # (helm-wrapper.sh says why: vcluster owns the fields of every virtual Service).
 COPY --chmod=0755 helm-wrapper.sh /usr/local/bin/helm
 RUN set -eu; cd /tmp \
- && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
- && echo "$(curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
- && curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+ && curl --retry 5 --retry-connrefused -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+ && echo "$(curl --retry 5 --retry-connrefused -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
+ && curl --retry 5 --retry-connrefused -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
  && echo "${HELM_TARBALL_SHA256}  helm.tgz" | sha256sum -c - \
  && install -d -m 0755 /usr/local/lib/cloudtrain \
  && tar -xzf helm.tgz --strip-components=1 -C /usr/local/lib/cloudtrain linux-amd64/helm \
- && curl -fsSLo etcd.tgz "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
+ && curl --retry 5 --retry-connrefused -fsSLo etcd.tgz "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
  && echo "${ETCD_TARBALL_SHA256}  etcd.tgz" | sha256sum -c - \
  && tar -xzf etcd.tgz --strip-components=1 -C /usr/local/bin "etcd-${ETCD_VERSION}-linux-amd64/etcdctl" "etcd-${ETCD_VERSION}-linux-amd64/etcdutl" \
- && curl -fsSLo /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+ && curl --retry 5 --retry-connrefused -fsSLo /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
  && echo "${YQ_BINARY_SHA256}  /usr/local/bin/yq" | sha256sum -c - \
  && rm -f helm.tgz etcd.tgz \
  && chmod 0755 /usr/local/bin/* /usr/local/lib/cloudtrain/helm \

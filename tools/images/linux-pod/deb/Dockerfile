@@ -19,6 +19,7 @@ RUN --mount=type=bind,from=noble,target=/mnt/noble --mount=type=bind,source=comm
     if dpkg-divert --list /usr/bin/man | grep -q .; then rm -f /usr/bin/man; dpkg-divert --quiet --local --rename --remove /usr/bin/man; fi; \
     mv /etc/apt/sources.list.d/ubuntu.sources /tmp/ubuntu.sources; \
     printf 'Types: deb\nURIs: file:/mnt/noble/\nSuites: ./\nSigned-By: /mnt/key.asc\n' > /etc/apt/sources.list.d/build.sources; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries; \
     apt-get -o APT::Update::Error-Mode=any update; \
     apt-get install -y --no-install-recommends \
       man-db manpages manpages-dev bash-completion vim nano less tree file \

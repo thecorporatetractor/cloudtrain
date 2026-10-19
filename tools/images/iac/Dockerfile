@@ -45,6 +45,7 @@ ARG TERRAFORM_SHIM=1
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
  && apt-get -o Acquire::ForceIPv4=true update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
@@ -55,12 +56,12 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
 
 # Kubernetes CLIs (kubectl: dl.k8s.io .sha256; helm, yq: pinned sha256).
 RUN set -eu; cd /tmp \
- && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
- && echo "$(curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
- && curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+ && curl --retry 5 --retry-connrefused -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+ && echo "$(curl --retry 5 --retry-connrefused -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
+ && curl --retry 5 --retry-connrefused -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
  && echo "${HELM_TARBALL_SHA256}  helm.tgz" | sha256sum -c - \
  && tar -xzf helm.tgz --strip-components=1 -C /usr/local/bin linux-amd64/helm \
- && curl -fsSLo /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+ && curl --retry 5 --retry-connrefused -fsSLo /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
  && echo "${YQ_BINARY_SHA256}  /usr/local/bin/yq" | sha256sum -c - \
  && rm -f helm.tgz && chmod 0755 /usr/local/bin/* \
  && C=/usr/share/bash-completion/completions \
@@ -69,12 +70,12 @@ RUN set -eu; cd /tmp \
 # IaC CLIs. Licence texts stay next to each binary under /usr/share/doc.
 RUN set -eu; cd /tmp \
  && case "$IAC_CLI" in terraform|tofu) ;; *) echo "IAC_CLI must be terraform or tofu" >&2; exit 1 ;; esac \
- && curl -fsSLo tofu.zip "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip" \
+ && curl --retry 5 --retry-connrefused -fsSLo tofu.zip "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip" \
  && echo "${TOFU_ZIP_SHA256}  tofu.zip" | sha256sum -c - \
  && unzip -q tofu.zip -d tofu.d && install -m 0755 tofu.d/tofu /usr/local/bin/tofu \
  && install -d /usr/share/doc/opentofu && install -m 0644 tofu.d/LICENSE /usr/share/doc/opentofu/LICENSE \
  && if [ "$IAC_CLI" = terraform ]; then \
-      curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+      curl --retry 5 --retry-connrefused -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
       && echo "${TERRAFORM_ZIP_SHA256}  terraform.zip" | sha256sum -c - \
       && unzip -q terraform.zip -d terraform.d && install -m 0755 terraform.d/terraform /usr/local/bin/terraform \
       && install -d /usr/share/doc/terraform && install -m 0644 terraform.d/LICENSE.txt /usr/share/doc/terraform/LICENSE.txt; \
@@ -84,25 +85,25 @@ RUN set -eu; cd /tmp \
       "$([ "$IAC_CLI" = terraform ] && echo "$TERRAFORM_VERSION")" "$TOFU_VERSION" > /tmp/iac.env
 # Local S3-compatible store for state-backend labs (SeaweedFS, Apache-2.0): see ct-s3.
 RUN set -eu; cd /tmp \
- && curl -fsSLo weed.tgz "https://github.com/seaweedfs/seaweedfs/releases/download/${SEAWEEDFS_VERSION}/linux_amd64.tar.gz" \
+ && curl --retry 5 --retry-connrefused -fsSLo weed.tgz "https://github.com/seaweedfs/seaweedfs/releases/download/${SEAWEEDFS_VERSION}/linux_amd64.tar.gz" \
  && echo "${SEAWEEDFS_TARBALL_SHA256}  weed.tgz" | sha256sum -c - \
  && tar -xzf weed.tgz -C /usr/local/bin weed && rm -f weed.tgz && chmod 0755 /usr/local/bin/weed \
  && weed version | head -1
 # Older Terraform releases for upgrade/migration labs, never on PATH as `terraform`:
 # terraform-1.9 (BUSL-1.1, Terraform flavour only) and terraform-1.5 (MPL-2.0, both).
 RUN set -eu; cd /tmp; d=/opt/cloudtrain/terraform \
- && stage() { v=$1 sha=$2; curl -fsSLo tf.zip "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_linux_amd64.zip" \
+ && stage() { v=$1 sha=$2; curl --retry 5 --retry-connrefused -fsSLo tf.zip "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_linux_amd64.zip" \
       && echo "${sha}  tf.zip" | sha256sum -c - && install -d "$d/$v" && unzip -q -o tf.zip -d "$d/$v" && rm -f tf.zip \
       && ln -s "$d/$v/terraform" "/usr/local/bin/terraform-${v%.*}"; } \
  && stage "$TERRAFORM_STAGED_15_VERSION" "$TERRAFORM_STAGED_15_ZIP_SHA256" \
- && curl -fsSLo "$d/$TERRAFORM_STAGED_15_VERSION/LICENSE" "https://raw.githubusercontent.com/hashicorp/terraform/v${TERRAFORM_STAGED_15_VERSION}/LICENSE" \
+ && curl --retry 5 --retry-connrefused -fsSLo "$d/$TERRAFORM_STAGED_15_VERSION/LICENSE" "https://raw.githubusercontent.com/hashicorp/terraform/v${TERRAFORM_STAGED_15_VERSION}/LICENSE" \
  && echo "${TERRAFORM_STAGED_15_LICENSE_SHA256}  $d/$TERRAFORM_STAGED_15_VERSION/LICENSE" | sha256sum -c - \
  && if [ "$IAC_CLI" = terraform ]; then stage "$TERRAFORM_STAGED_19_VERSION" "$TERRAFORM_STAGED_19_ZIP_SHA256"; fi \
  && chmod -R a+rX "$d" && terraform-1.5 version
 # conftest (policy on plan JSON), vcsim (vSphere API simulator, ct-vcsim), oras and the
 # distribution registry (OCI artifacts, ct-oci). Licences under /usr/share/doc/<tool>.
 RUN set -eu; cd /tmp \
- && get() { curl -fsSLo "$1.tgz" "$2" && echo "$3  $1.tgz" | sha256sum -c - && install -d "$1.d" "/usr/share/doc/$1" \
+ && get() { curl --retry 5 --retry-connrefused -fsSLo "$1.tgz" "$2" && echo "$3  $1.tgz" | sha256sum -c - && install -d "$1.d" "/usr/share/doc/$1" \
       && tar -xzf "$1.tgz" -C "$1.d" && install -m 0755 "$1.d/$1" /usr/local/bin/ \
       && install -m 0644 "$1.d"/LICENSE* "/usr/share/doc/$1/" && rm -rf "$1.tgz" "$1.d"; } \
  && get conftest "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" "$CONFTEST_TARBALL_SHA256" \
@@ -132,7 +133,7 @@ COPY providers.lock /opt/cloudtrain/providers.lock
 RUN set -eu; m=/opt/cloudtrain/providers/registry.terraform.io; cd /tmp \
  && grep -v '^#' /opt/cloudtrain/providers.lock | grep . | while read -r addr version platform sha; do \
       type=${addr#*/}; zip="terraform-provider-${type}_${version}_${platform}.zip"; \
-      curl -fsSLo "$zip" "https://releases.hashicorp.com/terraform-provider-${type}/${version}/${zip}"; \
+      curl --retry 5 --retry-connrefused -fsSLo "$zip" "https://releases.hashicorp.com/terraform-provider-${type}/${version}/${zip}"; \
       echo "${sha}  ${zip}" | sha256sum -c - >/dev/null; \
       if [ "$platform" = linux_amd64 ]; then \
         install -d "$m/$addr/$version/$platform"; unzip -q -o "$zip" -d "$m/$addr/$version/$platform"; \

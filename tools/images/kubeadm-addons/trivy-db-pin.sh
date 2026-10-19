@@ -12,9 +12,9 @@
 set -euo pipefail
 repo=${1:-ghcr.io/aquasecurity/trivy-db}; tag=${2:-2}
 host=${repo%%/*}; path=${repo#*/}
-token=$(curl -fsSL "https://$host/token?scope=repository:$path:pull" | jq -r .token)
+token=$(curl --retry 5 --retry-connrefused -fsSL "https://$host/token?scope=repository:$path:pull" | jq -r .token)
 hdr=$(mktemp); trap 'rm -f "$hdr"' EXIT
-manifest=$(curl -fsSL -D "$hdr" -H "Authorization: Bearer $token" \
+manifest=$(curl --retry 5 --retry-connrefused -fsSL -D "$hdr" -H "Authorization: Bearer $token" \
   -H "Accept: application/vnd.oci.image.manifest.v1+json" "https://$host/v2/$path/manifests/$tag")
 digest="sha256:$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)"
 grep -qi "docker-content-digest: *$digest" "$hdr" || { echo "digest mismatch for $repo:$tag" >&2; exit 1; }

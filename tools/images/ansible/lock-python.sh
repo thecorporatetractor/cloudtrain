@@ -14,7 +14,7 @@ if [[ ${RELOCK:-0} != 1 && -f $here/requirements.lock ]]; then
   grep -v '^#' "$here/requirements.lock" | sed 's/ --hash=.*//' | grep . > "$out/constraints.txt"
 fi
 docker run --rm -v "$here/requirements.in:/in/requirements.in:ro" -v "$out:/out" "$base" bash -ec '
-  apt-get -qq update >/dev/null; apt-get -qq install -y --no-install-recommends python3-venv >/dev/null 2>&1
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -qq update >/dev/null; apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -qq install -y --no-install-recommends python3-venv >/dev/null 2>&1
   python3 -m venv /v
   /v/bin/pip -q download --only-binary=:all: -d /out/dl -r /in/requirements.in -c /out/constraints.txt
   chmod -R a+rwX /out'

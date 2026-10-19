@@ -13,10 +13,10 @@ COPY services/lab-orchestrator/go.mod services/lab-orchestrator/go.sum ./
 RUN GOWORK=off go mod download
 COPY services/lab-orchestrator/ ./
 RUN GOWORK=off CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/manager ./cmd/manager
-RUN curl -fsSLo /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+RUN curl --retry 5 --retry-connrefused -fsSLo /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
  && echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c - \
  && tar -xzf /tmp/helm.tgz -C /tmp && install -m 0755 /tmp/linux-amd64/helm /out/helm \
- && curl -fsSLo /out/vcluster.tgz "https://charts.loft.sh/charts/vcluster-${VCLUSTER_VERSION}.tgz" \
+ && curl --retry 5 --retry-connrefused -fsSLo /out/vcluster.tgz "https://charts.loft.sh/charts/vcluster-${VCLUSTER_VERSION}.tgz" \
  && echo "${VCLUSTER_CHART_SHA256}  /out/vcluster.tgz" | sha256sum -c -
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab

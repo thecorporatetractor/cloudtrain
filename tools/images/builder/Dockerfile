@@ -8,6 +8,7 @@ ARG UBUNTU_APT_SNAPSHOT
 # live archive first (https to snapshot.ubuntu.com needs it); every other
 # package then comes from the pinned snapshot.
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
  && apt-get -o Acquire::ForceIPv4=true update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \

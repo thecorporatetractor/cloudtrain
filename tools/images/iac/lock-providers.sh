@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 HASHICORP_KEY_FPR=C874011F0AB405110D02105534365D9472D7468F
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export GNUPGHOME=$tmp/gnupg; install -d -m 0700 "$GNUPGHOME"
-curl -fsSL https://www.hashicorp.com/.well-known/pgp-key.txt | gpg --quiet --import 2>/dev/null
+curl --retry 5 --retry-connrefused -fsSL https://www.hashicorp.com/.well-known/pgp-key.txt | gpg --quiet --import 2>/dev/null
 gpg --quiet --list-keys --with-colons | grep -q "^fpr:::::::::$HASHICORP_KEY_FPR:" \
   || { echo "HashiCorp key fingerprint mismatch" >&2; exit 1; }
 out=$here/providers.lock
@@ -19,8 +19,8 @@ out=$here/providers.lock
     type=${addr#*/}
     base=https://releases.hashicorp.com/terraform-provider-$type/$version
     sums=$tmp/$type-$version.sums
-    curl -fsSLo "$sums" "$base/terraform-provider-${type}_${version}_SHA256SUMS"
-    curl -fsSLo "$sums.sig" "$base/terraform-provider-${type}_${version}_SHA256SUMS.sig"
+    curl --retry 5 --retry-connrefused -fsSLo "$sums" "$base/terraform-provider-${type}_${version}_SHA256SUMS"
+    curl --retry 5 --retry-connrefused -fsSLo "$sums.sig" "$base/terraform-provider-${type}_${version}_SHA256SUMS.sig"
     gpg --quiet --verify "$sums.sig" "$sums" 2>/dev/null || { echo "bad signature: $type $version" >&2; exit 1; }
     for p in ${platforms//,/ }; do
       sha=$(awk -v f="terraform-provider-${type}_${version}_${p}.zip" '$2 == f {print $1}' "$sums")

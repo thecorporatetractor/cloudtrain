@@ -24,6 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3008
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
+ && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-retries \
  && apt-get -o Acquire::ForceIPv4=true update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
@@ -59,7 +60,7 @@ RUN python3 -m venv /opt/ansible \
 COPY collections.lock /opt/ansible/collections.lock
 RUN set -eu; cd /tmp; c=/usr/share/ansible/collections \
  && grep -v '^#' /opt/ansible/collections.lock | grep . | while read -r file sha; do \
-      curl -fsSLo "$file" "https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/artifacts/${file}"; \
+      curl --retry 5 --retry-connrefused -fsSLo "$file" "https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/artifacts/${file}"; \
       echo "${sha#sha256:}  ${file}" | sha256sum -c - >/dev/null; \
       ansible-galaxy collection install --offline --no-deps -p "$c" "./${file}" >/dev/null; \
       rm -f "$file"; \

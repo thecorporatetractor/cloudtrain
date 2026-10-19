@@ -14,6 +14,7 @@ RUN set -eux; rm -f /etc/yum.repos.d/*.repo; \
       printf '[%s]\nname=AlmaLinux %s (point release)\nbaseurl=%s/%s/x86_64/os/\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10\n' \
         "$r" "$r" "$ALMA_REPO" "$r" >> /etc/yum.repos.d/build-alma.repo; done; \
     sed -i '/^tsflags=nodocs/d' /etc/dnf/dnf.conf; \
+    printf 'retries=10\ntimeout=30\n' >> /etc/dnf/dnf.conf; \
     dnf -y --setopt=install_weak_deps=False --allowerasing install coreutils curl \
       man-db man-pages bash-completion vim-enhanced nano less tree which file findutils \
       procps-ng psmisc lsof strace iproute iputils bind-utils traceroute nmap-ncat curl wget \
