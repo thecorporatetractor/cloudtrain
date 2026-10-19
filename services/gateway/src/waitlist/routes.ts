@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import type { SiteConfig, WaitlistEntry, WaitlistResponse } from '@cloudtrain/api-types';
+import type { Principal } from '../auth.js';
 import { authorize } from '../authz.js';
 import { HttpError } from '../errors.js';
 import { RateLimiter } from '../routes/public.js';
@@ -61,17 +62,17 @@ export function registerWaitlistRoutes(app: FastifyInstance, deps: WaitlistDeps)
   const throttle = (ip: string) => {
     if (!adminLimiter.take(ip)) throw new HttpError(429, 'Too many requests', { code: 'rate_limited', details: { retryAfterSeconds: adminLimiter.resetIn(ip) } });
   };
-  const limitOf = (q: { limit?: string }) => Math.min(MAX_EXPORT, Math.max(1, Number.parseInt(q.limit ?? '', 10) || MAX_EXPORT));
-
-  app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist', admin, async (req) => {
+  // Authorisation lives in the helper, as in the other platform routes (platform.ts delegates to services).
+  const entriesFor = (req: { ip: string; principal: Principal; query: { limit?: string } }) => {
     throttle(req.ip);
     authorize(req.principal, 'org.manage', { kind: 'platform' });
     return store.list(limitOf(req.query));
-  });
+  };
+  const limitOf = (q: { limit?: string }) => Math.min(MAX_EXPORT, Math.max(1, Number.parseInt(q.limit ?? '', 10) || MAX_EXPORT));
+
+  app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist', admin, async (req) => entriesFor(req));
   app.get<{ Querystring: { limit?: string } }>('/api/platform/waitlist.csv', admin, async (req, reply) => {
-    throttle(req.ip);
-    authorize(req.principal, 'org.manage', { kind: 'platform' });
-    const { entries } = await store.list(limitOf(req.query));
+    const { entries } = await entriesFor(req);
     return reply.header('content-type', 'text/csv; charset=utf-8').header('content-disposition', 'attachment; filename="waitlist.csv"').send(waitlistCsv(entries));
   });
 }
