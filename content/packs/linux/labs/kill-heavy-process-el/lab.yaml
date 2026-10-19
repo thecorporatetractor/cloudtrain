@@ -1,0 +1,167 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kill-heavy-process-el
+  title: Tame the CPU and memory hogs on the scheduler host
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [processes, ps, renice, signals]
+  version: 1
+spec:
+  description: |
+    **`tr-sched-1`** (`ssh tr-sched-1`; you have `sudo`) is sluggish. One process uses by
+    far the most **CPU** and another by far the most **memory**; a few smaller ones
+    are legitimate and must stay alive.
+
+    1. Lower the priority of the CPU hog: set its nice value to **15**. Do not kill it.
+    2. Stop the memory hog **gracefully**, with a signal it can handle, so that it can
+       clean up. A forced kill is not acceptable.
+    3. Record both PIDs in **`/home/learner/pids.txt`** as two lines, `cpu=<pid>` and
+       `mem=<pid>` (the PIDs they had before you touched them).
+  objectives:
+    - Rank processes by CPU and memory with ps or top
+    - Change a running process's priority with renice
+    - Terminate a process with SIGTERM rather than SIGKILL
+  params:
+    cpuproc:
+      type: choice
+      values: [tr-fare-rebuild, tr-seat-solver]
+    memproc:
+      type: choice
+      values: [tr-cache-warm, tr-tt-index]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-sched-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-sched-1
+      timeoutSec: 90
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V; B=/opt/tallowmere/bin; install -d $B
+        pkill -f "^(python3|/bin/bash|/usr/bin/python3) $B/" 2>/dev/null || true
+        rm -f $V/graceful $V/pids.ref /home/learner/pids.txt
+        printf '%s\n' '#!/bin/bash' 'while :; do :; done' > $B/{{cpuproc}}
+        printf '%s\n' 'import signal, sys, time' 'buf = bytearray(300 * 1024 * 1024)' 'for i in range(0, len(buf), 4096):' '    buf[i] = 1' 'def term(*a):' '    open("/var/lib/cloudtrain/graceful", "w").write("TERM\n")' '    sys.exit(0)' 'signal.signal(signal.SIGTERM, term)' 'while True:' '    time.sleep(1)' > $B/{{memproc}}
+        printf '%s\n' 'import time' 'buf = bytearray(40 * 1024 * 1024)' 'for i in range(0, len(buf), 4096):' '    buf[i] = 1' 'while True:' '    t = time.time()' '    while time.time() - t < 0.15:' '        pass' '    time.sleep(0.85)' > $B/tr-poll-sensors
+        printf '%s\n' '#!/bin/bash' 'while :; do sleep 30; done' > $B/tr-log-shipper
+        chmod 0755 $B/*
+        for s in tr-poll-sensors; do setsid nohup python3 $B/$s >/dev/null 2>&1 </dev/null & done
+        setsid nohup python3 $B/{{memproc}} >/dev/null 2>&1 </dev/null &
+        setsid nohup /bin/bash $B/{{cpuproc}} >/dev/null 2>&1 </dev/null &
+        setsid nohup /bin/bash $B/tr-log-shipper >/dev/null 2>&1 </dev/null &
+        sleep 4
+        cpu=$(pgrep -f "^/bin/bash $B/{{cpuproc}}\$"); mem=$(pgrep -f "^python3 $B/{{memproc}}\$")
+        d1=$(pgrep -f "^python3 $B/tr-poll-sensors\$"); d2=$(pgrep -f "^/bin/bash $B/tr-log-shipper\$")
+        [ -n "$cpu" ] && [ -n "$mem" ] && [ -n "$d1" ] && [ -n "$d2" ]
+        printf 'cpu=%s\nmem=%s\ndecoy1=%s\ndecoy2=%s\n' "$cpu" "$mem" "$d1" "$d2" > $V/pids.ref
+  checks:
+    - id: pids-recorded
+      description: pids.txt names the original CPU hog and memory hog
+      type: shell
+      on: tr-sched-1
+      skills: [linux.processes.management]
+      weight: 2
+      command: |
+        . /var/lib/cloudtrain/pids.ref
+        c=$(sed -n 's/^cpu=//p' /home/learner/pids.txt 2>/dev/null | head -1); m=$(sed -n 's/^mem=//p' /home/learner/pids.txt 2>/dev/null | head -1)
+        [ "$c" = "$cpu" ] && [ "$m" = "$mem" ] && echo recorded || echo "cpu=$c mem=$m"
+      expect: {match: exact, value: recorded}
+    - id: cpu-reniced
+      description: The CPU hog is still running with nice 15
+      type: shell
+      on: tr-sched-1
+      skills: [linux.processes.management]
+      weight: 2
+      command: |
+        . /var/lib/cloudtrain/pids.ref
+        n=$(ps -o ni= -p "$cpu" 2>/dev/null | tr -d ' '); echo "nice=${n:-gone}"
+      expect: {match: exact, value: "nice=15"}
+    - id: mem-graceful
+      description: The memory hog is gone and shut down on SIGTERM
+      type: shell
+      on: tr-sched-1
+      skills: [linux.processes.management]
+      weight: 2.5
+      command: |
+        . /var/lib/cloudtrain/pids.ref
+        if kill -0 "$mem" 2>/dev/null; then echo "still-running"; elif [ "$(cat /var/lib/cloudtrain/graceful 2>/dev/null)" = TERM ]; then echo graceful; else echo "killed-hard"; fi
+      expect: {match: exact, value: graceful}
+    - id: others-alive
+      description: The legitimate processes were left alone
+      type: shell
+      on: tr-sched-1
+      skills: [linux.processes.management]
+      weight: 1
+      command: |
+        . /var/lib/cloudtrain/pids.ref
+        kill -0 "$decoy1" 2>/dev/null && kill -0 "$decoy2" 2>/dev/null && echo alive || echo killed
+      expect: {match: exact, value: alive}
+  hints:
+    - title: Rank the processes
+      command: ps -eo pid,ni,pcpu,pmem,rss,args --sort=-pcpu | head
+      body: "Sort by -pcpu for the CPU hog and by -rss (or -pmem) for the memory hog. The sensor poller uses some of both, but far less."
+      cost: 0
+    - title: Priority and signals
+      body: "renice -n 15 -p PID sets the nice value of a running process (as root for raising it). kill PID sends SIGTERM by default; SIGKILL (-9) cannot be handled, so the process cannot clean up."
+      cost: 1
+  misconceptions:
+    - id: sigkill
+      description: Kills the memory hog with kill -9.
+      feedback: "SIGKILL cannot be caught, so the process had no chance to clean up. Send SIGTERM first (plain kill) and escalate only if it ignores it."
+      expectFail: [mem-graceful]
+      mutation:
+        on: tr-sched-1
+        as: learner
+        run: |
+          eval "$(sudo cat /var/lib/cloudtrain/pids.ref)"
+          sudo renice -n 15 -p "$cpu" >/dev/null; sudo kill -9 "$mem"
+          printf 'cpu=%s\nmem=%s\n' "$cpu" "$mem" > /home/learner/pids.txt
+    - id: wrong-processes
+      description: Treats the sensor poller as the CPU hog and records the wrong PIDs.
+      feedback: "The poller wakes briefly every second. Sort a few seconds of ps output by %CPU, or watch top, and look at the sustained leader."
+      expectFail: [pids-recorded, cpu-reniced, mem-graceful]
+      mutation:
+        on: tr-sched-1
+        as: learner
+        run: |
+          d=$(pgrep -f '^python3 /opt/tallowmere/bin/tr-poll-sensors$')
+          sudo renice -n 15 -p "$d" >/dev/null
+          printf 'cpu=%s\nmem=%s\n' "$d" "$d" > /home/learner/pids.txt
+  solution:
+    explanation: |
+      ps sorted by CPU and by RSS identifies the two hogs. renice -n 15 -p lowers the CPU
+      hog's priority; a plain kill sends SIGTERM, which the memory hog handles.
+    steps:
+      - on: tr-sched-1
+        as: learner
+        run: |
+          set -e
+          cpu=$(ps -eo pid,pcpu,args --sort=-pcpu | awk 'NR==2 {print $1}')
+          mem=$(ps -eo pid,rss,args --sort=-rss | awk 'NR==2 {print $1}')
+          printf 'cpu=%s\nmem=%s\n' "$cpu" "$mem" > /home/learner/pids.txt
+          sudo renice -n 15 -p "$cpu"
+          sudo kill -TERM "$mem"
+          sleep 1; cat /home/learner/pids.txt
+    alternatives:
+      - id: top-and-pkill
+        description: Use pkill by name for the signal and renice by name lookup.
+        steps:
+          - on: tr-sched-1
+            as: learner
+            run: |
+              set -e
+              cpu=$(pgrep -f '/opt/tallowmere/bin/{{cpuproc}}$'); mem=$(pgrep -f '/opt/tallowmere/bin/{{memproc}}$')
+              printf 'cpu=%s\nmem=%s\n' "$cpu" "$mem" > /home/learner/pids.txt
+              sudo renice 15 "$cpu"
+              sudo pkill -TERM -f '/opt/tallowmere/bin/{{memproc}}$'

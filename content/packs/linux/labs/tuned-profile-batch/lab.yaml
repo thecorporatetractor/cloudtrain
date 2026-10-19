@@ -1,0 +1,125 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tuned-profile-batch
+  title: Tune the fares batch host for throughput
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [tuned, performance, profiles]
+  version: 1
+spec:
+  description: |
+    **`tr-fares-batch`** (`ssh tr-fares-batch`; you have `sudo`) runs the nightly fares
+    batch and is currently on a general-purpose tuning profile.
+
+    1. Switch it to the **`throughput-performance`** profile, **persistently**: the
+       profile must survive a reboot, so `tuned` must also be running and enabled.
+    2. Write the profile that `tuned` itself **recommends** for this machine to
+       **`/home/learner/answers/{{ans}}`** (just the profile name, one line). It is not
+       necessarily the one you just applied.
+  objectives:
+    - Apply a tuned profile and keep it across reboots
+    - Ask tuned for the profile it recommends for the hardware
+  params:
+    ans:
+      type: choice
+      values: [tuned.txt, profile.txt]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-fares-batch
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-fares-batch
+      timeoutSec: 120
+      run: |
+        set -eu
+        systemctl enable --now tuned
+        tuned-adm profile balanced
+        systemctl disable --now tuned
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/tuned.txt /home/learner/answers/profile.txt
+  checks:
+    - id: active
+      description: throughput-performance is the active profile
+      type: shell
+      on: tr-fares-batch
+      skills: [linux.boot.tuned]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        tuned-adm active 2>/dev/null | sed -n 's/^Current active profile: //p'
+      expect: {match: exact, value: throughput-performance}
+    - id: persistent
+      description: The choice is stored and tuned is enabled and running
+      type: shell
+      on: tr-fares-batch
+      skills: [linux.boot.tuned]
+      weight: 2
+      command: echo "$(cat /etc/tuned/active_profile 2>/dev/null | tr -d '[:space:]') $(systemctl is-enabled tuned 2>/dev/null) $(systemctl is-active tuned 2>/dev/null)"
+      expect: {match: exact, value: "throughput-performance enabled active"}
+    - id: recommended
+      description: The answer file names the profile tuned recommends
+      type: shell
+      on: tr-fares-batch
+      skills: [linux.boot.tuned]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        a=$(head -1 /home/learner/answers/{{ans}} 2>/dev/null | tr -d '[:space:]')
+        [ -n "$a" ] && [ "$a" = "$(tuned-adm recommend 2>/dev/null)" ] && echo match || echo "answer=$a"
+      expect: {match: exact, value: match}
+  hints:
+    - title: Profiles
+      command: tuned-adm list
+      body: "tuned-adm list shows the profiles; tuned-adm profile NAME applies one. tuned-adm active shows the current one."
+      cost: 0
+    - title: Recommendation
+      command: tuned-adm recommend
+      body: "recommend looks at the hardware (a virtual guest here) and prints one profile name. It is advice and changes nothing."
+      cost: 1
+  misconceptions:
+    - id: daemon-not-enabled
+      description: Applies the profile but leaves tuned stopped and disabled at boot.
+      feedback: "tuned-adm profile needs the daemon running to apply it, and enabled to apply it again after a reboot: systemctl enable --now tuned."
+      expectFail: [persistent]
+      mutation:
+        on: tr-fares-batch
+        as: learner
+        run: |
+          sudo systemctl start tuned
+          sudo tuned-adm profile throughput-performance
+          sudo systemctl disable tuned
+          mkdir -p /home/learner/answers; echo "$(tuned-adm recommend)" > /home/learner/answers/{{ans}}
+    - id: applied-as-recommended
+      description: Writes the applied profile into the answer instead of asking tuned for its recommendation.
+      feedback: "The answer is the output of tuned-adm recommend, which for a virtual machine differs from throughput-performance."
+      expectFail: [recommended]
+      mutation:
+        on: tr-fares-batch
+        as: learner
+        run: |
+          sudo systemctl enable --now tuned
+          sudo tuned-adm profile throughput-performance
+          mkdir -p /home/learner/answers; echo throughput-performance > /home/learner/answers/{{ans}}
+  solution:
+    explanation: systemctl enable --now tuned starts the daemon now and at boot; tuned-adm profile applies and records the profile in /etc/tuned/active_profile; tuned-adm recommend gives the advised profile.
+    steps:
+      - on: tr-fares-batch
+        as: learner
+        run: |
+          set -e
+          sudo systemctl enable --now tuned
+          sudo tuned-adm profile throughput-performance
+          mkdir -p /home/learner/answers
+          tuned-adm recommend > /home/learner/answers/{{ans}}
+          tuned-adm active

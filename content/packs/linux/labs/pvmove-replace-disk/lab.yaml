@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: pvmove-replace-disk
+  title: Replace a failing disk in the depot volume group online
+  domain: linux
+  frameworks: [lpic2:advanced-storage]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [lvm, pvmove, vgreduce, disk-replacement]
+  version: 1
+spec:
+  description: |
+    Monitoring on **`tr-store-3`** (`ssh tr-store-3`; you have `sudo`) reports a SMART
+    warning for **`/dev/vdc`** (see `/var/log/smart-warning.txt`). The volume group
+    **`{{vg}}`** lives entirely on that disk, with the XFS volume `lv-depot`
+    (mounted at `/srv/depot`) and the ext4 volume `lv-spool` (mounted at `/srv/spool`).
+    A new disk, `/dev/vdd` (`/dev/disk/by-id/virtio-ct-data2`), has been added.
+
+    Replace the failing disk **while everything stays mounted** and the service
+    **`tr-depot-writer.service`** keeps writing (it must not be stopped or restarted):
+
+    1. Add `/dev/vdd` to the volume group.
+    2. Move all extents off `/dev/vdc`.
+    3. Remove `/dev/vdc` from the group and wipe its LVM label, so nobody reuses it by
+       mistake.
+  objectives:
+    - Add a PV to a volume group and migrate extents with pvmove
+    - Retire a PV with vgreduce and pvremove
+    - Do it online, without stopping the service or unmounting
+  params:
+    vg:
+      type: choice
+      values: [vg-depot, vg-tr]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-store-3
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-store-3
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! vgs {{vg}} >/dev/null 2>&1; then
+          wipefs -a /dev/vdc /dev/vdd >/dev/null 2>&1 || true
+          pvcreate -y /dev/vdc >/dev/null; vgcreate {{vg}} /dev/vdc >/dev/null
+          lvcreate -y -n lv-depot -L 320M {{vg}} >/dev/null; lvcreate -y -n lv-spool -L 160M {{vg}} >/dev/null
+          mkfs.xfs -q /dev/{{vg}}/lv-depot; mkfs.ext4 -q /dev/{{vg}}/lv-spool
+          mkdir -p /srv/depot /srv/spool
+          printf '/dev/{{vg}}/lv-depot /srv/depot xfs defaults 0 0\n/dev/{{vg}}/lv-spool /srv/spool ext4 defaults 0 2\n' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/depot; mount /srv/spool
+          seq 1 20000 | awk '{print "depot", $1, $1 * 31 % 1009}' > /srv/depot/records.dat
+          seq 1 20000 | awk '{print "spool", $1, $1 * 17 % 1009}' > /srv/spool/queue.dat
+          (cd /srv/depot && sha256sum records.dat) > $V/pvmove.sha; (cd /srv/spool && sha256sum queue.dat) >> $V/pvmove.sha
+        fi
+        printf 'SMART overall-health: WARNING\n/dev/vdc: Reallocated_Sector_Ct 118 (threshold 140)\nReplace the disk soon.\n' > /var/log/smart-warning.txt
+        printf '%s\n' '#!/bin/bash' 'while :; do echo "$(date +%s) write" >> /srv/depot/live.log; sleep 0.5; done' > /usr/local/bin/tr-depot-writer
+        chmod 0755 /usr/local/bin/tr-depot-writer
+        systemctl is-active --quiet tr-depot-writer || systemd-run --unit=tr-depot-writer --description="Tallowmere depot writer" /usr/local/bin/tr-depot-writer >/dev/null
+        sleep 1; systemctl show -P MainPID tr-depot-writer > $V/dwriter.pid
+  checks:
+    - id: pv-members
+      description: The volume group is on /dev/vdd only
+      type: shell
+      on: tr-store-3
+      skills: [linux.storage.lvm-advanced]
+      weight: 3
+      command: pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk '$2 == "{{vg}}" {print $1}' | paste -sd,
+      expect: {match: exact, value: /dev/vdd}
+    - id: old-wiped
+      description: /dev/vdc no longer carries an LVM label
+      type: shell
+      on: tr-store-3
+      skills: [linux.storage.lvm-advanced]
+      weight: 1.5
+      command: |
+        if pvs /dev/vdc >/dev/null 2>&1; then echo "still-pv"; else echo "$(blkid -s TYPE -o value /dev/vdc)" | sed 's/^$/clean/'; fi
+      expect: {match: exact, value: clean}
+    - id: online-and-intact
+      description: Both volumes are mounted from the group, active, with their data intact
+      type: shell
+      on: tr-store-3
+      skills: [linux.storage.lvm-advanced]
+      weight: 2
+      command: |
+        a=$(readlink -f "$(findmnt -n -o SOURCE /srv/depot)"); b=$(readlink -f "$(findmnt -n -o SOURCE /srv/spool)")
+        [ "$a" = "$(readlink -f /dev/{{vg}}/lv-depot)" ] && [ "$b" = "$(readlink -f /dev/{{vg}}/lv-spool)" ] || { echo "not-mounted"; exit 0; }
+        (cd /srv/depot && grep ' records.dat' /var/lib/cloudtrain/pvmove.sha | sha256sum -c --quiet) && (cd /srv/spool && grep ' queue.dat' /var/lib/cloudtrain/pvmove.sha | sha256sum -c --quiet) && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+    - id: writer-untouched
+      description: The writer was never restarted and still appends
+      type: shell
+      on: tr-store-3
+      skills: [linux.storage.lvm-advanced]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        p=$(systemctl show -P MainPID tr-depot-writer); a=$(wc -l < /srv/depot/live.log); sleep 2; b=$(wc -l < /srv/depot/live.log)
+        [ "$p" = "$(cat /var/lib/cloudtrain/dwriter.pid)" ] && [ "$b" -gt "$a" ] && echo appending || echo "pid=$p growth=$((b - a))"
+      expect: {match: exact, value: appending}
+  hints:
+    - title: New PV first
+      command: sudo pvcreate /dev/vdd && sudo vgextend {{vg}} /dev/vdd
+      body: "pvmove needs somewhere to move to, so the new disk joins the group before anything is moved."
+      cost: 0
+    - title: Move online
+      command: sudo pvmove /dev/vdc
+      body: "pvmove /dev/vdc migrates every allocated extent to the other PVs of the group while the volumes stay mounted. pvs -o+pv_used shows progress."
+      cost: 1
+    - title: Retire the old disk
+      body: "vgreduce VG /dev/vdc removes the empty PV from the group; pvremove /dev/vdc erases its LVM label."
+      cost: 1
+  misconceptions:
+    - id: stop-and-copy
+      description: Stops the service and unmounts while moving.
+      feedback: "pvmove works on mounted, active volumes; stopping the writer was not needed and the task forbids it."
+      expectFail: [writer-untouched]
+      mutation:
+        on: tr-store-3
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo systemctl stop tr-depot-writer
+          sudo pvcreate -y /dev/vdd >/dev/null; sudo vgextend {{vg}} /dev/vdd >/dev/null
+          sudo pvmove /dev/vdc >/dev/null; sudo vgreduce {{vg}} /dev/vdc >/dev/null; sudo pvremove -y /dev/vdc >/dev/null
+          sudo systemd-run --unit=tr-depot-writer /usr/local/bin/tr-depot-writer >/dev/null
+    - id: label-left
+      description: Moves the data and reduces the group but leaves the old LVM label on the disk.
+      feedback: "vgreduce only drops the PV from the group; pvremove (or wipefs) clears the label so the disk cannot be picked up again."
+      expectFail: [old-wiped]
+      mutation:
+        on: tr-store-3
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo pvcreate -y /dev/vdd >/dev/null; sudo vgextend {{vg}} /dev/vdd >/dev/null
+          sudo pvmove /dev/vdc >/dev/null; sudo vgreduce {{vg}} /dev/vdc >/dev/null
+  solution:
+    explanation: |
+      vgextend adds the new disk, pvmove /dev/vdc migrates all extents online, vgreduce
+      removes the now-empty PV and pvremove wipes its label.
+    steps:
+      - on: tr-store-3
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo pvcreate -y /dev/vdd
+          sudo vgextend {{vg}} /dev/vdd
+          sudo pvmove /dev/vdc
+          sudo vgreduce {{vg}} /dev/vdc
+          sudo pvremove -y /dev/vdc
+          sudo pvs
+    alternatives:
+      - id: by-id-and-wipefs
+        description: Use the stable by-id names and wipefs instead of pvremove.
+        steps:
+          - on: tr-store-3
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              sudo pvcreate -y /dev/disk/by-id/virtio-ct-data2
+              sudo vgextend {{vg}} /dev/disk/by-id/virtio-ct-data2
+              sudo pvmove /dev/disk/by-id/virtio-ct-data1
+              sudo vgreduce {{vg}} /dev/disk/by-id/virtio-ct-data1
+              sudo wipefs -a /dev/disk/by-id/virtio-ct-data1

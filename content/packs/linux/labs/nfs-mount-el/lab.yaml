@@ -1,0 +1,167 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nfs-mount-el
+  title: Mount the timetable archive export persistently
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems, lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [nfs, fstab, netdev, mount]
+  version: 1
+spec:
+  description: |
+    The file server **`depot-nfs-1`** exports the archived timetables as
+    **`depot-nfs-1:/exports/timetable`**. On **`tr-arch-1`** (`ssh tr-arch-1`; you have
+    `sudo`), mount it at **`/mnt/tt-archive`**:
+
+    - **read-only**, with the extra option **`{{opt}}`**;
+    - as a **network filesystem** in `/etc/fstab` (`_netdev`), so the boot waits for the
+      network instead of failing, now and at every boot.
+
+    The host is not rebooted here: that the mount will be ordered after the network is
+    judged from the mount unit systemd generates from `/etc/fstab`.
+  objectives:
+    - Mount an NFS export with read-only and security options
+    - Mark a network mount with _netdev
+    - Inspect the generated mount unit
+  params:
+    opt:
+      type: choice
+      values: [nosuid, nodev, noexec]
+    edition:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-nfs-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-arch-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-nfs-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q nfs-utils >/dev/null 2>&1 || dnf -y -q install nfs-utils >/dev/null
+        mkdir -p /exports/timetable; echo "edition {{edition}}" > /exports/timetable/EDITION
+        echo '/exports/timetable *(ro,sync,no_subtree_check)' > /etc/exports.d/timetable.exports
+        systemctl enable --now nfs-server; exportfs -ra
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done; firewall-cmd -q --reload
+    - on: tr-arch-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q nfs-utils >/dev/null 2>&1 || dnf -y -q install nfs-utils >/dev/null
+        umount /mnt/tt-archive 2>/dev/null || true
+        sed -i '\#/mnt/tt-archive#d' /etc/fstab; systemctl daemon-reload
+  checks:
+    - id: mounted
+      description: The export is mounted read-only with the option and readable
+      type: shell
+      on: tr-arch-1
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      timeoutSec: 40
+      command: |
+        s=$(findmnt -n -t nfs,nfs4 -o SOURCE /mnt/tt-archive 2>/dev/null | head -1); o=$(findmnt -n -t nfs,nfs4 -o OPTIONS /mnt/tt-archive 2>/dev/null | head -1)
+        c=$(timeout 10 cat /mnt/tt-archive/EDITION 2>/dev/null)
+        [ "$s" = "depot-nfs-1:/exports/timetable" ] || { echo "source=$s"; exit 0; }
+        echo ",$o," | grep -q ',ro,' && echo ",$o," | grep -q ',{{opt}},' && [ "$c" = "edition {{edition}}" ] && echo mounted || echo "opts=$o"
+      expect: {match: exact, value: mounted}
+    - id: fstab
+      description: /etc/fstab has the nfs line with ro, the option and _netdev
+      type: shell
+      on: tr-arch-1
+      skills: [linux.storage.network-mounts]
+      weight: 2
+      command: |
+        awk '$2 == "/mnt/tt-archive" && $1 == "depot-nfs-1:/exports/timetable" && $3 ~ /^nfs4?$/ {o = "," $4 ","; if (o ~ /,ro,/ && o ~ /,{{opt}},/ && o ~ /,_netdev,/) f = 1} END {print f ? "fstab" : "missing"}' /etc/fstab
+      expect: {match: exact, value: fstab}
+    - id: ordered-after-network
+      description: systemd orders the generated mount unit as a remote filesystem
+      type: shell
+      on: tr-arch-1
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      command: |
+        systemctl daemon-reload
+        u=$(systemd-escape -p --suffix=mount /mnt/tt-archive)
+        systemctl show -p WantedBy,After "$u" 2>/dev/null | tr '\n' ' ' | grep -q 'remote-fs.target' && systemctl show -p After "$u" | grep -q 'network' && echo remote-fs || echo "local-fs"
+      expect: {match: exact, value: remote-fs}
+    - id: fstab-valid
+      description: The fstab parses cleanly
+      type: shell
+      on: tr-arch-1
+      skills: [linux.storage.network-mounts]
+      weight: 0.5
+      command: findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; r=$?; if [ $r = 0 ] || [ $r = 64 ]; then echo valid; else echo "rc=$r"; fi
+      expect: {match: exact, value: valid}
+  hints:
+    - title: Options
+      body: "ro,<option>,_netdev in the fourth fstab field. _netdev marks the filesystem as needing the network: systemd mounts it from remote-fs.target after network-online."
+      cost: 1
+    - title: Apply it
+      command: sudo mkdir -p /mnt/tt-archive && sudo systemctl daemon-reload && sudo mount /mnt/tt-archive
+      body: "daemon-reload regenerates the mount units from fstab; mount with only the mount point uses the fstab entry."
+      cost: 1
+  misconceptions:
+    - id: no-netdev
+      description: Writes the fstab line without _netdev.
+      feedback: "Without _netdev the mount is treated as local and may be tried before the network is up; with _netdev it is ordered after the network."
+      expectFail: [fstab]
+      mutation:
+        on: tr-arch-1
+        as: learner
+        run: |
+          sudo mkdir -p /mnt/tt-archive
+          echo 'depot-nfs-1:/exports/timetable /mnt/tt-archive nfs ro,{{opt}} 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /mnt/tt-archive
+    - id: manual-mount
+      description: Mounts by hand and never edits fstab.
+      feedback: "A mount command lasts until the next reboot. Add the entry to /etc/fstab."
+      expectFail: [fstab, ordered-after-network]
+      mutation:
+        on: tr-arch-1
+        as: learner
+        run: |
+          sudo mkdir -p /mnt/tt-archive
+          sudo mount -t nfs -o ro,{{opt}} depot-nfs-1:/exports/timetable /mnt/tt-archive
+  solution:
+    explanation: An nfs line in /etc/fstab with ro, the option and _netdev; systemd generates a remote-fs mount unit and mount applies it now.
+    steps:
+      - on: tr-arch-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo mkdir -p /mnt/tt-archive
+          echo 'depot-nfs-1:/exports/timetable /mnt/tt-archive nfs ro,{{opt}},_netdev 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /mnt/tt-archive
+          findmnt /mnt/tt-archive
+    alternatives:
+      - id: nfs4-explicit
+        description: Spell out the nfs4 type and version in the options.
+        steps:
+          - on: tr-arch-1
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo mkdir -p /mnt/tt-archive
+              echo 'depot-nfs-1:/exports/timetable /mnt/tt-archive nfs4 ro,{{opt}},_netdev,vers=4.2 0 0' | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount /mnt/tt-archive

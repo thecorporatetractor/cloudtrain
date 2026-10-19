@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nfs-autofs-home
+  title: Mount crew home directories on demand with autofs
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems, lfcs:storage]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [autofs, nfs, automount, home]
+  version: 1
+spec:
+  description: |
+    Crew home directories live on the file server **`depot-nfs-1`**, exported below
+    **`depot-nfs-1:/exports/home`** (one directory per user, for example `{{u1}}` and
+    `{{u2}}`; more crew will follow). On **`tr-crew-2`** (`ssh tr-crew-2`; you have `sudo`),
+    configure **autofs** so that:
+
+    - **`/crew/<user>`** mounts `depot-nfs-1:/exports/home/<user>` read-write **on first
+      access**, for **every** user, without listing them one by one;
+    - an unused mount is **unmounted after {{idle}} seconds** of inactivity;
+    - autofs is running and starts at boot.
+
+    The `autofs` package is installed. Verify with `{{u1}}` and `{{u2}}`.
+  objectives:
+    - Write an autofs master entry and an indirect map with a wildcard key
+    - Set the idle timeout
+    - Verify on-demand mounting
+  params:
+    u1:
+      type: choice
+      values: [sian, tomos]
+    u2:
+      type: choice
+      values: [wyn, ynyr]
+    idle:
+      type: choice
+      values: ["60", "120"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-nfs-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-crew-2
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-nfs-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q nfs-utils >/dev/null 2>&1 || dnf -y -q install nfs-utils >/dev/null
+        for u in {{u1}} {{u2}} zed; do mkdir -p /exports/home/$u; echo "home of $u" > /exports/home/$u/WELCOME; done
+        echo '/exports/home *(rw,sync,no_subtree_check)' > /etc/exports.d/home.exports
+        systemctl enable --now nfs-server; exportfs -ra
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done; firewall-cmd -q --reload
+    - on: tr-crew-2
+      timeoutSec: 300
+      run: |
+        set -eu
+        rpm -q nfs-utils autofs >/dev/null 2>&1 || dnf -y -q install nfs-utils autofs >/dev/null
+        systemctl disable --now autofs >/dev/null 2>&1 || true
+        rm -f /etc/auto.master.d/*.autofs /etc/auto.crew /etc/auto.home
+        sed -i '/crew/d' /etc/auto.master
+        umount -l /crew/* 2>/dev/null || true
+  checks:
+    - id: on-demand
+      description: /crew/<user> shows that user's export, also for a user the task does not name
+      type: shell
+      on: tr-crew-2
+      skills: [linux.storage.network-mounts]
+      weight: 2.5
+      timeoutSec: 90
+      command: |
+        ok=0
+        for u in {{u1}} {{u2}} zed; do [ "$(timeout 20 cat /crew/$u/WELCOME 2>/dev/null)" = "home of $u" ] && ok=$((ok + 1)); done
+        echo "homes=$ok"
+      expect: {match: exact, value: "homes=3"}
+    - id: autofs-running
+      description: /crew is an autofs mount point and the autofs service is enabled and active
+      type: shell
+      on: tr-crew-2
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      command: |
+        a=plain; findmnt -n -t autofs -o TARGET /crew >/dev/null 2>&1 && a=autofs
+        echo "$a $(systemctl is-enabled autofs 2>/dev/null) $(systemctl is-active autofs 2>/dev/null)"
+      expect: {match: exact, value: "autofs enabled active"}
+    - id: idle-timeout
+      description: The /crew autofs mount uses the requested idle timeout
+      type: shell
+      on: tr-crew-2
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      command: |
+        findmnt -n -t autofs -o OPTIONS /crew 2>/dev/null | tr ',' '\n' | sed -n 's/^timeout=/timeout=/p' | head -1
+      expect: {match: exact, value: "timeout={{idle}}"}
+    - id: writable
+      description: The mounted home is read-write
+      type: shell
+      on: tr-crew-2
+      skills: [linux.storage.network-mounts]
+      weight: 1
+      timeoutSec: 40
+      command: |
+        f=/crew/{{u1}}/.probe-$$; timeout 20 touch $f 2>/dev/null && { rm -f $f; echo writable; } || echo read-only
+      expect: {match: exact, value: writable}
+  hints:
+    - title: Two files
+      body: "A master entry says which directory autofs manages and which map to use: /crew  /etc/auto.crew  --timeout=N (in /etc/auto.master or a file in /etc/auto.master.d/ ending in .autofs). The map holds key, options and location."
+      cost: 1
+    - title: Wildcard map
+      body: "A key of * with & in the location substitutes the requested name: *  -rw,sync  depot-nfs-1:/exports/home/&"
+      cost: 1
+    - title: Apply
+      command: sudo systemctl enable --now autofs && sudo systemctl reload autofs
+      body: "autofs rereads its maps on reload; ls /crew/NAME then triggers the mount (/crew itself looks empty until then)."
+      cost: 0
+  misconceptions:
+    - id: listed-users
+      description: Lists only the two named users in the map.
+      feedback: "A wildcard key (*) with & in the location serves every user, including those added later."
+      expectFail: [on-demand]
+      mutation:
+        on: tr-crew-2
+        as: learner
+        timeoutSec: 120
+        run: |
+          echo '/crew /etc/auto.crew --timeout={{idle}}' | sudo tee /etc/auto.master.d/crew.autofs >/dev/null
+          printf '{{u1}} -rw,sync depot-nfs-1:/exports/home/{{u1}}\n{{u2}} -rw,sync depot-nfs-1:/exports/home/{{u2}}\n' | sudo tee /etc/auto.crew >/dev/null
+          sudo systemctl enable --now autofs; sudo systemctl reload autofs
+    - id: default-timeout
+      description: Leaves the idle timeout at its default.
+      feedback: "The ticket asks for an idle unmount after {{idle}} seconds: add --timeout={{idle}} to the master entry (the default is 300)."
+      expectFail: [idle-timeout]
+      mutation:
+        on: tr-crew-2
+        as: learner
+        timeoutSec: 120
+        run: |
+          echo '/crew /etc/auto.crew' | sudo tee /etc/auto.master.d/crew.autofs >/dev/null
+          echo '* -rw,sync depot-nfs-1:/exports/home/&' | sudo tee /etc/auto.crew >/dev/null
+          sudo systemctl enable --now autofs; sudo systemctl reload autofs
+  solution:
+    explanation: |
+      A master entry for /crew with --timeout and a map with a wildcard key mount each user's
+      export on first access; autofs is enabled so the entry works after a reboot.
+    steps:
+      - on: tr-crew-2
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          echo '/crew /etc/auto.crew --timeout={{idle}}' | sudo tee /etc/auto.master.d/crew.autofs >/dev/null
+          echo '* -rw,sync depot-nfs-1:/exports/home/&' | sudo tee /etc/auto.crew >/dev/null
+          sudo systemctl enable --now autofs
+          sudo systemctl reload autofs
+          ls /crew/{{u1}}; findmnt /crew/{{u1}}
+    alternatives:
+      - id: master-and-conf
+        description: Put the master line in /etc/auto.master and the timeout in /etc/autofs.conf.
+        steps:
+          - on: tr-crew-2
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              echo '/crew /etc/auto.crew --timeout={{idle}}' | sudo tee -a /etc/auto.master >/dev/null
+              echo '* -rw,sync depot-nfs-1:/exports/home/&' | sudo tee /etc/auto.crew >/dev/null
+              sudo systemctl enable --now autofs
+              sudo systemctl restart autofs
