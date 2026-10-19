@@ -17,7 +17,12 @@ export type Tx = Transaction<DB>;
 pg.types.setTypeParser(20, (v) => Number(v));
 
 export function createDb(connectionString: string, max = 10): Db {
-  return new Kysely<DB>({ dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString, max }) }) });
+  const pool = new pg.Pool({ connectionString, max });
+  // An idle client that loses its connection (server restart, 57P01) emits 'error' on the pool;
+  // with no listener that is an uncaught exception. The pool drops the dead client and the next
+  // query opens a new one, so log and carry on.
+  pool.on('error', (err) => console.error('pg pool: idle client error:', err.message));
+  return new Kysely<DB>({ dialect: new PostgresDialect({ pool }) });
 }
 
 /** The RLS context of one transaction. */
