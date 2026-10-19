@@ -48,10 +48,10 @@ tar -xzf "$B/tools/trivy.tar.gz" -C "$D/trivy" LICENSE
 tar -xzf "$B/tools/notation.tar.gz" -C "$D/notation" LICENSE
 cat > "$D/README" <<R
 Separate programs, unmodified upstream release binaries (source: the release tags below).
-cosign   ${COSIGN_VERSION}   Apache-2.0  https://github.com/sigstore/cosign    (/usr/share/common-licenses/Apache-2.0)
+cosign   ${COSIGN_V2_VERSION}   Apache-2.0  https://github.com/sigstore/cosign    (/usr/share/common-licenses/Apache-2.0)
 notation ${NOTATION_VERSION}   Apache-2.0  https://github.com/notaryproject/notation
-trivy    ${TRIVY_VERSION}  Apache-2.0  https://github.com/aquasecurity/trivy
-Trivy DB (/var/lib/trivy) ghcr.io/${TRIVY_DB_REPO}:2 layer sha256:${TRIVY_DB_LAYER_SHA256}, built ${TRIVY_DB_CREATED}:
+trivy    v${TRIVY_VERSION}  Apache-2.0  https://github.com/aquasecurity/trivy
+Trivy DB (/var/lib/trivy) ${TRIVY_DB_REF}, built ${TRIVY_DB_DATE}:
   vulnerability data aggregated from public advisory sources, each under its source's terms.
 BuildKit images (moby/buildkit, docker/buildkit-syft-scanner) are Apache-2.0, preloaded as images.
 R
@@ -92,7 +92,7 @@ write_release \
   "BUILDX_VERSION=$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" \
   "COMPOSE_VERSION=$(dpkg-query -W -f='${Version}' docker-compose-plugin)" \
   "CONTAINERD_PACKAGE=${CONTAINERD_VERSION}" \
-  "COSIGN_VERSION=${COSIGN_VERSION}" "NOTATION_VERSION=${NOTATION_VERSION}" "TRIVY_VERSION=${TRIVY_VERSION}" \
-  "TRIVY_DB_CREATED=${TRIVY_DB_CREATED}"
+  "COSIGN_VERSION=${COSIGN_V2_VERSION}" "NOTATION_VERSION=${NOTATION_VERSION}" "TRIVY_VERSION=${TRIVY_VERSION}" \
+  "TRIVY_DB_DATE=${TRIVY_DB_DATE}"
 
 generalize

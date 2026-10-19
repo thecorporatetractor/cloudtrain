@@ -6,6 +6,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export REPO_ROOT
 # shellcheck source=../versions.env
 set -a; source "$REPO_ROOT/deploy/versions.env"; set +a
+# A key defined twice silently takes the later value (a docker-vm build once fetched cosign v3
+# against the v2 checksum): refuse that.
+_dup=$(grep -oE '^[A-Z0-9_]+=' "$REPO_ROOT/deploy/versions.env" | sort | uniq -d | tr -d '=' | tr '\n' ' ')
+[[ -z $_dup ]] || { printf 'deploy/versions.env defines these keys more than once: %s\n' "$_dup" >&2; exit 1; }
+unset _dup
 export PATH="$HOME/.local/bin:$PATH"
 # KIND_PROFILE picks the cluster flavour (docs/any-kubernetes.md, section 6):
 #   kubeovn-primary (default): Kube-OVN is the primary CNI (vCenter / bare metal model)
