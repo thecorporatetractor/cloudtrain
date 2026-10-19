@@ -110,11 +110,25 @@ Waves 5 to 7 add 67 built labs, none run live. Exam pools: every pool of sim-el-
 holds at least 2x its draw and both exams compile with and without `--allow-missing` (W7 report: sim-linux-sysadmin
 10/5, 8/4, 8/4, 6/3, 4/2; sim-el-sysadmin 6/3, 4/2, 2/1, 4/2, 6/3, 4/2, 4/2, 4/2, 4/2, 2/1).
 
-Image-blocked (written, setup fails until packages exist), details in the per-wave handoffs:
-iscsi-attach-volume (targetcli, iscsi-initiator-utils), samba-share-office (samba, smbclient), perf-cpu-flamegraph,
-bpftrace-who-opens, node-exporter-alert, openscap-scan-remediate, ssh-hardening-fail2ban (ban part), ldap-login-crew,
-xlf-ldap-user-login, flatpak-remote-install, xel-flatpak-remote, libvirt-test-vm, xlf-libvirt-autostart,
-libvirt-golden-template (clone proof). Console/reboot-blocked (end state graded over ssh): boot-target-default,
+Package gaps closed on 2026-10-19 (the per-wave handoffs still list them as they were written):
+noble adds linux-tools-common + linux-tools-6.8.0-142-generic (perf for the ubuntu-vm kernel; bump
+with UBUNTU_SERIAL), bpftrace, prometheus-node-exporter(-collectors), samba, smbclient, fail2ban,
+slapd, ldap-utils, sssd(-ldap, -tools), libpam-sss, libnss-sss, libvirt-daemon-system,
+libvirt-clients, qemu-system-x86, qemu-utils, virtinst; el10 adds targetcli, iscsi-initiator-utils,
+openscap-scanner, scap-security-guide, flatpak, ostree, flatpak-selinux, sssd(-ldap, -tools), oddjob,
+oddjob-mkhomedir, authselect and the companions that only rich dependencies pull in ("X if Y", checked
+for every package in the repo): adcli-selinux, libsss_sudo, sssd-nfs-idmap, glibc-gconv-extra,
+python(3)-rpm-macros, python3-rpm-generators. el-vm 1.78 -> 1.94 GB, ubuntu-vm 1.82 -> 2.04 GB.
+Live verify on the remote verify VM (one lab per package group): iscsi-attach-volume, samba-share-office,
+bpftrace-who-opens, libvirt-test-vm (qemu software emulation, no nested virt) and ldap-login-crew
+(solution and mutations) pass. Lab fixes on the way: samba-share-office's directories check expects 2770
+(setgid is inherited from the share root); ldap-login-crew (sssctl config-check non-fatal, 0640 accepted,
+the alternative turns off StartTLS). Remaining content blockers (packages install fine):
+flatpak-remote-install (setup's flatpak build-init needs the SDK runtime installed first),
+ssh-hardening-fail2ban and openscap-scan-remediate (after the solution the grader's root SSH is refused;
+openscap's profile-edit mutation is not caught), perf-cpu-flamegraph (profile check reports no-profile
+after the solution), node-exporter-alert (no-textfile mutation not caught), libvirt-golden-template
+(clone proof not run live). Console/reboot-blocked (end state graded over ssh): boot-target-default,
 grub-kernel-args, boot-slow-analysis, recover-root-password, recover-broken-fstab, kernel-panic-initramfs,
 xel-root-password-reset, xlf-recover-fstab-boot; journal-persistent-el previous-boot output. Partially blocked:
 cloud-init-new-depot-host (applies user-data in place; no nested virt).

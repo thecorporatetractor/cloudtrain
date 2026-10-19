@@ -157,7 +157,7 @@ spec:
         chmod 0600 $V/tryauth.py
   checks:
     - id: sssd-conf
-      description: sssd.conf defines an LDAP domain for the directory, root-owned mode 0600
+      description: sssd.conf defines an LDAP domain for the directory, root-owned mode 0600 (or 0640, which the EL10 sssd unit sets for its sssd group)
       type: shell
       on: tr-crew-01
       skills: [linux.identity.ldap-client]
@@ -170,7 +170,7 @@ spec:
             st = os.stat(f)
         except OSError:
             print("no-file"); raise SystemExit
-        if st.st_uid != 0 or (st.st_mode & 0o777) != 0o600:
+        if st.st_uid != 0 or (st.st_mode & 0o777) not in (0o600, 0o640):
             print("perms:%o" % (st.st_mode & 0o777)); raise SystemExit
         c = configparser.RawConfigParser(strict=False)
         c.read(f)
@@ -281,9 +281,7 @@ spec:
     explanation: |
       sssd.conf describes the LDAP domain; authselect select sssd with-mkhomedir edits
       nsswitch.conf and the PAM stacks; oddjobd (with the mkhomedir helper) creates the home
-      on first login. BLOCKED in this round: the directory server needs the slapd package
-      on tr-dir-01, which is not in the lab mirror, so the live checks can only pass once it
-      is added to the image or mirror.
+      on first login. The directory server is slapd on tr-dir-01, installed from the lab mirror.
     steps:
       - on: tr-crew-01
         as: learner
@@ -292,7 +290,8 @@ spec:
           set -e
           printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_id_use_start_tls = false\nldap_auth_disable_tls_never_use_in_production = true\ncache_credentials = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
           sudo chmod 600 /etc/sssd/sssd.conf
-          sudo sssctl config-check
+          # sssctl's validator does not know ldap_auth_disable_tls_never_use_in_production (sssd does)
+          sudo sssctl config-check || true
           sudo authselect select sssd with-mkhomedir --force
           sudo systemctl enable --now sssd oddjobd
           sleep 3
@@ -307,7 +306,7 @@ spec:
             timeoutSec: 120
             run: |
               set -e
-              printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+              printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_id_use_start_tls = false\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
               sudo chmod 600 /etc/sssd/sssd.conf
               sudo authselect select sssd --force
               sudo authselect enable-feature with-mkhomedir
