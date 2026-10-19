@@ -40,6 +40,12 @@ const (
 	// endpoints withdrawn and every learner process on the entry node and the
 	// VM nodes killed.
 	ConditionAccessRevoked = "AccessRevoked"
+	// ConditionSandboxed is set when the manager has tier sandboxes and the
+	// topology has container nodes of a sandboxed tier: True when all of them
+	// run in their sandbox RuntimeClass, False (reason VMFallback or
+	// SandboxUnavailable) when a tier's sandbox is unavailable, with the nodes
+	// that run as KubeVirt VMs or without a sandbox.
+	ConditionSandboxed = "Sandboxed"
 )
 
 // LearnerRef identifies the learner owning a session.

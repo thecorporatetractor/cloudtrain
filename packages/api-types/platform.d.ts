@@ -1057,10 +1057,15 @@ export interface CapacityNode {
   roles: string[];
   ready: boolean;
   kvm: boolean;
+  /** The node runs Kata sandboxes (label katacontainers.io/kata-runtime=true): tier-B sandbox capacity. */
+  sandbox?: boolean;
+  /** requested includes the RuntimeClass overhead of sandboxed pods (pod.spec.overhead). */
   cpu: { capacity: number; allocatable: number; requested: number };
   memoryMiB: { capacity: number; allocatable: number; requested: number };
   pods: number;
   vms: number;
+  /** Lab pods running in a tier sandbox (a Kata VM per pod), counted apart from KubeVirt VMs. */
+  sandboxes?: number;
 }
 
 export interface WarmPoolInfo {
@@ -1071,12 +1076,14 @@ export interface WarmPoolInfo {
   ready: number;
 }
 
-/** `GET /platform/capacity`: live from the cluster (nodes, KubeVirt VMIs, WarmPools, LabSessions). */
+/** `GET /platform/capacity`: live from the cluster (nodes, KubeVirt VMIs, tier sandboxes, WarmPools, LabSessions). */
 export interface Capacity {
   generatedAt: string;
   cluster: { context: string; reachable: boolean; error?: string };
   nodes: CapacityNode[];
   vms: { running: number; total: number };
+  /** Tier sandboxes: lab pods running in a sandbox RuntimeClass, and the nodes that can run them. */
+  sandboxes?: { running: number; nodes: number };
   warmPools: WarmPoolInfo[];
   sessions: { total: number; byPhase: Record<string, number>; byOrg: { orgId: string; name: string; count: number }[] };
 }

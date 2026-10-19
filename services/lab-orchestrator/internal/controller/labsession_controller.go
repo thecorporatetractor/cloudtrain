@@ -74,6 +74,10 @@ const (
 	ReasonResetRequested   = "ResetRequested"
 	ReasonResetFailed      = "ResetFailed"
 	ReasonProvisionTimeout = "ProvisionTimeout"
+	// Sandboxed condition reasons.
+	ReasonSandboxed          = "Sandboxed"
+	ReasonVMFallback         = "VMFallback"
+	ReasonSandboxUnavailable = "SandboxUnavailable"
 )
 
 // LabSessionReconciler walks a session's topology nodes through their
@@ -83,6 +87,10 @@ type LabSessionReconciler struct {
 	Scheme   *runtime.Scheme
 	Drivers  *drivers.Registry
 	Recorder events.EventRecorder
+	// Sandboxes and Catalog: tier sandboxes and their vmFallback rewrite
+	// (nil Sandboxes = off).
+	Sandboxes *drivers.Sandboxes
+	Catalog   *drivers.ImageCatalog
 	// Now is injectable for tests; defaults to time.Now.
 	Now func() time.Time
 	// ProvisionTimeout defaults to DefaultProvisionTimeout.
@@ -309,12 +317,63 @@ func (r *LabSessionReconciler) template(ctx context.Context, s *labsv1.LabSessio
 	if err != nil {
 		return nil, &resolveError{err}
 	}
-	return &resolvedTemplate{spec: spec, values: values}, nil
+	// Tier sandboxes: container nodes whose sandbox is unavailable become
+	// their KubeVirt VM twin (vmFallback). Every driver call, the recorded
+	// topology and teardown see the rewritten nodes.
+	sb, err := r.Sandboxes.PlanSandboxes(ctx, r.Catalog, spec, s.Status.Topology)
+	if err != nil {
+		if drivers.IsPermanent(err) {
+			return nil, &resolveError{err}
+		}
+		return nil, err // an API error while checking a sandbox: retry
+	}
+	return &resolvedTemplate{spec: spec, values: values, sandbox: sb}, nil
 }
 
 type resolvedTemplate struct {
 	spec   *labsv1.LabTemplateSpec
 	values map[string]string
+	// sandbox: the sandbox decision of each container node of a sandboxed
+	// tier (empty when the manager has no sandboxes).
+	sandbox []drivers.SandboxNode
+}
+
+// sandboxCondition sets the Sandboxed condition from the template's sandbox
+// decisions (and an event when it changes).
+func (r *LabSessionReconciler) sandboxCondition(s *labsv1.LabSession, nodes []drivers.SandboxNode) {
+	if len(nodes) == 0 {
+		return
+	}
+	status, reason := metav1.ConditionTrue, ReasonSandboxed
+	var parts []string
+	for _, n := range nodes {
+		switch n.Substrate {
+		case drivers.SubstrateSandbox:
+			parts = append(parts, fmt.Sprintf("%s: tier %s sandbox %s", n.Node, n.Tier, n.RuntimeClass))
+		case drivers.SubstrateVM:
+			status = metav1.ConditionFalse
+			if reason != ReasonSandboxUnavailable {
+				reason = ReasonVMFallback
+			}
+			if n.Tier == "" {
+				parts = append(parts, fmt.Sprintf("%s: KubeVirt VM %s (provisioned as the VM fallback; kept for the session)", n.Node, n.VMImage))
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%s: KubeVirt VM %s instead of %s (tier %s sandbox %s unavailable: %s)", n.Node, n.VMImage, n.Image, n.Tier, n.RuntimeClass, n.Reason))
+		default:
+			status, reason = metav1.ConditionFalse, ReasonSandboxUnavailable
+			parts = append(parts, fmt.Sprintf("%s: no sandbox (tier %s sandbox %s unavailable: %s)", n.Node, n.Tier, n.RuntimeClass, n.Reason))
+		}
+	}
+	msg := strings.Join(parts, "; ")
+	if prev := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionSandboxed); prev == nil || prev.Reason != reason {
+		typ := corev1.EventTypeNormal
+		if status == metav1.ConditionFalse {
+			typ = corev1.EventTypeWarning
+		}
+		r.event(s, typ, reason, msg)
+	}
+	r.setCondition(s, labsv1.ConditionSandboxed, status, reason, msg)
 }
 
 type resolveError struct{ error }
@@ -383,6 +442,7 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	st.ResolvedParams = tpl.values
 	st.EntryNode = tpl.spec.Topology.Entry
 	r.setCondition(s, labsv1.ConditionTemplateResolved, metav1.ConditionTrue, ReasonResolved, "template found and params resolved")
+	r.sandboxCondition(s, tpl.sandbox)
 
 	// Exam time is up: freeze the session for the learner (endpoints
 	// withdrawn, learner processes ended) while it keeps running for grading.

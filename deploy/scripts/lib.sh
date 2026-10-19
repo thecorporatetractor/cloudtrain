@@ -21,7 +21,7 @@ export PATH="$HOME/.local/bin:$PATH"
 #     Cluster cloudtrain-calico.
 #   kata: kubeovn-primary plus Kata Containers (Cloud Hypervisor on runtime-rs, the lab guest
 #     kernel) for tier-B sandboxes (deploy/scripts/kata-up.sh, docs/kata-spike.md). Cluster
-#     cloudtrain-kata; the orchestrator gets --tier-runtime-classes B=$KATA_RUNTIME_CLASS.
+#     cloudtrain-kata; the orchestrator gets --sandboxes B=$KATA_RUNTIME_CLASS.
 # CT_CLUSTER_NAME overrides the cluster name of any profile.
 export KIND_PROFILE=${KIND_PROFILE:-kubeovn-primary}
 case $KIND_PROFILE in

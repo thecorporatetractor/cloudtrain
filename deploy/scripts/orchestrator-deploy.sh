@@ -21,9 +21,15 @@ case ${VCLUSTER_POD_SECURITY:-baseline} in baseline|restricted) ;; *) die "VCLUS
 # Kube-OVN is not the primary CNI (the managed-cni profiles default to it).
 if [[ -z ${NETWORK_MODE:-} && $SECONDARY_PROFILE == 1 ]]; then NETWORK_MODE=secondary; fi
 case ${NETWORK_MODE:-primary} in primary|secondary) ;; *) die "NETWORK_MODE must be primary or secondary";; esac
-# KIND_PROFILE=kata maps tier B to its Kata RuntimeClass unless TIER_RUNTIME_CLASSES is set
-# (TIER_RUNTIME_CLASSES= , empty, deploys without the flag: the default behaviour).
-if [[ $KATA_PROFILE == 1 && -z ${TIER_RUNTIME_CLASSES+x} ]]; then TIER_RUNTIME_CLASSES=B=$KATA_RUNTIME_CLASS; fi
+# KIND_PROFILE=kata sandboxes tier B in its Kata RuntimeClass (fallback kubevirt) unless
+# SANDBOXES (or the deprecated TIER_RUNTIME_CLASSES) is set (SANDBOXES= , empty, deploys
+# without sandboxes: the default behaviour).
+if [[ $KATA_PROFILE == 1 && -z ${SANDBOXES+x} && -z ${TIER_RUNTIME_CLASSES+x} ]]; then SANDBOXES=B=$KATA_RUNTIME_CLASS; fi
+[[ -n ${SANDBOXES:-} && -n ${TIER_RUNTIME_CLASSES:-} ]] && die "SANDBOXES and the deprecated TIER_RUNTIME_CLASSES are exclusive"
+if [[ -n ${SANDBOX_PREFLIGHT:-} ]]; then
+  [[ -f $SANDBOX_PREFLIGHT ]] || die "SANDBOX_PREFLIGHT $SANDBOX_PREFLIGHT not found"
+  [[ -n ${SANDBOXES:-} ]] || die "SANDBOX_PREFLIGHT needs SANDBOXES"
+fi
 
 SVC="$REPO_ROOT/services/lab-orchestrator"
 log "building manager image"
@@ -85,15 +91,18 @@ fi
 # cluster's default class and CDI StorageProfile (see docs/storage.md).
 # VCLUSTER_POD_SECURITY (baseline|restricted) sets --vcluster-pod-security.
 # NETWORK_MODE (see above) sets --network-mode; LAB_MTU sets --lab-mtu.
-# TIER_RUNTIME_CLASSES (prototype, docs/kata-spike.md; e.g. B=kata-clh-runtime-rs) sets
-# --tier-runtime-classes (default with KIND_PROFILE=kata, see above).
+# SANDBOXES (docs/kata-spike.md; <tier>=<RuntimeClass>[:kubevirt|:fail], e.g.
+# B=kata-clh-runtime-rs) sets --sandboxes (default with KIND_PROFILE=kata, see above) and
+# mounts the optional ConfigMap lab-sandbox-preflight (--sandbox-preflight): SANDBOX_PREFLIGHT=<file>
+# applies one written by labctl preflight --sandbox-configmap <file>. TIER_RUNTIME_CLASSES is the
+# deprecated prototype flag (--tier-runtime-classes, fallback fail).
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 # Cluster-scoped RBAC and admission objects (and the Roles in kube-system) of a
 # separate instance carry its namespace as a suffix.
 SUF=""; [[ $NS != cloudtrain-system ]] && SUF="-$NS"
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" TRC="${TIER_RUNTIME_CLASSES:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
+    | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" TRC="${TIER_RUNTIME_CLASSES:-}" SBX="${SANDBOXES:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
         (select(.kind == "ClusterRole" or .kind == "Role" or .kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") | .metadata.name) += strenv(SUF) |
@@ -119,12 +128,18 @@ manifests() {
         (select(.kind == "Deployment" and strenv(PSS) != "") | .spec.template.spec.containers[0].args) += ["--vcluster-pod-security=" + strenv(PSS)] |
         (select(.kind == "Deployment" and strenv(NM) != "") | .spec.template.spec.containers[0].args) += ["--network-mode=" + strenv(NM)] |
         (select(.kind == "Deployment" and strenv(MTU) != "") | .spec.template.spec.containers[0].args) += ["--lab-mtu=" + strenv(MTU)] |
-        (select(.kind == "Deployment" and strenv(TRC) != "") | .spec.template.spec.containers[0].args) += ["--tier-runtime-classes=" + strenv(TRC)]' \
+        (select(.kind == "Deployment" and strenv(TRC) != "") | .spec.template.spec.containers[0].args) += ["--tier-runtime-classes=" + strenv(TRC)] |
+        (select(.kind == "Deployment" and strenv(SBX) != "") | .spec.template.spec.containers[0].args) += ["--sandboxes=" + strenv(SBX), "--sandbox-preflight=/etc/cloudtrain/sandbox-preflight/preflight.yaml"] |
+        (select(.kind == "Deployment" and strenv(SBX) != "") | .spec.template.spec.containers[0].volumeMounts) += [{"name": "sandbox-preflight", "mountPath": "/etc/cloudtrain/sandbox-preflight", "readOnly": true}] |
+        (select(.kind == "Deployment" and strenv(SBX) != "") | .spec.template.spec.volumes) += [{"name": "sandbox-preflight", "configMap": {"name": "lab-sandbox-preflight", "optional": true}}]' \
     | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
-log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}${TIER_RUNTIME_CLASSES:+, tier runtime classes $TIER_RUNTIME_CLASSES}"
+log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}${NETWORK_MODE:+, network mode $NETWORK_MODE}${TIER_RUNTIME_CLASSES:+, tier runtime classes $TIER_RUNTIME_CLASSES}${SANDBOXES:+, sandboxes $SANDBOXES}"
 k apply -f <(manifests) >/dev/null
 k -n "$NS" create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -o yaml | k apply -f - >/dev/null
+if [[ -n ${SANDBOX_PREFLIGHT:-} ]]; then # labctl preflight's verdict, whatever namespace it was written for
+  yq ".metadata.namespace = \"$NS\" | .metadata.name = \"lab-sandbox-preflight\"" "$SANDBOX_PREFLIGHT" | k apply -f - >/dev/null
+fi
 # A catalog change alone does not change the pod template: restart to reload it.
 k -n "$NS" rollout restart deploy/lab-orchestrator >/dev/null
 k -n "$NS" rollout status deploy/lab-orchestrator --timeout=180s

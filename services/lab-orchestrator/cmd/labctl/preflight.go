@@ -102,8 +102,11 @@ type preflightOpts struct {
 	modulesFile string
 	mtu         int
 	timeout     time.Duration
-	// tiers is the manager's --tier-runtime-classes (sandbox section).
-	tiers map[string]string
+	// sandboxesConfig, sandboxes and tierRC are the manager's sandbox
+	// configuration (--sandboxes-config, --sandboxes, the deprecated
+	// --tier-runtime-classes); tiers is it resolved (sandbox section).
+	sandboxesConfig, sandboxes, tierRC string
+	tiers                              map[string]drivers.SandboxTier
 	// systemdImage, with probe: a tier-B systemd image to boot in each sandbox.
 	systemdImage string
 }
@@ -119,14 +122,21 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 	repoRoot := fl.String("repo-root", "", "repository root, for deploy/scripts/lab-kernel-modules.txt (default: found from the working directory)")
 	mtu := fl.Int("lab-mtu", network.DefaultLinkMTU, "the orchestrator's --lab-mtu (the segment MTU the probe sets and expects)")
 	timeout := fl.Duration("timeout", 5*time.Minute, "probe timeout")
-	tierRC := fl.String("tier-runtime-classes", "", "the orchestrator's --tier-runtime-classes to check (e.g. B=kata-clh-runtime-rs); empty: report the Kata RuntimeClasses only")
+	sandboxes := fl.String("sandboxes", "", "the orchestrator's --sandboxes to check (e.g. B=kata-clh-runtime-rs); empty and no --sandboxes-config: report the Kata RuntimeClasses only")
+	sandboxesConfig := fl.String("sandboxes-config", "", "the orchestrator's sandbox config to check: a SandboxConfig or ConfigMap file, or configmap:<namespace>/<name> (Helm: configmap:<ns>/<release>-orchestrator-sandboxes); --sandboxes overrides its tiers")
+	tierRC := fl.String("tier-runtime-classes", "", "deprecated: the prototype's --tier-runtime-classes (= --sandboxes with fallback fail)")
+	sbCM := fl.String("sandbox-configmap", "", "write the sandbox verdict per tier as the ConfigMap the orchestrator reads (--sandbox-preflight) to this file (- = stdout; the report then goes to stderr); apply it with kubectl apply -f")
+	sbCMName := fl.String("sandbox-configmap-name", "cloudtrain-system/"+sandboxPreflightDefault, "<namespace>/<name> of that ConfigMap (Helm: <release namespace>/<orchestrator.sandboxPreflightConfigMap>)")
 	systemdImage := fl.String("systemd-image", "", "with --probe: a tier-B systemd image (e.g. cloudtrain/deb-sys:24.04, on the nodes) to boot in each sandbox RuntimeClass and exec into")
 	asJSON := fl.Bool("json", false, "print the report as JSON")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
-	tiers, err := drivers.ParseTierRuntimeClasses(*tierRC)
-	if err != nil {
+	if _, err := drivers.ParseSandboxFlag(*sandboxes); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if _, err := drivers.ParseTierRuntimeClasses(*tierRC); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
@@ -146,13 +156,23 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	o := preflightOpts{mode: *mode, probe: *probe, toolsImage: *toolsImage, mtu: *mtu, timeout: *timeout,
-		modulesFile: filepath.Join(root, "deploy", "scripts", "lab-kernel-modules.txt"), tiers: tiers, systemdImage: *systemdImage}
+		modulesFile: filepath.Join(root, "deploy", "scripts", "lab-kernel-modules.txt"), systemdImage: *systemdImage,
+		sandboxesConfig: *sandboxesConfig, sandboxes: *sandboxes, tierRC: *tierRC}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+2*time.Minute)
 	defer cancel()
-	rep, err := runNetworkPreflight(ctx, cfg, o, stderr)
+	rep, sbVerdict, err := runNetworkPreflight(ctx, cfg, o, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
+	}
+	if *sbCM != "" {
+		if err := writeSandboxConfigMap(sbVerdict, *sbCMName, *sbCM, stdout); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		if *sbCM == "-" {
+			stdout = stderr
+		}
 	}
 	if *asJSON {
 		enc := json.NewEncoder(stdout)
@@ -199,25 +219,28 @@ func (c *pfCluster) served(gv, resource string) bool {
 	return false
 }
 
-func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts, logOut io.Writer) (*pfReport, error) {
+func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts, logOut io.Writer) (*pfReport, *drivers.SandboxPreflight, error) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := labsv1.AddToScheme(scheme); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	c, err := client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	disc, err := discovery.NewDiscoveryClientForConfig(cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cl, err := readCluster(ctx, c, disc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if o.tiers, err = loadSandboxTiers(ctx, c, o.sandboxesConfig, o.sandboxes, o.tierRC); err != nil {
+		return nil, nil, err
 	}
 	rep := &pfReport{Section: "network, sandbox"}
 	mode := evaluateNetwork(cl, o.mode, rep)
@@ -225,19 +248,19 @@ func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts,
 	var ex drivers.PodExecutor
 	if o.probe {
 		if ex, err = drivers.NewRESTPodExecutor(cfg); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		p := &netProbe{c: c, ex: ex, o: o, mode: mode, log: logOut}
 		p.run(ctx, cl, rep)
 	} else {
 		rep.add("probe", pfWarn, "not run: MTU, 1400-byte frames, isolation and kernel modules unchecked", "re-run with --probe")
 	}
-	runSandboxPreflight(ctx, c, ex, o, cl.Nodes, rep, func(format string, args ...any) {
+	verdict := runSandboxPreflight(ctx, c, ex, o, mode, cl.Nodes, rep, func(format string, args ...any) {
 		if logOut != nil {
 			fmt.Fprintf(logOut, "preflight: "+format+"\n", args...)
 		}
 	})
-	return rep, nil
+	return rep, verdict, nil
 }
 
 func readCluster(ctx context.Context, c client.Client, disc discovery.DiscoveryInterface) (*pfCluster, error) {

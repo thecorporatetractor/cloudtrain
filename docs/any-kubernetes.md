@@ -92,7 +92,7 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 | `services/lab-orchestrator/internal/network/pod.go:122-131` | wired pods: `hostUsers: false` plus `procMount: Unmasked` (needs the `ProcMountType` feature, beta; off on some managed versions) or else a **privileged** `net-init` | P |
 | `services/lab-orchestrator/internal/drivers/netdev.go:66-69` | FRR containers add `SYS_ADMIN` | P |
 | session namespace `cloudtrain-sessions` (`Taskfile.yml:198`, `services/gateway/src/config.ts:130`) created without Pod Security labels; kind enforces nothing | privileged init containers are rejected where a cluster enforces `baseline` by default (AKS deployment safeguards, GKE Autopilot, policy add-ons) | P |
-| `services/lab-orchestrator/internal/drivers/container.go:68-69,203-205` | `--runtime-class` for Kata is a free string; no check that the RuntimeClass exists or that its handler supports userns | P |
+| `services/lab-orchestrator/internal/drivers/container.go:68-69,203-205` | `--runtime-class` for Kata is a free string; no check that the RuntimeClass exists or that its handler supports userns. The per-tier `--sandboxes` (`internal/drivers/sandbox.go`, section 11) do check: RuntimeClass, VM handler, schedulable nodes, preflight verdict | P |
 
 ### 1.5 Kernel modules
 
@@ -397,7 +397,7 @@ fail with the fix:
 | CIDR overlap | node, pod and service CIDRs vs `192.168.99.0/24`, `192.168.100.0/24`, `198.18.0.0/15` |
 | StorageClass | default class, configured classes exist, volume mode, snapshot class, CDI StorageProfile complete (from the storage branch) |
 | User namespaces | `runtimeHandlers[].features.userNamespaces` on lab nodes (the existing `DetectUserNamespaces`), `ProcMountType` usable (dry-run pod) |
-| RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes. **Sandbox section implemented** (`labctl preflight --tier-runtime-classes B=<rc> [--probe] [--systemd-image <img>]`, section 11): Kata RuntimeClasses, the manager's tier map, and with `--probe` a pod per sandbox that must boot its own kernel with the lab features (dummy, GRE, bond, VLAN, WireGuard, netem, md), a guest sized to the pod limit, and a systemd image that boots and accepts `kubectl exec` |
+| RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes. **Sandbox section implemented** (`labctl preflight --sandboxes B=<rc>` or `--sandboxes-config configmap:<ns>/<name>` `[--probe] [--systemd-image <img>] [--sandbox-configmap <file>]`, section 11): Kata RuntimeClasses, the manager's sandbox check per tier, and with `--probe` a pod per sandbox that must boot its own kernel with the lab features (dummy, GRE, bond, VLAN, WireGuard, netem, md), a guest sized to the pod limit, a lab link between a runc pod and a sandboxed pod (MTU, 1400-byte frames with DF both ways, eth0), and a systemd image that boots and accepts `kubectl exec`. `--sandbox-configmap` writes the verdict as the ConfigMap the manager reads |
 | Pod Security / admission | session namespace accepts a privileged `net-init` (server-side dry-run), no policy engine rejects it |
 | Registry | every catalog image resolvable from a node (dry-run pull Job) |
 | Versions | Kubernetes minor within the KubeVirt/CDI support range |
@@ -642,7 +642,7 @@ be Calico-specific.
 Kube-OVN primary plus Kata Containers for tier-B sandboxes
 ([kata-spike.md](kata-spike.md), section 10; [dev-environment.md](dev-environment.md),
 "Cluster profiles"). It is opt-in: the other profiles and the orchestrator's default
-(`--tier-runtime-classes` unset) do not change.
+(no `--sandboxes`) do not change.
 
 | Piece | What the profile does |
 |---|---|
@@ -650,9 +650,14 @@ Kube-OVN primary plus Kata Containers for tier-B sandboxes
 | kind nodes | `/dev/shm` remounted larger, `dbus` installed and started (runtime-rs needs it with the systemd cgroup driver); redone by every `dev:up` |
 | Runtime | kata-deploy `KATA_DEPLOY_VERSION` (chart sha256, image digest), Cloud Hypervisor on runtime-rs only, RuntimeClass `kata-clh-runtime-rs` |
 | Guest kernel | the CloudTrain lab guest kernel (`tools/images/kata-kernel`, published as `kata-lab-kernel:<release>`) through a `config.d` drop-in |
-| Orchestrator | `orchestrator-deploy.sh` adds `--tier-runtime-classes B=kata-clh-runtime-rs` (`TIER_RUNTIME_CLASSES=` turns it off) |
+| Orchestrator | `orchestrator-deploy.sh` adds `--sandboxes B=kata-clh-runtime-rs` (fallback kubevirt) and mounts the optional `lab-sandbox-preflight` ConfigMap (`SANDBOX_PREFLIGHT=<file>` applies one); `SANDBOXES=` turns it off |
 
-On managed clusters the same tier map points at the provider's RuntimeClass
-(AKS `kata-vm-isolation`, GKE `microvm`), whose guest kernel is not ours.
-`labctl preflight --tier-runtime-classes B=<rc> --probe` reports which lab
-kernel features that guest has; without Kata, tier B stays on KubeVirt.
+On managed clusters the same setting points at the provider's RuntimeClass
+(Helm `orchestrator.sandboxes.B.runtimeClass`: AKS `kata-vm-isolation`, GKE
+`microvm`), whose guest kernel is not ours. `labctl preflight --sandboxes B=<rc>
+--probe --sandbox-configmap <file>` reports which lab kernel features that guest
+has and hands the verdict to the manager: a tier that fails falls back to KubeVirt
+per cluster, and a non-Kata handler the probe proves a VM (GKE `microvm`) is
+trusted. Without Kata, tier B stays on KubeVirt: with `orchestrator.sandboxes` set
+the manager rewrites tier-B pod nodes to their catalog `vmFallback` VM, without it
+nothing changes ([deploy.md](deploy.md#tier-sandboxes-kata)).

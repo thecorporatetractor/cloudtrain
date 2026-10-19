@@ -179,6 +179,26 @@ data:
   {{ printf "30-%s" $file }}: |
     {{- $body | nindent 4 }}
   {{- end }}
+{{- if and $o.sandboxes $o.tierRuntimeClasses }}
+{{- fail "orchestrator.sandboxes and the deprecated orchestrator.tierRuntimeClasses are exclusive" }}
+{{- end }}
+{{- with $o.sandboxes }}
+---
+# Tier sandboxes (--sandboxes-config): docs/kata-spike.md, values.yaml orchestrator.sandboxes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-sandboxes
+  labels:
+    {{- include "ct.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+data:
+  sandboxes.yaml: |
+    apiVersion: labs.cloudtrain.dev/v1alpha1
+    kind: SandboxConfig
+    tiers:
+      {{- toYaml . | nindent 6 }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -200,6 +220,9 @@ spec:
         app.kubernetes.io/component: orchestrator
       annotations:
         checksum/catalog: {{ toJson $o.catalog | cat (.Files.Get "files/catalog.yaml") | sha256sum | trunc 16 }}
+        {{- with $o.sandboxes }}
+        checksum/sandboxes: {{ toJson . | sha256sum | trunc 16 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ $name }}
       {{- include "ct.pullSecrets" . | nindent 6 }}
@@ -237,6 +260,10 @@ spec:
             {{- with $o.runtimeClass }}
             - --runtime-class={{ . }}
             {{- end }}
+            {{- if $o.sandboxes }}
+            - --sandboxes-config=/etc/cloudtrain/sandboxes/sandboxes.yaml
+            - --sandbox-preflight=/etc/cloudtrain/sandbox-preflight/preflight.yaml
+            {{- end }}
             {{- with $o.tierRuntimeClasses }}
             - --tier-runtime-classes={{ range $i, $t := keys . | sortAlpha }}{{ if $i }},{{ end }}{{ $t }}={{ get $o.tierRuntimeClasses $t }}{{ end }}
             {{- end }}
@@ -265,9 +292,20 @@ spec:
           volumeMounts:
             - {name: catalog, mountPath: /etc/cloudtrain/catalog, readOnly: true}
             - {name: tmp, mountPath: /tmp}
+            {{- if $o.sandboxes }}
+            - {name: sandboxes, mountPath: /etc/cloudtrain/sandboxes, readOnly: true}
+            - {name: sandbox-preflight, mountPath: /etc/cloudtrain/sandbox-preflight, readOnly: true}
+            {{- end }}
       volumes:
         - name: catalog
           configMap: {name: {{ $name }}-catalog}
+        {{- if $o.sandboxes }}
+        - name: sandboxes
+          configMap: {name: {{ $name }}-sandboxes}
+        # Written by labctl preflight --sandbox-configmap; optional.
+        - name: sandbox-preflight
+          configMap: {name: {{ $o.sandboxPreflightConfigMap }}, optional: true}
+        {{- end }}
         - name: tmp
           emptyDir: {}
       {{- with $o.nodeSelector }}

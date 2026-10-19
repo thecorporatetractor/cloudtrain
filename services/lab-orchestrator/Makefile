@@ -12,7 +12,7 @@ CURRICULUM_SRC := ../../packages/lab-schema/schema/curriculum.schema.json
 CURRICULUM_DST := internal/labschema/curriculum.schema.json
 BIN            := bin
 
-.PHONY: all generate schema deepcopy manifests fmt vet test test-rbac build labctl manager samples clean controller-gen
+.PHONY: all generate schema deepcopy manifests fmt vet test test-envtest test-rbac build labctl manager samples clean controller-gen
 
 all: generate build test
 
@@ -47,13 +47,18 @@ vet:
 test: vet
 	go test ./...
 
-## test-rbac: the RBAC envtest (real API server: RBAC authorizer and the admission
-## policy; downloads the envtest binaries into $(LOCALBIN)/envtest)
+## test-envtest: every envtest (real API server): the RBAC authorizer and admission
+## policy (internal/rbac), the tier sandbox rules with RuntimeClass admission
+## (internal/drivers). Downloads the envtest binaries into $(LOCALBIN)/envtest.
+## test-rbac: the RBAC one only.
 ENVTEST_K8S_VERSION    ?= 1.36.0
 SETUP_ENVTEST_VERSION  ?= release-0.25
+ENVTEST_ASSETS = $$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/envtest -p path)
+test-envtest:
+	KUBEBUILDER_ASSETS="$(ENVTEST_ASSETS)" go test ./internal/rbac/ ./internal/drivers/ -run 'Envtest' -count=1 -v
+
 test-rbac:
-	KUBEBUILDER_ASSETS="$$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/envtest -p path)" \
-		go test ./internal/rbac/ -run 'Envtest' -count=1 -v
+	KUBEBUILDER_ASSETS="$(ENVTEST_ASSETS)" go test ./internal/rbac/ -run 'Envtest' -count=1 -v
 
 ## build: binaries into bin/
 build: labctl manager

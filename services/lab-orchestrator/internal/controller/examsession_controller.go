@@ -747,7 +747,7 @@ func (r *ExamSessionReconciler) executor(ctx context.Context, ls *labsv1.LabSess
 	if err != nil {
 		return nil, err
 	}
-	return &NodeExecutor{Drivers: r.Drivers, Session: ls, Template: spec}, nil
+	return &NodeExecutor{Drivers: r.Drivers, Session: ls, Template: EffectiveTemplate(spec, ls)}, nil
 }
 
 // rerun runs each task's exam.rerun actions once (results persisted per
