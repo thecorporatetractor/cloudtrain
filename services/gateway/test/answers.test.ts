@@ -38,7 +38,9 @@ describe('AnswerService (memory store)', () => {
     expect(q(v, 'q-attacker-ip')).toMatchObject({ points: 100, penalty: 10, maxAttempts: 5, attemptsLeft: 5, available: 100, input: 'text', placeholder: '192.0.2.1', hintCost: 0 });
     expect(q(v, 'q-failed-count').input).toBe('number');
     expect(q(v, 'q-failed-count').prompt).toBe('');
-    const json = JSON.stringify(v);
+    // sessionId is random hex (e.g. "aab484" contains "48"), so exclude it from the substring scan.
+    expect(v.sessionId).toBe(id);
+    const json = JSON.stringify({ ...v, sessionId: undefined });
     for (const secret of ['203.0.113.77', '48', 'cato', 'refunds', 'python-requests']) expect(json).not.toContain(secret);
   });
 
