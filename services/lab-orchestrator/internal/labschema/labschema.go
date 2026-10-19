@@ -10,6 +10,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -39,7 +40,7 @@ func Default() (*jsonschema.Schema, error) {
 // FromFile compiles a schema from a path on disk (e.g. a newer checkout of
 // packages/lab-schema), bypassing the embedded copy.
 func FromFile(path string) (*jsonschema.Schema, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}

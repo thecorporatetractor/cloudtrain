@@ -1,0 +1,135 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-flatpak-remote
+  title: Add a Flatpak remote and install an app
+  domain: linux
+  frameworks: [rhcsa-aligned:software]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, flatpak, software]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    A local Flatpak repository is published at **`file:///srv/xel-flatpak/repo`**. It is not
+    GPG signed and carries no runtime.
+
+    Add it as a **system-wide** remote named **`{{rname}}`** and install the application
+    **`org.tallowmere.Gate{{n}}`** from it, system-wide, without dependencies.
+  objectives:
+    - Add a Flatpak remote and install an application from it
+  params:
+    rname:
+      type: choice
+      values: [tallowmere-apps, depot-apps]
+    n:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        if ! rpm -q flatpak >/dev/null 2>&1; then
+          dnf -y -q install flatpak ostree >/dev/null 2>&1 || { echo "BLOCKED: flatpak is not in the el10 mirror (image gap)" | tee /var/lib/cloudtrain/xel-flatpak-missing; exit 0; }
+        fi
+        APP=org.tallowmere.Gate{{n}}; REPO=/srv/xel-flatpak/repo
+        flatpak --system remote-delete --force {{rname}} 2>/dev/null || true
+        flatpak --system uninstall -y --noninteractive $APP >/dev/null 2>&1 || true
+        rm -rf /srv/xel-flatpak; mkdir -p $REPO
+        ostree init --repo=$REPO --mode=archive-z2
+        d=$(mktemp -d)
+        flatpak build-init "$d" $APP org.tallowmere.Sdk org.tallowmere.Platform 1 >/dev/null
+        mkdir -p "$d/files/bin"
+        printf '#!/bin/sh\necho gate {{n}}\n' > "$d/files/bin/gate-viewer"
+        chmod 0755 "$d/files/bin/gate-viewer"
+        flatpak build-finish "$d" --command=gate-viewer >/dev/null
+        flatpak build-export $REPO "$d" stable >/dev/null
+        flatpak build-update-repo $REPO >/dev/null
+        rm -rf "$d"
+        chmod -R a+rX /srv/xel-flatpak
+  checks:
+    - id: remote
+      description: The system remote {{rname}} points at the repository
+      type: shell
+      on: tr-el-01
+      skills: [linux.packages.flatpak]
+      weight: 1.5
+      command: |
+        flatpak remotes --system --columns=name,url 2>/dev/null | awk '$1 == "{{rname}}" {print $2}'
+      expect: {match: exact, value: "file:///srv/xel-flatpak/repo"}
+    - id: installed
+      description: org.tallowmere.Gate{{n}} is installed system-wide from {{rname}}
+      type: shell
+      on: tr-el-01
+      skills: [linux.packages.flatpak]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        flatpak list --system --app --columns=application,origin 2>/dev/null | awk '$1 == "org.tallowmere.Gate{{n}}" {print $2}'
+      expect: {match: exact, value: "{{rname}}"}
+  misconceptions:
+    - id: user-scope
+      description: Adds the remote and installs the app for the user only.
+      feedback: "Without --system the remote and the app live in the per-user installation."
+      expectFail: [remote, installed]
+      mutation:
+        on: tr-el-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          flatpak --user remote-add --no-gpg-verify {{rname}} file:///srv/xel-flatpak/repo
+          flatpak --user install -y --noninteractive --no-deps {{rname}} org.tallowmere.Gate{{n}}
+    - id: wrong-name
+      description: Names the remote differently from the task.
+      feedback: "The remote must be named exactly as asked."
+      expectFail: [remote, installed]
+      mutation:
+        on: tr-el-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          sudo flatpak remote-add --system --no-gpg-verify gates-local file:///srv/xel-flatpak/repo
+          sudo flatpak install --system -y --noninteractive --no-deps gates-local org.tallowmere.Gate{{n}}
+  solution:
+    explanation: flatpak remote-add --system --no-gpg-verify NAME URL, then flatpak install --system --no-deps NAME APPID. BLOCKED when the el10 mirror lacks flatpak.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo flatpak remote-add --system --no-gpg-verify {{rname}} file:///srv/xel-flatpak/repo
+          sudo flatpak install --system -y --noninteractive --no-deps {{rname}} org.tallowmere.Gate{{n}}
+    alternatives:
+      - id: if-not-exists
+        description: Use --if-not-exists and the --assumeyes long option.
+        steps:
+          - on: tr-el-01
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo flatpak remote-add --system --if-not-exists --no-gpg-verify {{rname}} file:///srv/xel-flatpak/repo
+              sudo flatpak install --system --assumeyes --noninteractive --no-deps {{rname}} org.tallowmere.Gate{{n}}

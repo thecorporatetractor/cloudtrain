@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: openscap-scan-remediate
+  title: Scan the ticket server against a baseline and remediate the failures
+  domain: linux
+  frameworks:
+  - linuxplus:security
+  difficulty: hard
+  estimatedMinutes: 35
+  tags:
+  - security
+  - compliance
+  - openscap
+  - scap
+  - hardening
+  version: 1
+spec:
+  description: |
+    The ticket server **`tr-scap-01`** (`ssh tr-scap-01`; you have `sudo`) must meet the Tallowmere baseline
+    profile `xccdf_tr_profile_lite`, a CIS-style subset in **`/root/tr-tailoring.xml`** (tailoring of the
+    distribution's SCAP Security Guide data stream; its path is in `/var/lib/cloudtrain/ds.path`).
+
+    1. Scan with `oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite ...`
+       and list the failing rules; there are **five** in the SSH daemon and audit sections.
+    2. Fix the host configuration (not the profile!) so that every rule passes, keeping `sshd` running.
+    3. Rescan and write the HTML report to **`/home/learner/answers/after.html`**.
+  objectives:
+  - Run an OpenSCAP evaluation with a tailoring file
+  - Remediate failing rules by hand and prove it with a rescan
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-scap-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-scap-01
+    timeoutSec: 600
+    run: |
+      set -eu
+      V=/var/lib/cloudtrain; install -d -m 0700 $V
+      install -d -o learner -g learner /home/learner/answers; rm -f /home/learner/answers/after.html
+      dnf -y -q install openscap-scanner scap-security-guide audit openssh-server >/dev/null 2>&1 || true
+      command -v oscap >/dev/null || { echo "openscap-scanner is not installed (image gap)" >&2; exit 1; }
+      ds=$(ls /usr/share/xml/scap/ssg/content/ssg-*10-ds.xml 2>/dev/null | head -1)
+      [ -n "$ds" ] || { echo "scap-security-guide data stream for EL10 missing (image gap)" >&2; exit 1; }
+      echo "$ds" > $V/ds.path
+      R=xccdf_org.ssgproject.content_rule
+      cat > /root/tr-tailoring.xml <<EOX
+      <?xml version="1.0" encoding="UTF-8"?>
+      <xccdf:Tailoring xmlns:xccdf="http://checklists.nist.gov/xccdf/1.2" id="xccdf_tr_tailoring_baseline">
+        <xccdf:benchmark href="$ds"/>
+        <xccdf:version time="2026-10-01T00:00:00">1</xccdf:version>
+        <xccdf:Profile id="xccdf_tr_profile_lite">
+          <xccdf:title>Tallowmere CIS-style baseline (lite)</xccdf:title>
+          <xccdf:description>SSH daemon and audit rules for the ticket server.</xccdf:description>
+          <xccdf:select idref="${R}_sshd_disable_root_login" selected="true"/>
+          <xccdf:select idref="${R}_sshd_disable_empty_passwords" selected="true"/>
+          <xccdf:select idref="${R}_sshd_set_max_auth_tries" selected="true"/>
+          <xccdf:select idref="${R}_sshd_disable_x11_forwarding" selected="true"/>
+          <xccdf:select idref="${R}_service_auditd_enabled" selected="true"/>
+          <xccdf:select idref="${R}_package_audit_installed" selected="true"/>
+        </xccdf:Profile>
+      </xccdf:Tailoring>
+      EOX
+      sha256sum /root/tr-tailoring.xml > $V/tailoring.sha
+      sed -i -E '/^[#[:space:]]*(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config
+      printf 'PermitRootLogin yes\nPermitEmptyPasswords yes\nMaxAuthTries 10\nX11Forwarding yes\n' | cat - /etc/ssh/sshd_config > /tmp/sshd_new && cat /tmp/sshd_new > /etc/ssh/sshd_config && rm -f /tmp/sshd_new
+      rm -f /etc/ssh/sshd_config.d/*tr-*.conf
+      sshd -t && systemctl reload sshd >/dev/null 2>&1 || true
+      systemctl disable --now auditd >/dev/null 2>&1 || true
+  checks:
+  - id: scan-clean
+    description: The profile scan passes every rule
+    type: shell
+    'on': tr-scap-01
+    skills: &id001
+    - linux.security.compliance-scan
+    weight: 4
+    timeoutSec: 240
+    command: |
+      ds=$(cat /var/lib/cloudtrain/ds.path)
+      oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --results /tmp/tr-grade.xml $ds >/tmp/tr-grade.txt 2>&1
+      f=$(grep -c '^Result.*fail' /tmp/tr-grade.txt); p=$(grep -c '^Result.*pass' /tmp/tr-grade.txt)
+      echo "fail=$f pass=$p"
+    expect:
+      match: exact
+      value: fail=0 pass=6
+  - id: tailoring-intact
+    description: The profile was not edited
+    type: shell
+    'on': tr-scap-01
+    skills: *id001
+    weight: 2
+    command: |
+      sha256sum -c /var/lib/cloudtrain/tailoring.sha >/dev/null 2>&1 && echo intact || echo edited
+    expect:
+      match: exact
+      value: intact
+  - id: services-ok
+    description: sshd is valid and running and auditd is active
+    type: shell
+    'on': tr-scap-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      sshd -t 2>/dev/null && systemctl is-active sshd >/dev/null && systemctl is-active auditd >/dev/null && echo ok || echo broken
+    expect:
+      match: exact
+      value: ok
+  - id: report
+    description: The rescan report exists and shows passing results
+    type: shell
+    'on': tr-scap-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      f=/home/learner/answers/after.html; [ -s $f ] && grep -qi "xccdf" $f && ! grep -q "result-fail\|>fail<" $f && echo ok || echo missing-or-failing
+    expect:
+      match: exact
+      value: ok
+  hints:
+  - title: Which rules
+    body: oscap prints "Title / Rule / Result" blocks; filter with grep -B3 "^Result.*fail".
+    cost: 0
+  - title: sshd precedence
+    body: sshd uses the first value it reads for a keyword, so edit or remove the old lines instead of
+      appending a second one.
+    cost: 1
+  misconceptions:
+  - id: profile-edit
+    description: Removes the failing rules from the profile instead of fixing the host.
+    feedback: The profile is the standard; remediate the host configuration.
+    expectFail:
+    - scan-clean
+    - tailoring-intact
+    - services-ok
+    mutation:
+      'on': tr-scap-01
+      as: learner
+      timeoutSec: 300
+      run: |
+        sudo sed -i '/sshd_disable_root_login\|sshd_disable_empty_passwords\|sshd_set_max_auth_tries\|sshd_disable_x11_forwarding\|service_auditd_enabled/d' /root/tr-tailoring.xml
+        sudo oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --results /tmp/tr-scan.xml --report /home/learner/answers/after.html $(sudo cat /var/lib/cloudtrain/ds.path) >/dev/null 2>&1 || true
+  - id: ssh-only
+    description: Fixes the SSH rules and forgets auditd.
+    feedback: 'The audit rules are part of the profile: enable and start auditd.'
+    expectFail:
+    - scan-clean
+    - services-ok
+    - report
+    mutation:
+      'on': tr-scap-01
+      as: learner
+      timeoutSec: 300
+      run: |
+        sudo sed -i -E '/^(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config
+        printf 'PermitRootLogin no\nPermitEmptyPasswords no\nMaxAuthTries 4\nX11Forwarding no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+        sudo sshd -t && sudo systemctl reload sshd
+        sudo oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --results /tmp/tr-scan.xml --report /home/learner/answers/after.html $(sudo cat /var/lib/cloudtrain/ds.path) >/dev/null 2>&1 || true
+  solution:
+    explanation: |
+      oscap lists the failing rules with their IDs. The four sshd rules need PermitRootLogin no, PermitEmptyPasswords no,
+      MaxAuthTries 4 (or lower) and X11Forwarding no in sshd_config (the first occurrence wins for sshd), and the audit rule needs
+      auditd enabled and running. A rescan with --report writes the HTML evidence.
+    steps:
+    - 'on': tr-scap-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --results /tmp/before.xml $(sudo cat /var/lib/cloudtrain/ds.path) | grep -B1 -A1 '^Result.*fail'
+        sudo sed -i -E '/^(PermitRootLogin|PermitEmptyPasswords|MaxAuthTries|X11Forwarding)[[:space:]]/d' /etc/ssh/sshd_config
+        printf 'PermitRootLogin no\nPermitEmptyPasswords no\nMaxAuthTries 4\nX11Forwarding no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+        sudo sshd -t && sudo systemctl reload sshd
+        sudo systemctl enable --now auditd
+        sudo oscap xccdf eval --tailoring-file /root/tr-tailoring.xml --profile xccdf_tr_profile_lite --report /home/learner/answers/after.html $(sudo cat /var/lib/cloudtrain/ds.path) | grep -c '^Result.*pass'

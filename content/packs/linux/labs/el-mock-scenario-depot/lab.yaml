@@ -1,0 +1,602 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: el-mock-scenario-depot
+  title: "Mixed review: stand up a depot server end to end"
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage, rhcsa-aligned:security, rhcsa-aligned:users-groups]
+  difficulty: hard
+  estimatedMinutes: 75
+  tags: [capstone, mixed-review, lvm, selinux, firewalld, reboot-graded]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail is opening a new depot. The fresh server **`tr-depot-01`**
+    (`ssh tr-depot-01`; you have `sudo`) must be configured in one session. It has three
+    unused data disks: **`/dev/vdc`** (2 GiB), **`/dev/vdd`** (1 GiB) and **`/dev/vde`**
+    (2 GiB). The task is graded on what persists: everything below must survive a reboot
+    (the grader checks the configuration, not only the live state, until a reboot step exists).
+
+    1. **Repository.** The offline package tree is at `/opt/cloudtrain/repo/el10` (BaseOS and
+       AppStream in one tree; the signing key is
+       `/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10`). Define one repository `depot-local` for it,
+       enabled, with signature checking on, and install **`httpd`** from it.
+    2. **Users.** Group **`depotops`** (GID 5200). User **`dep-ana`** (UID 5201, shell
+       `/bin/bash`) with `depotops` as a supplementary group. User **`dep-bram`** (UID 5202,
+       shell `/sbin/nologin`), no extra groups. Members of `depotops` may run exactly
+       `systemctl restart httpd` as root without a password through a validated
+       `/etc/sudoers.d/depotops`, and nothing else.
+    3. **LVM.** Volume group **`{{vg}}`** on **whole disks `/dev/vdc` and `/dev/vdd`**; in it
+       logical volume **`lv_web`** of **400 MiB** with XFS mounted at **`/srv/depot-web`**, and
+       **`lv_data`** of **200 MiB** with ext4 mounted at **`/srv/depot-data`**. Both mounted now
+       and at boot by an `/etc/fstab` entry that does not depend on raw device names.
+    4. **Swap.** A **512 MiB** swap partition on `/dev/vde`, active now and in `/etc/fstab`.
+    5. **Shared directory.** `/srv/depot-data` owned by `root:depotops`, mode `2770`.
+    6. **Web service.** `httpd` listens on **TCP port {{port}}** and serves
+       `/srv/depot-web`. The page `index.html` there must contain `depot {{token}}`. The
+       service is enabled and running; the grader fetches the page from the workstation.
+    7. **Firewall.** Open TCP {{port}} in firewalld, permanently and now.
+    8. **SELinux** stays **enforcing**. Label port {{port}} `http_port_t` and the content
+       under `/srv/depot-web` `httpd_sys_content_t` in a way that survives a relabel. No
+       permissive domains.
+
+    Take your time: this is a 75 minute review. Hints cost points.
+  objectives:
+    - Combine repositories, users and sudo, LVM, swap, a service, firewalld and SELinux on one host
+    - Verify persistence from configuration instead of trusting the live state
+  params:
+    vg:
+      type: choice
+      values: [vg_depot, vg_yard]
+    port:
+      type: choice
+      values: ["8725", "8735"]
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-depot-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-depot-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data3)" = /dev/vde ]
+        mkdir -p /root/repos.disabled
+        for f in /etc/yum.repos.d/*.repo; do [ -e "$f" ] && mv "$f" /root/repos.disabled/; done
+        dnf clean all >/dev/null 2>&1 || true
+        systemctl disable --now httpd >/dev/null 2>&1 || true
+        rpm -q httpd >/dev/null 2>&1 && rpm -e --nodeps httpd >/dev/null 2>&1 || true
+        swapoff -a 2>/dev/null || true
+        for d in /dev/vdc /dev/vdd /dev/vde; do wipefs -a $d >/dev/null 2>&1 || true; done
+        systemctl enable --now firewalld >/dev/null 2>&1 || true
+        setenforce 1; sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+        [ -d /opt/cloudtrain/repo/el10/repodata ]
+  checks:
+    - id: repo
+      description: Repository depot-local is enabled with GPG checking and httpd is installed
+      type: shell
+      on: tr-depot-01
+      skills: [linux.packages.repositories]
+      weight: 1.5
+      command: |
+        python3 - <<'PY'
+        import configparser, glob, subprocess
+        def t(v): return str(v).strip().lower() in ("1", "yes", "true", "on")
+        ok = False
+        for f in glob.glob("/etc/yum.repos.d/*.repo"):
+            c = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                c.read(f)
+            except Exception:
+                continue
+            for s in c.sections():
+                urls = [u.rstrip("/") for u in c.get(s, "baseurl", fallback="").split()]
+                if "file:///opt/cloudtrain/repo/el10" in urls and t(c.get(s, "enabled", fallback="1")) and t(c.get(s, "gpgcheck", fallback="0")) and c.get(s, "gpgkey", fallback="").strip():
+                    ok = True
+        r = subprocess.run(["rpm", "-q", "httpd"], capture_output=True).returncode == 0
+        print("repo-ok httpd-ok" if ok and r else "repo=%s httpd=%s" % (ok, r))
+        PY
+      expect: {match: exact, value: "repo-ok httpd-ok"}
+    - id: users
+      description: Group depotops and the two users exist as specified
+      type: shell
+      on: tr-depot-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        g=$(getent group depotops | cut -d: -f3)
+        a=$(getent passwd dep-ana | cut -d: -f3,7)
+        b=$(getent passwd dep-bram | cut -d: -f3,7)
+        m=$(id -nG dep-ana 2>/dev/null | tr ' ' '\n' | grep -cx depotops || true)
+        n=$(id -nG dep-bram 2>/dev/null | tr ' ' '\n' | grep -cx depotops || true)
+        echo "gid=$g ana=$a bram=$b ana-in=$m bram-in=$n"
+      expect: {match: exact, value: "gid=5200 ana=5201:/bin/bash bram=5202:/sbin/nologin ana-in=1 bram-in=0"}
+    - id: sudo
+      description: depotops may run only systemctl restart httpd without a password, and sudoers is valid
+      type: shell
+      on: tr-depot-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        visudo -c >/dev/null 2>&1 || { echo invalid; exit 0; }
+        l=$(sudo -l -U dep-ana 2>/dev/null)
+        a=$(echo "$l" | grep -c 'NOPASSWD: /usr/bin/systemctl restart httpd' || true)
+        w=$(echo "$l" | grep -cE 'NOPASSWD: ALL|\(ALL(:ALL)?\) ALL' || true)
+        echo "restart=$a wide=$w"
+      expect: {match: exact, value: "restart=1 wide=0"}
+    - id: lvm
+      description: "{{vg}} sits on /dev/vdc and /dev/vdd with lv_web 400 MiB (XFS) and lv_data 200 MiB (ext4)"
+      type: shell
+      on: tr-depot-01
+      skills: [linux.storage.lvm]
+      weight: 3
+      command: |
+        p=$(pvs --noheadings -o pv_name -S vg_name={{vg}} 2>/dev/null | tr -d ' ' | sort | paste -sd,)
+        w=$(lvs --noheadings --units m --nosuffix -o lv_size {{vg}}/lv_web 2>/dev/null | tr -d ' ' | cut -d. -f1)
+        d=$(lvs --noheadings --units m --nosuffix -o lv_size {{vg}}/lv_data 2>/dev/null | tr -d ' ' | cut -d. -f1)
+        fw=$(blkid -s TYPE -o value /dev/{{vg}}/lv_web 2>/dev/null); fd=$(blkid -s TYPE -o value /dev/{{vg}}/lv_data 2>/dev/null)
+        echo "pvs=$p web=$w:$fw data=$d:$fd"
+      expect: {match: exact, value: "pvs=/dev/vdc,/dev/vdd web=400:xfs data=200:ext4"}
+    - id: mounted
+      description: The logical volumes are mounted now at the right places
+      type: shell
+      on: tr-depot-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        w=$(findmnt -n -o SOURCE,FSTYPE /srv/depot-web 2>/dev/null | awk '{print $2}'); d=$(findmnt -n -o SOURCE,FSTYPE /srv/depot-data 2>/dev/null | awk '{print $2}')
+        sw=$(readlink -f "$(findmnt -n -o SOURCE /srv/depot-web 2>/dev/null)"); sd=$(readlink -f "$(findmnt -n -o SOURCE /srv/depot-data 2>/dev/null)")
+        [ "$sw" = "$(readlink -f /dev/{{vg}}/lv_web)" ] && [ "$sd" = "$(readlink -f /dev/{{vg}}/lv_data)" ] && echo "web=$w data=$d" || echo "wrong-sources"
+      expect: {match: exact, value: "web=xfs data=ext4"}
+    - id: fstab
+      description: fstab mounts both volumes by UUID or mapper name, and the file verifies
+      type: shell
+      on: tr-depot-01
+      skills: [linux.storage.mounts]
+      weight: 2
+      command: |
+        r=""
+        for pair in "/srv/depot-web:lv_web" "/srv/depot-data:lv_data"; do
+          mp=${pair%%:*}; lv=${pair##*:}
+          src=$(findmnt --fstab -n -o SOURCE "$mp" 2>/dev/null)
+          dev=$(findmnt --fstab --evaluate -n -o SOURCE "$mp" 2>/dev/null)
+          case "$src" in /dev/vd*) r="$r $lv=raw-device"; continue;; esac
+          [ -n "$dev" ] && [ "$(readlink -f "$dev")" = "$(readlink -f /dev/{{vg}}/$lv)" ] && r="$r $lv=ok" || r="$r $lv=missing"
+        done
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1 && v=verify-ok || v=verify-errors
+        echo "${r# } $v"
+      expect: {match: exact, value: "lv_web=ok lv_data=ok verify-ok"}
+    - id: swap
+      description: A 512 MiB swap partition on /dev/vde is active and in fstab
+      type: shell
+      on: tr-depot-01
+      skills: [linux.storage.mounts]
+      weight: 2
+      command: |
+        a=$(swapon --noheadings --raw --bytes --show=NAME,SIZE 2>/dev/null | awk '$1 == "/dev/vde1" && $2 > 480*1048576 && $2 < 540*1048576 {print "active"}')
+        src=$(awk '!/^[[:space:]]*#/ && $3 == "swap" {print $1}' /etc/fstab | head -1)
+        dev=$(findmnt --fstab --evaluate -n -o SOURCE -t swap 2>/dev/null | head -1)
+        [ -n "$dev" ] && [ "$(readlink -f "$dev")" = /dev/vde1 ] && p=fstab || p=no-fstab
+        echo "${a:-inactive} $p"
+      expect: {match: exact, value: "active fstab"}
+    - id: perms
+      description: /srv/depot-data is root:depotops with mode 2770
+      type: shell
+      on: tr-depot-01
+      skills: [linux.users.accounts]
+      weight: 1
+      command: stat -c '%U:%G %a' /srv/depot-data 2>/dev/null || echo missing
+      expect: {match: exact, value: "root:depotops 2770"}
+    - id: service
+      description: httpd is enabled and running, listening on {{port}} from its configuration
+      type: shell
+      on: tr-depot-01
+      skills: [linux.net.firewalld]
+      weight: 1.5
+      command: |
+        c=$(grep -rhE '^[[:space:]]*Listen[[:space:]]+(.*:)?{{port}}([[:space:]]|$)' /etc/httpd/conf /etc/httpd/conf.d 2>/dev/null | wc -l)
+        l=$(ss -ltn 2>/dev/null | awk '$4 ~ /:{{port}}$/' | wc -l)
+        [ "$c" -ge 1 ] && cfg=conf || cfg=noconf
+        [ "$l" -ge 1 ] && lis=listening || lis=silent
+        echo "$(systemctl is-enabled httpd 2>/dev/null) $(systemctl is-active httpd 2>/dev/null) $cfg $lis"
+      expect: {match: exact, value: "enabled active conf listening"}
+    - id: page
+      description: The workstation fetches the page with depot {{token}} from port {{port}}
+      type: shell
+      on: workstation
+      skills: [linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: curl -s -m 8 http://tr-depot-01:{{port}}/ | grep -o 'depot {{token}}' | head -1 || echo unreachable
+      expect: {match: exact, value: "depot {{token}}"}
+    - id: firewall
+      description: TCP {{port}} is open in firewalld, permanent and runtime
+      type: shell
+      on: tr-depot-01
+      skills: [linux.net.firewalld]
+      weight: 1.5
+      command: |
+        p=$(firewall-cmd --permanent --list-ports 2>/dev/null | tr ' ' '\n' | grep -cx '{{port}}/tcp' || true)
+        r=$(firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -cx '{{port}}/tcp' || true)
+        echo "permanent=$p runtime=$r"
+      expect: {match: exact, value: "permanent=1 runtime=1"}
+    - id: selinux-port
+      description: Port {{port}} is labelled http_port_t in the persistent policy
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1.5
+      command: |
+        semanage port -l 2>/dev/null | awk '$1 == "http_port_t" && $2 == "tcp"' | grep -qw {{port}} && echo labelled || echo missing
+      expect: {match: exact, value: labelled}
+    - id: selinux-content
+      description: /srv/depot-web has a persistent httpd_sys_content_t rule and the files carry the label
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1.5
+      command: |
+        r=$(semanage fcontext -l -C 2>/dev/null | grep -c '/srv/depot-web.*httpd_sys_content_t' || true)
+        t=$(stat -c %C /srv/depot-web/index.html 2>/dev/null | cut -d: -f3)
+        echo "rule=$r file=$t"
+      expect: {match: exact, value: "rule=1 file=httpd_sys_content_t"}
+    - id: enforcing
+      description: SELinux is enforcing now and in the configuration
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: echo "$(getenforce) $(sed -n 's/^SELINUX=//p' /etc/selinux/config)"
+      expect: {match: exact, value: "Enforcing enforcing"}
+  hints:
+    - title: Order of work
+      body: "Repository first (nothing installs without it), then users, storage, content, SELinux labels, service, firewall. The page must be written after the volume is mounted, or the mount hides it."
+      cost: 1
+    - title: Persisting mounts
+      command: sudo blkid; findmnt --verify
+      body: "Use UUID= entries (blkid), run systemctl daemon-reload, then mount -a to test the file. findmnt --verify checks fstab without a reboot."
+      cost: 2
+    - title: Partitioning the swap disk
+      command: man parted
+      body: "parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB, then mkswap /dev/vde1, an fstab line of type swap and swapon -a."
+      cost: 2
+    - title: SELinux and the port
+      command: sudo semanage port -l | grep http_port_t
+      body: "semanage port -a -t http_port_t -p tcp PORT; semanage fcontext -a -t httpd_sys_content_t '/srv/depot-web(/.*)?'; restorecon -R /srv/depot-web. semanage is in policycoreutils-python-utils."
+      cost: 3
+    - title: Narrow sudo
+      body: "A drop-in with one command line: %depotops ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd. Validate with visudo -c -f. Mode 0440."
+      cost: 2
+  misconceptions:
+    - id: no-selinux-labels
+      description: Does everything except the SELinux port and content labels.
+      feedback: "httpd cannot bind a non-standard port without http_port_t, and unlabelled content is not readable by it; use semanage, not setenforce 0."
+      expectFail: [service, page, selinux-port, selinux-content]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        timeoutSec: 420
+        run: |
+          set -e
+          sudo tee /etc/yum.repos.d/depot.repo >/dev/null <<'EOF'
+          [depot-local]
+          name=Depot local repository
+          baseurl=file:///opt/cloudtrain/repo/el10
+          enabled=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+          EOF
+          sudo dnf -y -q install httpd
+          sudo groupadd -g 5200 depotops
+          sudo useradd -u 5201 -G depotops -s /bin/bash dep-ana
+          sudo useradd -u 5202 -s /sbin/nologin dep-bram
+          echo '%depotops ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd' | sudo tee /etc/sudoers.d/depotops >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/depotops
+          sudo visudo -c -f /etc/sudoers.d/depotops
+          sudo pvcreate -q /dev/vdc /dev/vdd
+          sudo vgcreate -q {{vg}} /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv_web -L 400M {{vg}}
+          sudo lvcreate -q -y -n lv_data -L 200M {{vg}}
+          sudo mkfs.xfs -q /dev/{{vg}}/lv_web
+          sudo mkfs.ext4 -q /dev/{{vg}}/lv_data
+          sudo mkdir -p /srv/depot-web /srv/depot-data
+          w=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_web); d=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_data)
+          printf 'UUID=%s /srv/depot-web xfs defaults 0 0\nUUID=%s /srv/depot-data ext4 defaults 0 2\n' "$w" "$d" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount -a
+          sudo parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+          sudo udevadm settle
+          sudo mkswap -q /dev/vde1
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vde1) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a
+          sudo chgrp depotops /srv/depot-data
+          sudo chmod 2770 /srv/depot-data
+          printf 'Listen {{port}}\n<VirtualHost *:{{port}}>\n    DocumentRoot /srv/depot-web\n    <Directory /srv/depot-web>\n        Require all granted\n    </Directory>\n</VirtualHost>\n' | sudo tee /etc/httpd/conf.d/depot.conf >/dev/null
+          echo "<h1>depot {{token}}</h1>" | sudo tee /srv/depot-web/index.html >/dev/null
+          sudo restorecon -R /srv/depot-web 2>/dev/null || true
+          sudo systemctl enable --now httpd || true
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp
+          sudo firewall-cmd -q --reload
+    - id: no-firewall
+      description: Does everything except the firewall rule.
+      feedback: "The service listens, but firewalld still blocks the port from other hosts."
+      expectFail: [page, firewall]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        timeoutSec: 420
+        run: |
+          set -e
+          sudo tee /etc/yum.repos.d/depot.repo >/dev/null <<'EOF'
+          [depot-local]
+          name=Depot local repository
+          baseurl=file:///opt/cloudtrain/repo/el10
+          enabled=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+          EOF
+          sudo dnf -y -q install httpd
+          sudo groupadd -g 5200 depotops
+          sudo useradd -u 5201 -G depotops -s /bin/bash dep-ana
+          sudo useradd -u 5202 -s /sbin/nologin dep-bram
+          echo '%depotops ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd' | sudo tee /etc/sudoers.d/depotops >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/depotops
+          sudo visudo -c -f /etc/sudoers.d/depotops
+          sudo pvcreate -q /dev/vdc /dev/vdd
+          sudo vgcreate -q {{vg}} /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv_web -L 400M {{vg}}
+          sudo lvcreate -q -y -n lv_data -L 200M {{vg}}
+          sudo mkfs.xfs -q /dev/{{vg}}/lv_web
+          sudo mkfs.ext4 -q /dev/{{vg}}/lv_data
+          sudo mkdir -p /srv/depot-web /srv/depot-data
+          w=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_web); d=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_data)
+          printf 'UUID=%s /srv/depot-web xfs defaults 0 0\nUUID=%s /srv/depot-data ext4 defaults 0 2\n' "$w" "$d" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount -a
+          sudo parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+          sudo udevadm settle
+          sudo mkswap -q /dev/vde1
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vde1) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a
+          sudo chgrp depotops /srv/depot-data
+          sudo chmod 2770 /srv/depot-data
+          sudo dnf -y -q install policycoreutils-python-utils || true
+          sudo semanage port -a -t http_port_t -p tcp {{port}}
+          sudo semanage fcontext -a -t httpd_sys_content_t '/srv/depot-web(/.*)?'
+          sudo restorecon -R /srv/depot-web
+          printf 'Listen {{port}}\n<VirtualHost *:{{port}}>\n    DocumentRoot /srv/depot-web\n    <Directory /srv/depot-web>\n        Require all granted\n    </Directory>\n</VirtualHost>\n' | sudo tee /etc/httpd/conf.d/depot.conf >/dev/null
+          echo "<h1>depot {{token}}</h1>" | sudo tee /srv/depot-web/index.html >/dev/null
+          sudo restorecon -R /srv/depot-web 2>/dev/null || true
+          sudo systemctl enable --now httpd
+    - id: mount-by-hand
+      description: Mounts the volumes by hand and never writes the fstab entries for them.
+      feedback: "A mount made with mount alone disappears at boot; add UUID entries to /etc/fstab."
+      expectFail: [fstab]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        timeoutSec: 420
+        run: |
+          set -e
+          sudo tee /etc/yum.repos.d/depot.repo >/dev/null <<'EOF'
+          [depot-local]
+          name=Depot local repository
+          baseurl=file:///opt/cloudtrain/repo/el10
+          enabled=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+          EOF
+          sudo dnf -y -q install httpd
+          sudo groupadd -g 5200 depotops
+          sudo useradd -u 5201 -G depotops -s /bin/bash dep-ana
+          sudo useradd -u 5202 -s /sbin/nologin dep-bram
+          echo '%depotops ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd' | sudo tee /etc/sudoers.d/depotops >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/depotops
+          sudo visudo -c -f /etc/sudoers.d/depotops
+          sudo pvcreate -q /dev/vdc /dev/vdd
+          sudo vgcreate -q {{vg}} /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv_web -L 400M {{vg}}
+          sudo lvcreate -q -y -n lv_data -L 200M {{vg}}
+          sudo mkfs.xfs -q /dev/{{vg}}/lv_web
+          sudo mkfs.ext4 -q /dev/{{vg}}/lv_data
+          sudo mkdir -p /srv/depot-web /srv/depot-data
+          sudo parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+          sudo udevadm settle
+          sudo mkswap -q /dev/vde1
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vde1) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a
+          sudo mount /dev/{{vg}}/lv_web /srv/depot-web
+          sudo mount /dev/{{vg}}/lv_data /srv/depot-data
+          sudo chgrp depotops /srv/depot-data
+          sudo chmod 2770 /srv/depot-data
+          sudo dnf -y -q install policycoreutils-python-utils || true
+          sudo semanage port -a -t http_port_t -p tcp {{port}}
+          sudo semanage fcontext -a -t httpd_sys_content_t '/srv/depot-web(/.*)?'
+          sudo restorecon -R /srv/depot-web
+          printf 'Listen {{port}}\n<VirtualHost *:{{port}}>\n    DocumentRoot /srv/depot-web\n    <Directory /srv/depot-web>\n        Require all granted\n    </Directory>\n</VirtualHost>\n' | sudo tee /etc/httpd/conf.d/depot.conf >/dev/null
+          echo "<h1>depot {{token}}</h1>" | sudo tee /srv/depot-web/index.html >/dev/null
+          sudo restorecon -R /srv/depot-web 2>/dev/null || true
+          sudo systemctl enable --now httpd
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp
+          sudo firewall-cmd -q --reload
+    - id: sudo-too-wide
+      description: Grants the group full passwordless sudo.
+      feedback: "The rule must allow exactly one command."
+      expectFail: [sudo]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        timeoutSec: 420
+        run: |
+          set -e
+          sudo tee /etc/yum.repos.d/depot.repo >/dev/null <<'EOF'
+          [depot-local]
+          name=Depot local repository
+          baseurl=file:///opt/cloudtrain/repo/el10
+          enabled=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+          EOF
+          sudo dnf -y -q install httpd
+          sudo groupadd -g 5200 depotops
+          sudo useradd -u 5201 -G depotops -s /bin/bash dep-ana
+          sudo useradd -u 5202 -s /sbin/nologin dep-bram
+          echo '%depotops ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/depotops >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/depotops
+          sudo pvcreate -q /dev/vdc /dev/vdd
+          sudo vgcreate -q {{vg}} /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv_web -L 400M {{vg}}
+          sudo lvcreate -q -y -n lv_data -L 200M {{vg}}
+          sudo mkfs.xfs -q /dev/{{vg}}/lv_web
+          sudo mkfs.ext4 -q /dev/{{vg}}/lv_data
+          sudo mkdir -p /srv/depot-web /srv/depot-data
+          w=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_web); d=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_data)
+          printf 'UUID=%s /srv/depot-web xfs defaults 0 0\nUUID=%s /srv/depot-data ext4 defaults 0 2\n' "$w" "$d" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount -a
+          sudo parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+          sudo udevadm settle
+          sudo mkswap -q /dev/vde1
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vde1) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a
+          sudo chgrp depotops /srv/depot-data
+          sudo chmod 2770 /srv/depot-data
+          sudo dnf -y -q install policycoreutils-python-utils || true
+          sudo semanage port -a -t http_port_t -p tcp {{port}}
+          sudo semanage fcontext -a -t httpd_sys_content_t '/srv/depot-web(/.*)?'
+          sudo restorecon -R /srv/depot-web
+          printf 'Listen {{port}}\n<VirtualHost *:{{port}}>\n    DocumentRoot /srv/depot-web\n    <Directory /srv/depot-web>\n        Require all granted\n    </Directory>\n</VirtualHost>\n' | sudo tee /etc/httpd/conf.d/depot.conf >/dev/null
+          echo "<h1>depot {{token}}</h1>" | sudo tee /srv/depot-web/index.html >/dev/null
+          sudo restorecon -R /srv/depot-web 2>/dev/null || true
+          sudo systemctl enable --now httpd
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp
+          sudo firewall-cmd -q --reload
+  solution:
+    explanation: |
+      Define the repository and install httpd; create the group, users and a narrow sudoers drop-in;
+      build the volume group on the two whole disks, create and format the logical volumes and mount
+      them by UUID; create the swap partition; set the setgid group directory; label the port
+      and the content with semanage and restorecon; write the web configuration and page, enable
+      httpd; open the port permanently. Persistence is checked from configuration (fstab, enabled
+      units, permanent firewall rules, persistent SELinux rules) until a reboot step exists.
+    steps:
+      - on: tr-depot-01
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          sudo tee /etc/yum.repos.d/depot.repo >/dev/null <<'EOF'
+          [depot-local]
+          name=Depot local repository
+          baseurl=file:///opt/cloudtrain/repo/el10
+          enabled=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+          EOF
+          sudo dnf -y -q install httpd
+          sudo groupadd -g 5200 depotops
+          sudo useradd -u 5201 -G depotops -s /bin/bash dep-ana
+          sudo useradd -u 5202 -s /sbin/nologin dep-bram
+          echo '%depotops ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd' | sudo tee /etc/sudoers.d/depotops >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/depotops
+          sudo visudo -c -f /etc/sudoers.d/depotops
+          sudo pvcreate -q /dev/vdc /dev/vdd
+          sudo vgcreate -q {{vg}} /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv_web -L 400M {{vg}}
+          sudo lvcreate -q -y -n lv_data -L 200M {{vg}}
+          sudo mkfs.xfs -q /dev/{{vg}}/lv_web
+          sudo mkfs.ext4 -q /dev/{{vg}}/lv_data
+          sudo mkdir -p /srv/depot-web /srv/depot-data
+          w=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_web); d=$(sudo blkid -s UUID -o value /dev/{{vg}}/lv_data)
+          printf 'UUID=%s /srv/depot-web xfs defaults 0 0\nUUID=%s /srv/depot-data ext4 defaults 0 2\n' "$w" "$d" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount -a
+          sudo parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+          sudo udevadm settle
+          sudo mkswap -q /dev/vde1
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vde1) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a
+          sudo chgrp depotops /srv/depot-data
+          sudo chmod 2770 /srv/depot-data
+          sudo dnf -y -q install policycoreutils-python-utils || true
+          sudo semanage port -a -t http_port_t -p tcp {{port}}
+          sudo semanage fcontext -a -t httpd_sys_content_t '/srv/depot-web(/.*)?'
+          sudo restorecon -R /srv/depot-web
+          printf 'Listen {{port}}\n<VirtualHost *:{{port}}>\n    DocumentRoot /srv/depot-web\n    <Directory /srv/depot-web>\n        Require all granted\n    </Directory>\n</VirtualHost>\n' | sudo tee /etc/httpd/conf.d/depot.conf >/dev/null
+          echo "<h1>depot {{token}}</h1>" | sudo tee /srv/depot-web/index.html >/dev/null
+          sudo restorecon -R /srv/depot-web 2>/dev/null || true
+          sudo systemctl enable --now httpd
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp
+          sudo firewall-cmd -q --reload
+    alternatives:
+      - id: extents-and-alias
+        description: Size the logical volumes in extents, use a Cmnd_Alias and mapper names in fstab, and make the firewall rule runtime first.
+        steps:
+          - on: tr-depot-01
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              sudo tee /etc/yum.repos.d/depot.repo >/dev/null <<'EOF'
+              [depot-local]
+              name=Depot local repository
+              baseurl=file:///opt/cloudtrain/repo/el10
+              enabled=1
+              gpgcheck=1
+              gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+              EOF
+              sudo dnf -y -q install httpd
+              sudo groupadd -g 5200 depotops
+              sudo useradd -u 5201 -G depotops -s /bin/bash dep-ana
+              sudo useradd -u 5202 -s /sbin/nologin dep-bram
+              printf 'Cmnd_Alias DEPOT_WEB = /usr/bin/systemctl restart httpd\n%%depotops ALL=(root) NOPASSWD: DEPOT_WEB\n' | sudo tee /etc/sudoers.d/depotops >/dev/null
+              sudo chmod 0440 /etc/sudoers.d/depotops
+              sudo visudo -c -f /etc/sudoers.d/depotops
+              sudo pvcreate -q /dev/vdc /dev/vdd
+              sudo vgcreate -q -s 4M {{vg}} /dev/vdc /dev/vdd
+              sudo lvcreate -q -y -n lv_web -l 100 {{vg}}
+              sudo lvcreate -q -y -n lv_data -l 50 {{vg}}
+              sudo mkfs.xfs -q /dev/{{vg}}/lv_web
+              sudo mkfs.ext4 -q /dev/{{vg}}/lv_data
+              sudo mkdir -p /srv/depot-web /srv/depot-data
+              printf '/dev/mapper/%s-lv_web /srv/depot-web xfs defaults 0 0\n/dev/mapper/%s-lv_data /srv/depot-data ext4 defaults 0 2\n' "$(echo {{vg}} | sed 's/-/--/g')" "$(echo {{vg}} | sed 's/-/--/g')" | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount -a
+              sudo parted -s /dev/vde mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+              sudo udevadm settle
+              sudo mkswap -q /dev/vde1
+              echo "UUID=$(sudo blkid -s UUID -o value /dev/vde1) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo swapon -a
+              sudo chgrp depotops /srv/depot-data
+              sudo chmod 2770 /srv/depot-data
+              sudo dnf -y -q install policycoreutils-python-utils || true
+              sudo semanage port -a -t http_port_t -p tcp {{port}}
+              sudo semanage fcontext -a -t httpd_sys_content_t '/srv/depot-web(/.*)?'
+              sudo restorecon -R /srv/depot-web
+              printf 'Listen {{port}}\n<VirtualHost *:{{port}}>\n    DocumentRoot /srv/depot-web\n    <Directory /srv/depot-web>\n        Require all granted\n    </Directory>\n</VirtualHost>\n' | sudo tee /etc/httpd/conf.d/depot.conf >/dev/null
+              echo "<h1>depot {{token}}</h1>" | sudo tee /srv/depot-web/index.html >/dev/null
+              sudo restorecon -R /srv/depot-web 2>/dev/null || true
+              sudo systemctl enable --now httpd
+              sudo firewall-cmd -q --add-port={{port}}/tcp
+              sudo firewall-cmd -q --runtime-to-permanent

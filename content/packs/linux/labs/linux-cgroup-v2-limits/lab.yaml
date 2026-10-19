@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: linux-cgroup-v2-limits
+  title: Cap a batch job with cgroup v2 controllers
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - internals
+  - cgroups
+  - memory
+  - cpu
+  - pids
+  version: 1
+spec:
+  description: |
+    The route-planner batch on **`tr-cg-01`** (`ssh tr-cg-01`; you have `sudo`) is started with
+    `/usr/local/bin/tr-route-batch`. It allocates about 600 MiB in a hurry and is starving the other
+    jobs on the host. Without systemd units, using the cgroup v2 filesystem directly:
+
+    - create the cgroup **`/sys/fs/cgroup/route-planner`**;
+    - set **`memory.max` to {{mem}} MiB**, **`cpu.max` to 50 %** of one CPU (period 100000 us)
+      and **`pids.max` to 64**;
+    - run the batch inside that cgroup, to the end, so that it hits the memory limit, and look at
+      `memory.events`.
+
+    Leave the cgroup in place.
+  objectives:
+  - Create a cgroup and write controller limits
+  - Move a process into a cgroup and read memory.events
+  params:
+    mem:
+      type: choice
+      values:
+      - '256'
+      - '192'
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-cg-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-cg-01
+    timeoutSec: 180
+    run: |
+      set -eu
+      grep -qw memory /sys/fs/cgroup/cgroup.controllers
+      grep -qw pids /sys/fs/cgroup/cgroup.controllers
+      for p in $(cat /sys/fs/cgroup/route-planner/cgroup.procs 2>/dev/null); do kill -9 $p 2>/dev/null || true; done
+      sleep 1; rmdir /sys/fs/cgroup/route-planner 2>/dev/null || true
+
+      cat > /usr/local/bin/tr-route-batch <<'EOPY'
+      #!/usr/bin/python3
+      import time
+      buf = []
+      try:
+          for i in range(40):
+              buf.append(bytearray(16 << 20))
+              for p in range(0, len(buf[-1]), 4096):
+                  buf[-1][p] = 1
+              time.sleep(0.15)
+      except MemoryError:
+          pass
+      time.sleep(20)
+      EOPY
+      chmod 0755 /usr/local/bin/tr-route-batch
+  checks:
+  - id: mem-limit
+    description: memory.max is {{mem}} MiB
+    type: shell
+    'on': tr-cg-01
+    skills: &id001
+    - linux.internals.cgroups
+    weight: 1.5
+    command: |
+      v=$(cat /sys/fs/cgroup/route-planner/memory.max 2>/dev/null); [ "$v" = "$(( {{mem}} * 1048576 ))" ] && echo ok || echo "memory.max=$v"
+    expect:
+      match: exact
+      value: ok
+  - id: cpu-limit
+    description: cpu.max is 50000 100000
+    type: shell
+    'on': tr-cg-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      echo "cpu.max=$(cat /sys/fs/cgroup/route-planner/cpu.max 2>/dev/null)"
+    expect:
+      match: exact
+      value: cpu.max=50000 100000
+  - id: pids-limit
+    description: pids.max is 64
+    type: shell
+    'on': tr-cg-01
+    skills: *id001
+    weight: 1
+    command: |
+      echo "pids.max=$(cat /sys/fs/cgroup/route-planner/pids.max 2>/dev/null)"
+    expect:
+      match: exact
+      value: pids.max=64
+  - id: limit-hit
+    description: The batch ran inside the cgroup and hit the memory limit
+    type: shell
+    'on': tr-cg-01
+    skills: *id001
+    weight: 2
+    timeoutSec: 30
+    command: |
+      f=/sys/fs/cgroup/route-planner/memory.events
+      [ -r $f ] || { echo none; exit; }
+      m=$(awk '$1=="max"{print $2}' $f); o=$(awk '$1=="oom_kill"{print $2}' $f)
+      [ "${m:-0}" -gt 0 ] || [ "${o:-0}" -gt 0 ] && echo hit || echo "events=$m/$o"
+    expect:
+      match: exact
+      value: hit
+  hints:
+  - title: Controllers
+    body: The root cgroup already delegates cpu, memory and pids if they are listed in /sys/fs/cgroup/cgroup.subtree_control;
+      otherwise write "+memory +cpu +pids" there.
+    cost: 0
+  - title: Start the job inside
+    body: A process joins a cgroup when its PID is written to cgroup.procs. Write the shell PID ($$),
+      then exec the batch.
+    cost: 1
+  misconceptions:
+  - id: wrong-unit
+    description: Writes the limit in MiB instead of bytes.
+    feedback: memory.max takes bytes (or a K/M/G suffix); a bare 256 means 256 bytes.
+    expectFail:
+    - mem-limit
+    mutation:
+      'on': tr-cg-01
+      as: learner
+      timeoutSec: 120
+      run: |2
+          G=/sys/fs/cgroup/route-planner; sudo mkdir -p $G
+          echo {{mem}} | sudo tee $G/memory.max >/dev/null
+          echo "50000 100000" | sudo tee $G/cpu.max >/dev/null; echo 64 | sudo tee $G/pids.max >/dev/null
+
+        sudo sh -c 'echo $$ > /sys/fs/cgroup/route-planner/cgroup.procs; exec /usr/local/bin/tr-route-batch' >/dev/null 2>&1 || true
+  - id: cpu-unlimited
+    description: Sets the period but not the quota.
+    feedback: 'cpu.max is "QUOTA PERIOD": 50000 100000 is half a CPU; "max 100000" is unlimited.'
+    expectFail:
+    - cpu-limit
+    mutation:
+      'on': tr-cg-01
+      as: learner
+      timeoutSec: 120
+      run: |2
+          G=/sys/fs/cgroup/route-planner; sudo mkdir -p $G
+          echo $(( {{mem}} * 1048576 )) | sudo tee $G/memory.max >/dev/null
+          echo "max 100000" | sudo tee $G/cpu.max >/dev/null; echo 64 | sudo tee $G/pids.max >/dev/null
+
+        sudo sh -c 'echo $$ > /sys/fs/cgroup/route-planner/cgroup.procs; exec /usr/local/bin/tr-route-batch' >/dev/null 2>&1 || true
+  - id: outside
+    description: Sets the limits but runs the batch outside the cgroup.
+    feedback: Limits only apply to processes listed in cgroup.procs; move the shell in before starting
+      the job.
+    expectFail:
+    - limit-hit
+    mutation:
+      'on': tr-cg-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        G=/sys/fs/cgroup/route-planner; sudo mkdir -p $G
+        echo $(( {{mem}} * 1048576 )) | sudo tee $G/memory.max >/dev/null
+        echo "50000 100000" | sudo tee $G/cpu.max >/dev/null; echo 64 | sudo tee $G/pids.max >/dev/null
+        timeout 5 /usr/local/bin/tr-route-batch || true
+  solution:
+    explanation: |
+      Create the directory, write the three limit files and move the shell into cgroup.procs before
+      exec'ing the batch, so all its children inherit the cgroup. memory.events counts the times the
+      limit was reached (max) and the OOM kills inside the group.
+    steps:
+    - 'on': tr-cg-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        G=/sys/fs/cgroup/route-planner
+        sudo mkdir -p $G
+        echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+        echo $(( {{mem}} * 1048576 )) | sudo tee $G/memory.max >/dev/null
+        echo "50000 100000" | sudo tee $G/cpu.max >/dev/null
+        echo 64 | sudo tee $G/pids.max >/dev/null
+        sudo sh -c 'echo $$ > /sys/fs/cgroup/route-planner/cgroup.procs; exec /usr/local/bin/tr-route-batch' || true
+        cat $G/memory.events

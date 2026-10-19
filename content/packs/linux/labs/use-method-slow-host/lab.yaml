@@ -1,0 +1,186 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: use-method-slow-host
+  title: Find the saturated resource on a slow host with the USE method
+  domain: linux
+  frameworks:
+  - lpic2:capacity
+  - linuxplus:troubleshooting
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - performance
+  - use-method
+  - troubleshooting
+  - cpu
+  - disk
+  version: 1
+spec:
+  description: |
+    Passenger complaints say the timetable server **`tr-use-01`** (`ssh tr-use-01`; you have `sudo`) is
+    slow. Run a 60-second **USE checklist** (utilisation, saturation, errors for CPU, memory, disk and
+    network) and find out which resource is saturated and which service is responsible.
+
+    Write **`/home/learner/answers/use.txt`** with exactly three lines:
+
+    ```
+    resource=<cpu|memory|disk|network>
+    unit=<the systemd service name, without .service>
+    pid=<its main PID>
+    ```
+    Do not stop the culprit: the operations team wants to look at it afterwards.
+  objectives:
+  - Apply the USE method to CPU, memory, disk and network
+  - Attribute a saturated resource to a process and a unit
+  params:
+    res:
+      type: choice
+      values:
+      - cpu
+      - disk
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-use-01
+      driver: vm
+      image: ubuntu-vm:24.04
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-use-01
+    timeoutSec: 240
+    run: |
+      set -eu
+      install -d -o learner -g learner /home/learner/answers
+      rm -f /home/learner/answers/use.txt
+      for u in tr-fare-reindex tr-ticket-poller tr-pis-refresh; do systemctl stop $u.service >/dev/null 2>&1 || true; done
+      cat > /usr/local/bin/tr-fare-reindex <<'EOS'
+      #!/bin/bash
+      if [ "{{res}}" = cpu ]; then
+        for i in 1 2 3 4; do ( while :; do :; done ) & done
+        wait
+      else
+        while :; do dd if=/dev/zero of=/var/tmp/reindex.tmp bs=1M count=48 oflag=dsync status=none; rm -f /var/tmp/reindex.tmp; done
+      fi
+      EOS
+      cat > /usr/local/bin/tr-ticket-poller <<'EOS'
+      #!/bin/sh
+      while :; do date >/dev/null; sleep 5; done
+      EOS
+      cat > /usr/local/bin/tr-pis-refresh <<'EOS'
+      #!/bin/sh
+      while :; do ls /etc >/dev/null; sleep 10; done
+      EOS
+      chmod 0755 /usr/local/bin/tr-fare-reindex /usr/local/bin/tr-ticket-poller /usr/local/bin/tr-pis-refresh
+      for u in tr-fare-reindex tr-ticket-poller tr-pis-refresh; do
+        printf '[Unit]\nDescription=Tallowmere %s\n[Service]\nExecStart=/usr/local/bin/%s\nNice=5\n[Install]\nWantedBy=multi-user.target\n' $u $u > /etc/systemd/system/$u.service
+      done
+      systemctl daemon-reload
+      for u in tr-fare-reindex tr-ticket-poller tr-pis-refresh; do systemctl start $u.service; done
+      sleep 5
+      systemctl is-active tr-fare-reindex.service >/dev/null
+  checks:
+  - id: resource
+    description: The saturated resource is named correctly
+    type: shell
+    'on': tr-use-01
+    skills: &id001
+    - linux.performance.use-method
+    weight: 2
+    command: |
+      got=$(sed -n "s/^resource=//p" /home/learner/answers/use.txt 2>/dev/null | head -1); [ "$got" = "{{res}}" ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: unit
+    description: The responsible unit is named correctly
+    type: shell
+    'on': tr-use-01
+    skills: *id001
+    weight: 2
+    command: |
+      got=$(sed -n "s/^unit=//p" /home/learner/answers/use.txt 2>/dev/null | head -1); got=${got%.service}; [ "$got" = tr-fare-reindex ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: pid
+    description: The PID is the unit main PID
+    type: shell
+    'on': tr-use-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      got=$(sed -n "s/^pid=//p" /home/learner/answers/use.txt 2>/dev/null | head -1)
+      [ "$got" = "$(systemctl show -P MainPID tr-fare-reindex.service)" ] && [ "$got" != 0 ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: left-running
+    description: The culprit was left running
+    type: shell
+    'on': tr-use-01
+    skills: *id001
+    weight: 0.5
+    command: |
+      systemctl is-active tr-fare-reindex.service
+    expect:
+      match: exact
+      value: active
+  hints:
+  - title: Quick tools
+    body: uptime, vmstat 1, systemd-cgtop, /proc/pressure/*, /proc/diskstats and pidstat -d (package sysstat).
+    cost: 0
+  - title: Disk or CPU?
+    body: High us/sy and a long run queue is CPU saturation; high wa, blocked tasks (b) and io pressure
+      is disk.
+    cost: 1
+  misconceptions:
+  - id: wrong-resource
+    description: Blames memory.
+    feedback: 'Check utilisation AND saturation per resource: vmstat shows free memory is fine and the
+      run queue (cpu) or blocked processes (disk) are the saturated signals.'
+    expectFail:
+    - resource
+    mutation:
+      'on': tr-use-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'resource=memory\nunit=tr-fare-reindex\npid=%s\n' "$(systemctl show -P MainPID tr-fare-reindex.service)" > /home/learner/answers/use.txt
+  - id: top-name
+    description: Names the busiest-looking decoy service.
+    feedback: Attribute load by cgroup/unit (systemd-cgtop, pidstat) rather than by the first process
+      in the list.
+    expectFail:
+    - unit
+    - pid
+    mutation:
+      'on': tr-use-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'resource={{res}}\nunit=tr-ticket-poller\npid=%s\n' "$(systemctl show -P MainPID tr-ticket-poller.service)" > /home/learner/answers/use.txt
+  solution:
+    explanation: |
+      For each resource list utilisation, saturation and errors: run queue and load for CPU, vmstat wa/b and
+      iostat/diskstats util and queue for disk, free and swap for memory, interface drops for the network. The
+      culprit unit shows in systemd-cgtop or pidstat, and its PID in systemctl show -P MainPID.
+    steps:
+    - 'on': tr-use-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        vmstat 1 5; cat /proc/pressure/cpu /proc/pressure/io
+        systemd-cgtop -n 2 -b --order=cpu | head -12
+        res={{res}}
+        printf 'resource=%s\nunit=tr-fare-reindex\npid=%s\n' "$res" "$(systemctl show -P MainPID tr-fare-reindex.service)" > /home/learner/answers/use.txt

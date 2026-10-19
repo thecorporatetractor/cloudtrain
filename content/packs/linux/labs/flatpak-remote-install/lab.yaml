@@ -1,0 +1,172 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: flatpak-remote-install
+  title: Install a desktop tool from the local Flatpak remote
+  domain: linux
+  frameworks: [rhcsa-aligned:software]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [flatpak, software, remotes]
+  version: 1
+spec:
+  description: |
+    The crew terminal **`tr-desk-01`** (`ssh tr-desk-01`; you have `sudo`) needs the
+    timetable viewer, application ID **`org.tallowmere.Timetable`**. Tallowmere publishes it
+    in a local Flatpak repository at **`file:///srv/flatpak-repo`**, version **{{ver}}** is the
+    current one. An older version (1.0) was installed for the user `learner` only.
+
+    On `tr-desk-01`:
+
+    1. Add the repository as a **system-wide** remote (any name; it is not GPG signed, so the
+       remote is added without verification).
+    2. Install `org.tallowmere.Timetable` **system-wide** from it. The repository has no
+       runtime to pull in, so install the application without dependencies.
+    3. Remove the outdated **user-level** installation of the application (for `learner`).
+
+    Flatpak is installed as `flatpak`. Hint: `flatpak --help` lists the sub-commands and the
+    `--system` and `--user` flags.
+  objectives:
+    - Add a Flatpak remote and install an application system-wide
+    - Tell system and user installations apart and remove the stale one
+  params:
+    ver:
+      type: choice
+      values: ["2.0", "2.1"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-desk-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-desk-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        if ! rpm -q flatpak >/dev/null 2>&1; then
+          dnf -y -q install flatpak ostree >/dev/null 2>&1 || { echo "BLOCKED: flatpak is not in the el10 mirror (image gap)" | tee /var/lib/cloudtrain/flatpak-missing; exit 0; }
+        fi
+        APP=org.tallowmere.Timetable; REPO=/srv/flatpak-repo
+        flatpak --system remote-delete --force tallowmere-local 2>/dev/null || true
+        flatpak --system uninstall -y --noninteractive $APP >/dev/null 2>&1 || true
+        rm -rf $REPO
+        mkdir -p $REPO
+        ostree init --repo=$REPO --mode=archive-z2
+        mk() {
+          d=$(mktemp -d)
+          flatpak build-init "$d" $APP org.tallowmere.Sdk org.tallowmere.Platform 1 >/dev/null
+          mkdir -p "$d/files/bin" "$d/files/share"
+          printf '#!/bin/sh\necho timetable viewer %s\n' "$1" > "$d/files/bin/timetable-viewer"
+          chmod 0755 "$d/files/bin/timetable-viewer"
+          echo "$1" > "$d/files/share/version"
+          flatpak build-finish "$d" --command=timetable-viewer >/dev/null
+          flatpak build-export $REPO "$d" stable >/dev/null
+          rm -rf "$d"
+        }
+        mk 1.0
+        flatpak build-update-repo $REPO >/dev/null
+        chmod -R a+rX $REPO
+        su - learner -c "flatpak --user remote-add --if-not-exists --no-gpg-verify tr-old file://$REPO && flatpak --user install -y --noninteractive --no-deps tr-old $APP" >/dev/null 2>&1 || echo "user install failed" >> /var/lib/cloudtrain/flatpak-warn
+        mk {{ver}}
+        flatpak build-update-repo $REPO >/dev/null
+        chmod -R a+rX $REPO
+  checks:
+    - id: system-remote
+      description: A system-wide remote points at the local repository
+      type: shell
+      on: tr-desk-01
+      skills: [linux.packages.flatpak]
+      weight: 1.5
+      command: |
+        flatpak remotes --system --columns=url 2>/dev/null | grep -qx 'file:///srv/flatpak-repo' && echo present || echo missing
+      expect: {match: exact, value: present}
+    - id: system-install
+      description: The application is installed system-wide from that remote at version {{ver}}
+      type: shell
+      on: tr-desk-01
+      skills: [linux.packages.flatpak]
+      weight: 2.5
+      timeoutSec: 30
+      command: |
+        o=$(flatpak list --system --app --columns=application,origin 2>/dev/null | awk '$1 == "org.tallowmere.Timetable" {print $2}')
+        [ -n "$o" ] || { echo not-installed; exit 0; }
+        u=$(flatpak remotes --system --columns=name,url 2>/dev/null | awk -v o="$o" '$1 == o {print $2}')
+        v=$(cat /var/lib/flatpak/app/org.tallowmere.Timetable/current/active/files/share/version 2>/dev/null)
+        echo "origin-url=$u version=$v"
+      expect: {match: exact, value: "origin-url=file:///srv/flatpak-repo version={{ver}}"}
+    - id: user-removed
+      description: The user-level installation for learner is gone
+      type: shell
+      on: tr-desk-01
+      skills: [linux.packages.flatpak]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        su - learner -c "flatpak --user list --app --columns=application" 2>/dev/null | grep -qx org.tallowmere.Timetable && echo still-installed || echo removed
+      expect: {match: exact, value: removed}
+  hints:
+    - title: System versus user
+      command: flatpak list --app --columns=application,origin,installation
+      body: "Every flatpak command works on the system installation with --system and on the current user's with --user. The list shows the installation column."
+      cost: 0
+    - title: Add and install
+      body: "flatpak remote-add --system --no-gpg-verify NAME file:///srv/flatpak-repo, then flatpak install --system --no-deps NAME org.tallowmere.Timetable (the repository carries no runtime)."
+      cost: 2
+  misconceptions:
+    - id: user-install
+      description: Installs the application for the user only and leaves the old copy.
+      feedback: "Without --system, flatpak uses the per-user installation; the crew terminal needs it system-wide."
+      expectFail: [system-remote, system-install, user-removed]
+      mutation:
+        on: tr-desk-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          flatpak --user remote-add --if-not-exists --no-gpg-verify tr-new file:///srv/flatpak-repo
+          flatpak --user install -y --noninteractive --no-deps tr-new org.tallowmere.Timetable
+    - id: stale-user-copy
+      description: Installs system-wide but leaves the outdated user-level installation.
+      feedback: "The user installation shadows the system one for that user; uninstall it with flatpak --user uninstall."
+      expectFail: [user-removed]
+      mutation:
+        on: tr-desk-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          sudo flatpak remote-add --system --if-not-exists --no-gpg-verify tallowmere-local file:///srv/flatpak-repo
+          sudo flatpak install --system -y --noninteractive --no-deps tallowmere-local org.tallowmere.Timetable
+  solution:
+    explanation: |
+      remote-add --system registers the repository, install --system --no-deps installs the
+      current version, and flatpak --user uninstall removes the old per-user copy.
+      BLOCKED this round if the el10 mirror has no flatpak package (image gap).
+    steps:
+      - on: tr-desk-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo flatpak remote-add --system --if-not-exists --no-gpg-verify tallowmere-local file:///srv/flatpak-repo
+          sudo flatpak install --system -y --noninteractive --no-deps tallowmere-local org.tallowmere.Timetable
+          flatpak --user uninstall -y --noninteractive org.tallowmere.Timetable
+          flatpak list --app --columns=application,origin,installation
+    alternatives:
+      - id: reinstall-by-name
+        description: Use a different remote name and remove the user copy first.
+        steps:
+          - on: tr-desk-01
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              flatpak --user uninstall -y --noninteractive org.tallowmere.Timetable
+              sudo flatpak remote-add --system --no-gpg-verify depot-local file:///srv/flatpak-repo
+              sudo flatpak install --system -y --noninteractive --no-deps depot-local org.tallowmere.Timetable

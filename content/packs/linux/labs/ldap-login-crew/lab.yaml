@@ -1,0 +1,314 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ldap-login-crew
+  title: Let crew members log in with directory accounts
+  domain: linux
+  frameworks: [lfcs:users-groups, linuxplus:security, lpic2:client-mgmt]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [ldap, sssd, pam, nss, identity]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail keeps crew accounts in a central LDAP directory on **`tr-dir-01`**
+    (base **`dc=tallowmere,dc=example`**, users in `ou=people`, groups in `ou=groups`;
+    it has no TLS, so the client must be told that plain LDAP is acceptable for this lab).
+    The crew terminal **`tr-crew-01`** (`ssh tr-crew-01`; you have `sudo`) knows nothing
+    about it.
+
+    Configure `tr-crew-01` with **SSSD** so that:
+
+    - the directory user **`{{user}}`** resolves (`getent passwd {{user}}`) and is a member of
+      the directory group **`crew`** (`id`);
+    - the user can **log in with the directory password** and gets a **home directory
+      created on first login** (`/home/{{user}}`);
+    - `/etc/sssd/sssd.conf` is owned by root with mode `0600`, and `sssd` and `oddjobd`
+      start at boot.
+
+    You do not need the user's password: the grader tries a login for you.
+  objectives:
+    - Configure SSSD as an LDAP identity and authentication provider
+    - Select an authselect profile with automatic home directory creation
+  params:
+    user:
+      type: choice
+      values: [driver42, driver57]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-dir-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-crew-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-dir-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        export DEBIAN_FRONTEND=noninteractive
+        if ! dpkg -s slapd >/dev/null 2>&1; then
+          ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null 2>&1 || true
+          for kv in 'slapd/password1 password lab-admin-pw' 'slapd/password2 password lab-admin-pw' 'slapd/domain string tallowmere.example' 'shared/organization string Tallowmere Rail' 'slapd/no_configuration boolean false' 'slapd/purge_database boolean true'; do
+            echo "slapd $kv" | debconf-set-selections
+          done
+          if ! apt-get install -y -q slapd ldap-utils >/dev/null 2>&1; then
+            echo "BLOCKED: slapd is not in the package mirror (image gap)" | tee /var/lib/cloudtrain/ldap-missing
+            exit 0
+          fi
+        fi
+        systemctl enable --now slapd >/dev/null 2>&1 || true
+        for i in $(seq 20); do ldapsearch -x -H ldap://127.0.0.1 -b dc=tallowmere,dc=example -s base >/dev/null 2>&1 && break; sleep 1; done
+        if ! ldapsearch -x -H ldap://127.0.0.1 -b ou=people,dc=tallowmere,dc=example -s base >/dev/null 2>&1; then
+          h=$(slappasswd -s 'Crew-Pass-{{user}}')
+          cat > /tmp/crew.ldif <<EOL
+        dn: ou=people,dc=tallowmere,dc=example
+        objectClass: organizationalUnit
+        ou: people
+
+        dn: ou=groups,dc=tallowmere,dc=example
+        objectClass: organizationalUnit
+        ou: groups
+
+        dn: cn=crew,ou=groups,dc=tallowmere,dc=example
+        objectClass: posixGroup
+        cn: crew
+        gidNumber: 5100
+        memberUid: driver42
+        memberUid: driver57
+
+        dn: uid=driver42,ou=people,dc=tallowmere,dc=example
+        objectClass: inetOrgPerson
+        objectClass: posixAccount
+        objectClass: shadowAccount
+        uid: driver42
+        cn: Driver 42
+        sn: Forty-Two
+        uidNumber: 5042
+        gidNumber: 5100
+        homeDirectory: /home/driver42
+        loginShell: /bin/bash
+        userPassword: $h
+
+        dn: uid=driver57,ou=people,dc=tallowmere,dc=example
+        objectClass: inetOrgPerson
+        objectClass: posixAccount
+        objectClass: shadowAccount
+        uid: driver57
+        cn: Driver 57
+        sn: Fifty-Seven
+        uidNumber: 5057
+        gidNumber: 5100
+        homeDirectory: /home/driver57
+        loginShell: /bin/bash
+        userPassword: $h
+        EOL
+          ldapadd -x -D cn=admin,dc=tallowmere,dc=example -w lab-admin-pw -f /tmp/crew.ldif >/dev/null
+          rm -f /tmp/crew.ldif
+        fi
+    - on: tr-crew-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        echo 'Crew-Pass-{{user}}' > $V/crew.pw
+        rpm -q sssd sssd-ldap sssd-tools oddjob oddjob-mkhomedir authselect >/dev/null 2>&1 || dnf -y -q install sssd sssd-ldap sssd-tools oddjob oddjob-mkhomedir authselect >/dev/null
+        id tr-caller >/dev/null 2>&1 || useradd -m tr-caller
+        systemctl disable --now sssd oddjobd >/dev/null 2>&1 || true
+        rm -f /etc/sssd/sssd.conf; rm -rf /home/{{user}}
+        authselect select minimal --force >/dev/null 2>&1 || true
+        cat > $V/tryauth.py <<'EOPY'
+        import os, pty, pwd, select, sys, time
+        user, pw, caller = sys.argv[1:4]
+        pid, fd = pty.fork()
+        if pid == 0:
+            p = pwd.getpwnam(caller)
+            os.setgroups([]); os.setgid(p.pw_gid); os.setuid(p.pw_uid)
+            os.environ["HOME"] = p.pw_dir
+            os.execv("/usr/bin/su", ["su", "-", user, "-c", "true"])
+        buf = b""; sent = False; end = time.time() + 20
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    d = os.read(fd, 1024)
+                except OSError:
+                    d = b""
+                if d:
+                    buf += d
+                    if not sent and b"assword" in buf:
+                        os.write(fd, (pw + "\n").encode()); sent = True
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                sys.exit(0 if os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 else 1)
+        os.kill(pid, 9); os.waitpid(pid, 0); sys.exit(2)
+        EOPY
+        chmod 0600 $V/tryauth.py
+  checks:
+    - id: sssd-conf
+      description: sssd.conf defines an LDAP domain for the directory, root-owned mode 0600
+      type: shell
+      on: tr-crew-01
+      skills: [linux.identity.ldap-client]
+      weight: 2
+      command: |
+        python3 - <<'PY'
+        import configparser, os
+        f = "/etc/sssd/sssd.conf"
+        try:
+            st = os.stat(f)
+        except OSError:
+            print("no-file"); raise SystemExit
+        if st.st_uid != 0 or (st.st_mode & 0o777) != 0o600:
+            print("perms:%o" % (st.st_mode & 0o777)); raise SystemExit
+        c = configparser.RawConfigParser(strict=False)
+        c.read(f)
+        doms = [d.strip() for d in c.get("sssd", "domains", fallback="").split(",") if d.strip()]
+        ok = False
+        for d in doms:
+            s = "domain/" + d
+            if c.has_section(s) and c.get(s, "id_provider", fallback="") == "ldap" and "tr-dir-01" in c.get(s, "ldap_uri", fallback="") and c.get(s, "ldap_search_base", fallback="").lower().replace(" ", "") == "dc=tallowmere,dc=example":
+                ok = True
+        print("ok" if ok else "wrong-domain")
+        PY
+      expect: {match: exact, value: ok}
+    - id: authselect
+      description: The sssd profile with mkhomedir is selected
+      type: shell
+      on: tr-crew-01
+      skills: [linux.identity.sssd-pam]
+      weight: 1.5
+      command: |
+        c=$(authselect current --raw 2>/dev/null)
+        echo "$c" | grep -q '^sssd' && echo "$c" | grep -qw with-mkhomedir && echo selected || echo "got:$c"
+      expect: {match: exact, value: selected}
+    - id: services
+      description: sssd and oddjobd are running and enabled
+      type: shell
+      on: tr-crew-01
+      skills: [linux.identity.sssd-pam]
+      weight: 1
+      command: |
+        echo "$(systemctl is-active sssd) $(systemctl is-enabled sssd) $(systemctl is-enabled oddjobd)"
+      expect: {match: exact, value: "active enabled enabled"}
+    - id: resolves
+      description: "{{user}} resolves with the directory UID and is in the group crew"
+      type: shell
+      on: tr-crew-01
+      skills: [linux.identity.ldap-client]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        u=$(getent passwd {{user}} | cut -d: -f3)
+        g=$(id -Gn {{user}} 2>/dev/null | tr ' ' '\n' | grep -cx crew || true)
+        [ "$u" = "$((5000 + $(echo {{user}} | tr -dc 0-9)))" ] && [ "$g" = 1 ] && echo resolved || echo "uid=${u:-none} crew=$g"
+      expect: {match: exact, value: resolved}
+    - id: login-home
+      description: A login as {{user}} with the directory password works and creates the home directory
+      type: shell
+      on: tr-crew-01
+      skills: [linux.identity.sssd-pam]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        rm -rf /home/{{user}}
+        python3 /var/lib/cloudtrain/tryauth.py {{user}} "$(cat /var/lib/cloudtrain/crew.pw)" tr-caller >/dev/null 2>&1 && l=login-ok || l=login-failed
+        echo "$l $(stat -c %U /home/{{user}} 2>/dev/null || echo no-home)"
+      expect: {match: exact, value: "login-ok {{user}}"}
+  hints:
+    - title: The pieces
+      body: "SSSD needs /etc/sssd/sssd.conf (mode 0600) with a [sssd] section naming the domain and a [domain/NAME] section with id_provider and auth_provider ldap, ldap_uri and ldap_search_base. authselect wires it into nsswitch and PAM; oddjobd creates home directories."
+      cost: 1
+    - title: No TLS in this lab
+      body: "SSSD refuses to send passwords over plain LDAP unless you set ldap_auth_disable_tls_never_use_in_production = true (or use ldaps). This directory has no certificate."
+      cost: 2
+    - title: Test it
+      command: getent passwd driver42; sudo sssctl domain-status tallowmere
+      body: "getent shows what NSS returns. sssctl config-check validates sssd.conf. Clear the cache with sss_cache -E after changing the configuration."
+      cost: 1
+  misconceptions:
+    - id: no-mkhomedir
+      description: Selects the sssd profile without the mkhomedir feature.
+      feedback: "Without with-mkhomedir (and oddjobd) PAM never creates /home/NAME, so the first login lands in /."
+      expectFail: [authselect, login-home]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 600 /etc/sssd/sssd.conf
+          sudo authselect select sssd --force
+          sudo systemctl enable --now sssd oddjobd
+    - id: wrong-base
+      description: Uses a search base that does not exist in the directory.
+      feedback: "ldap_search_base must be the directory's base DN: dc=tallowmere,dc=example."
+      expectFail: [sssd-conf, resolves, login-home]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=test\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 600 /etc/sssd/sssd.conf
+          sudo authselect select sssd with-mkhomedir --force
+          sudo systemctl enable --now sssd oddjobd
+    - id: open-perms
+      description: Leaves sssd.conf world-readable.
+      feedback: "sssd refuses a configuration file that is not 0600 root-owned."
+      expectFail: [sssd-conf, services, resolves, login-home]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 644 /etc/sssd/sssd.conf
+          sudo authselect select sssd with-mkhomedir --force
+          sudo systemctl enable oddjobd; sudo systemctl enable --now sssd || true
+  solution:
+    explanation: |
+      sssd.conf describes the LDAP domain; authselect select sssd with-mkhomedir edits
+      nsswitch.conf and the PAM stacks; oddjobd (with the mkhomedir helper) creates the home
+      on first login. BLOCKED in this round: the directory server needs the slapd package
+      on tr-dir-01, which is not in the lab mirror, so the live checks can only pass once it
+      is added to the image or mirror.
+    steps:
+      - on: tr-crew-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_id_use_start_tls = false\nldap_auth_disable_tls_never_use_in_production = true\ncache_credentials = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+          sudo chmod 600 /etc/sssd/sssd.conf
+          sudo sssctl config-check
+          sudo authselect select sssd with-mkhomedir --force
+          sudo systemctl enable --now sssd oddjobd
+          sleep 3
+          getent passwd {{user}}
+          id {{user}}
+    alternatives:
+      - id: feature-after
+        description: Select the profile first and enable the feature afterwards.
+        steps:
+          - on: tr-crew-01
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              printf '[sssd]\nservices = nss, pam\ndomains = tallowmere\n\n[domain/tallowmere]\nid_provider = ldap\nauth_provider = ldap\nldap_uri = ldap://tr-dir-01\nldap_search_base = dc=tallowmere,dc=example\nldap_auth_disable_tls_never_use_in_production = true\n' | sudo tee /etc/sssd/sssd.conf >/dev/null
+              sudo chmod 600 /etc/sssd/sssd.conf
+              sudo authselect select sssd --force
+              sudo authselect enable-feature with-mkhomedir
+              sudo systemctl enable --now sssd oddjobd

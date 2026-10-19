@@ -171,7 +171,7 @@ func cmdExamRun(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	rep := (&examRunner{v: v, o: o, c: compiled}).run(ctx)
 
-	if err := os.MkdirAll(o.outDir, 0o755); err != nil {
+	if err := os.MkdirAll(o.outDir, 0o750); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -181,7 +181,7 @@ func cmdExamRun(args []string, stdout, stderr io.Writer) int {
 	}
 	path := filepath.Join(o.outDir, fmt.Sprintf("%s-%s.json", rep.Exam, suffix))
 	b, _ := json.MarshalIndent(rep, "", "  ")
-	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
 		fmt.Fprintln(stderr, err)
 	}
 	printExamSummary(stdout, rep)

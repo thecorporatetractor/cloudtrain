@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: oom-kill-investigation
+  title: Prove which process the OOM killer chose and cap the real memory hog
+  domain: linux
+  frameworks:
+  - linuxplus:troubleshooting
+  difficulty: medium
+  estimatedMinutes: 20
+  tags:
+  - performance
+  - memory
+  - oom
+  - cgroups
+  - troubleshooting
+  version: 1
+spec:
+  description: |
+    The nightly fares batch **`tr-fares-batch.service`** on **`tr-oom-01`** (`ssh tr-oom-01`; you have
+    `sudo`) was killed again. Both it and **`{{hog}}.service`** run in the memory-limited slice
+    `tr-nightly.slice`. Find out from the kernel log, the journal and the cgroup memory statistics what
+    happened, then:
+
+    1. write **`/home/learner/answers/oom.txt`** with two lines: `victim=<unit killed by the OOM killer>`
+       and `consumer=<unit that really used the memory>` (unit names without `.service`);
+    2. cap the real consumer with a **finite `MemoryMax` of at most 200 MiB** so that the batch
+       survives. Keep the slice limit as it is.
+
+    When you are done the batch must be able to run to completion.
+  objectives:
+  - Read OOM evidence from the journal and memory.events
+  - Cap the real consumer with a cgroup limit
+  params:
+    hog:
+      type: choice
+      values:
+      - tr-cache-warm
+      - tr-ledger-index
+  topology:
+    entry: workstation
+    nodes:
+    - name: workstation
+      driver: container
+      image: jumphost:1
+      access:
+      - shell
+    - name: tr-oom-01
+      driver: vm
+      image: el-vm:10
+      resources:
+        cpu: 2
+        memoryMiB: 1536
+      access:
+      - ssh
+      - console
+  setup:
+  - 'on': tr-oom-01
+    timeoutSec: 240
+    run: |
+      set -eu
+      install -d -o learner -g learner /home/learner/answers
+      rm -f /home/learner/answers/oom.txt
+      systemctl stop tr-fares-batch.service {{hog}}.service tr-nightly.slice >/dev/null 2>&1 || true
+      rm -rf /etc/systemd/system/{{hog}}.service.d /etc/systemd/system/tr-fares-batch.service.d /etc/systemd/system.control /run/systemd/system.control
+      cat > /usr/local/bin/tr-memload <<'EOPY'
+      #!/usr/bin/python3
+      import sys, time
+      mb, hold = int(sys.argv[1]), int(sys.argv[2])
+      buf = []
+      for i in range(mb // 10):
+          b = bytearray(10 << 20)
+          for p in range(0, len(b), 4096):
+              b[p] = 1
+          buf.append(b)
+          time.sleep(0.4)
+      time.sleep(hold if hold > 0 else 10**6)
+      EOPY
+      chmod 0755 /usr/local/bin/tr-memload
+      printf '[Unit]\nDescription=Nightly jobs\n[Slice]\nMemoryMax=400M\nMemorySwapMax=0\n' > /etc/systemd/system/tr-nightly.slice
+      printf '[Unit]\nDescription=Fares batch\n[Service]\nSlice=tr-nightly.slice\nType=oneshot\nExecStart=/usr/local/bin/tr-memload 150 20\nOOMScoreAdjust=500\n' > /etc/systemd/system/tr-fares-batch.service
+      printf '[Unit]\nDescription=Cache warmer\nStartLimitIntervalSec=0\n[Service]\nSlice=tr-nightly.slice\nExecStart=/usr/local/bin/tr-memload 330 0\nRestart=always\nRestartSec=5\n' > /etc/systemd/system/{{hog}}.service
+      systemctl daemon-reload
+      systemctl start {{hog}}.service
+      sleep 9
+      systemctl start --no-block tr-fares-batch.service
+      for i in $(seq 1 40); do [ "$(systemctl show -P Result tr-fares-batch.service)" = oom-kill ] && break; sleep 1; done
+      [ "$(systemctl show -P Result tr-fares-batch.service)" = oom-kill ]
+  checks:
+  - id: victim
+    description: The OOM victim is named correctly
+    type: shell
+    'on': tr-oom-01
+    skills: &id001
+    - linux.performance.memory
+    weight: 1.5
+    command: |
+      got=$(sed -n "s/^victim=//p" /home/learner/answers/oom.txt 2>/dev/null | head -1); [ "${got%.service}" = tr-fares-batch ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: consumer
+    description: The real consumer is named correctly
+    type: shell
+    'on': tr-oom-01
+    skills: *id001
+    weight: 1.5
+    command: |
+      got=$(sed -n "s/^consumer=//p" /home/learner/answers/oom.txt 2>/dev/null | head -1); [ "${got%.service}" = {{hog}} ] && echo ok || echo "got=$got"
+    expect:
+      match: exact
+      value: ok
+  - id: hog-capped
+    description: The consumer has a finite MemoryMax of at most 200 MiB and the slice limit is unchanged
+    type: shell
+    'on': tr-oom-01
+    skills: *id001
+    weight: 2
+    command: |
+      m=$(systemctl show -P MemoryMax {{hog}}.service); s=$(systemctl show -P MemoryMax tr-nightly.slice)
+      [ "$s" = 419430400 ] && [ "$m" -gt 0 ] 2>/dev/null && [ "$m" -le 209715200 ] && echo capped || echo "hog=$m slice=$s"
+    expect:
+      match: exact
+      value: capped
+  - id: batch-survives
+    description: The batch now runs to completion
+    type: shell
+    'on': tr-oom-01
+    skills: *id001
+    weight: 3
+    timeoutSec: 120
+    command: |
+      systemctl reset-failed tr-fares-batch.service >/dev/null 2>&1; systemctl restart {{hog}}.service; sleep 12
+      systemctl start tr-fares-batch.service >/dev/null 2>&1
+      echo "result=$(systemctl show -P Result tr-fares-batch.service)"
+    expect:
+      match: exact
+      value: result=success
+  hints:
+  - title: Evidence
+    body: journalctl -k | grep -i oom; systemctl show -P Result UNIT; /sys/fs/cgroup/SLICE/memory.events
+      and memory.current of each unit.
+    cost: 0
+  - title: Whose memory
+    body: systemd-cgtop -m shows the memory use per unit; the victim is not necessarily the consumer.
+    cost: 1
+  misconceptions:
+  - id: raise-slice
+    description: Removes the slice limit instead of capping the consumer.
+    feedback: The slice limit protects the rest of the host; cap the consumer (MemoryMax on the hog) instead
+      of lifting the shared ceiling.
+    expectFail:
+    - hog-capped
+    mutation:
+      'on': tr-oom-01
+      as: learner
+      timeoutSec: 90
+      run: |
+        printf 'victim=tr-fares-batch\nconsumer={{hog}}\n' > /home/learner/answers/oom.txt
+        sudo systemctl set-property tr-nightly.slice MemoryMax=infinity
+        sudo systemctl restart {{hog}}.service
+  - id: cap-victim
+    description: Caps the victim and blames it.
+    feedback: 'The batch is only the victim: the OOM killer picked it by score, but the cache warmer holds
+      the memory.'
+    expectFail:
+    - victim
+    - consumer
+    - hog-capped
+    - batch-survives
+    mutation:
+      'on': tr-oom-01
+      as: learner
+      timeoutSec: 120
+      run: |
+        printf 'victim={{hog}}\nconsumer=tr-fares-batch\n' > /home/learner/answers/oom.txt
+        sudo systemctl set-property tr-fares-batch.service MemoryMax=100M
+  solution:
+    explanation: |
+      journalctl -k and the unit result show the batch (OOMScoreAdjust=500) died with "Memory cgroup out of memory"
+      in tr-nightly.slice, while systemd-cgtop or memory.current shows the cache warmer holding about 330 MB. A
+      MemoryMax below the batch's headroom on the real consumer keeps both inside the slice limit.
+    steps:
+    - 'on': tr-oom-01
+      as: learner
+      timeoutSec: 180
+      run: |
+        sudo journalctl -k --no-pager | grep -i 'out of memory' | tail -3
+        cat /sys/fs/cgroup/tr-nightly.slice/memory.events
+        printf 'victim=tr-fares-batch\nconsumer={{hog}}\n' > /home/learner/answers/oom.txt
+        sudo systemctl set-property {{hog}}.service MemoryMax=150M
+    alternatives:
+    - id: dropin
+      description: Cap the consumer with a drop-in file.
+      steps:
+      - 'on': tr-oom-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          printf 'victim=tr-fares-batch\nconsumer={{hog}}\n' > /home/learner/answers/oom.txt
+          sudo mkdir -p /etc/systemd/system/{{hog}}.service.d
+          printf '[Service]\nMemoryMax=150M\n' | sudo tee /etc/systemd/system/{{hog}}.service.d/cap.conf >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl restart {{hog}}.service

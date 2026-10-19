@@ -1,0 +1,172 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kernel-panic-initramfs
+  title: Rebuild an initramfs that lacks the storage driver
+  domain: linux
+  frameworks: [linuxplus:troubleshooting, lpic2:kernel]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [boot, recovery, initramfs, dracut]
+  version: 1
+spec:
+  description: |
+    After a storage change on depot host **`depot-ctl-4`** (`ssh depot-ctl-4`; you have
+    `sudo`) the newly installed kernel, **Tallowmere new kernel**, panics at boot with
+    `VFS: Unable to mount root fs on unknown-block(0,0)`. The older, working kernel is
+    still in the boot menu. Someone added a dracut configuration that omits the virtio
+    block driver, **`virtio_blk`**, and built the new kernel's initramfs
+    (`/boot/initramfs-9-tr-new.img`) with it.
+
+    On `depot-ctl-4`, as if you had booted the old kernel and repaired the new one:
+
+    - remove the cause, so a rebuild keeps the driver;
+    - rebuild `/boot/initramfs-9-tr-new.img` so it **contains `virtio_blk`**;
+    - keep **Tallowmere new kernel** as the default boot entry, and leave the working
+      older entry and its initramfs untouched.
+
+    Do not reboot. Choosing the old kernel at the boot menu is the console part of the
+    procedure and cannot be driven here.
+  objectives:
+    - Explain why a missing storage driver in the initramfs stops the boot
+    - Inspect an initramfs with lsinitrd and rebuild it with dracut
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-ctl-4
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-ctl-4
+      timeoutSec: 300
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        kver=$(uname -r)
+        mid=$(cat /etc/machine-id)
+        cur=$(grubby --default-kernel)
+        src=$(ls /boot/loader/entries/*.conf | grep -v tr-new | head -1)
+        new=/boot/loader/entries/${mid}-9-tr-new.conf
+        sha256sum "/boot/initramfs-${kver}.img" | cut -d' ' -f1 > /var/lib/cloudtrain/initrd-good.sha
+        printf 'omit_drivers+=" virtio_blk "\n' > /etc/dracut.conf.d/90-tr-storage.conf
+        dracut -f /boot/initramfs-9-tr-new.img "$kver"
+        if [ ! -f "$new" ]; then
+          cp "$src" "$new"
+          sed -i 's/^title .*/title Tallowmere new kernel/; s/^version .*/version 9-tr-new/; s#^initrd .*#initrd /initramfs-9-tr-new.img#' "$new"
+        fi
+        grubby --set-default="$cur"
+        grub2-set-default "$(basename "$new" .conf)"
+        basename "$new" .conf > /var/lib/cloudtrain/new-entry.id
+        basename "$src" .conf > /var/lib/cloudtrain/good-entry.id
+  checks:
+    - id: initrd-has-driver
+      description: The new kernel's initramfs contains virtio_blk
+      type: shell
+      on: depot-ctl-4
+      skills: [linux.boot.initramfs]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        lsinitrd /boot/initramfs-9-tr-new.img 2>/dev/null | grep -q 'virtio_blk' && echo present || echo missing
+      expect: {match: exact, value: present}
+    - id: omit-removed
+      description: No dracut configuration omits virtio_blk any more
+      type: shell
+      on: depot-ctl-4
+      skills: [linux.boot.initramfs]
+      weight: 1.5
+      command: |
+        n=$(cat /etc/dracut.conf /etc/dracut.conf.d/*.conf /usr/lib/dracut/dracut.conf.d/*.conf 2>/dev/null | sed 's/#.*//' | grep -c 'omit_drivers.*virtio_blk' || true)
+        echo "omits=$n"
+      expect: {match: exact, value: "omits=0"}
+    - id: default-new
+      description: The new kernel is still the default boot entry
+      type: shell
+      on: depot-ctl-4
+      skills: [linux.boot.recovery]
+      weight: 1
+      command: |
+        s=$(grub2-editenv list 2>/dev/null | sed -n 's/^saved_entry=//p')
+        [ "$s" = "$(cat /var/lib/cloudtrain/new-entry.id)" ] && echo new || echo "saved=$s"
+      expect: {match: exact, value: new}
+    - id: old-untouched
+      description: The working kernel's entry and initramfs are untouched
+      type: shell
+      on: depot-ctl-4
+      skills: [linux.boot.recovery]
+      weight: 1
+      command: |
+        [ -f "/boot/loader/entries/$(cat /var/lib/cloudtrain/good-entry.id).conf" ] || { echo entry-gone; exit 0; }
+        [ "$(sha256sum /boot/initramfs-$(uname -r).img | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/initrd-good.sha)" ] && echo untouched || echo rebuilt
+      expect: {match: exact, value: untouched}
+  hints:
+    - title: Look inside the initramfs
+      command: sudo lsinitrd /boot/initramfs-9-tr-new.img | grep -i virtio
+      body: "lsinitrd lists the files of an initramfs. The root disk needs virtio_blk; if it is not listed the kernel cannot see /dev/vda."
+      cost: 1
+    - title: Why it is missing
+      command: grep -r omit_drivers /etc/dracut.conf /etc/dracut.conf.d
+      body: "omit_drivers excludes modules from every image dracut builds. Remove the line, then rebuild: dracut -f <image> <kernel version>."
+      cost: 2
+    - title: Which kernel version
+      body: "The new entry shares the running kernel's modules. dracut needs a real version (uname -r) and the output path of the image the entry loads."
+      cost: 2
+  misconceptions:
+    - id: rebuild-with-omit
+      description: Rebuilds the initramfs but leaves the omit_drivers configuration in place.
+      feedback: "dracut reads /etc/dracut.conf.d on every run; with omit_drivers still there the driver is dropped again."
+      expectFail: [initrd-has-driver, omit-removed]
+      mutation:
+        on: depot-ctl-4
+        as: learner
+        run: sudo dracut -f /boot/initramfs-9-tr-new.img "$(uname -r)"
+    - id: config-only
+      description: Removes the configuration but never rebuilds the image.
+      feedback: "The image on /boot was built with the old settings; it must be rebuilt."
+      expectFail: [initrd-has-driver]
+      mutation:
+        on: depot-ctl-4
+        as: learner
+        run: sudo rm -f /etc/dracut.conf.d/90-tr-storage.conf
+    - id: back-to-old
+      description: Rebuilds correctly but makes the old kernel the default and stops there.
+      feedback: "Booting the old kernel is how you get in; the goal is that the new kernel boots too."
+      expectFail: [default-new]
+      mutation:
+        on: depot-ctl-4
+        as: learner
+        run: |
+          sudo rm -f /etc/dracut.conf.d/90-tr-storage.conf
+          sudo dracut -f /boot/initramfs-9-tr-new.img "$(uname -r)"
+          sudo grub2-set-default "$(sudo cat /var/lib/cloudtrain/good-entry.id)"
+  solution:
+    explanation: |
+      lsinitrd shows virtio_blk missing from the new image; the cause is
+      /etc/dracut.conf.d/90-tr-storage.conf (omit_drivers). Removing it and running dracut
+      -f for the image the new entry loads restores the driver; the default entry is not
+      changed. At the console you would have booted the old kernel from the menu first.
+    steps:
+      - on: depot-ctl-4
+        as: learner
+        run: |
+          set -e
+          sudo lsinitrd /boot/initramfs-9-tr-new.img | grep -c virtio_blk || true
+          sudo rm -f /etc/dracut.conf.d/90-tr-storage.conf
+          sudo dracut -f /boot/initramfs-9-tr-new.img "$(uname -r)"
+          sudo lsinitrd /boot/initramfs-9-tr-new.img | grep virtio_blk
+    alternatives:
+      - id: add-drivers
+        description: Remove the omit line and force the driver into the rebuild with --add-drivers.
+        steps:
+          - on: depot-ctl-4
+            as: learner
+            run: |
+              set -e
+              sudo sed -i '/omit_drivers/d' /etc/dracut.conf.d/90-tr-storage.conf
+              sudo dracut -f --add-drivers virtio_blk /boot/initramfs-9-tr-new.img "$(uname -r)"
