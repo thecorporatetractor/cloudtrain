@@ -532,7 +532,22 @@ Next steps, in order (status after Phase 1, section 10):
 
 ## 9. Reproduce
 
-Everything ran in `/srv/ct-work/dev/kata` on ct-testvm with its own kubeconfig
+Phase 1 (section 10) replaces most of the spike steps below with the profile:
+
+```bash
+source env.sh                     # KUBECONFIG, KIND_PROFILE=kata, CT_CLUSTER_NAME=ct-kata2, KIND_CONFIG
+tools/slots/run.sh build -- tools/images/kata-kernel/build.sh          # or let kata-up pull the artifact
+LOAD_INTO_KIND=0 tools/slots/run.sh build -- tools/images/build-linux-pod.sh deb-sys el-sys
+tools/slots/run.sh vm -- deploy/scripts/dev-up.sh                      # vhost_vsock, cluster, kata-up.sh
+tools/images/load.sh jumphost linux-pod-deb-sys linux-pod-el-sys ubuntu-vm
+SESSION_SELECTOR=labs.cloudtrain.dev/verify=true LOAD_LAB_IMAGES=0 deploy/scripts/orchestrator-deploy.sh
+tools/kata/lab-variant.sh content/packs/linux/labs/netem-impaired-link labs
+bin/labctl preflight --context kind-ct-kata2 --tier-runtime-classes B=kata-clh-runtime-rs --probe --systemd-image cloudtrain/deb-sys:24.04
+tools/slots/run.sh vm -- bin/labctl verify --context kind-ct-kata2 --parallel 1 --grade-timeout 15m labs/*
+kind delete cluster --name ct-kata2
+```
+
+The spike itself ran in `/srv/ct-work/dev/kata` on ct-testvm with its own kubeconfig
 (`kata-spike/env.sh`). The heavy steps went through `tools/slots/run.sh`.
 
 ```bash
