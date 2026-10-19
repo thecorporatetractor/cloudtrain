@@ -84,7 +84,7 @@ spec:
       skills: [linux.systemd.targets]
       weight: 0.5
       command: |
-        grubby --info=ALL 2>/dev/null | grep '^args=' | grep -c 'root=' | awk '{print ($1 > 0 ? "intact" : "damaged")}'
+        grubby --info=ALL 2>/dev/null | grep -cE '^(root=|args=.*root=)' | awk '{print ($1 > 0 ? "intact" : "damaged")}'
       expect: {match: exact, value: intact}
   hints:
     - title: Where the default lives
@@ -124,12 +124,14 @@ spec:
         as: learner
         run: |
           sudo systemctl set-default multi-user.target
-          sudo grubby --update-kernel=ALL --remove-args="systemd.unit"
+          sudo sh -c "sed -i 's/ *systemd\\.unit=[^ ]*//' /boot/loader/entries/*.conf"
   solution:
     explanation: |
       systemctl set-default points default.target at multi-user.target. grubby
       --remove-args drops the systemd.unit override from every boot entry, and the same
       word is removed from /etc/kernel/cmdline so new kernels do not bring it back.
+      On el10, grubby --update-kernel=ALL also cleans /etc/kernel/cmdline and GRUB_CMDLINE_LINUX
+      in /etc/default/grub; if you edit the BLS entries by hand, clean those defaults too.
       The one-off rescue boot is an edit of the entry at the boot menu (append
       systemd.unit=rescue.target, Ctrl-X); it is not persistent and cannot be graded over ssh.
     steps:
@@ -150,5 +152,6 @@ spec:
             run: |
               set -e
               sudo ln -sf /usr/lib/systemd/system/multi-user.target /etc/systemd/system/default.target
-              sudo sed -i 's/ *systemd\.unit=[^ ]*//' /boot/loader/entries/*.conf
+              sudo sh -c "sed -i 's/ *systemd\\.unit=[^ ]*//' /boot/loader/entries/*.conf"
               sudo sed -i 's/ *systemd\.unit=[^ ]*//' /etc/kernel/cmdline
+              sudo sed -i '/^GRUB_CMDLINE_LINUX/s/ *systemd\.unit=[^ "]*//' /etc/default/grub
