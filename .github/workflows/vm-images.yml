@@ -1,0 +1,327 @@
+# KubeVirt VM containerDisks (kubeadm-node, kubeadm-upgrade, etcd-host, docker-vm,
+# kubeadm-full) built on GitHub-hosted ubuntu runners with KVM (/dev/kvm via the udev
+# rule in .github/actions/build-vm-image; free for a public repository) from
+# tools/images/build.sh, the list in tools/images/vm-images.yaml and the catalog
+# (deploy/images/catalog.yaml). el-vm and ubuntu-vm need the package-mirror content and
+# are not built here (docs/deploy.md).
+# Pull requests build (and boot-smoke) only the images whose inputs changed, no push.
+# Push to main (inputs changed), v* tags, the weekly schedule and manual runs: build,
+# boot-smoke, push to GHCR (branch, sha-<commit>, semver and catalog tags), cosign
+# keyless signature, SLSA provenance and an SBOM attestation, as images.yml does.
+# The catalog overlay job maps the containerDisk refs to the pushed digests.
+name: vm-images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - tools/images/**
+      - deploy/images/catalog.yaml
+      - deploy/versions.env
+      - deploy/scripts/lib.sh
+      - .github/workflows/vm-images.yml
+      - .github/actions/build-vm-image/**
+      - .github/actions/publish-vm-image/**
+      - .github/scripts/image-matrix.sh
+      - .github/scripts/install-tools.sh
+  pull_request:
+    paths:
+      - tools/images/**
+      - deploy/images/catalog.yaml
+      - deploy/versions.env
+      - deploy/scripts/lib.sh
+      - .github/workflows/vm-images.yml
+      - .github/actions/build-vm-image/**
+      - .github/actions/publish-vm-image/**
+      - .github/scripts/image-matrix.sh
+      - .github/scripts/install-tools.sh
+  schedule:
+    - cron: '41 3 * * 1' # weekly: rebuild every image on current runner and base-image state
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: 'Comma separated build.sh variants to build and publish (kubeadm-node, kubeadm-upgrade, etcd-host, docker-vm, kubeadm-full) or "all"'
+        default: all
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Files whose change rebuilds every image (the per-image paths are in vm-images.yaml).
+  REBUILD_ALL_PATHS: >-
+    tools/images/build.sh tools/images/builder/* tools/images/containerdisk/*
+    tools/images/scripts/customize.sh tools/images/scripts/guest-common.sh
+    tools/images/lock/workloads.lock tools/images/vm-images.yaml
+    deploy/images/catalog.yaml deploy/versions.env deploy/scripts/lib.sh
+    .github/workflows/vm-images.yml .github/actions/build-vm-image/* .github/actions/publish-vm-image/*
+    .github/scripts/install-tools.sh .github/scripts/image-matrix.sh
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # list the PR's files
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      stage1: ${{ steps.m.outputs.stage1 }}
+      stage2: ${{ steps.m.outputs.stage2 }}
+      any: ${{ steps.m.outputs.any }}
+      any1: ${{ steps.m.outputs.any1 }}
+      any2: ${{ steps.m.outputs.any2 }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            tools/images/vm-images.yaml
+            deploy/images/catalog.yaml
+      - id: m
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+          VARIANTS: ${{ inputs.variants }}
+          MATRIX_YQ: .images
+        run: |
+          pick=(bash .github/scripts/image-matrix.sh tools/images/vm-images.yaml)
+          if [[ $EVENT == pull_request ]]; then
+            out=$("${pick[@]}" --pr "$PR")
+          elif [[ $EVENT == push && $REF_TYPE == branch && $BEFORE =~ [1-9a-f] ]] \
+              && files=$(gh api --paginate "repos/$REPO/compare/$BEFORE...$SHA" --jq '.files[].filename') && [[ -n $files ]]; then
+            out=$("${pick[@]}" <<<"$files") # only the images whose inputs this push changed
+          else
+            out=$("${pick[@]}" --all) # tags, schedule, manual runs
+          fi
+          matrix=$(sed -n 's/^matrix=//p' <<<"$out")
+          if [[ $EVENT == workflow_dispatch && ${VARIANTS:-all} != all ]]; then
+            matrix=$(jq -c --arg v "$VARIANTS" '($v | split(",") | map(gsub(" "; ""))) as $l | .include |= map(select([.name] | inside($l)))' <<<"$matrix")
+          fi
+          # Resolve the catalog image of every entry (the contract with build.sh and
+          # labctl catalog overlay): kind containerDisk, publishable, publishName.
+          resolved='[]'
+          while IFS= read -r e; do
+            pn=$(jq -r .publishName <<<"$e")
+            image=$(PN=$pn yq -r '[.images[] | select(.kind == "containerDisk" and .publishable == true)
+              | select((.publishName // (.image | sub(":[^:/]*$"; "") | sub(".*/"; ""))) == strenv(PN))][0].image // ""' deploy/images/catalog.yaml)
+            [[ -n $image ]] || { echo "::error::no publishable containerDisk named $pn in deploy/images/catalog.yaml"; exit 1; }
+            resolved=$(jq -c --argjson e "$e" --arg i "$image" '. + [$e + {image: $i, tag: ($i | sub(".*:"; ""))}]' <<<"$resolved")
+          done < <(jq -c '.include[]' <<<"$matrix")
+          {
+            echo "matrix={\"include\":$resolved}"
+            echo "stage1={\"include\":$(jq -c 'map(select(.stage == 1))' <<<"$resolved")}"
+            echo "stage2={\"include\":$(jq -c 'map(select(.stage == 2))' <<<"$resolved")}"
+            echo "any=$(jq -r 'length > 0' <<<"$resolved")"
+            echo "any1=$(jq -r 'map(select(.stage == 1)) | length > 0' <<<"$resolved")"
+            echo "any2=$(jq -r 'map(select(.stage == 2)) | length > 0' <<<"$resolved")"
+          } >> "$GITHUB_OUTPUT"
+
+  # Pull requests: build and boot-smoke only, nothing is pushed or signed, no write token.
+  build:
+    name: build (${{ matrix.name }})
+    needs: plan
+    if: github.event_name == 'pull_request' && needs.plan.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read # kubeadm-full pulls the published kubeadm-node base
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: matrix.stage == 2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: ./.github/actions/build-vm-image
+        with:
+          variant: ${{ matrix.name }}
+          source-url: ${{ github.server_url }}/${{ github.repository }}
+          revision: ${{ github.sha }}
+          base-package: ${{ matrix.stage == 2 && format('ghcr.io/{0}/kubeadm-node-v1.37', github.repository) || '' }}
+          base-tags: main
+          base-identity: ^https://github.com/${{ github.repository }}/\.github/workflows/vm-images\.yml@refs/(heads/main|tags/v.+)$
+          base-optional: 'true' # before the first publish there is no base to layer on
+
+  publish-1:
+    name: publish (${{ matrix.name }})
+    needs: plan
+    if: github.event_name != 'pull_request' && needs.plan.outputs.any1 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # cosign keyless + attestations (Sigstore OIDC)
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.stage1) }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-vm-image
+        with:
+          variant: ${{ matrix.name }}
+          source-url: ${{ github.server_url }}/${{ github.repository }}
+          revision: ${{ github.sha }}
+      - name: Registry prefix
+        id: reg
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "registry=ghcr.io/${REPO,,}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/publish-vm-image
+        with:
+          variant: ${{ matrix.name }}
+          publish-name: ${{ matrix.publishName }}
+          local-image: ${{ matrix.image }}
+          catalog-tag: ${{ matrix.tag }}
+          registry: ${{ steps.reg.outputs.registry }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-vm-${{ matrix.publishName }}
+          path: sbom-${{ matrix.publishName }}.*.json
+          retention-days: 90
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-vm-${{ matrix.publishName }}
+          path: digests/${{ matrix.publishName }}
+          retention-days: 90
+
+  # Stage 2: kubeadm-full layers on the kubeadm-node disk published by this run (tag
+  # sha-<commit>; the main tag when a manual run builds kubeadm-full alone).
+  publish-2:
+    name: publish (${{ matrix.name }})
+    needs: [plan, publish-1]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.plan.outputs.any2 == 'true' && needs.publish-1.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.stage2) }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Registry prefix
+        id: reg
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "registry=ghcr.io/${REPO,,}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/build-vm-image
+        with:
+          variant: ${{ matrix.name }}
+          source-url: ${{ github.server_url }}/${{ github.repository }}
+          revision: ${{ github.sha }}
+          base-package: ${{ steps.reg.outputs.registry }}/kubeadm-node-v1.37
+          base-tags: sha-${{ github.sha }} main
+          base-identity: ^https://github.com/${{ github.repository }}/\.github/workflows/vm-images\.yml@refs/(heads/main|tags/v.+)$
+      - uses: ./.github/actions/publish-vm-image
+        with:
+          variant: ${{ matrix.name }}
+          publish-name: ${{ matrix.publishName }}
+          local-image: ${{ matrix.image }}
+          catalog-tag: ${{ matrix.tag }}
+          registry: ${{ steps.reg.outputs.registry }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-vm-${{ matrix.publishName }}
+          path: sbom-${{ matrix.publishName }}.*.json
+          retention-days: 90
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-vm-${{ matrix.publishName }}
+          path: digests/${{ matrix.publishName }}
+          retention-days: 90
+
+  # The containerDisk release overlay: every containerDisk ref published in this run mapped
+  # to ghcr.io/<repo>/<publishName>@<digest>. A workflow artifact; attached to the
+  # release on v* tags. Merge it with images.yml's catalog-release.yaml (docs/deploy.md).
+  catalog-overlay:
+    name: catalog overlay
+    needs: [publish-1, publish-2]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.publish-1.result == 'success' || needs.publish-2.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # attach the overlay to the release (v* tags)
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache: false # a publishing workflow: no cache that a PR could poison
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-vm-*
+          path: digests
+          merge-multiple: true
+      - name: Generate the overlay
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          cd services/lab-orchestrator && GOWORK=off go build -o ../../labctl ./cmd/labctl && cd ../..
+          ./labctl catalog overlay --allow-missing \
+            --catalog deploy/images/catalog.yaml \
+            --registry "ghcr.io/${REPO,,}" --digests digests > catalog-release-vm.yaml
+          # keep the containerDisk entries only (images.yml owns the container refs)
+          yq -i '.images |= with_entries(select(.value.kind == "containerDisk"))' catalog-release-vm.yaml
+          cat catalog-release-vm.yaml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: catalog-release-vm
+          path: catalog-release-vm.yaml
+          retention-days: 90
+      - name: Attach to the release (v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes "CloudTrain $TAG"
+          gh release upload "$TAG" catalog-release-vm.yaml --clobber
