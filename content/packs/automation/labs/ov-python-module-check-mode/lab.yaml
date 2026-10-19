@@ -96,6 +96,15 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.61
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
+      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      chmod 0700 /var/lib/ctjudge
+      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
+      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-branch-lon-gw; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
   - 'on': ov-ctl
     run: |
       set -eu
@@ -146,7 +155,7 @@ spec:
       match: exact
       value: ok
   - id: module-contract
-    description: The module is documented, reports changed correctly, is idempotent and honours check mode (judged with ad-hoc calls on the branch gateway)
+    description: The module is documented, reports changed correctly, is idempotent and honours check mode (judged with ad-hoc calls on the branch gateway, from the collection's own plugins/modules with a fixed configuration)
     type: shell
     'on': ov-ctl
     skills:
@@ -154,18 +163,33 @@ spec:
     weight: 4
     timeoutSec: 300
     command: |
-      /opt/ansible/bin/python3 -I - <<'EOF'
-      import atexit, json, os, random, signal, subprocess
+      # The collection's modules and module_utils are read as the learner into a root-owned archive and unpacked into a
+      # fresh collection tree for the grading account ctjudge (own uid and key), with a fixed configuration. Every call below
+      # runs as ctjudge from that tree: no project configuration, no controller-side plugin and no learner process is involved.
+      c=/home/learner/printer-modules/collections/ansible_collections/orrinvale/claims
+      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
+      t=$j/collections/ansible_collections/orrinvale/claims
+      install -d $t/plugins
+      printf '[defaults]\ninventory = %s/inventory.ini\ncollections_path = %s/collections\nremote_user = ovauto\n' $j $j > $j/ansible.cfg
+      printf 'ov-branch-lon-gw\n' > $j/inventory.ini
+      chown -R ctjudge $j
+      ( ulimit -f 8192; ct-ansible run $c/plugins timeout 20 tar -cf - modules $(ct-ansible run $c/plugins sh -c 'test -d module_utils && echo module_utils') > $a 2>/dev/null ) || { echo no-module; exit 0; }
+      runuser -u ctjudge -- timeout 20 tar -x --no-same-owner --no-same-permissions -C $t/plugins -f - < $a 2>/dev/null || { echo no-module; exit 0; }
+      runuser -u ctjudge -- find $t -mindepth 1 \( -type l -o \( -type f ! -name '*.py' \) \) -delete
+      /opt/ansible/bin/python3 -I - "$j" <<'EOF'
+      import atexit, json, os, random, signal, subprocess, sys
       H = 'ov-branch-lon-gw'
       # per-attempt names and devices, so a module cannot special-case fixed values
       sfx = os.urandom(3).hex()
       T = 'lon-t' + sfx
       C = 'lon-c' + sfx
       U1, U2, U3 = ['lpd://10.70.9.%d' % n for n in random.sample(range(100, 250), 3)]
-      D = '/home/learner/printer-modules'
+      D = sys.argv[1]
+      ENV = ['HOME=/var/lib/ctjudge', 'PATH=/opt/ansible/bin:/usr/bin:/bin', 'LANG=C.UTF-8', 'LC_ALL=C.UTF-8',
+             'ANSIBLE_CONFIG=' + D + '/ansible.cfg', 'ANSIBLE_NOCOLOR=1']
       def run(*a):
           try:
-              return subprocess.run(['ct-ansible', 'run', D] + list(a), capture_output=True, text=True, timeout=90)
+              return subprocess.run(['runuser', '-u', 'ctjudge', '--', 'env', '-i'] + ENV + list(a), cwd=D, capture_output=True, text=True, timeout=90)
           except subprocess.TimeoutExpired:
               return subprocess.CompletedProcess(a, 124, '', '')
       def adhoc(args, check=False):

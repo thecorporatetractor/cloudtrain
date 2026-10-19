@@ -93,6 +93,15 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-test-el1=10.70.0.71 ov-test-deb1=10.70.0.72
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-test-el1 ov-test-deb1
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
+      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      chmod 0700 /var/lib/ctjudge
+      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
+      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-test-el1 ov-test-deb1; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
   - 'on': ov-ctl
     run: |2
 
@@ -160,6 +169,9 @@ spec:
       EOF
       chown -R learner:learner $p
       cat $r/tasks/main.yml $r/defaults/main.yml $r/templates/audit-agent.conf.j2 $r/files/ov-audit-agent | sha256sum > /var/tmp/.ct-molecule.sum
+      # the role as supplied, for the graded Molecule run
+      rm -rf /var/lib/ct-molecule; install -d -m 0700 /var/lib/ct-molecule
+      cp -r $r /var/lib/ct-molecule/audit_agent; chown -R root:root /var/lib/ct-molecule
   checks:
   - id: node-testel1
     description: ov-test-el1 has the agent configuration and a running agent
@@ -211,7 +223,7 @@ spec:
       match: exact
       value: ok
   - id: molecule-cycle
-    description: molecule test passes (converge, idempotence, verify) and the verification fails when the config owner, the config mode or the agent is wrong
+    description: molecule test passes (converge, idempotence, verify) and the verification fails when the config owner, the config mode or the agent is wrong (graded on a copy with the supplied role, by a separate account)
     type: shell
     'on': ov-ctl
     skills:
@@ -219,37 +231,146 @@ spec:
     weight: 4
     timeoutSec: 600
     command: |
+      # Graded on a copy, by the grading account ctjudge (own uid, own key, a home the learner cannot read): the role as
+      # supplied plus the scenario's playbooks, read as the learner. The scenario may only use the default driver, the two
+      # test nodes and Ansible inventory variables for the login; no plugins, configuration overrides, lookups, local or
+      # delegated tasks, so no learner code runs on the control node and nothing outside the copy feeds the verdict.
       d=/home/learner/audit-roles/roles/audit_agent
-      run() { ct-ansible run $d env ANSIBLE_NOCOLOR=1 "$@"; }
-      ssh_n() { n=$1; shift; ct-ansible run /home/learner ssh ovauto@$n "$@"; }
+      w=$(mktemp -d); chmod 0700 $w; trap 'rm -rf $w' EXIT
+      cp -r /var/lib/ct-molecule/audit_agent $w/audit_agent
+      install -d $w/in $w/audit_agent/molecule/default
+      chown -R ctjudge:ctjudge $w
+      J() { (cd $w/audit_agent && runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 TERM=dumb "$@"); }
+      S() { runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin ssh ovauto@$1 "$2" >/dev/null 2>&1; }
+      ( ulimit -f 8192; ct-ansible run $d/molecule/default timeout 20 tar -cf - . > $w/in.tar 2>/dev/null ) || { echo no-scenario; exit 0; }
+      runuser -u ctjudge -- timeout 20 tar -x --no-same-owner --no-same-permissions -C $w/in -f - < $w/in.tar 2>/dev/null || { echo no-scenario; exit 0; }
+      for f in molecule converge verify prepare side_effect cleanup; do
+        if [ -f $w/in/$f.yml ] && [ ! -L $w/in/$f.yml ]; then cp $w/in/$f.yml $w/audit_agent/molecule/default/$f.yml; fi
+      done
+      rm -rf $w/in $w/in.tar; chown -R ctjudge:ctjudge $w/audit_agent
+      v=$(J timeout 30 /opt/ansible/bin/python3 -I - molecule/default <<'EOF'
+      import os, re, sys, yaml
+      S = sys.argv[1]
+      bad = set()
+      NODES = {'ov-test-el1', 'ov-test-deb1'}
+      LOGIN = {'ansible_user', 'ansible_become', 'ansible_become_method', 'ansible_become_user', 'ansible_python_interpreter'}
+      SAFE_LOOPS = {'items', 'list', 'dict', 'together', 'nested', 'sequence', 'subelements', 'indexed_items', 'flattened', 'random_choice'}
+      NOKEYS = {'delegate_to', 'local_action', 'connection', 'vars_files', 'include_vars', 'include_tasks', 'import_tasks',
+                'import_playbook', 'include', 'script', 'fetch', 'add_host', 'group_by', 'vars_prompt', 'module_defaults'}
+      LOOKUP = re.compile(r'(^|[^A-Za-z0-9_])(lookup|query|q)\s*\(')
+
+
+      def load(f):
+          p = os.path.join(S, f)
+          if not os.path.exists(p):
+              return None
+          try:
+              return yaml.safe_load(open(p))
+          except Exception:
+              bad.add('yaml-' + f)
+
+
+      def only(d, keys, what):
+          if not isinstance(d, dict) or set(d) - keys:
+              bad.add(what)
+              return {}
+          return d
+
+
+      m = load('molecule.yml')
+      if not isinstance(m, dict):
+          bad.add('molecule.yml')
+          m = {}
+      only(m, {'driver', 'platforms', 'provisioner', 'verifier', 'scenario', 'dependency', 'role_name_check', 'prerun'}, 'molecule-keys')
+      drv = only(m.get('driver') or {}, {'name', 'options'}, 'driver')
+      if drv.get('name', 'default') != 'default' or only(drv.get('options') or {}, {'managed'}, 'driver').get('managed', False) is not False:
+          bad.add('driver')
+      for pl in m.get('platforms') or []:
+          if only(pl, {'name', 'groups', 'children'}, 'platforms').get('name') not in NODES:
+              bad.add('platforms')
+      prov = only(m.get('provisioner') or {}, {'name', 'inventory', 'log'}, 'provisioner')
+      if prov.get('name', 'ansible') != 'ansible':
+          bad.add('provisioner')
+      inv = only(prov.get('inventory') or {}, {'group_vars', 'host_vars'}, 'inventory')
+      for scope in inv.values():
+          for hv in (scope or {}).values() if isinstance(scope, dict) else [None]:
+              if not isinstance(hv, dict):
+                  bad.add('inventory')
+                  continue
+              for k, v in hv.items():
+                  if str(k).startswith('ansible_') and str(k) not in LOGIN:
+                      bad.add('inventory-' + str(k))
+                  if str(k) == 'ansible_user' and v != 'ovauto':
+                      bad.add('inventory-user')
+      ver = only(m.get('verifier') or {}, {'name', 'enabled'}, 'verifier')
+      if ver.get('name', 'ansible') != 'ansible':
+          bad.add('verifier')
+      sc = only(m.get('scenario') or {}, {'name', 'test_sequence', 'converge_sequence', 'check_sequence', 'destroy_sequence', 'create_sequence'}, 'scenario')
+      dep = only(m.get('dependency') or {}, {'name', 'enabled'}, 'dependency')
+      if dep.get('name', 'galaxy') != 'galaxy':
+          bad.add('dependency')
+
+
+      def walk(node):
+          if isinstance(node, dict):
+              for k, v in node.items():
+                  key = str(k).split('.')[-1]
+                  if key in NOKEYS or str(k).startswith('ansible_') or (key.startswith('with_') and key[5:] not in SAFE_LOOPS):
+                      bad.add('not-allowed-' + key)
+                  if key in ('include_role', 'import_role'):
+                      if not isinstance(v, dict) or v.get('name') not in ('orrinvale.audit_agent', 'audit_agent') or set(v) - {'name'}:
+                          bad.add('role-' + key)
+                  if key == 'roles':
+                      for r in v or []:
+                          if (r.get('role', r.get('name')) if isinstance(r, dict) else r) not in ('orrinvale.audit_agent', 'audit_agent'):
+                              bad.add('roles')
+                  if key == 'hosts' and re.search(r'localhost|127\.|ov-ctl', str(v)):
+                      bad.add('local-play')
+                  if key == 'src' and (str(v).startswith('/') or '..' in str(v) or '{' in str(v)):
+                      bad.add('src-outside')
+                  walk(v)
+          elif isinstance(node, list):
+              for v in node:
+                  walk(v)
+          elif isinstance(node, str) and LOOKUP.search(node):
+              bad.add('lookup')
+
+
+      for f in ('converge.yml', 'verify.yml', 'prepare.yml', 'side_effect.yml', 'cleanup.yml'):
+          walk(load(f))
+      print('ok' if not bad else 'scenario-not-allowed:' + ','.join(sorted(bad)))
+      EOF
+      )
+      [ "$v" = ok ] || { echo "${v:-scenario-not-allowed}"; exit 0; }
       killed=""
       heal() {
-        ssh_n ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf; sudo -n chmod 0644 /etc/ov/audit-agent.conf' >/dev/null 2>&1
-        [ -z "$killed" ] || run molecule converge >/dev/null 2>&1
+        S ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf; sudo -n chmod 0644 /etc/ov/audit-agent.conf'
+        [ -z "$killed" ] || J molecule converge >/dev/null 2>&1
+        rm -rf $w
       }
       trap heal EXIT
-      out=$(run molecule test 2>&1); rc=$?
+      out=$(J timeout 420 molecule test 2>&1); rc=$?
       [ $rc = 0 ] || { echo "molecule-test-failed"; exit 0; }
       printf '%s' "$out" | grep -q 'idempotence: Executed: Successful' || { echo no-idempotence-step; exit 0; }
       printf '%s' "$out" | grep -q 'verify: Executed: Successful' || { echo no-verify-step; exit 0; }
       # the verification must notice a wrong owner
-      ssh_n ov-test-el1 'sudo -n chown nobody /etc/ov/audit-agent.conf' >/dev/null 2>&1
-      run molecule verify >/dev/null 2>&1 && { ssh_n ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf' >/dev/null 2>&1; echo verify-ignores-owner; exit 0; }
-      ssh_n ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf' >/dev/null 2>&1
+      S ov-test-el1 'sudo -n chown nobody /etc/ov/audit-agent.conf'
+      J timeout 120 molecule verify >/dev/null 2>&1 && { S ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf'; echo verify-ignores-owner; exit 0; }
+      S ov-test-el1 'sudo -n chown root /etc/ov/audit-agent.conf'
       # positive control: on the healed state the verification must pass again (a verify that fails on every later run proves nothing)
-      run molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
+      J timeout 120 molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
       # a wrong mode
-      ssh_n ov-test-el1 'sudo -n chmod 0600 /etc/ov/audit-agent.conf' >/dev/null 2>&1
-      run molecule verify >/dev/null 2>&1 && { ssh_n ov-test-el1 'sudo -n chmod 0644 /etc/ov/audit-agent.conf' >/dev/null 2>&1; echo verify-ignores-mode; exit 0; }
-      ssh_n ov-test-el1 'sudo -n chmod 0644 /etc/ov/audit-agent.conf' >/dev/null 2>&1
-      run molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
+      S ov-test-el1 'sudo -n chmod 0600 /etc/ov/audit-agent.conf'
+      J timeout 120 molecule verify >/dev/null 2>&1 && { S ov-test-el1 'sudo -n chmod 0644 /etc/ov/audit-agent.conf'; echo verify-ignores-mode; exit 0; }
+      S ov-test-el1 'sudo -n chmod 0644 /etc/ov/audit-agent.conf'
+      J timeout 120 molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
       # and a stopped agent
       killed=1
-      ssh_n ov-test-deb1 'sudo -n sh -c "kill \$(cat /run/ov-audit-agent.pid); rm -f /run/ov-audit-agent.pid"' >/dev/null 2>&1
-      run molecule verify >/dev/null 2>&1 && { echo verify-ignores-agent; exit 0; }
-      run molecule converge >/dev/null 2>&1 && killed=""
+      S ov-test-deb1 'sudo -n sh -c "kill \$(cat /run/ov-audit-agent.pid); rm -f /run/ov-audit-agent.pid"'
+      J timeout 120 molecule verify >/dev/null 2>&1 && { echo verify-ignores-agent; exit 0; }
+      J timeout 180 molecule converge >/dev/null 2>&1 && killed=""
       [ -z "$killed" ] || { echo converge-failed; exit 0; }
-      run molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
+      J timeout 120 molecule verify >/dev/null 2>&1 || { echo verify-fails-when-healthy; exit 0; }
       echo ok
     expect:
       match: exact

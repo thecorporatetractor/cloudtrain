@@ -112,14 +112,7 @@ spec:
       ssh-keygen -A >/dev/null 2>&1
       mkdir -p /run/sshd
       pgrep -x sshd >/dev/null || /usr/sbin/sshd
-      case $(hostname) in
-        ov-claims-web1) t=gold;       m={{teamweb}} ;;
-        ov-claims-web2) t={{tierweb2}}; m={{teamweb}} ;;
-        ov-db-1)        t=gold;       m=data ;;
-        ov-quote-api1)  t={{tierquote}}; m=quoting ;;
-      esac
-      printf '%s %s\n' "$t" "$m" > /var/tmp/.ct-expect-tier
-      rm -rf /etc/ansible/facts.d /usr/local/bin/ov-pager-agent /etc/ov/pager
+      rm -rf /etc/ansible/facts.d /usr/local/bin/ov-pager-agent /etc/ov/pager /var/tmp/.ct-expect-tier
   - 'on': ov-claims-web2
     run: *ov-node
   - 'on': ov-db-1
@@ -186,10 +179,17 @@ spec:
     - automation.data.facts
     weight: 2
     command: &chk_fact-n |
-      read tier team < /var/tmp/.ct-expect-tier
+      # the expected tier and team come from the lab parameters, not from anything stored on the node
+      case $(hostname) in
+        ov-claims-web1) tier=gold; team={{teamweb}} ;;
+        ov-claims-web2) tier={{tierweb2}}; team={{teamweb}} ;;
+        ov-db-1) tier=gold; team=data ;;
+        ov-quote-api1) tier={{tierquote}}; team=quoting ;;
+        *) echo unknown-host; exit 0 ;;
+      esac
       f=/etc/ansible/facts.d/ov.fact
       [ -f "$f" ] || { echo no-fact; exit 0; }
-      if [ -x "$f" ]; then out=$("$f" 2>/dev/null); else out=$(cat "$f"); fi
+      if [ -x "$f" ]; then out=$(timeout 10 "$f" </dev/null 2>/dev/null | head -c 65536); else out=$(head -c 65536 "$f"); fi
       printf '%s' "$out" | python3 -c '
       import json, sys
       t, m = sys.argv[1], sys.argv[2]
@@ -243,7 +243,14 @@ spec:
     - automation.data.facts
     weight: 2
     command: &chk_agent-n |
-      read tier team < /var/tmp/.ct-expect-tier
+      # the expected tier and team come from the lab parameters, not from anything stored on the node
+      case $(hostname) in
+        ov-claims-web1) tier=gold; team={{teamweb}} ;;
+        ov-claims-web2) tier={{tierweb2}}; team={{teamweb}} ;;
+        ov-db-1) tier=gold; team=data ;;
+        ov-quote-api1) tier={{tierquote}}; team=quoting ;;
+        *) echo unknown-host; exit 0 ;;
+      esac
       a=/usr/local/bin/ov-pager-agent; c=/etc/ov/pager/agent.conf
       if [ "$tier" = gold ]; then
         [ -x $a ] || { echo no-agent; exit 0; }

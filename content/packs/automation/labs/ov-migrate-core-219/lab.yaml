@@ -236,12 +236,16 @@ spec:
       cd /home/learner/claims-automation
       ct-ansible run /home/learner timeout 30 sha256sum -c --quiet /var/tmp/.ct-migrate.sum >/dev/null 2>&1 || { echo group-vars-edited; exit 0; }
       r=""
-      # searched as the learner under a time bound (a FIFO or a link to a huge file cannot stall or leak through the grader)
-      if ct-ansible run . timeout 30 grep -rIqsi -D skip 'allow_broken_conditionals' . /home/learner/.bashrc /home/learner/.profile /home/learner/.bash_profile /home/learner/.ansible.cfg /home/learner/.config 2>/dev/null; then r="$r escape-hatch-file"; fi
-      ct-ansible run . ansible-config dump --only-changed 2>/dev/null | grep -qi 'ALLOW_BROKEN_CONDITIONALS' && r="$r escape-hatch-config"
-      [ -z "$(ct-ansible run . printenv ANSIBLE_ALLOW_BROKEN_CONDITIONALS)" ] || r="$r escape-hatch-env"
-      for f in deploy-release render-tuning capacity; do ct-ansible run . test -s $f.yml || r="$r missing-$f"; done
-      ct-ansible run . timeout 20 sh -c "grep -q 'Shard markers' capacity.yml && grep -q 'Production tuning' render-tuning.yml && grep -q 'Fast path marker' deploy-release.yml" 2>/dev/null || r="$r tasks-removed"
+      # The project and the learner's shell and Ansible dotfiles are read as the learner into a root-owned archive (bounded;
+      # a read that fails or is cut short fails the check) and searched by nobody, so no learner process decides anything.
+      j=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j $a' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"); }
+      ( ulimit -f 131072; ct-ansible run /home/learner timeout 60 sh -c 'tar -cf - --exclude=claims-automation/.git claims-automation $(for f in .bashrc .profile .bash_profile .bash_login .ansible.cfg .config .pam_environment; do [ -e "$f" ] && echo "$f"; done)' > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      N timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      N find . -type l -delete
+      if N timeout 30 grep -rIqsi 'allow_broken_conditionals' .; then r="$r escape-hatch-file"; fi
+      for f in deploy-release render-tuning capacity; do N test -s claims-automation/$f.yml || r="$r missing-$f"; done
+      N sh -c "grep -q 'Shard markers' claims-automation/capacity.yml && grep -q 'Production tuning' claims-automation/render-tuning.yml && grep -q 'Fast path marker' claims-automation/deploy-release.yml" 2>/dev/null || r="$r tasks-removed"
       echo "${r:-ok}"
     expect:
       match: exact

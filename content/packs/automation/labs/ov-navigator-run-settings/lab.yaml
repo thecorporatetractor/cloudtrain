@@ -82,6 +82,18 @@ spec:
       ssh-keygen -A >/dev/null 2>&1
       mkdir -p /run/sshd
       pgrep -x sshd >/dev/null || /usr/sbin/sshd
+      # run stamp: every fact gathering (as root) gets a fresh token, logged on the host for the grader
+      mkdir -p /etc/ansible/facts.d /var/lib/ov-nav
+      chmod 0700 /var/lib/ov-nav
+      : > /var/lib/ov-nav/tokens
+      cat > /etc/ansible/facts.d/ov_run.fact <<'EOF'
+      #!/bin/sh
+      # Orrin and Vale run stamp
+      t=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+      echo "$(date +%s) $t" >> /var/lib/ov-nav/tokens
+      printf '{"token": "%s"}\n' "$t"
+      EOF
+      chmod 0755 /etc/ansible/facts.d/ov_run.fact
   - 'on': ov-claims-web2
     run: *ov-node
   - 'on': ov-ctl
@@ -90,6 +102,15 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
+      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      chmod 0700 /var/lib/ctjudge
+      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
+      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-claims-web1 ov-claims-web2; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
   - 'on': ov-ctl
     run: |
       p=/home/learner/claims-automation
@@ -164,29 +185,69 @@ spec:
       match: exact
       value: ok
   - id: artifact-saved
-    description: A playbook artifact of a site.yml run exists under artifacts/ and parses
+    description: An artifact that ansible-navigator saved for a site.yml run is under artifacts/, with navigator's fields, both web nodes' task results and recap, and fact-gathering stamps the web nodes issued during this lab
     type: shell
     'on': ov-ctl
     skills:
     - automation.devworkflow.navigator
     weight: 2
+    timeoutSec: 120
     command: |
+      # Each artifact is copied as the learner (bounded) into a root-owned file and parsed by nobody. It must be a real
+      # navigator artifact of a site.yml run: navigator's own fields, the per-host task events of both web nodes and a clean
+      # recap in its stdout, and the run stamps that fact gathering issued on each node (the nodes log every stamp they
+      # hand out, and the grading account ctjudge reads those logs). A hand-written JSON file has none of these stamps.
       d=/home/learner/claims-automation/artifacts
-      f=$(ct-ansible run $d timeout 20 find $d -maxdepth 1 -type f -name '*.json' -newer /var/tmp/.ct-nav-start 2>/dev/null | head -1)
-      [ -n "$f" ] || { echo none; exit 0; }
-      ct-ansible run $d timeout 30 /opt/ansible/bin/python3 -I - "$f" <<'EOF'
-      import json, os, sys
+      s=$(mktemp); trap 'rm -f $s' EXIT; chmod 0644 $s
+      S() { runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin timeout 30 ssh ovauto@$1 "$2" 2>/dev/null; }
+      r=none
+      for f in $(ct-ansible run $d timeout 20 sh -c 'ls -t -- *.json 2>/dev/null | head -20'); do
+        case $f in *[!A-Za-z0-9._-]*) continue ;; esac
+        ( ulimit -f 65536; ct-ansible run $d timeout 20 sh -c 'test -f "$1" && test ! -L "$1" && test "$1" -nt /var/tmp/.ct-nav-start && head -c 33554433 "$1"' sh "$f" > $s 2>/dev/null ) || continue
+        v=$(runuser -u nobody -- env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 timeout 60 /opt/ansible/bin/python3 -I - "$s" <<'EOF'
+      import json, os, re, sys
       try:
-          if os.path.getsize(sys.argv[1]) > 33554432: raise ValueError('large')
+          if os.path.getsize(sys.argv[1]) > 33554432:
+              raise ValueError('large')
           j = json.load(open(sys.argv[1]))
       except Exception:
           print('invalid'); raise SystemExit
-      t = json.dumps(j)
-      # fields every ansible-navigator playbook artifact carries: hand-written JSON with just a plays list is not one
-      nav = j.get('status') == 'successful' and j.get('version') == '2.0.0' and isinstance(j.get('stdout'), list) and isinstance(j.get('settings_entries'), dict)
-      ok = nav and isinstance(j.get('plays'), list) and j['plays'] and 'ov-claims-web1' in t and 'ov-claims-web2' in t and 'site.yml' in t
-      print('ok' if ok else 'incomplete')
+      if not (isinstance(j, dict) and j.get('status') == 'successful' and j.get('version') == '2.0.0'
+              and isinstance(j.get('stdout'), list) and isinstance(j.get('settings_entries'), dict) and isinstance(j.get('plays'), list) and j['plays']):
+          print('incomplete'); raise SystemExit
+      pb = (((j['settings_entries'].get('ansible-navigator') or {}).get('ansible') or {}).get('playbook') or {}).get('path')
+      if pb != '/home/learner/claims-automation/site.yml':
+          print('not-site'); raise SystemExit
+      H = ('ov-claims-web1', 'ov-claims-web2')
+      toks, seen = {}, {h: set() for h in H}
+      for play in j['plays']:
+          for t in (play.get('tasks') or []) if isinstance(play, dict) else []:
+              if not isinstance(t, dict) or t.get('host') not in H:
+                  continue
+              seen[t['host']].add(t.get('task'))
+              loc = (((t.get('res') or {}).get('ansible_facts') or {}).get('ansible_local') or {}).get('ov_run') or {}
+              if t.get('task_action') in ('gather_facts', 'setup', 'ansible.builtin.gather_facts', 'ansible.builtin.setup') and re.fullmatch(r'[0-9a-f]{16}', str(loc.get('token', ''))):
+                  toks.setdefault(t['host'], set()).add(loc['token'])
+      out = re.sub(r'\x1b\[[0-9;]*m', '', '\n'.join(str(x) for x in j['stdout']))
+      bad = []
+      for h in H:
+          if not re.search(r'^%s\s*:\s*ok=\d+\s+changed=\d+\s+unreachable=0\s+failed=0\b' % re.escape(h), out, re.M):
+              bad.append('recap-' + h)
+          if not {'Portal configuration directory', 'Portal release marker'} <= seen[h]:
+              bad.append('tasks-' + h)
+          if len(toks.get(h, ())) != 1:
+              bad.append('stamp-' + h)
+      print(' '.join(bad) if bad else 'ok ' + ' '.join(next(iter(toks[h])) for h in H))
       EOF
+        )
+        set -- $v
+        [ "$1" = ok ] || { r=${1:-parse-failed}; continue; }
+        a=$(S ov-claims-web1 'sudo -n cat /var/lib/ov-nav/tokens' | awk -v t="$2" '$2 == t {print $1; exit}')
+        b=$(S ov-claims-web2 'sudo -n cat /var/lib/ov-nav/tokens' | awk -v t="$3" '$2 == t {print $1; exit}')
+        if [ -n "$a" ] && [ -n "$b" ] && [ $((a - b)) -le 600 ] && [ $((b - a)) -le 600 ]; then echo ok; exit 0; fi
+        r=stamps-not-issued
+      done
+      echo "$r"
     expect:
       match: exact
       value: ok
@@ -288,6 +349,45 @@ spec:
       run: |
         cd ~/claims-automation
         ansible-playbook site.yml
+  - id: hand-written-artifact
+    description: Runs the playbook with ansible-playbook and writes a navigator-style artifact by hand (navigator's fields, task events for both nodes, a recap and made-up run stamps).
+    feedback: The artifact has to come from an ansible-navigator run; its fact-gathering stamps must be ones the web nodes issued.
+    expectFail:
+    - artifact-saved
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-automation
+        mkdir -p artifacts
+        cat > ansible-navigator.yml <<'EOF'
+        ---
+        ansible-navigator:
+          execution-environment:
+            enabled: false
+          mode: stdout
+          playbook-artifact:
+            enable: true
+            save-as: "{playbook_dir}/artifacts/{playbook_name}-{time_stamp}.json"
+        EOF
+        ansible-playbook site.yml
+        /opt/ansible/bin/python3 - <<'EOF'
+        import json
+        tasks = []
+        for h, tok in (('ov-claims-web1', '0123456789abcdef'), ('ov-claims-web2', 'fedcba9876543210')):
+            tasks.append({'host': h, 'task': 'Gathering Facts', 'task_action': 'gather_facts',
+                          'res': {'ansible_facts': {'ansible_local': {'ov_run': {'token': tok}}}}})
+            tasks.append({'host': h, 'task': 'Portal configuration directory', 'task_action': 'ansible.builtin.file', 'res': {}})
+            tasks.append({'host': h, 'task': 'Portal release marker', 'task_action': 'ansible.builtin.copy', 'res': {}})
+        art = {'version': '2.0.0', 'status': 'successful', 'status_color': 42,
+               'settings_entries': {'ansible-navigator': {'ansible': {'playbook': {'path': '/home/learner/claims-automation/site.yml'}}}},
+               'settings_sources': {}, 'plays': [{'name': 'Claims portal baseline', 'tasks': tasks}],
+               'stdout': ['PLAY RECAP ****',
+                          'ov-claims-web1             : ok=3    changed=0    unreachable=0    failed=0    skipped=0',
+                          'ov-claims-web2             : ok=3    changed=0    unreachable=0    failed=0    skipped=0']}
+        json.dump(art, open('artifacts/site-artifact-2026-10-19T00:00:00.000000+00:00.json', 'w'))
+        EOF
   solution:
     explanation: |
       The project settings file `ansible-navigator.yml` turns execution environments off (the pod has no

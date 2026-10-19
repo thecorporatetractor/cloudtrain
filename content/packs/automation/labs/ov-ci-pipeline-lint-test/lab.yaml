@@ -341,9 +341,9 @@ spec:
           return res
 
 
-      def record(n, ref, sha, chain, steps, status, note='', lint=None):
+      def record(n, ref, sha, chain, steps, status, note='', lint=None, molecule=None):
           rec = {'n': n, 'ref': ref, 'sha': sha, 'chain': chain, 'status': status, 'steps': steps, 'note': note,
-                 'lint': lint or {'verdict': 'none'}, 'finished': int(time.time())}
+                 'lint': lint or {'verdict': 'none'}, 'molecule': molecule or {'verdict': 'none'}, 'finished': int(time.time())}
           tmp = os.path.join(BASE, 'runs', '.%06d.tmp' % n)
           with open(tmp, 'w') as f:
               json.dump(rec, f)
@@ -359,6 +359,14 @@ spec:
       cd src || exit 4
       if find . \( -name '.ansible-lint*' -o -name 'ansible-lint*' -o -name '.config' -o -name '.yamllint*' -o -name '.gitattributes' \) | grep -q .; then exit 3; fi
       if grep -rIEq 'skip_ansible_lint|noqa' .; then exit 3; fi
+      # code in the commit would run inside the linter (and inside Molecule): plugins, modules, module_utils, vendored
+      # collections, any Python file, and lookups (which run commands while playbooks load) make the commit "tampered"
+      if find . \( -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o -name '*.pth' \) | grep -q .; then exit 3; fi
+      if find . -type d \( -name library -o -name module_utils -o -name plugins -o -name '*_plugins' -o -name collections \) | grep -q .; then exit 3; fi
+      if grep -rIEq '(^|[^a-zA-Z0-9_])(lookup|query|q)[[:space:]]*\(|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)' .; then exit 3; fi
+      # the commit's own ansible.cfg files and hidden directories are not used for the verdict
+      find . -name ansible.cfg -delete
+      find . -mindepth 1 -type d -name '.*' -prune -exec rm -rf {} +
       # ansible-lint skips every path a .gitignore matches: a .gitignore that hides yml files, roles or the playbooks is tampering,
       # and whatever else is left is deleted so it cannot hide anything from the judged export
       if grep -rIqsEi --include=.gitignore 'yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]' .; then exit 3; fi
@@ -397,6 +405,48 @@ spec:
           return {'verdict': verdict, 'rc': rc, 'tail': out[-600:]}
 
 
+      # The Molecule verdict is the runner's own as well: the clean commit is exported again for the grading account
+      # ctjudge (its own uid and SSH key, a home the learner cannot read), the scenario is replaced by the one the
+      # repository was created with, and `molecule test` runs there. A learner process cannot reach that copy or that run.
+      JUDGE_MOL = 'ctjudge' if USER else ''
+      PRISTINE_SCENARIO = '/usr/local/lib/ov-ci/pristine-molecule'
+      MOL_ENV = {'HOME': '/var/lib/ctjudge', 'USER': 'ctjudge', 'LOGNAME': 'ctjudge', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+                 'PATH': '/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin', 'ANSIBLE_NOCOLOR': '1', 'TERM': 'dumb'}
+
+
+      def judge_molecule(repo, sha, mol):
+          gitenv = ' '.join('%s=%s' % (k, shlex.quote(v)) for k, v in ENV.items())
+          molenv = ' '.join('%s=%s' % (k, shlex.quote(v)) for k, v in MOL_ENV.items())
+          if JUDGE_MOL:
+              arch = 'runuser -u %s -- env -i %s ' % (USER, gitenv)
+              as_judge = 'runuser -u %s -- env -i %s ' % (JUDGE_MOL, molenv)
+          else:
+              arch = as_judge = ''
+          src = os.path.join(mol, 'src')
+          cmd = ('set -o pipefail 2>/dev/null; %sgit -C %s -c core.attributesFile=/dev/null archive --format=tar %s'
+                 ' | head -c 67108864 | %star -x --no-same-owner --no-same-permissions -C %s -f -'
+                 % (arch, shlex.quote(repo), shlex.quote(sha), as_judge, shlex.quote(src)))
+          p = subprocess.run(['/bin/bash', '-c', cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, text=True)
+          if p.returncode != 0:
+              return {'verdict': 'error', 'rc': p.returncode, 'tail': 'export failed'}
+          prep = ('cd %s && find . -type l -delete && find . -name ansible.cfg -delete'
+                  ' && find . -mindepth 1 -type d -name ".*" -prune -exec rm -rf {} + && test -d roles/audit_agent'
+                  ' && rm -rf roles/audit_agent/molecule && cp -r %s roles/audit_agent/molecule'
+                  % (shlex.quote(src), PRISTINE_SCENARIO))
+          test = 'cd %s/roles/audit_agent && exec timeout 420 molecule test' % shlex.quote(src)
+          if JUDGE_MOL:
+              prep = '%ssh -c %s' % (as_judge, shlex.quote(prep))
+              test = '%ssh -c %s' % (as_judge, shlex.quote(test))
+          p = subprocess.run(['/bin/bash', '-c', prep], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, text=True)
+          if p.returncode != 0:
+              return {'verdict': 'error', 'rc': p.returncode, 'tail': (p.stdout or '')[-300:]}
+          try:
+              p = subprocess.run(['/bin/bash', '-c', test], cwd='/', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=480, text=True)
+          except subprocess.TimeoutExpired:
+              return {'verdict': 'failed', 'rc': 124, 'tail': 'timeout'}
+          return {'verdict': 'passed' if p.returncode == 0 else 'failed', 'rc': p.returncode, 'tail': (p.stdout or '')[-600:]}
+
+
       def step_timeout(s):
           try:
               return max(1, min(int(s.get('timeout', 300)), 900))
@@ -410,15 +460,20 @@ spec:
           token = '%d-%s' % (n, secrets.token_hex(8))
           work = os.path.join(BASE, 'work', token)
           judge = os.path.join(BASE, 'judge', token)
+          mol = os.path.join(BASE, 'judge', token + '-m')
           os.makedirs(work, exist_ok=True)
           os.makedirs(os.path.join(judge, 'src'), exist_ok=True)
+          os.makedirs(os.path.join(mol, 'src'), exist_ok=True)
           try:
               if USER:
                   shutil.chown(work, USER)
                   shutil.chown(judge, JUDGE)
                   shutil.chown(os.path.join(judge, 'src'), JUDGE)
+                  shutil.chown(mol, JUDGE_MOL)
+                  shutil.chown(os.path.join(mol, 'src'), JUDGE_MOL)
               os.chmod(work, 0o700)
               os.chmod(judge, 0o755)
+              os.chmod(mol, 0o700)
               rc, out = run('git clone -q %s repo && cd repo && git checkout -q %s && git rev-list --first-parent -50 %s' % (REPO, sha, sha), cwd=work)
               if rc != 0:
                   record(n, ref, sha, [], [], 'error', 'checkout failed')
@@ -453,7 +508,8 @@ spec:
                                'seconds': int(time.time() - t0), 'tail': out[-600:]})
                   failed = rc != 0
               lint = independent_lint(judge)
-              record(n, ref, sha, chain, recs, 'failed' if failed else 'passed', lint=lint)
+              molv = judge_molecule(repo, sha, mol) if (not failed and lint['verdict'] == 'clean') else None
+              record(n, ref, sha, chain, recs, 'failed' if failed else 'passed', lint=lint, molecule=molv)
           except Exception as e:
               try:
                   record(n, ref, sha, [], [], 'error', 'runner error: %s' % type(e).__name__)
@@ -462,6 +518,7 @@ spec:
           finally:
               shutil.rmtree(work, ignore_errors=True)
               shutil.rmtree(judge, ignore_errors=True)
+              shutil.rmtree(mol, ignore_errors=True)
 
 
       def main():
@@ -495,6 +552,23 @@ spec:
       chmod 0755 /usr/local/lib/ov-ci/runner.py
       printf -- '---\nskip_list: []\nwarn_list: []\n' > /usr/local/lib/ov-ci/ansible-lint.yml
       chmod 0644 /usr/local/lib/ov-ci/ansible-lint.yml
+      # grading account for the runner's own Molecule run: separate uid, own key for ovauto on the test node
+      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      chmod 0700 /var/lib/ctjudge
+      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
+      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      ct-ansible run /home/learner ssh ovauto@ov-test-el1 "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"
+      # the scenario the repository was created with, for that run
+      t=$(mktemp -d); chown learner $t
+      ct-ansible run $t git clone -q git@ov-git:claims-automation.git repo
+      rm -rf /usr/local/lib/ov-ci/pristine-molecule
+      cp -r $t/repo/roles/audit_agent/molecule /usr/local/lib/ov-ci/pristine-molecule
+      chown -R root:root /usr/local/lib/ov-ci/pristine-molecule; chmod -R u=rwX,go=rX /usr/local/lib/ov-ci/pristine-molecule
+      rm -rf $t
+      test -f /usr/local/lib/ov-ci/pristine-molecule/default/molecule.yml
       cat > /usr/local/bin/ov-ci-runs <<'EOF'
       #!/bin/sh
       # one line per pipeline run: number, branch, commit, result, steps
@@ -615,7 +689,7 @@ spec:
       else:
           for i, r in enumerate(ci):
               lint = st(r, 'lint'); syn = st(r, 'syntax'); mol = st(r, 'molecule')
-              if r['status'] != 'passed' or verdict(r) != 'clean' or not (lint and syn and mol) or any(s['status'] != 'passed' for s in r['steps']):
+              if r['status'] != 'passed' or verdict(r) != 'clean' or (r.get('molecule') or {}).get('verdict') != 'passed' or not (lint and syn and mol) or any(s['status'] != 'passed' for s in r['steps']):
                   continue
               for f in ci[:i]:
                   if f['status'] == 'failed' and verdict(f) == 'findings' and f['sha'] in r['chain'] and f['sha'] != r['sha']:
@@ -704,7 +778,7 @@ spec:
       else:
           for i, r in enumerate(ci):
               lint = st(r, 'lint'); syn = st(r, 'syntax'); mol = st(r, 'molecule')
-              if r['status'] != 'passed' or verdict(r) != 'clean' or not (lint and syn and mol) or any(s['status'] != 'passed' for s in r['steps']):
+              if r['status'] != 'passed' or verdict(r) != 'clean' or (r.get('molecule') or {}).get('verdict') != 'passed' or not (lint and syn and mol) or any(s['status'] != 'passed' for s in r['steps']):
                   continue
               for f in ci[:i]:
                   if f['status'] == 'failed' and verdict(f) == 'findings' and f['sha'] in r['chain'] and f['sha'] != r['sha']:
@@ -818,6 +892,47 @@ spec:
         printf -- '---\n- name: Dummy\n  hosts: localhost\n  gather_facts: false\n  tasks:\n    - name: Nothing\n      ansible.builtin.debug:\n        msg: ok\n' > dummy.yml
         git add -A
         git commit -q -m 'Hide the finding'
+        git push -q origin ci
+        wait_runs 2
+  - id: plugin-silences-lint
+    description: After the red lint run, keeps the unnamed task and adds a filter plugin (in the repository and through an ansible.cfg pointing outside it) that ends ansible-lint with exit code 0.
+    feedback: The runner lints every commit itself without project code or configuration; code that stops the linter makes the commit tampered, so the task has to be fixed.
+    expectFail:
+    - green-after-fix
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 900
+      run: |
+        cd ~ && rm -rf claims-automation && git clone -q git@ov-git:claims-automation.git && cd claims-automation
+        git config user.name learner && git config user.email learner@orrinvale.example
+        git switch -q -c ci
+        wait_runs() { i=0; while [ "$(ls /var/ci/runs/*.json 2>/dev/null | wc -l)" -lt "$1" ] && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done; }
+        cat > .ov-ci.yml <<'EOF'
+        steps:
+          - name: syntax
+            run: ansible-playbook --syntax-check site.yml
+          - name: lint
+            run: ansible-lint
+          - name: molecule
+            run: cd roles/audit_agent && molecule test
+            timeout: 420
+        EOF
+        cat >> roles/audit_agent/tasks/main.yml <<'EOF'
+
+        - ansible.builtin.shell: echo audit agent ready
+        EOF
+        git add -A
+        git commit -q -m 'Add pipeline (and a sloppy task)'
+        git push -q -u origin ci
+        wait_runs 1
+        mkdir -p filter_plugins /tmp/ci-shim
+        printf 'import os\nos._exit(0)\n' > filter_plugins/quiet.py
+        cp filter_plugins/quiet.py /tmp/ci-shim/quiet.py
+        chmod -R a+rX /tmp/ci-shim
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\nroles_path = ./roles\nfilter_plugins = /tmp/ci-shim\n' > ansible.cfg
+        git add -A
+        git commit -q -m 'Quiet the linter'
         git push -q origin ci
         wait_runs 2
   - id: wrong-pipeline-name

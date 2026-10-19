@@ -167,7 +167,7 @@ spec:
       cat $r/defaults/main.yml $r/templates/gateway.conf.j2 $p/site.yml | sha256sum > /var/tmp/.ct-lint.sum
   checks:
   - id: lint-production
-    description: The project passes ansible-lint at the production profile (judged on a copy without any lint configuration)
+    description: The project passes ansible-lint at the production profile (judged on a copy without lint configuration, ansible.cfg or project code)
     type: shell
     'on': ov-ctl
     skills:
@@ -177,16 +177,23 @@ spec:
     command: |
       # The learner's tree is only read as the learner. It is streamed (without .git) into a directory owned by the
       # unprivileged account nobody, and every later step runs as nobody, so no learner process can touch the judged copy.
+      # The linter's home and configuration are separate root-made directories, never the copy.
       cfg=$(mktemp); printf -- '---\nprofile: production\nskip_list: []\nwarn_list: []\n' > $cfg; chmod 0644 $cfg
-      j=$(mktemp -d); chmod 0755 $j; chown nobody $j
-      N() { (cd $j && runuser -u nobody -- env -i HOME=$j PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 "$@"); }
-      clean() { rm -f $cfg; rm -rf $j; }
-      ct-ansible run /home/learner/branch-automation timeout 60 tar --exclude=./.git -cf - . | N timeout 60 tar -x --no-same-owner --no-same-permissions -f - || { clean; echo copy-failed; exit 0; }
+      j=$(mktemp -d); h=$(mktemp -d); chmod 0755 $j; chmod 0700 $h; chown nobody $j $h
+      N() { (cd $j && runuser -u nobody -- env -i HOME=$h PATH=/opt/ansible/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 ANSIBLE_NOCOLOR=1 "$@"); }
+      a=$(mktemp); clean() { rm -f $cfg $a; rm -rf $j $h; }
+      # the archive is written by the learner's tar into a root-owned file (size-capped); a tar that fails or is cut short fails the check
+      ( ulimit -f 131072; ct-ansible run /home/learner/branch-automation timeout 60 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { clean; echo copy-failed; exit 0; }
+      N timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { clean; echo copy-failed; exit 0; }
       # ansible-lint drops every path a .gitignore matches, so the judged copy has no ignore file or lint configuration at any depth
       N sh -c 'find . -type l -delete; rm -rf .git .config; find . \( -name ".gitignore" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name ".yamllint*" \) -delete'
       if [ "$(N sh -c 'grep -rIlE "skip_ansible_lint|noqa" . | head -1')" != "" ]; then clean; echo silenced; exit 0; fi
-      # ansible-lint only reads *.yml/*.yaml, so tasks hidden in other files or pulled in through include/import would escape it
-      if [ -n "$(N sh -c 'find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1')" ]; then clean; echo hidden-tasks; exit 0; fi
+      # ansible-lint only reads *.yml/*.yaml, so tasks hidden in other files or pulled in through include/import would escape it;
+      # lookups would run commands while the linter loads the playbooks
+      if [ -n "$(N sh -c 'find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:|(^|[^a-zA-Z0-9_])(lookup|query|q)[[:space:]]*\(|with_(pipe|lines|file|fileglob|first_found|template|csvfile|ini|env|url|password|unvault|config)" . | head -1')" ]; then clean; echo hidden-tasks; exit 0; fi
+      # No learner code is ever loaded by the linter: every ansible.cfg, Python file, plugin, module and module_utils
+      # directory and vendored collection is removed, hidden directories too, and only YAML and Jinja files remain
+      N sh -c 'find . -mindepth 1 -type d \( -name ".*" -o -name library -o -name module_utils -o -name plugins -o -name "*_plugins" -o -name collections \) -prune -exec rm -rf {} +; find . -type f ! \( -name "*.yml" -o -name "*.yaml" -o -name "*.j2" \) -delete'
       out=$(N timeout 150 /opt/ansible/bin/ansible-lint -c $cfg --profile production -q --offline 2>&1); rc=$?
       n=$(printf '%s\n' "$out" | grep -c ':[0-9]')
       clean
@@ -202,16 +209,24 @@ spec:
     - automation.quality.lint
     weight: 2
     command: |
-      # reads of the learner's tree run as the learner
-      cd /
-      r=$(ct-ansible run /home/learner/branch-automation sh -c '
-        if [ -n "$(find . /home/learner/.config/yamllint \( -name ".yamllint*" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -name config -path "*yamllint*" -o -path "*/.config/*" \) 2>/dev/null | head -1)" ]; then echo silenced; exit 0; fi
-        if timeout 30 grep -rIqsEi --include=.gitignore "yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]" . ; then echo silenced; exit 0; fi
-        if timeout 30 grep -rIqsE --exclude-dir=.git "skip_ansible_lint|noqa|skip_list|warn_list|skip_tasks|exclude_paths|enable_list" . ; then echo silenced; exit 0; fi
-        if [ -n "$(find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; timeout 30 grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1)" ]; then echo silenced; exit 0; fi
+      # The learner's tree is only read as the learner, streamed into a copy owned by nobody; the verdict is computed from
+      # that copy by nobody and this root shell, never by a learner process. A failed copy fails the check.
+      j=$(mktemp -d); a=$(mktemp); chmod 0755 $j; chown nobody $j; trap 'rm -rf $j $a' EXIT
+      N() { (cd $j && runuser -u nobody -- env -i HOME=/nonexistent PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"); }
+      ( ulimit -f 131072; ct-ansible run /home/learner/branch-automation timeout 60 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      N timeout 60 tar -x --no-same-owner --no-same-permissions -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      N find . -type l -delete
+      # a global yamllint configuration in the learner's home (the listing must end with the marker, or it was cut short)
+      y=$(ct-ansible run /home/learner timeout 20 sh -c 'find .config -maxdepth 2 -iname "*yamllint*" 2>/dev/null | head -1; echo end-of-list')
+      [ "$y" = end-of-list ] || { echo silenced; exit 0; }
+      r=$(N timeout 60 sh -c '
+        if [ -n "$(find . \( -name ".yamllint*" -o -name ".ansible-lint*" -o -name "ansible-lint*" -o -path "*/.config/*" \) | head -1)" ]; then echo silenced; exit 0; fi
+        if grep -rIqsEi --include=.gitignore "yml|yaml|role|site|playbook|task|meta|templ|default|^[[:space:]]*[*/!]" . ; then echo silenced; exit 0; fi
+        if grep -rIqsE "skip_ansible_lint|noqa|skip_list|warn_list|skip_tasks|exclude_paths|enable_list" . ; then echo silenced; exit 0; fi
+        if [ -n "$(find . -type f \( -path "*/tasks/*" -o -path "*/handlers/*" -o -path "*/vars/*" -o -path "*/defaults/*" -o -path "*/meta/*" \) ! -name "*.yml" ! -name "*.yaml" | head -1; grep -rIlE "(include|import)_(tasks|role|playbook|vars)|builtin\.(include|import)|vars_files|^[[:space:]-]*include:" . | head -1)" ]; then echo silenced; exit 0; fi
         echo clean')
       [ "$r" = clean ] || { echo silenced; exit 0; }
-      [ "$(ct-ansible run /home/learner/branch-automation cat roles/branch_gateway/defaults/main.yml roles/branch_gateway/templates/gateway.conf.j2 site.yml | sha256sum)" = "$(cat /var/tmp/.ct-lint.sum)" ] && echo ok || echo supplied-files-changed
+      [ "$(N cat roles/branch_gateway/defaults/main.yml roles/branch_gateway/templates/gateway.conf.j2 site.yml | sha256sum)" = "$(cat /var/tmp/.ct-lint.sum)" ] && echo ok || echo supplied-files-changed
     expect:
       match: exact
       value: ok
@@ -285,6 +300,39 @@ spec:
         printf 'roles/\nsite.yml\n.gitignore\n' > .gitignore
         printf -- '---\n- name: Dummy\n  hosts: localhost\n  gather_facts: false\n  tasks:\n    - name: Nothing\n      ansible.builtin.debug:\n        msg: ok\n' > dummy.yml
         ansible-playbook site.yml || true
+  - id: exit-early-plugin
+    description: Leaves the role as it is and adds a project filter plugin that ends the Python process with exit code 0 as soon as it is loaded.
+    feedback: A plugin that stops the linter is not a fix; the role is judged without any project code and its findings stay.
+    expectFail:
+    - lint-production
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        mkdir -p filter_plugins roles/branch_gateway/filter_plugins
+        printf 'import os\nos._exit(0)\n' > filter_plugins/quiet.py
+        cp filter_plugins/quiet.py roles/branch_gateway/filter_plugins/quiet.py
+        ansible-lint --profile production -q || true
+  - id: config-points-at-plugin
+    description: Leaves the role as it is and points ansible.cfg (and home ansible.cfg files) at a world-readable plugin directory outside the project that ends the linter with exit code 0.
+    feedback: Configuration that loads code into the linter is not a fix; the role is judged with a fixed configuration and its findings stay.
+    expectFail:
+    - lint-production
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 120
+      run: |
+        cd ~/branch-automation
+        mkdir -p /tmp/lint-shim
+        printf 'import os\nos._exit(0)\n' > /tmp/lint-shim/quiet.py
+        chmod -R a+rX /tmp/lint-shim
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\nfilter_plugins = /tmp/lint-shim\n' > ansible.cfg
+        cp ansible.cfg .ansible.cfg
+        cp ansible.cfg ~/.ansible.cfg
+        ansible-lint --profile production -q || true
   - id: half-fixed
     description: Names the tasks and uses FQCNs but leaves the file modes, the shell command and the metadata as they were.
     feedback: 'Production needs more than names: explicit file permissions, no shell where a module exists and real role metadata.'

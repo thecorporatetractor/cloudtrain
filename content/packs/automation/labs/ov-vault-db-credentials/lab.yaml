@@ -100,6 +100,15 @@ spec:
       set -eu
       ct-fleet-net 10.70.0.10/24 ov-db-1=10.70.0.21 ov-db-2=10.70.0.22
       ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-db-1 ov-db-2
+      # grading account: a separate uid with its own key for ovauto on the nodes; graded runs never execute as the learner
+      id ctjudge >/dev/null 2>&1 || useradd -r -m -d /var/lib/ctjudge -s /usr/sbin/nologin ctjudge
+      chmod 0700 /var/lib/ctjudge
+      install -d -m 0700 -o ctjudge -g ctjudge /var/lib/ctjudge/.ssh
+      [ -f /var/lib/ctjudge/.ssh/id_ed25519 ] || runuser -u ctjudge -- ssh-keygen -q -t ed25519 -N '' -C ctjudge -f /var/lib/ctjudge/.ssh/id_ed25519
+      printf 'Host *\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > /var/lib/ctjudge/.ssh/config
+      chown ctjudge:ctjudge /var/lib/ctjudge/.ssh/config; chmod 0600 /var/lib/ctjudge/.ssh/config
+      k=$(cat /var/lib/ctjudge/.ssh/id_ed25519.pub)
+      for h in ov-db-1 ov-db-2; do ct-ansible run /home/learner ssh ovauto@$h "grep -qxF '$k' .ssh/authorized_keys || echo '$k' >> .ssh/authorized_keys"; done
   - 'on': ov-ctl
     run: |
       p=/home/learner/policy-db
@@ -235,18 +244,34 @@ spec:
     weight: 2
     timeoutSec: 240
     command: |
-      cd /home/learner/policy-db
+      # The project is copied as the learner (bounded, into a root-owned archive) and run from that copy by the grading
+      # account ctjudge (own uid and key; the vault password comes from the lab, not from the learner's files). A project
+      # with code (plugins, modules, Python files) or configuration that loads callbacks or plugins is refused, so only
+      # stock Ansible prints the output that is searched for the secret.
+      j=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $a' EXIT; chmod 0700 $j
+      install -d $j/p $j/home/.ov-vault
+      printf 'Ov-vault-{{vaultpw}}\n' > $j/home/.ov-vault/prod; chmod 0600 $j/home/.ov-vault/prod
+      chown -R ctjudge $j
+      ( ulimit -f 65536; ct-ansible run /home/learner/policy-db timeout 30 tar --exclude=./.git -cf - . > $a 2>/dev/null ) || { echo copy-failed; exit 0; }
+      runuser -u ctjudge -- timeout 30 tar -x --no-same-owner --no-same-permissions -C $j/p -f - < $a 2>/dev/null || { echo copy-failed; exit 0; }
+      [ -z "$(cd $j/p && find . \( -type l -o -name '*.py' -o -name '*.py[co]' -o -name '*.so' -o \( -type d \( -name library -o -name module_utils -o -name plugins -o -name collections -o -name '*_plugins' \) \) \) | head -1)" ] || { echo project-code; exit 0; }
+      ! grep -qiE '^[[:space:]]*([a-z_]*_plugins|library|module_utils|callbacks_enabled|callback_whitelist|stdout_callback|vars_plugins_enabled|enable_plugins|strategy|collections_paths?)[[:space:]]*[=:]' $j/p/ansible.cfg 2>/dev/null || { echo config-loads-code; exit 0; }
+      J() { (cd $j/p && runuser -u ctjudge -- env -i HOME=$j/home PATH=/opt/ansible/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+        ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_CALLBACKS_ENABLED= ANSIBLE_RETRY_FILES_ENABLED=0 \
+        ANSIBLE_VAULT_IDENTITY_LIST=prod@$j/home/.ov-vault/prod ANSIBLE_VAULT_PASSWORD_FILE=$j/home/.ov-vault/prod \
+        timeout 100 ansible-playbook db-login.yml "$@" 2>&1); }
       # make the credentials file differ once, so a run that changes it would print the difference
-      ct-ansible run /home/learner ssh ovauto@ov-db-1 "sudo -n sh -c 'echo junk >> /etc/ov/policy-db/credentials'" >/dev/null 2>&1
-      # the output is produced by the stock callback only: a project callback or action plugin cannot hide the secret from this check
-      E="env ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_CALLBACKS_ENABLED= ANSIBLE_CALLBACK_PLUGINS=/var/empty ANSIBLE_ACTION_PLUGINS=/var/empty ANSIBLE_RETRY_FILES_ENABLED=0"
-      probe=$(ct-ansible run . $E ansible-playbook db-login.yml --diff -vv 2>&1)
+      runuser -u ctjudge -- env -i HOME=/var/lib/ctjudge PATH=/usr/bin:/bin timeout 30 ssh ovauto@ov-db-1 "sudo -n sh -c 'echo junk >> /etc/ov/policy-db/credentials'" >/dev/null 2>&1
+      probe=$(J --diff -vv); prc=$?
       printf '%s' "$probe" | grep -q 'Ov-db-{{dbpw}}' && { echo leak; exit 0; }
-      out=$(ct-ansible run . $E ansible-playbook db-login.yml -vv 2>&1)
+      [ $prc = 0 ] || { echo "run-failed"; exit 0; }
+      out=$(J -vv); orc=$?
       printf '%s' "$out" | grep -q 'Ov-db-{{dbpw}}' && { echo leak; exit 0; }
+      [ $orc = 0 ] || { echo "run-failed"; exit 0; }
+      [ "$(printf '%s\n' "$out" | grep -c '^PLAY RECAP')" = 1 ] || { echo error; exit 0; }
       printf '%s\n' "$out" | awk '/^PLAY RECAP/ {r=1; next}
-        r && /:/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "changed") c += kv[2]; if (kv[1] == "failed") f += kv[2]; if (kv[1] == "unreachable") u += kv[2] } n++ }
-        END { if (n) printf "changed=%d failed=%d unreachable=%d\n", c, f, u; else print "error" }'
+        r && /^[a-z0-9.-]+ +: ok=[0-9]+ +changed=[0-9]+ +unreachable=[0-9]+ +failed=[0-9]+/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "changed") c += kv[2]; if (kv[1] == "failed") f += kv[2]; if (kv[1] == "unreachable") u += kv[2] } n++ }
+        END { if (n == 2) printf "changed=%d failed=%d unreachable=%d\n", c, f, u; else print "error" }'
     expect:
       match: exact
       value: changed=0 failed=0 unreachable=0

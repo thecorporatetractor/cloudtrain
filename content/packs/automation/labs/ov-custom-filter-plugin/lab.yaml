@@ -102,7 +102,7 @@ spec:
       sha256sum $p/vars/policies.yml $p/report.yml $p/collections/ansible_collections/orrinvale/claims/galaxy.yml > /var/tmp/.ct-filter.sum
   checks:
   - id: filter-behaviour
-    description: orrinvale.claims.mask_policy keeps the last four characters by default, honours keep and char, leaves short values alone and accepts numbers
+    description: orrinvale.claims.mask_policy keeps the last four characters by default, honours keep and char, leaves short values alone and accepts numbers (called from the collection's own plugins/filter with a fixed configuration)
     type: shell
     'on': ov-ctl
     skills:
@@ -110,10 +110,32 @@ spec:
     weight: 3
     timeoutSec: 180
     command: |
-      /opt/ansible/bin/python3 -I - <<'EOF'
-      import json, subprocess
+      # The collection's filter files (and its module_utils) are read as the learner into a root-owned archive and
+      # unpacked into a fresh collection tree owned by nobody, with a fixed configuration and an empty home. The filter is
+      # then called through Ansible by nobody: no project configuration, no other plugin and no learner process is involved,
+      # and the verdict is computed here from the returned values.
+      c=/home/learner/claims-collection/collections/ansible_collections/orrinvale/claims
+      j=$(mktemp -d); h=$(mktemp -d); a=$(mktemp); trap 'rm -rf $j $h $a' EXIT
+      chmod 0755 $j; chmod 0700 $h
+      t=$j/collections/ansible_collections/orrinvale/claims
+      install -d $t/plugins
+      printf '[defaults]\ninventory = %s/inventory.ini\ncollections_path = %s/collections\n' $j $j > $j/ansible.cfg
+      printf 'localhost ansible_connection=local\n' > $j/inventory.ini
+      chown -R nobody $j $h
+      ( ulimit -f 8192; ct-ansible run $c/plugins timeout 20 tar -cf - filter $(ct-ansible run $c/plugins sh -c 'test -d module_utils && echo module_utils') > $a 2>/dev/null ) || { echo no-filter; exit 0; }
+      runuser -u nobody -- timeout 20 tar -x --no-same-owner --no-same-permissions -C $t/plugins -f - < $a 2>/dev/null || { echo no-filter; exit 0; }
+      runuser -u nobody -- find $t -mindepth 1 \( -type l -o \( -type f ! -name '*.py' \) \) -delete
+      /opt/ansible/bin/python3 -I - "$j" "$h" <<'EOF'
+      import json, subprocess, sys
+      J, H = sys.argv[1], sys.argv[2]
+      ENV = ['HOME=' + H, 'PATH=/opt/ansible/bin:/usr/bin:/bin', 'LANG=C.UTF-8', 'LC_ALL=C.UTF-8', 'ANSIBLE_CONFIG=' + J + '/ansible.cfg',
+             'ANSIBLE_NOCOLOR=1', 'ANSIBLE_LOCALHOST_WARNING=0', 'ANSIBLE_INVENTORY_UNPARSED_WARNING=0']
       def f(expr):
-          out = subprocess.run(['ct-ansible', 'run', '/home/learner/claims-collection', 'ansible', 'localhost', '-m', 'ansible.builtin.debug', '-a', json.dumps({'msg': '{{ ' + expr + ' }}'})], capture_output=True, text=True).stdout
+          argv = ['runuser', '-u', 'nobody', '--', 'env', '-i'] + ENV + ['timeout', '60', 'ansible', 'localhost', '-m', 'ansible.builtin.debug', '-a', json.dumps({'msg': '{{ ' + expr + ' }}'})]
+          try:
+              out = subprocess.run(argv, cwd=J, capture_output=True, text=True, timeout=90).stdout
+          except subprocess.TimeoutExpired:
+              return None
           i = out.find('=>')
           try:
               return json.loads(out[i + 2:])['msg']
@@ -406,6 +428,51 @@ spec:
         {% endfor %}
         EOF
         ansible-playbook report.yml
+  - id: filter-from-elsewhere
+    description: Leaves a wrong filter in the collection and points ansible.cfg at a second copy of the collection outside the project whose filter is right.
+    feedback: The filter has to be right in the collection that ships (plugins/filter of orrinvale.claims in the project); it is judged from there with a fixed configuration.
+    expectFail:
+    - filter-behaviour
+    mutation:
+      'on': ov-ctl
+      as: learner
+      timeoutSec: 240
+      run: |
+        cd ~/claims-collection
+        c=collections/ansible_collections/orrinvale/claims
+        s=$HOME/shim/ansible_collections/orrinvale/claims
+        mkdir -p $c/plugins/filter $s/plugins/filter
+        cat > $c/plugins/filter/mask_policy.py <<'EOF'
+        def mask_policy(value, keep=4, char="*"):
+            return str(value)
+
+
+        class FilterModule(object):
+            def filters(self):
+                return {"mask_policy": mask_policy}
+        EOF
+        cat > $s/plugins/filter/mask_policy.py <<'EOF'
+        def mask_policy(value, keep=4, char="*"):
+            text = "" if value is None else str(value)
+            keep = int(keep)
+            if len(text) <= keep:
+                return text
+            return char * (len(text) - keep) + text[len(text) - keep:]
+
+
+        class FilterModule(object):
+            def filters(self):
+                return {"mask_policy": mask_policy}
+        EOF
+        printf '[defaults]\ninventory = inventory.ini\ncollections_path = %s/shim:./collections\n' "$HOME" > ansible.cfg
+        cat > templates/claims-report.txt.j2 <<'EOF'
+        Claims report
+        {% for p in policies %}
+        {{ p.holder }}: {{ p.number | orrinvale.claims.mask_policy }}
+        {% endfor %}
+        EOF
+        ansible-playbook report.yml
+        ansible-galaxy collection build $c --output-path dist --force
   solution:
     explanation: |
       A filter plugin is a Python file in the collection's `plugins/filter` directory with a `FilterModule` class whose `filters()`
