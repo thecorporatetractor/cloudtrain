@@ -35,8 +35,8 @@ kubeadm:1.37-full/-sec add Trivy with a dated offline DB, cosign with the signed
 golang:1.25 and static-nonroot:2026.10 base images in buildah's storage, and
 `addons-install csi-hostpath` (see docs/dev-environment.md "kubeadm extras"). Verified
 live on the VM: build-waybill-image, xkd-build-tag-image, xka-expand-claim,
-xks-signature-verify, xks-sbom-spdx; sbom-dispatch-image, xks-scan-pick-image and
-waybill-image-slim-scan are re-queued in the batch runner.
+xks-signature-verify, xks-sbom-spdx, xks-scan-pick-image, waybill-image-slim-scan;
+sbom-dispatch-image is re-queued in the batch runner.
 
 **Lab bugs fixed:** `xka-crd-custom-resource` (the "operator" loop never started:
 `pgrep -f /tmp/berth-operator.sh` matched the setup shell's own command line; now
