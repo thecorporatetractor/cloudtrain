@@ -332,9 +332,20 @@ case ${1:-loop} in
         fi
         exec 9>"$RES/state/runner.flock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
         log "runner cycle start (pid $$)"
-        cycle || log "cycle failed; retrying after sleep"; summary >/dev/null
-        log "cycle done; sleeping ${CYCLE_SLEEP}s (a requeue wakes it)"
-        for ((t = 0; t < CYCLE_SLEEP; t += 15)); do [[ -s $REQUEUE ]] && break; sleep 15; done
+        # Failed cycles (cluster, repo or manager deploy) back off exponentially, FAIL_BACKOFF_BASE
+        # doubling up to FAIL_BACKOFF_MAX (default 12 s .. 300 s), so a broken deploy does not loop and
+        # rebuild the manager image every few seconds. The count lives in a file (the loop re-execs itself).
+        FAILF=$RES/state/cycle.fails
+        if cycle; then
+          rm -f "$FAILF"; summary >/dev/null; nap=$CYCLE_SLEEP; wake=1
+          log "cycle done; sleeping ${nap}s (a requeue wakes it)"
+        else
+          n=$(( $(cat "$FAILF" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAILF"
+          nap=$(( ${FAIL_BACKOFF_BASE:-12} << (n > 5 ? 5 : n - 1) )); (( nap > ${FAIL_BACKOFF_MAX:-300} )) && nap=${FAIL_BACKOFF_MAX:-300}
+          wake=0; summary >/dev/null
+          log "cycle failed ($n in a row); backing off ${nap}s"
+        fi
+        for ((t = 0; t < nap; t += 3)); do (( wake )) && [[ -s $REQUEUE ]] && break; sleep 3; done
         exec 9>&-
         cp "$SELF" "$RES/state/ct-batch.run.sh.new" && mv "$RES/state/ct-batch.run.sh.new" "$RES/state/ct-batch.run.sh"
         CT_BATCH_SELF=$SELF exec bash "$RES/state/ct-batch.run.sh" loop ;;

@@ -21,20 +21,11 @@ ALL_NODES=$(kind get nodes --name "$CLUSTER_NAME")
 # Only nodes that can run VMs (KVM device advertised) need the 1-3 GB containerDisks.
 VM_NODES=$(k get nodes -o json | jq -r '.items[] | select((.status.allocatable["devices.kubevirt.io/kvm"] // "0") != "0") | .metadata.name')
 
-# load_docker_image <image> <node...>: `kind load` compares Docker's image ID with the CRI
-# image ID; with Docker's containerd image store those differ, so it would re-import every
-# time. Compare against containerd's index digest instead.
+# load_docker_image <image> <node...>: load_image from lib.sh (skip by digest/name, fallback
+# to a single-platform import when `kind load` fails).
 load_docker_image() {
-  local img=$1 id node todo=(); shift
-  docker image inspect "$img" >/dev/null 2>&1 || die "$img not built (run: task image:build:all)"
-  id=$(docker image inspect -f '{{.Id}}' "$img")
-  for node in "$@"; do
-    [[ $(docker exec "$node" ctr -n k8s.io images ls "name==docker.io/$img" 2>/dev/null) == *"$id"* ]] && continue
-    todo+=("$node")
-  done
-  ((${#todo[@]})) || { log "ok: $img already on $*"; return 0; }
-  log "loading $img into ${todo[*]}"
-  kind load docker-image --name "$CLUSTER_NAME" --nodes "$(IFS=,; echo "${todo[*]}")" "$img" >/dev/null || die "kind load $img failed"
+  docker image inspect "$1" >/dev/null 2>&1 || die "$1 not built (run: task image:build:all)"
+  KIND_LOAD_VERBOSE=1 load_image "$@"
 }
 
 # load_workloads <node...>: pull each locked image BY DIGEST inside the node's containerd

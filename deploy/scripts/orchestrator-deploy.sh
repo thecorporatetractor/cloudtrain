@@ -28,19 +28,6 @@ ID=$(docker image inspect -f '{{.Id}}' cloudtrain/lab-orchestrator:dev | cut -d:
 IMG="cloudtrain/lab-orchestrator:dev-$ID"
 docker tag cloudtrain/lab-orchestrator:dev "$IMG"
 
-# load_image <image> <node...>: kind load only where containerd lacks it
-# (see lab-demo.sh for why the Docker image ID is not enough).
-load_image() {
-  local img=$1 id node todo=(); shift
-  id=$(docker image inspect -f '{{.Id}}' "$img")
-  for node in "$@"; do
-    [[ $(docker exec "$node" ctr -n k8s.io images ls "name==docker.io/$img" 2>/dev/null) == *"$id"* ]] && continue
-    todo+=("$node")
-  done
-  ((${#todo[@]})) || return 0
-  log "loading $img into ${todo[*]}"
-  kind load docker-image --name "$CLUSTER_NAME" --nodes "$(IFS=,; echo "${todo[*]}")" "$img" >/dev/null || die "kind load $img failed"
-}
 mapfile -t ALL_NODES < <(kind get nodes --name "$CLUSTER_NAME")
 load_image "$IMG" "${ALL_NODES[@]}"
 
