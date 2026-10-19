@@ -31,10 +31,11 @@ type world struct {
 	boots    map[string]int  // node -> boot counter
 	commands []string        // "<node>|<user>|<script>"
 	provErr  map[string]error
+	execErr  map[string]error // marker in an action -> transient exec error
 }
 
 func newWorld() *world {
-	return &world{passing: map[string]bool{}, failRun: map[string]bool{}, boots: map[string]int{}, provErr: map[string]error{}}
+	return &world{passing: map[string]bool{}, failRun: map[string]bool{}, boots: map[string]int{}, provErr: map[string]error{}, execErr: map[string]error{}}
 }
 
 func (w *world) ran(substr string) []string {
@@ -81,6 +82,11 @@ func (d *scriptDriver) Exec(_ context.Context, ref drivers.NodeRef, req drivers.
 	}
 	script := strings.Join(req.Command, " ") + string(req.Stdin)
 	d.w.commands = append(d.w.commands, fmt.Sprintf("%s|%s|%s", node, req.User, script))
+	for marker, err := range d.w.execErr {
+		if strings.Contains(script, marker) {
+			return drivers.ExecResult{}, err
+		}
+	}
 	switch {
 	case strings.Contains(script, "boot_id"):
 		return drivers.ExecResult{Stdout: fmt.Sprintf("boot-%d\n", d.w.boots[node])}, nil
@@ -567,5 +573,140 @@ func TestExamWaitsForTaskTemplatesCreatedAlongside(t *testing.T) {
 	h2.pump(1)
 	if h2.es().Status.Phase != labsv1.ExamFailed {
 		t.Errorf("phase %s", h2.es().Status.Phase)
+	}
+}
+
+// heldAccess models the session RoleBinding's finalizer (rbac.SessionAccess).
+type heldAccess struct {
+	mu                  sync.Mutex
+	held                bool
+	ensures, ensureHeld int
+}
+
+func (a *heldAccess) Ensure(context.Context, string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ensures++
+	return nil
+}
+
+func (a *heldAccess) EnsureHeld(context.Context, string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ensureHeld++
+	a.held = true
+	return nil
+}
+
+func (a *heldAccess) Release(context.Context, string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.held = false
+	return nil
+}
+
+func (a *heldAccess) Forget(string) {}
+
+// After the environments are released, reconciling the completed attempt
+// must not hold the session binding again: nothing would release it and
+// the namespace's deletion would hang on its finalizer (seen live: a
+// completed sim-k8s-developer attempt kept ctv-* Terminating).
+func TestExamDoesNotHoldSessionAccessAfterRelease(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	acc := &heldAccess{}
+	h.er.Access, h.lr.Access = acc, acc
+	h.pump(3)
+	if !acc.held {
+		t.Fatal("environment sessions did not hold the binding")
+	}
+	h.solveAll()
+	h.patchES(`{"spec":{"submit":true}}`)
+	h.pump(14)
+	if es := h.es(); es.Status.Phase != labsv1.ExamCompleted || !es.Status.EnvironmentReleased || len(h.sessions()) != 0 {
+		t.Fatalf("phase %s released %v sessions %d", es.Status.Phase, es.Status.EnvironmentReleased, len(h.sessions()))
+	}
+	h.pump(3) // the completed attempt keeps being reconciled
+	if acc.held {
+		t.Error("the completed attempt holds the session binding again")
+	}
+	if acc.ensures == 0 {
+		t.Error("the attempt never ensured its access")
+	}
+}
+
+// pumpLenient is pump without failing on reconcile errors.
+func (h *examHarness) pumpLenient(n int) {
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		_, _ = h.er.Reconcile(ctx, ctrl.Request{NamespacedName: h.name})
+		for _, ls := range h.sessions() {
+			_, _ = h.lr.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&ls)})
+		}
+	}
+}
+
+// A node that cannot be reached during the re-run or the reboot does not hold
+// grading until the environment expires: after the stage timeout the tasks
+// not re-run fail and grading goes on.
+func TestExamRerunAndRebootStagesTimeOut(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, true, true))
+	h.pump(3)
+	h.solveAll()
+	h.w.mu.Lock()
+	h.w.execErr["RERUN "] = fmt.Errorf("connection refused")
+	h.w.execErr["boot_id"] = fmt.Errorf("connection refused")
+	h.w.mu.Unlock()
+	h.patchES(`{"spec":{"submit":true}}`)
+	h.pumpLenient(8)
+	if st := h.es().Status.Grading; st == nil || st.Stage != labsv1.GradingRerun {
+		t.Fatalf("grading %+v, want stuck in the re-run before the timeout", st)
+	}
+	h.now = h.now.Add(DefaultExamStageTimeout + time.Minute)
+	h.pumpLenient(4)
+	if st := h.es().Status.Grading; st == nil || st.Stage != labsv1.GradingReboot {
+		t.Fatalf("grading %+v, want the reboot stage after the re-run timed out", st)
+	}
+	h.now = h.now.Add(DefaultExamStageTimeout + time.Minute)
+	h.pumpLenient(12)
+	es := h.es()
+	if es.Status.Phase != labsv1.ExamCompleted || es.Status.Report == nil {
+		t.Fatalf("phase %s grading %+v", es.Status.Phase, es.Status.Grading)
+	}
+	rep := es.Status.Report
+	// o:a's task has no re-run (passes); o:b's task re-run never ran (fails).
+	if rep.Tasks[0].Outcome != labsv1.OutcomePass || rep.Tasks[1].Outcome != labsv1.OutcomeFail {
+		t.Errorf("tasks %+v", rep.Tasks)
+	}
+	if strings.Join(rep.Passes, ",") != "initial,rerun,reboot" {
+		t.Errorf("passes %v", rep.Passes)
+	}
+}
+
+// An environment that cannot be built fails the attempt once the provision
+// budget is spent instead of keeping it preparing forever.
+func TestExamEnvironmentBuildErrorFailsAfterBudget(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	ctx := context.Background()
+	for _, name := range []string{"ta1-v1-0123456789", "ta2-v1-0123456789"} {
+		lt := &labsv1.LabTemplate{}
+		if err := h.c.Get(ctx, types.NamespacedName{Namespace: examNS, Name: name}, lt); err != nil {
+			t.Fatal(err)
+		}
+		lt.Spec.Topology.Nodes[1].Cluster.Context = "other" // "core" now differs from the tb tasks'
+		if err := h.c.Update(ctx, lt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.er.Reconcile(ctx, ctrl.Request{NamespacedName: h.name}); err == nil {
+		t.Fatal("building the environment should fail")
+	}
+	if es := h.es(); es.Status.Phase != labsv1.ExamPending {
+		t.Fatalf("phase %s before the budget", es.Status.Phase)
+	}
+	h.now = t0.Add(DefaultExamProvisionBudget + time.Minute)
+	h.pumpLenient(2)
+	es := h.es()
+	if es.Status.Phase != labsv1.ExamFailed || es.Status.Message != ExamMsgEnvFailed || es.Status.Report != nil {
+		t.Fatalf("status %+v", es.Status)
 	}
 }

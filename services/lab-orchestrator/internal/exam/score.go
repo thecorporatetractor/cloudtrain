@@ -27,7 +27,8 @@ type ScoredTask struct {
 // Score turns the grading passes into the score report.
 //
 //   - A check passes when it passed in every pass that ran (initial, then
-//     rerun, then reboot) and its task's re-run did not fail.
+//     rerun, then reboot) and its task's re-run did not fail. A check missing
+//     from a pass that ran (its environment could not be graded) fails.
 //   - Task score: per-check = weighted share of passed checks; per-task and
 //     none = 100 when every check passed, else 0.
 //   - Objective score = mean of its task scores; total = sum of task scores
@@ -93,6 +94,19 @@ func Score(spec *labsv1.ExamTemplateSpec, tasks []ScoredTask, g *labsv1.ExamGrad
 				}
 				if rb, ok := passes[labsv1.PassReboot][id]; ok && cr.Passed && !rb.Passed {
 					cr.FailedAfterReboot, cr.Passed, cr.Message = true, false, MsgFailedAfterReboot
+				}
+				// Every pass grades every check of every working environment:
+				// a check a later pass could not grade (its environment broke
+				// or timed out after the re-run or the reboot) fails instead of
+				// keeping its first-pass credit.
+				for _, later := range []string{labsv1.PassRerun, labsv1.PassReboot} {
+					if p, ran := passes[later]; ran && cr.Passed {
+						if _, ok := p[id]; !ok {
+							cr.Passed, cr.Message = false, MsgNotGraded
+							cr.FailedOnRerun = later == labsv1.PassRerun
+							cr.FailedAfterReboot = later == labsv1.PassReboot
+						}
+					}
 				}
 			}
 			if cr.Message == "" {

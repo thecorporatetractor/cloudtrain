@@ -117,6 +117,9 @@ type LabSessionReconciler struct {
 // SessionNamespaceAccess grants the manager its session permissions in a
 // namespace holding LabSessions (*rbac.SessionAccess).
 type SessionNamespaceAccess interface {
+	// Ensure binds the session permissions without holding the binding: an
+	// ExamSession uses it, since only LabSessions release the hold.
+	Ensure(ctx context.Context, namespace string) error
 	// EnsureHeld binds the session permissions; the binding outlives the
 	// namespace's deletion until Release.
 	EnsureHeld(ctx context.Context, namespace string) error
