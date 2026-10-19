@@ -101,7 +101,8 @@ spec:
       skills: [containers.operations.ci-pipeline]
       weight: 3
       command: |
-        su -s /bin/sh learner -c '/srv/ci/pipeline.sh' 2>&1 | tail -1
+        # from a directory learner can read: trivy opens ./trivy.yaml and fails in root's cwd
+        su -s /bin/sh learner -c 'cd /srv/ci && /srv/ci/pipeline.sh' 2>&1 | tail -1
       expect: {match: exact, value: pipeline ok}
     - id: nothing-privileged
       description: No container is privileged and ci-dind is gone
@@ -217,7 +218,7 @@ spec:
           /srv/ci/pipeline.sh
     alternatives:
       - id: registry-output-sign-first
-        description: Push with the registry exporter, sign the digest, then scan it.
+        description: Push from the image exporter (push=true), sign the digest first, then scan it.
         steps:
           - on: cl-ci-02
             as: learner
@@ -234,7 +235,7 @@ spec:
                 -v /srv/ci/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro -v /srv/ci/thumbnailer:/ctx:ro \
                 --entrypoint buildctl-daemonless.sh moby/buildkit:rootless \
                 build --frontend dockerfile.v0 --local context=/ctx --local dockerfile=/ctx \
-                --opt build-arg:REV={{rev}} --output type=registry,ref=$REG/thumbnailer:ci,registry.insecure=true
+                --opt build-arg:REV={{rev}} --output type=image,name=$REG/thumbnailer:ci,push=true,registry.insecure=true
               A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
               d=$(curl -fsI -H "$A" http://$REG/v2/thumbnailer/manifests/ci | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
               COSIGN_PASSWORD='' cosign sign --key /etc/copperleaf/ci/cosign.key --tlog-upload=false --allow-insecure-registry --yes "$REG/thumbnailer@$d"

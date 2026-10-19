@@ -67,10 +67,13 @@ Merged labs: no lab is blocked on a missing image, Kata or kubeadm. Environment 
 - Not written: el variants of packages-install-from-mirror and package-repo-pinning
   (`python3-dnf-plugin-versionlock` is not mirrored).
 
-Blockers recorded for the merged wave 4 labs: iperf-throughput-baseline is
-image-blocked (iperf3 in neither package list); netem-impaired-link is image-blocked (sch_netem is in
-linux-modules-extra / kernel-modules-extra, not mirrored); kernel modules ip_gre, bridge, 8021q,
-bonding, wireguard assumed present on the VM images.
+Blockers recorded with wave 4, both cleared on 2026-10-19 (curriculum notes updated): iperf-throughput-baseline needed iperf3, now in both package lists
+(`packages-noble.txt`, `packages-el10.txt`) and so in the mirror and the el-vm/ubuntu-vm local repos;
+netem-impaired-link was thought to need linux-modules-extra, but the ubuntu-vm kernel
+(6.8.0-142-generic, cloud image 20260926) ships `sch_netem` and `sch_tbf` in linux-modules, so no
+image change was needed. Both labs passed a full `labctl verify` on the remote verify VM from the
+image-gaps clone (2026-10-19). Kernel modules ip_gre, bridge, 8021q, bonding,
+wireguard are still assumed present on the VM images.
 
 ## Verify queue (34 built labs on main), by slot kind
 
@@ -82,7 +85,7 @@ bonding, wireguard assumed present on the VM images.
 | kubeadm | none |
 | netdev | none |
 | Kata-blocked | none |
-| image-blocked | iperf-throughput-baseline and netem-impaired-link (wave 4, outside the 34 counted here) |
+| image-blocked | none (iperf-throughput-baseline and netem-impaired-link, wave 4, were unblocked on 2026-10-19) |
 
 All VM tasks are `workstation` (jumphost:1) plus one VM. By name the queue is 9 pod + 19 ubuntu-vm
 (16 tier B/C learning and pool tasks plus the 3 tier-C xpe tasks) + 6 el-vm = 34. The 23 wave 4 labs (21 unblocked) are queued separately; the list is in `linux-r5-w4.md`.

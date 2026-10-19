@@ -1252,7 +1252,7 @@ CTF investigations: answer-check questions with points and costed hints; the sam
 | `sim-containers-podman` | Rootless container practical exam simulation (optional) | ex188-aligned | practical | 90 min | 70% | 8 | 16 | shared | yes | C |
 | `sim-iac-associate` | Infrastructure as code associate exam simulation | tf-associate | practical-simulation | 60 min | 70% | 12 | 25 | shared | no | A |
 | `sim-iac-advanced` | Infrastructure as code advanced lab exam simulation | tf-advanced | practical | 240 min | 70% | 9 | 18 | shared | no | V |
-| `sim-el-automation` | Enterprise Linux automation practical exam simulation | ex294-aligned | practical | 240 min | 70% | 15 | 32 | shared | yes | C |
+| `sim-el-automation` | Enterprise Linux automation practical exam simulation | ex294-aligned | practical | 240 min | 70% | 15 | 34 | shared | yes | C |
 | `sim-net-associate` | Associate network engineer practical exam simulation | ccna | practical-simulation | 120 min | 80% | 15 | 31 | shared | no | N |
 | `sim-platform-engineer` | Platform engineer practical capstone | ct-platform | practical | 240 min | 70% | 10 | 20 | shared | yes | K |
 | `sim-soc-analyst` | Security operations analyst practical exam simulation | sc200-aligned | practical-simulation | 120 min | 70% | 12 | 25 | shared | no | A |
@@ -1879,7 +1879,7 @@ Aligns to: Red Hat Ansible automation exam (EX294) objective themes.
 | ex294-aligned:run-content | 8% | 1 | 2 |
 | ex294-aligned:git-devworkflow | 7% | 1 | 2 |
 | ex294-aligned:plays-errors | 12% | 2 | 4 |
-| ex294-aligned:roles-collections | 12% | 2 | 4 |
+| ex294-aligned:roles-collections | 12% | 2 | 6 |
 | ex294-aligned:automate-system-tasks | 20% | 3 | 8 |
 | ex294-aligned:templates-vault | 8% | 1 | 2 |
 
@@ -1891,7 +1891,7 @@ Aligns to: Red Hat Ansible automation exam (EX294) objective themes.
 
 _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certified Engineer (RHCE) is a trademark of Red Hat, Inc. This simulation covers objectives aligned to that exam; passing it confers no certification._
 
-<details><summary>Task pool (32 tasks)</summary>
+<details><summary>Task pool (34 tasks)</summary>
 
 | Task | Objective | Title | Difficulty | Min | Tier | Scenario |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1917,6 +1917,8 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certifie
 | `xan-roles-author-web` | ex294-aligned:roles-collections | Write a web role driven by defaults | medium | 18 | C | Create role webpage that installs httpd, opens the firewall and renders an index page showing the host's FQDN and IPv4 address from a template, and apply it to the webservers group. |
 | `xan-roles-galaxy-role-use` | ex294-aligned:roles-collections | Use an installed role with overridden variables | medium | 12 | C | Apply the installed balancer role to the balancers group with the webservers as backends by overriding its documented variables, so the balancer page alternates between backends. |
 | `xan-roles-argument-spec` | ex294-aligned:roles-collections | Reject invalid input to a role | medium | 10 | C | Add an argument spec to role report so it requires report_dir as a path and report_level as one of brief or full, and show a run with an invalid level fails before any task runs. |
+| `xan-roles-system-timesync` | ex294-aligned:roles-collections | Configure time sources with the timesync system role | easy | 10 | C | Use the timesync system role so every node uses the exam NTP server with iburst and sources survive a reboot. |
+| `xan-roles-system-selinux` | ex294-aligned:roles-collections | Set SELinux state with the selinux system role | medium | 12 | C | Use the selinux system role to put all nodes in enforcing mode with the targeted policy and enable the boolean that lets httpd reach the network, persisting across a reboot. |
 | `xan-sys-lvm-volumes` | ex294-aligned:automate-system-tasks | Create logical volumes where capacity allows | hard | 20 | C | Create LV data of 1500 MiB in VG research on all nodes, falling back to 800 MiB with a warning where the VG is too small and printing 'volume group does not exist' where it is missing; format ext4 without mounting. |
 | `xan-sys-partition-mount` | ex294-aligned:automate-system-tasks | Partition a disk and mount it persistently | medium | 15 | C | On the test hosts create a 1 GiB partition on vdc, format it xfs and mount it at /mnt/archive by UUID so it is mounted after a reboot. |
 | `xan-sys-vault-users` | ex294-aligned:automate-system-tasks | Create users with vaulted password hashes | medium | 15 | C | Create the users in the supplied list with password hashes derived from a vault-encrypted variable file and its password file, using SHA-512 hashes and the group memberships given. |

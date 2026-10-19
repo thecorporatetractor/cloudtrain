@@ -7,7 +7,8 @@
 # into containerd's `moby` namespace (what the engine's image store reads), so labs
 # build and run with no registry. No apt source needs the internet. No users or keys
 # are baked in (cloud-init injects `learner`, keys, host key); labs add the learner to
-# the docker group themselves when they want it.
+# the docker group themselves when they want it. Supply-chain tools: cosign, notation, trivy
+# with an offline vulnerability DB in /var/lib/trivy, and the BuildKit/syft-scanner images.
 source /opt/cloudtrain/build/guest-common.sh
 
 grow_root
@@ -33,6 +34,34 @@ for f in /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/ubuntu.sour
   if [ -f "$f" ]; then mv "$f" "$f.disabled"; fi
 done
 if grep -q '^deb ' /etc/apt/sources.list 2>/dev/null; then mv /etc/apt/sources.list /etc/apt/sources.list.disabled; fi
+
+# --- supply-chain CLIs and the offline Trivy DB (fetched and sha256-checked by build.sh) ---
+# cosign v2, notation 1.x and trivy in /usr/local/bin; the Trivy DB in /var/lib/trivy (a
+# trivy --cache-dir: db/trivy.db + db/metadata.json), world-readable; labs copy it or run
+# trivy with --cache-dir /var/lib/trivy --skip-db-update (the VM is offline).
+install -m 0755 "$B/tools/cosign" /usr/local/bin/cosign
+tar -xzf "$B/tools/trivy.tar.gz" -C /usr/local/bin trivy
+tar -xzf "$B/tools/notation.tar.gz" -C /usr/local/bin notation
+chown root:root /usr/local/bin/trivy /usr/local/bin/notation; chmod 0755 /usr/local/bin/trivy /usr/local/bin/notation
+D=/usr/share/doc/cloudtrain-supply-chain; install -d "$D/trivy" "$D/notation"
+tar -xzf "$B/tools/trivy.tar.gz" -C "$D/trivy" LICENSE
+tar -xzf "$B/tools/notation.tar.gz" -C "$D/notation" LICENSE
+cat > "$D/README" <<R
+Separate programs, unmodified upstream release binaries (source: the release tags below).
+cosign   ${COSIGN_VERSION}   Apache-2.0  https://github.com/sigstore/cosign    (/usr/share/common-licenses/Apache-2.0)
+notation ${NOTATION_VERSION}   Apache-2.0  https://github.com/notaryproject/notation
+trivy    ${TRIVY_VERSION}  Apache-2.0  https://github.com/aquasecurity/trivy
+Trivy DB (/var/lib/trivy) ghcr.io/${TRIVY_DB_REPO}:2 layer sha256:${TRIVY_DB_LAYER_SHA256}, built ${TRIVY_DB_CREATED}:
+  vulnerability data aggregated from public advisory sources, each under its source's terms.
+BuildKit images (moby/buildkit, docker/buildkit-syft-scanner) are Apache-2.0, preloaded as images.
+R
+install -d -m 0755 /var/lib/trivy/db
+tar -xzf "$B/tools/trivy-db.tar.gz" -C /var/lib/trivy/db
+test -s /var/lib/trivy/db/trivy.db && test -s /var/lib/trivy/db/metadata.json
+cosign version
+notation version
+trivy --cache-dir /var/lib/trivy version
+chmod -R a+rX /var/lib/trivy
 
 # --- preload images into the engine's image store (containerd namespace moby) ---
 install -d /opt/cloudtrain/images
@@ -62,6 +91,8 @@ write_release \
   "DOCKER_VERSION=$(dpkg-query -W -f='${Version}' docker-ce)" \
   "BUILDX_VERSION=$(dpkg-query -W -f='${Version}' docker-buildx-plugin)" \
   "COMPOSE_VERSION=$(dpkg-query -W -f='${Version}' docker-compose-plugin)" \
-  "CONTAINERD_PACKAGE=${CONTAINERD_VERSION}"
+  "CONTAINERD_PACKAGE=${CONTAINERD_VERSION}" \
+  "COSIGN_VERSION=${COSIGN_VERSION}" "NOTATION_VERSION=${NOTATION_VERSION}" "TRIVY_VERSION=${TRIVY_VERSION}" \
+  "TRIVY_DB_CREATED=${TRIVY_DB_CREATED}"
 
 generalize
