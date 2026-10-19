@@ -1,6 +1,8 @@
 # Tier-B systemd pod, Enterprise Linux family (catalog ref el-sys:10): el-lab:10 plus systemd as
 # PID 1 and the admin tooling of the el-vm labs. Runs only in a Kata sandbox (privileged inside
 # the guest VM; docs/kata-spike.md). Built by tools/images/build-linux-pod.sh el-sys.
+# checkov:skip=CKV_DOCKER_3: systemd is PID 1 and must run as root; the image runs only in a Kata sandbox (root of the guest VM)
+# checkov:skip=CKV_DOCKER_7: BASE_IMAGE is the tier-A image build-linux-pod.sh just built (deploy/versions.env tag)
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ARG ALMA_REPO
