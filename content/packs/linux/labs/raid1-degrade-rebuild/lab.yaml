@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: raid1-degrade-rebuild
+  title: Replace a failing member of the depot mirror and rebuild it
+  domain: linux
+  frameworks: [lpic2:advanced-storage, linuxplus:system-management]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [mdadm, raid1, rebuild, mdadm.conf]
+  version: 1
+spec:
+  description: |
+    The depot mirror **`/dev/md0`** on **`tr-raid-1`** (`ssh tr-raid-1`; you have `sudo`)
+    holds an ext4 filesystem mounted at `/srv/raid-depot`. The kernel log excerpt in
+    `/var/log/disk-errors.txt` shows repeated read errors on **`/dev/{{bad}}`**, one of
+    its two members. Both members are still online, so the array has not given up on it
+    yet. A blank replacement disk, **`/dev/vde`**, is fitted.
+
+    1. Mark the failing member **failed** and **remove** it from the array.
+    2. **Add** `/dev/vde` and let the array **resync** until it is clean with two active
+       devices.
+    3. `/etc/mdadm/mdadm.conf` has an `ARRAY` line with an explicit
+       `devices=` list. Update it so it matches the array as it is now, without the
+       removed disk. The data on the array must survive and stay mounted.
+  objectives:
+    - Fail, remove and add RAID members with mdadm
+    - Wait for a resync and verify the array state
+    - Keep mdadm.conf in step with the array
+  params:
+    bad:
+      type: choice
+      values: [vdc, vdd]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-raid-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-raid-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        for n in 1 2 3; do d=$(readlink -f /dev/disk/by-id/virtio-ct-data$n); [ "$d" = /dev/vd$(echo c d e | cut -d' ' -f$n) ]; done
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! [ -b /dev/md0 ]; then
+          mdadm --zero-superblock --force /dev/vdc /dev/vdd /dev/vde 2>/dev/null || true
+          wipefs -a /dev/vdc /dev/vdd /dev/vde >/dev/null
+          mdadm --create /dev/md0 --level=1 --raid-devices=2 --metadata=1.2 --run --force --assume-clean /dev/vdc /dev/vdd >/dev/null 2>&1
+          mkfs.ext4 -q -L RAID-DEPOT /dev/md0
+          mkdir -p /srv/raid-depot
+          echo "UUID=$(blkid -s UUID -o value /dev/md0) /srv/raid-depot ext4 defaults,nofail 0 2" >> /etc/fstab
+          systemctl daemon-reload; mount /srv/raid-depot
+          seq 1 20000 | awk '{print "depot-event", $1, $1 * 13 % 211}' > /srv/raid-depot/events.dat
+          sha256sum /srv/raid-depot/events.dat > $V/raid.sha
+        fi
+        sed -i '/^ARRAY/d' /etc/mdadm/mdadm.conf
+        u=$(mdadm --detail /dev/md0 | awk '/UUID :/ {print $3}')
+        echo "ARRAY /dev/md0 metadata=1.2 UUID=$u devices=/dev/vdc,/dev/vdd" >> /etc/mdadm/mdadm.conf
+        echo "$u" > $V/raid.uuid
+        for i in 1 2 3 4; do echo "[ 8$i.1] blk_update_request: I/O error, dev {{bad}}, sector $((i * 4096)) op 0x0:(READ)"; done > /var/log/disk-errors.txt
+        echo "[ 90.0] md/raid1:md0: {{bad}}: rescheduling sector 16384" >> /var/log/disk-errors.txt
+  checks:
+    - id: rebuilt
+      description: md0 is clean with the good disk and vde as its only members
+      type: shell
+      on: tr-raid-1
+      skills: [linux.storage.raid]
+      weight: 2.5
+      timeoutSec: 90
+      command: |
+        for i in $(seq 30); do mdadm --detail /dev/md0 2>/dev/null | grep -Eq 'recovering|resyncing' || break; sleep 2; done
+        if [ {{bad}} = vdc ]; then good=/dev/vdd; else good=/dev/vdc; fi
+        det=$(mdadm --detail /dev/md0 2>/dev/null)
+        st=$(echo "$det" | awk -F' : ' '/^ *State :/ {print $2}' | tr -d ' ')
+        act=$(echo "$det" | awk -F' : ' '/Active Devices :/ {print $2}' | tr -d ' ')
+        mem=$(echo "$det" | awk '/active sync/ {print $NF}' | sort | paste -sd,)
+        [ "$st" = clean ] && [ "$act" = 2 ] && [ "$mem" = "$good,/dev/vde" ] && echo rebuilt || echo "state=$st active=$act members=$mem"
+      expect: {match: exact, value: rebuilt}
+    - id: bad-removed
+      description: The failing disk is no longer listed in the array
+      type: shell
+      on: tr-raid-1
+      skills: [linux.storage.raid]
+      weight: 1
+      command: mdadm --detail /dev/md0 2>/dev/null | grep -q '/dev/{{bad}}' && echo still-listed || echo removed
+      expect: {match: exact, value: removed}
+    - id: conf
+      description: mdadm.conf has one ARRAY line for md0 with the UUID and no stale devices
+      type: shell
+      on: tr-raid-1
+      skills: [linux.storage.raid]
+      weight: 1.5
+      command: |
+        u=$(cat /var/lib/cloudtrain/raid.uuid)
+        n=$(grep -c '^ARRAY' /etc/mdadm/mdadm.conf); l=$(grep '^ARRAY' /etc/mdadm/mdadm.conf | head -1)
+        [ "$n" = 1 ] && echo "$l" | grep -q "UUID=$u" || { echo "lines=$n"; exit 0; }
+        if echo "$l" | grep -q 'devices='; then
+          d=$(echo "$l" | sed 's/.*devices=//; s/ .*//')
+          echo ",$d," | grep -q ',/dev/{{bad}},' && { echo stale-device; exit 0; }
+          echo ",$d," | grep -q ',/dev/vde,' || { echo missing-vde; exit 0; }
+        fi
+        echo current
+      expect: {match: exact, value: current}
+    - id: data
+      description: The filesystem is still mounted and its data is intact
+      type: shell
+      on: tr-raid-1
+      skills: [linux.storage.raid]
+      weight: 1.5
+      command: |
+        [ "$(readlink -f "$(findmnt -n -o SOURCE /srv/raid-depot)")" = "$(readlink -f /dev/md0)" ] && (cd /; sha256sum -c --quiet /var/lib/cloudtrain/raid.sha >/dev/null 2>&1) && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+  hints:
+    - title: Read the array
+      command: sudo mdadm --detail /dev/md0; cat /proc/mdstat
+      body: "--detail lists each member and its state. A member that has not been failed yet shows as active sync."
+      cost: 0
+    - title: The three steps
+      command: sudo mdadm /dev/md0 --fail /dev/{{bad}} --remove /dev/{{bad}}
+      body: "--fail, --remove and --add can be combined on one command line or run in turn. After --add, mdadm --wait /dev/md0 returns when the resync finishes."
+      cost: 1
+    - title: mdadm.conf
+      body: "mdadm --detail --scan prints the ARRAY line for the running array. Replace the old line with it (or edit devices=)."
+      cost: 1
+  misconceptions:
+    - id: wrong-member
+      description: Fails and replaces the healthy disk instead of the one with the errors.
+      feedback: "The errors are on /dev/{{bad}}; read the log before choosing which member to fail. Replacing the good disk leaves the failing one in the mirror."
+      expectFail: [rebuilt, bad-removed]
+      mutation:
+        on: tr-raid-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          if [ {{bad}} = vdc ]; then g=/dev/vdd; else g=/dev/vdc; fi
+          sudo mdadm /dev/md0 --fail $g >/dev/null; sudo mdadm /dev/md0 --remove $g >/dev/null
+          sudo mdadm /dev/md0 --add /dev/vde >/dev/null
+          sudo mdadm --wait /dev/md0 || true
+          sudo sed -i '/^ARRAY/d' /etc/mdadm/mdadm.conf
+          sudo mdadm --detail --scan /dev/md0 | sudo tee -a /etc/mdadm/mdadm.conf >/dev/null
+    - id: conf-forgotten
+      description: Rebuilds the array but leaves the old devices= list in mdadm.conf.
+      feedback: "mdadm.conf still names the removed disk; the config no longer matches the array. Regenerate the ARRAY line."
+      expectFail: [conf]
+      mutation:
+        on: tr-raid-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo mdadm /dev/md0 --fail /dev/{{bad}} >/dev/null; sudo mdadm /dev/md0 --remove /dev/{{bad}} >/dev/null
+          sudo mdadm /dev/md0 --add /dev/vde >/dev/null
+          sudo mdadm --wait /dev/md0 || true
+  solution:
+    explanation: |
+      mdadm --fail and --remove take the failing member out, --add brings in the blank
+      disk and the kernel resyncs the mirror. The ARRAY line is regenerated from the
+      running array so mdadm.conf matches it.
+    steps:
+      - on: tr-raid-1
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cat /var/log/disk-errors.txt
+          sudo mdadm /dev/md0 --fail /dev/{{bad}}
+          sudo mdadm /dev/md0 --remove /dev/{{bad}}
+          sudo mdadm /dev/md0 --add /dev/vde
+          sudo mdadm --wait /dev/md0 || true
+          sudo sed -i '/^ARRAY/d' /etc/mdadm/mdadm.conf
+          sudo mdadm --detail --scan /dev/md0 | sudo tee -a /etc/mdadm/mdadm.conf >/dev/null
+          cat /proc/mdstat
+    alternatives:
+      - id: edit-devices
+        description: Keep the line and edit its devices= list by hand.
+        steps:
+          - on: tr-raid-1
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              sudo mdadm /dev/md0 --fail /dev/{{bad}} --remove /dev/{{bad}}
+              sudo mdadm /dev/md0 --add /dev/vde
+              sudo mdadm --wait /dev/md0 || true
+              if [ {{bad}} = vdc ]; then n=/dev/vdd,/dev/vde; else n=/dev/vdc,/dev/vde; fi
+              sudo sed -i "s#devices=[^ ]*#devices=$n#" /etc/mdadm/mdadm.conf

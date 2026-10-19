@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: lvm-mbr-gpt-mixed
+  title: Extend the depot volume group from the half-used MBR disk
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [lvm, partitions, mbr, gpt, fstab]
+  version: 1
+spec:
+  description: |
+    **`tr-store-1`** (`ssh tr-store-1`; you have `sudo`) has two data disks:
+
+    - the first (`/dev/disk/by-id/virtio-ct-data1`) is **GPT** and holds the single PV of
+      volume group **`vg-depot`** (logical volume `lv-spool`, mounted at `/depot/spool`);
+    - the second (`/dev/disk/by-id/virtio-ct-data2`) uses an **MBR** partition table. Its
+      first partition holds the filesystem **`TT-DATA`** mounted at `/depot/tt`, and the
+      rest of the disk is free.
+
+    Without touching what is already on either disk:
+
+    1. Create a **new partition** in the free space of the second disk (it becomes
+       `/dev/vdd2`) and turn it into a **PV**.
+    2. Add the PV to **`vg-depot`**.
+    3. Create the logical volume **`lv-logs`** of exactly **120 extents**.
+    4. Put a **{{fs}}** filesystem with the label **`{{label}}`** on it and mount it at
+       **`/depot/logs`**, in `/etc/fstab` **by label**, and now.
+
+    The change must survive a reboot. The host is not rebooted here: persistence is
+    judged from `/etc/fstab` and the LVM metadata.
+  objectives:
+    - Add a partition to an MBR disk next to existing data
+    - Grow a volume group with a new PV and carve a volume by extent count
+    - Mount a new filesystem persistently by label
+  params:
+    fs:
+      type: choice
+      values: [xfs, ext4]
+    label:
+      type: choice
+      values: [DEPOT-LOGS, TR-LOGS]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-store-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-store-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! vgs vg-depot >/dev/null 2>&1; then
+          wipefs -a /dev/vdc /dev/vdd >/dev/null 2>&1 || true
+          parted -s /dev/vdc mklabel gpt mkpart depot 1MiB 641MiB set 1 lvm on
+          parted -s /dev/vdd mklabel msdos mkpart primary 1MiB 501MiB
+          udevadm settle
+          pvcreate -y /dev/vdc1 >/dev/null; vgcreate vg-depot /dev/vdc1 >/dev/null
+          lvcreate -y -n lv-spool -L 300M vg-depot >/dev/null
+          mkfs.xfs -q /dev/vg-depot/lv-spool; mkfs.ext4 -q -L TT-DATA /dev/vdd1
+          mkdir -p /depot/spool /depot/tt /depot/logs
+          printf '/dev/mapper/vg--depot-lv--spool /depot/spool xfs defaults 0 0\nLABEL=TT-DATA /depot/tt ext4 defaults 0 2\n' >> /etc/fstab
+          systemctl daemon-reload; mount /depot/spool; mount /depot/tt
+          seq 1 3000 | sed 's/^/spool record /' > /depot/spool/records.txt
+          seq 1 3000 | sed 's/^/timetable row /' > /depot/tt/rows.txt
+        fi
+        sha256sum /depot/spool/records.txt /depot/tt/rows.txt > $V/lvm-mixed.sha
+        parted -s /dev/vdd unit s print | awk '$1 == "1" {print $2}' > $V/vdd1.start
+  checks:
+    - id: vg-members
+      description: vg-depot has exactly the old PV and the new partition of the MBR disk
+      type: shell
+      on: tr-store-1
+      skills: [linux.storage.partitions, linux.storage.lvm]
+      weight: 2
+      command: pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk '$2 == "vg-depot" {print $1}' | sort | paste -sd,
+      expect: {match: exact, value: "/dev/vdc1,/dev/vdd2"}
+    - id: lv-extents
+      description: lv-logs has exactly 120 extents
+      type: shell
+      on: tr-store-1
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: |
+        e=$(vgs --noheadings --units b --nosuffix -o vg_extent_size vg-depot 2>/dev/null | tr -d ' ')
+        s=$(lvs --noheadings --units b --nosuffix -o lv_size vg-depot/lv-logs 2>/dev/null | tr -d ' ')
+        [ -n "$e" ] && [ -n "$s" ] && echo "extents=$((s / e))" || echo "extents=none"
+      expect: {match: exact, value: "extents=120"}
+    - id: mounted
+      description: The labelled {{fs}} filesystem on lv-logs is mounted at /depot/logs
+      type: shell
+      on: tr-store-1
+      skills: [linux.storage.filesystems, linux.storage.mounts]
+      weight: 2
+      command: |
+        src=$(findmnt -n -o SOURCE /depot/logs 2>/dev/null); t=$(findmnt -n -o FSTYPE /depot/logs 2>/dev/null)
+        l=$(blkid -s LABEL -o value /dev/vg-depot/lv-logs 2>/dev/null)
+        [ -n "$src" ] && [ "$(readlink -f "$src")" = "$(readlink -f /dev/vg-depot/lv-logs)" ] && w=lv || w="src=$src"
+        echo "$w $t $l"
+      expect: {match: exact, value: "lv {{fs}} {{label}}"}
+    - id: fstab-by-label
+      description: /etc/fstab mounts it by label and parses cleanly
+      type: shell
+      on: tr-store-1
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        s=$(awk '!/^[[:space:]]*#/ && $2 == "/depot/logs" {print $1; exit}' /etc/fstab | tr -d '"')
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; v=$?
+        [ "$s" = "LABEL={{label}}" ] && { [ "$v" = 0 ] || [ "$v" = 64 ]; } && echo by-label || echo "source=$s verify=$v"
+      expect: {match: exact, value: by-label}
+    - id: existing-intact
+      description: Existing data, the MBR table and partition 1 are untouched
+      type: shell
+      on: tr-store-1
+      skills: [linux.storage.partitions]
+      weight: 1.5
+      command: |
+        cd /; sha256sum -c --quiet /var/lib/cloudtrain/lvm-mixed.sha >/dev/null 2>&1 || { echo data-changed; exit 0; }
+        t=$(parted -s /dev/vdd print 2>/dev/null | awk -F': ' '/Partition Table/ {print $2}')
+        s=$(parted -s /dev/vdd unit s print 2>/dev/null | awk '$1 == "1" {print $2}')
+        g=$(parted -s /dev/vdc print 2>/dev/null | awk -F': ' '/Partition Table/ {print $2}')
+        [ "$t" = msdos ] && [ "$g" = gpt ] && [ "$s" = "$(cat /var/lib/cloudtrain/vdd1.start)" ] && findmnt -n /depot/tt >/dev/null && echo intact || echo "table=$t gpt=$g start=$s"
+      expect: {match: exact, value: intact}
+  hints:
+    - title: Free space on an MBR disk
+      command: sudo parted /dev/vdd unit MiB print free
+      body: "The second partition starts where the first ends. parted mkpart primary ... or fdisk both work; an MBR disk allows four primary partitions."
+      cost: 0
+    - title: Let the kernel see the partition
+      command: sudo partprobe /dev/vdd && udevadm settle
+      body: "If /dev/vdd2 does not appear after the partitioning tool exits, re-read the table with partprobe or partx -a."
+      cost: 1
+    - title: Extents, not megabytes
+      command: sudo lvcreate -l 120 -n lv-logs vg-depot
+      body: "-l counts logical extents, -L takes a size. vgs -o vg_extent_size shows what one extent is."
+      cost: 1
+  misconceptions:
+    - id: whole-disk-pv
+      description: Wipes the second disk and uses it whole as a PV.
+      feedback: "That destroys the partition table and the TT-DATA filesystem. Add a partition in the free space instead."
+      expectFail: [vg-members, existing-intact]
+      mutation:
+        on: tr-store-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo umount /depot/tt; sudo sed -i '/TT-DATA/d' /etc/fstab
+          sudo wipefs -a /dev/vdd >/dev/null
+          sudo pvcreate -y /dev/vdd >/dev/null
+          sudo vgextend vg-depot /dev/vdd >/dev/null
+          sudo lvcreate -y -l 120 -n lv-logs vg-depot >/dev/null
+          sudo mkfs.{{fs}} -q -L {{label}} /dev/vg-depot/lv-logs
+          sudo mkdir -p /depot/logs
+          echo 'LABEL={{label}} /depot/logs {{fs}} defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /depot/logs
+    - id: fstab-by-path
+      description: Mounts the volume by its device path instead of the label.
+      feedback: "The task asks for the mount by label, which stays valid if the volume is renamed or moved."
+      expectFail: [fstab-by-label]
+      mutation:
+        on: tr-store-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo parted -s /dev/vdd mkpart primary 501MiB 100%
+          sudo partprobe /dev/vdd; sudo udevadm settle
+          sudo pvcreate -y /dev/vdd2 >/dev/null
+          sudo vgextend vg-depot /dev/vdd2 >/dev/null
+          sudo lvcreate -y -l 120 -n lv-logs vg-depot >/dev/null
+          sudo mkfs.{{fs}} -q -L {{label}} /dev/vg-depot/lv-logs
+          sudo mkdir -p /depot/logs
+          echo '/dev/vg-depot/lv-logs /depot/logs {{fs}} defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /depot/logs
+  solution:
+    explanation: |
+      parted adds an MBR primary partition after the first one; pvcreate and vgextend bring
+      it into vg-depot; lvcreate -l 120 sizes the volume in extents; the filesystem gets
+      the label and fstab refers to it with LABEL=.
+    steps:
+      - on: tr-store-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo parted -s /dev/vdd mkpart primary 501MiB 100%
+          sudo partprobe /dev/vdd; sudo udevadm settle
+          sudo pvcreate -y /dev/vdd2
+          sudo vgextend vg-depot /dev/vdd2
+          sudo lvcreate -y -l 120 -n lv-logs vg-depot
+          sudo mkfs.{{fs}} -q -L {{label}} /dev/vg-depot/lv-logs
+          sudo mkdir -p /depot/logs
+          echo 'LABEL={{label}} /depot/logs {{fs}} defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /depot/logs
+          findmnt /depot/logs
+    alternatives:
+      - id: sfdisk-append
+        description: Append the partition with sfdisk and size the volume with -L.
+        steps:
+          - on: tr-store-1
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              echo ',,8e' | sudo sfdisk --append /dev/vdd >/dev/null
+              sudo partprobe /dev/vdd; sudo udevadm settle
+              sudo pvcreate -y /dev/vdd2
+              sudo vgextend vg-depot /dev/vdd2
+              sudo lvcreate -y -L 480M -n lv-logs vg-depot
+              sudo mkfs.{{fs}} -q -L {{label}} /dev/vg-depot/lv-logs
+              sudo mkdir -p /depot/logs
+              echo 'LABEL={{label}} /depot/logs {{fs}} defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount /depot/logs

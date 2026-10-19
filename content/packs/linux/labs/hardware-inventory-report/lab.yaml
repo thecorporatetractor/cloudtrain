@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: hardware-inventory-report
+  title: Inventory a depot host's hardware without vendor tools
+  domain: linux
+  frameworks: [lpic1:system-architecture, linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [hardware, lscpu, lsblk, lspci, inventory]
+  version: 1
+spec:
+  description: |
+    The asset team at Tallowmere Rail is auditing **`depot-ctl-2`** (`ssh depot-ctl-2`;
+    you have `sudo`) and cannot run the vendor inventory agent on it. Build the report
+    from what Linux itself exposes and write it to **`/home/learner/{{file}}`** as
+    comma-separated lines, in this order, with no header:
+
+    ```
+    cpu_model,<model name as the kernel reports it>
+    cpu_cores,<number of logical CPUs>
+    mem_mib,<installed memory in MiB, as free -m shows it>
+    disk,<name>,<size in bytes>        (one line per whole disk, sorted by name)
+    nic,<PCI address>                  (one line per PCI network controller, e.g. 00:03.0)
+    ```
+
+    Whole disks only: no partitions, loop devices or optical drives.
+  objectives:
+    - Read CPU, memory, block-device and PCI information from /proc, /sys and the standard tools
+    - Produce a machine-readable report from several sources
+  params:
+    file:
+      type: choice
+      values: [inventory.csv, asset-report.csv]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-ctl-2
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: depot-ctl-2
+      timeoutSec: 180
+      run: |
+        set -eu
+        rm -f /home/learner/inventory.csv /home/learner/asset-report.csv
+        if ! command -v lspci >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q pciutils >/dev/null
+        fi
+        command -v lscpu >/dev/null && command -v lsblk >/dev/null
+  checks:
+    - id: cpu
+      description: The CPU model and logical CPU count are right
+      type: shell
+      on: depot-ctl-2
+      skills: [linux.kernel.hardware-discovery]
+      weight: 1.5
+      command: |
+        f=/home/learner/{{file}}
+        want=$(awk -F: '/^model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)
+        got=$(sed -n 's/^cpu_model,//p' $f 2>/dev/null | head -1 | sed 's/^"//; s/"$//')
+        n=$(sed -n 's/^cpu_cores,//p' $f 2>/dev/null | head -1)
+        [ -n "$want" ] && [ "$got" = "$want" ] && [ "$n" = "$(nproc --all)" ] && echo cpu-ok || echo "model='$got' cores='$n'"
+      expect: {match: exact, value: cpu-ok}
+    - id: memory
+      description: The memory size matches free -m
+      type: shell
+      on: depot-ctl-2
+      skills: [linux.kernel.hardware-discovery]
+      weight: 1
+      command: |
+        want=$(free -m | awk '/^Mem:/ {print $2}')
+        got=$(sed -n 's/^mem_mib,//p' /home/learner/{{file}} 2>/dev/null | head -1)
+        case "$got" in ''|*[!0-9]*) echo "mem='$got'"; exit 0;; esac
+        d=$((got - want)); [ $d -lt 0 ] && d=$((0 - d))
+        [ $d -le 4 ] && echo mem-ok || echo "mem=$got want~$want"
+      expect: {match: exact, value: mem-ok}
+    - id: disks
+      description: Exactly the whole disks are listed with their sizes in bytes
+      type: shell
+      on: depot-ctl-2
+      skills: [linux.kernel.hardware-discovery]
+      weight: 2
+      command: |
+        want=$(lsblk -dn -b -o NAME,SIZE,TYPE | awk '$3 == "disk" {print "disk," $1 "," $2}' | sort | paste -sd';')
+        got=$(grep '^disk,' /home/learner/{{file}} 2>/dev/null | sort | paste -sd';')
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo disks-ok || echo "got=$got"
+      expect: {match: exact, value: disks-ok}
+    - id: nics
+      description: Every PCI network controller is listed by address
+      type: shell
+      on: depot-ctl-2
+      skills: [linux.kernel.hardware-discovery]
+      weight: 2
+      command: |
+        want=$(for d in /sys/bus/pci/devices/*; do c=$(cat $d/class); case "$c" in 0x0200*) echo "nic,${d##*/}" | sed 's/nic,0000:/nic,/';; esac; done | sort | paste -sd';')
+        got=$(grep '^nic,' /home/learner/{{file}} 2>/dev/null | sort | paste -sd';')
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo nics-ok || echo "got=$got"
+      expect: {match: exact, value: nics-ok}
+    - id: format
+      description: The report has only the expected record types in order
+      type: shell
+      on: depot-ctl-2
+      skills: [linux.kernel.hardware-discovery]
+      weight: 0.5
+      command: |
+        cut -d, -f1 /home/learner/{{file}} 2>/dev/null | uniq | paste -sd, 
+      expect: {match: exact, value: "cpu_model,cpu_cores,mem_mib,disk,nic"}
+  hints:
+    - title: Where the facts live
+      body: "lscpu and /proc/cpuinfo for the CPU, free -m for memory, lsblk -d for whole disks, lspci for PCI devices."
+      cost: 0
+    - title: Machine-readable lsblk
+      command: lsblk -dn -b -o NAME,SIZE,TYPE
+      body: "-d skips partitions, -n drops the header, -b prints bytes. Keep only TYPE disk."
+      cost: 1
+    - title: Network controllers
+      command: lspci -D | grep -i ethernet
+      body: "lspci -nn shows class [0200] for Ethernet controllers; the address in the first column is what the report needs, without the 0000: domain."
+      cost: 2
+  misconceptions:
+    - id: partitions-listed
+      description: Lists partitions as if they were disks.
+      feedback: "The report is for whole disks. lsblk -d (or filtering TYPE disk) leaves out partitions, loop devices and optical drives."
+      expectFail: [disks]
+      mutation:
+        on: depot-ctl-2
+        as: learner
+        run: |
+          set -e
+          f=/home/learner/{{file}}
+          { echo "cpu_model,$(awk -F: '/^model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+            echo "cpu_cores,$(nproc --all)"; echo "mem_mib,$(free -m | awk '/^Mem:/ {print $2}')"
+            lsblk -n -b -o NAME,SIZE | awk '{gsub(/[^a-z0-9]/, "", $1); print "disk," $1 "," $2}'
+            for d in /sys/bus/pci/devices/*; do case "$(cat $d/class)" in 0x0200*) echo "nic,${d##*/}" | sed 's/nic,0000:/nic,/';; esac; done; } > $f
+    - id: kib-not-mib
+      description: Reports the memory in KiB straight from /proc/meminfo.
+      feedback: "The asset format wants MiB, the unit free -m shows; /proc/meminfo is in KiB."
+      expectFail: [memory]
+      mutation:
+        on: depot-ctl-2
+        as: learner
+        run: |
+          set -e
+          f=/home/learner/{{file}}
+          { echo "cpu_model,$(awk -F: '/^model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+            echo "cpu_cores,$(nproc --all)"; echo "mem_mib,$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+            lsblk -dn -b -o NAME,SIZE,TYPE | awk '$3 == "disk" {print "disk," $1 "," $2}'
+            for d in /sys/bus/pci/devices/*; do case "$(cat $d/class)" in 0x0200*) echo "nic,${d##*/}" | sed 's/nic,0000:/nic,/';; esac; done; } > $f
+  solution:
+    explanation: |
+      /proc/cpuinfo (or lscpu) gives the model and nproc the logical CPUs; free -m gives
+      MiB; lsblk -d with bytes and TYPE disk gives the whole disks; PCI class 0200 is an
+      Ethernet controller, which lspci -D lists with its address.
+    steps:
+      - on: depot-ctl-2
+        as: learner
+        run: |
+          set -e
+          f=/home/learner/{{file}}
+          { echo "cpu_model,$(lscpu | awk -F: '/^Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}')"
+            echo "cpu_cores,$(nproc --all)"
+            echo "mem_mib,$(free -m | awk '/^Mem:/ {print $2}')"
+            lsblk -dn -b -o NAME,SIZE,TYPE | awk '$3 == "disk" {print "disk," $1 "," $2}' | sort
+            lspci -D -d ::0200 | awk '{sub(/^0000:/, "", $1); print "nic," $1}' | sort; } > $f
+          cat $f
+    alternatives:
+      - id: sys-files
+        description: Read the same facts straight from /proc and /sys instead of lscpu and lspci.
+        steps:
+          - on: depot-ctl-2
+            as: learner
+            run: |
+              set -e
+              f=/home/learner/{{file}}
+              { echo "cpu_model,$(awk -F: '/^model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo)"
+                echo "cpu_cores,$(grep -c '^processor' /proc/cpuinfo)"
+                echo "mem_mib,$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)"
+                for d in /sys/block/*; do n=${d##*/}; case $n in loop*|sr*|ram*) continue;; esac; echo "disk,$n,$(( $(cat $d/size) * 512 ))"; done | sort
+                for d in /sys/bus/pci/devices/*; do case "$(cat $d/class)" in 0x0200*) a=${d##*/}; echo "nic,${a#0000:}";; esac; done | sort; } > $f

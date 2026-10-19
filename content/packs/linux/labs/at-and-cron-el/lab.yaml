@@ -1,0 +1,177 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: at-and-cron-el
+  title: Schedule a one-off purge and a weekly report for the ops crew
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [at, cron, scheduling, access-control]
+  version: 1
+spec:
+  description: |
+    On **`depot-ops-2`** (`ssh depot-ops-2`; you have `sudo`) the operations crew
+    needs two scheduled jobs and tighter control over who may schedule at all. The group
+    **`ops`** has the members **`ops`** and **`oncall`**; the user `intern` is not in it.
+
+    1. As user **`ops`**, schedule a **one-off** run of `/usr/local/bin/purge-cache` at
+       **{{purge}}** with `at`.
+    2. In the **crontab of user `ops`**, run `/usr/local/bin/weekly-report` every
+       **Sunday** at **{{rep}}**.
+    3. Allow **only the members of group `ops`** to use `at` (root is always allowed);
+       `intern` must be refused.
+  objectives:
+    - Queue a one-off job with at as a given user
+    - Install a recurring job in a user's crontab
+    - Restrict at with /etc/at.allow
+  params:
+    purge:
+      type: choice
+      values: ["23:30", "22:45"]
+    rep:
+      type: choice
+      values: ["02:15", "03:40"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: depot-ops-2
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: depot-ops-2
+      timeoutSec: 180
+      run: |
+        set -eu
+        rpm -q at cronie >/dev/null 2>&1 || dnf -y -q install at cronie >/dev/null
+        getent group ops >/dev/null || groupadd ops
+        for u in ops oncall intern; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        usermod -aG ops ops; usermod -aG ops oncall; gpasswd -d intern ops >/dev/null 2>&1 || true
+        printf '#!/bin/sh\nrm -rf /var/cache/tr-fares/*\n' > /usr/local/bin/purge-cache
+        printf '#!/bin/sh\ndate > /var/tmp/weekly-report.out\n' > /usr/local/bin/weekly-report
+        chmod 0755 /usr/local/bin/purge-cache /usr/local/bin/weekly-report
+        rm -f /etc/at.allow /var/spool/cron/ops /var/spool/cron/oncall
+        for j in $(atq | awk '{print $1}'); do atrm $j; done
+        systemctl enable --now atd crond >/dev/null 2>&1
+  checks:
+    - id: at-job
+      description: User ops has a queued at job at the requested time that runs the purge
+      type: shell
+      on: depot-ops-2
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        id=$(atq | awk -v t="{{purge}}:00" '$NF == "ops" && $5 == t {print $1; exit}')
+        [ -n "$id" ] && at -c "$id" | grep -q '/usr/local/bin/purge-cache' && echo queued || echo "none"
+      expect: {match: exact, value: queued}
+    - id: cron-entry
+      description: The crontab of user ops runs the report on Sundays at the right time
+      type: shell
+      on: depot-ops-2
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        crontab -u ops -l 2>/dev/null | grep -v '^[[:space:]]*#' | awk -v m="$(echo {{rep}} | cut -d: -f2 | sed 's/^0//')" -v h="$(echo {{rep}} | cut -d: -f1 | sed 's/^0//')" '
+          {mm=$1; sub(/^0/, "", mm); hh=$2; sub(/^0/, "", hh)}
+          mm == m && hh == h && $3 == "*" && $4 == "*" && ($5 == "0" || $5 == "7" || tolower($5) == "sun") && $6 == "/usr/local/bin/weekly-report" {f = 1}
+          END {print f ? "scheduled" : "missing"}'
+      expect: {match: exact, value: scheduled}
+    - id: not-root
+      description: The report is not in root's crontab
+      type: shell
+      on: depot-ops-2
+      skills: [linux.processes.scheduled-jobs]
+      weight: 0.5
+      command: crontab -l 2>/dev/null | grep -c weekly-report | sed 's/^0$/clean/'
+      expect: {match: exact, value: clean}
+    - id: at-allow
+      description: at.allow lists exactly the members of group ops
+      type: shell
+      on: depot-ops-2
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        have=$(grep -v '^[[:space:]]*#' /etc/at.allow 2>/dev/null | grep -v '^root$' | sed '/^$/d' | sort -u | paste -sd,)
+        want=$(getent group ops | cut -d: -f4 | tr ',' '\n' | sort -u | paste -sd,)
+        [ -n "$have" ] && [ "$have" = "$want" ] && echo exact || echo "allow=$have"
+      expect: {match: exact, value: exact}
+    - id: intern-refused
+      description: intern is refused by at, ops is accepted
+      type: shell
+      on: depot-ops-2
+      skills: [linux.processes.scheduled-jobs]
+      weight: 1.5
+      command: |
+        a=$(runuser -u intern -- atq 2>&1 | grep -c 'not have permission')
+        b=$(runuser -u oncall -- atq 2>&1 | grep -c 'not have permission')
+        [ "$a" = 1 ] && [ "$b" = 0 ] && echo enforced || echo "intern=$a oncall=$b"
+      expect: {match: exact, value: enforced}
+  hints:
+    - title: One-off jobs
+      command: echo /usr/local/bin/purge-cache | sudo -u ops at 23:30
+      body: "at reads the commands from standard input; atq lists the queue and at -c ID shows a job's script."
+      cost: 0
+    - title: Per-user crontab
+      command: sudo crontab -u ops -e
+      body: "Five time fields (minute hour day-of-month month day-of-week) then the command. Sunday is 0 or 7 in the last field."
+      cost: 1
+    - title: Who may use at
+      body: "If /etc/at.allow exists only the users listed in it may use at (plus root); /etc/at.deny is then ignored. There are no group entries: list the members."
+      cost: 2
+  misconceptions:
+    - id: root-crontab
+      description: Puts the weekly report in root's crontab.
+      feedback: "The report must run as ops: use crontab -u ops (or sudo -u ops crontab -e), not root's table."
+      expectFail: [cron-entry, not-root]
+      mutation:
+        on: depot-ops-2
+        as: learner
+        run: |
+          echo '{{purge}}' >/dev/null
+          echo "$(echo {{rep}} | cut -d: -f2) $(echo {{rep}} | cut -d: -f1) * * 0 /usr/local/bin/weekly-report" | sudo crontab -
+          echo /usr/local/bin/purge-cache | sudo -u ops at {{purge}} 2>/dev/null
+          printf 'ops\noncall\n' | sudo tee /etc/at.allow >/dev/null
+    - id: allow-one-user
+      description: Allows only the user ops, not the whole group.
+      feedback: "at.allow takes user names, not group names. List every member of group ops (ops and oncall)."
+      expectFail: [at-allow, intern-refused]
+      mutation:
+        on: depot-ops-2
+        as: learner
+        run: |
+          echo ops | sudo tee /etc/at.allow >/dev/null
+          echo /usr/local/bin/purge-cache | sudo -u ops at {{purge}} 2>/dev/null
+          echo "$(echo {{rep}} | cut -d: -f2) $(echo {{rep}} | cut -d: -f1) * * 0 /usr/local/bin/weekly-report" | sudo crontab -u ops -
+  solution:
+    explanation: |
+      at takes the job from standard input and runs it as the invoking user, so use
+      sudo -u ops. crontab -u ops installs the weekly entry. at.allow lists the group's
+      members; once the file exists at.deny is ignored.
+    steps:
+      - on: depot-ops-2
+        as: learner
+        run: |
+          set -e
+          echo /usr/local/bin/purge-cache | sudo -u ops at {{purge}}
+          h=$(echo {{rep}} | cut -d: -f1); m=$(echo {{rep}} | cut -d: -f2)
+          echo "$m $h * * 0 /usr/local/bin/weekly-report" | sudo crontab -u ops -
+          getent group ops | cut -d: -f4 | tr ',' '\n' | sudo tee /etc/at.allow >/dev/null
+          atq; sudo crontab -u ops -l
+    alternatives:
+      - id: cron-dow-name
+        description: Spell the weekday as Sun and add the entry through an editor-free append.
+        steps:
+          - on: depot-ops-2
+            as: learner
+            run: |
+              set -e
+              echo /usr/local/bin/purge-cache | sudo -u ops at {{purge}}
+              h=$(echo {{rep}} | cut -d: -f1); m=$(echo {{rep}} | cut -d: -f2)
+              (sudo crontab -u ops -l 2>/dev/null; echo "$m $h * * Sun /usr/local/bin/weekly-report") | sudo crontab -u ops -
+              printf 'ops\noncall\n' | sudo tee /etc/at.allow >/dev/null

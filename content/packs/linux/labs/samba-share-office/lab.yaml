@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: samba-share-office
+  title: Share the office folder with the planners over SMB
+  domain: linux
+  frameworks: [lpic2:file-sharing]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [samba, smb, smbclient, permissions]
+  version: 1
+spec:
+  description: |
+    The planning office wants a Windows-style share on **`tr-files`** (`ssh tr-files`; you
+    have `sudo`). The Samba packages are installed. Publish **`/srv/office`** as the share
+    **`office`** (reachable as `\\tr-files\office`) so that:
+
+    - only members of the Unix group **`planners`** (`ines` and `jory`) can connect; `kit`
+      is not a planner and anonymous users get nothing;
+    - planners can **write**, and every new file belongs to group `planners` with mode
+      **`0660`** and every new directory has mode **`0770`** (the directory itself is
+      `root:planners`, mode `2770`);
+    - planners log in with the Samba password **`{{pw}}`** (set it with `smbpasswd`).
+
+    Verify with `smbclient //localhost/office -U ines%{{pw}}`.
+  objectives:
+    - Write a Samba share definition with access control and create masks
+    - Set Unix permissions that match the share
+    - Create Samba accounts and test them with smbclient
+  params:
+    pw:
+      type: choice
+      values: [PlanDesk-7, PlanDesk-9]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-files
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-files
+      timeoutSec: 300
+      run: |
+        set -eu
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        dpkg -s samba smbclient >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -q samba smbclient >/dev/null
+        getent group planners >/dev/null || groupadd planners
+        for u in ines jory kit; do id $u >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin $u; done
+        usermod -aG planners ines; usermod -aG planners jory; gpasswd -d kit planners >/dev/null 2>&1 || true
+        mkdir -p /srv/office; chown root:root /srv/office; chmod 0755 /srv/office
+        echo "office plans" > /srv/office/README
+        printf 'KitPass-1\nKitPass-1\n' | smbpasswd -a -s kit >/dev/null
+        sed -i '/^\[office\]/,$d' /etc/samba/smb.conf
+        systemctl enable --now smbd >/dev/null 2>&1 || true
+  checks:
+    - id: planner-writes
+      description: A planner can connect and write; the new file is group planners, mode 0660
+      type: shell
+      on: tr-files
+      skills: [linux.services.samba]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        n=probe-$$.txt; echo x > /tmp/$n
+        smbclient //localhost/office -U ines%{{pw}} -c "put /tmp/$n $n" >/dev/null 2>&1 || { echo "cannot-write"; rm -f /tmp/$n; exit 0; }
+        r=$(stat -c '%G %a' /srv/office/$n 2>/dev/null); rm -f /srv/office/$n /tmp/$n; echo "$r"
+      expect: {match: exact, value: "planners 660"}
+    - id: directories
+      description: A planner-created directory is mode 0770 and the share root is root:planners 2770
+      type: shell
+      on: tr-files
+      skills: [linux.services.samba]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        d=probe-dir-$$
+        smbclient //localhost/office -U jory%{{pw}} -c "mkdir $d" >/dev/null 2>&1 || { echo "cannot-mkdir"; exit 0; }
+        r=$(stat -c '%a' /srv/office/$d 2>/dev/null); rmdir /srv/office/$d
+        echo "$r $(stat -c '%U:%G %a' /srv/office)"
+      expect: {match: exact, value: "770 root:planners 2770"}
+    - id: outsiders-refused
+      description: kit (a valid Samba user outside the group) and anonymous users are refused
+      type: shell
+      on: tr-files
+      skills: [linux.services.samba]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        smbclient //localhost/office -U kit%KitPass-1 -c ls >/dev/null 2>&1 && a=kit-in || a=kit-out
+        smbclient //localhost/office -N -c ls >/dev/null 2>&1 && b=anon-in || b=anon-out
+        echo "$a $b"
+      expect: {match: exact, value: "kit-out anon-out"}
+    - id: config-valid
+      description: testparm accepts the configuration and smbd is enabled and active
+      type: shell
+      on: tr-files
+      skills: [linux.services.samba]
+      weight: 1
+      command: |
+        testparm -s >/dev/null 2>&1 && c=valid || c=invalid
+        echo "$c $(systemctl is-enabled smbd 2>/dev/null) $(systemctl is-active smbd 2>/dev/null)"
+      expect: {match: exact, value: "valid enabled active"}
+  hints:
+    - title: Share definition
+      body: "A [office] section in /etc/samba/smb.conf with path, valid users = @planners, read only = no, create mask, directory mask and force group. testparm -s checks it."
+      cost: 1
+    - title: Unix side
+      body: "Samba only exposes what the Unix permissions allow: chgrp planners /srv/office; chmod 2770 /srv/office (setgid keeps the group on new files)."
+      cost: 1
+    - title: Samba passwords
+      command: printf 'PW\nPW\n' | sudo smbpasswd -a -s ines
+      body: "Samba keeps its own password database; the Unix account must exist first. Do it for ines and jory, then restart or reload smbd."
+      cost: 1
+  misconceptions:
+    - id: open-share
+      description: Shares the folder to everyone, world-writable, without valid users.
+      feedback: "valid users = @planners limits the share to the group; chmod 777 hides the problem instead of controlling access."
+      expectFail: [planner-writes, directories, outsiders-refused]
+      mutation:
+        on: tr-files
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo chmod 0777 /srv/office
+          printf '\n[office]\n   path = /srv/office\n   read only = no\n   guest ok = yes\n' | sudo tee -a /etc/samba/smb.conf >/dev/null
+          for u in ines jory; do printf '{{pw}}\n{{pw}}\n' | sudo smbpasswd -a -s $u >/dev/null; done
+          sudo systemctl restart smbd
+    - id: default-masks
+      description: Restricts access correctly but leaves Samba's default create masks.
+      feedback: "Files default to 0744 and directories 0755, so other planners cannot write. Set create mask = 0660, directory mask = 0770 and force group = planners."
+      expectFail: [planner-writes, directories]
+      mutation:
+        on: tr-files
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo chgrp planners /srv/office; sudo chmod 2770 /srv/office
+          printf '\n[office]\n   path = /srv/office\n   read only = no\n   valid users = @planners\n' | sudo tee -a /etc/samba/smb.conf >/dev/null
+          for u in ines jory; do printf '{{pw}}\n{{pw}}\n' | sudo smbpasswd -a -s $u >/dev/null; done
+          sudo systemctl restart smbd
+  solution:
+    explanation: |
+      The share limits access with valid users = @planners, applies create and directory masks
+      and forces the group; the directory is root:planners with the setgid bit; the planners get
+      Samba passwords and smbd is restarted.
+    steps:
+      - on: tr-files
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo chgrp planners /srv/office; sudo chmod 2770 /srv/office
+          printf '\n[office]\n   path = /srv/office\n   read only = no\n   guest ok = no\n   valid users = @planners\n   force group = planners\n   create mask = 0660\n   directory mask = 0770\n' | sudo tee -a /etc/samba/smb.conf >/dev/null
+          for u in ines jory; do printf '{{pw}}\n{{pw}}\n' | sudo smbpasswd -a -s $u >/dev/null; done
+          testparm -s >/dev/null
+          sudo systemctl restart smbd
+          smbclient //localhost/office -U ines%{{pw}} -c ls
+    alternatives:
+      - id: force-create-mode
+        description: Use force create mode / force directory mode with looser masks and reload instead of restart.
+        steps:
+          - on: tr-files
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo chgrp planners /srv/office; sudo chmod 2770 /srv/office
+              printf '\n[office]\n   path = /srv/office\n   writable = yes\n   valid users = @planners\n   force group = planners\n   create mask = 0660\n   force create mode = 0660\n   directory mask = 0770\n   force directory mode = 0770\n' | sudo tee -a /etc/samba/smb.conf >/dev/null
+              for u in ines jory; do printf '{{pw}}\n{{pw}}\n' | sudo smbpasswd -a -s $u >/dev/null; done
+              sudo smbcontrol smbd reload-config
+              sudo systemctl reload smbd

@@ -1,0 +1,211 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: quotas-crew-homes
+  title: Cap the crew's home space with user quotas
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [quota, xfs, xfs_quota, storage]
+  version: 1
+spec:
+  description: |
+    The crew home directories on **`tr-crew-1`** (`ssh tr-crew-1`; you have `sudo`) live on
+    their own XFS filesystem (label `CREW-HOMES`) mounted at **`/home/crew`**. Space has
+    run out twice this quarter.
+
+    1. Turn on **user quotas** for that filesystem, now and in `/etc/fstab`. (XFS reads
+       the quota options at mount time, so a plain remount is not enough.)
+    2. Give **every member of the group `crew`** a **soft block limit of {{soft}} MiB** and a
+       **hard block limit of {{hard}} MiB**. Users who are not in the group, such as `visitor`,
+       must stay unlimited.
+    3. Write the **names of the crew members who are over their soft limit** right now,
+       one per line, to **`/home/learner/over.txt`**.
+  objectives:
+    - Enable XFS user quota accounting through mount options
+    - Set and read block limits with xfs_quota
+    - Report quota usage
+  params:
+    soft:
+      type: choice
+      values: ["200", "150"]
+    hard:
+      type: choice
+      values: ["250", "300"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-crew-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-crew-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        umount /home/crew 2>/dev/null || true
+        sed -i '\#/home/crew#d' /etc/fstab
+        getent group crew >/dev/null || groupadd crew
+        for u in crewa crewb crewc crewd crewe visitor; do id $u >/dev/null 2>&1 || useradd -M -d /home/crew/$u -s /bin/bash $u; done
+        for u in crewa crewb crewc crewd crewe; do usermod -aG crew $u; done
+        gpasswd -d visitor crew >/dev/null 2>&1 || true
+        wipefs -a /dev/vdc >/dev/null; mkfs.xfs -q -L CREW-HOMES /dev/vdc
+        mkdir -p /home/crew
+        echo 'LABEL=CREW-HOMES /home/crew xfs defaults 0 0' >> /etc/fstab
+        systemctl daemon-reload; mount /home/crew
+        s={{soft}}; h={{hard}}
+        : > $V/over.ref
+        for p in crewa:$((s / 2)) crewb:$((s + 20)) crewc:$((h - 10)) crewd:$((s - 10)) crewe:5 visitor:$((h + 20)); do
+          u=${p%%:*}; m=${p##*:}
+          install -d -o $u -g $u /home/crew/$u
+          dd if=/dev/zero of=/home/crew/$u/data.bin bs=1M count=$m status=none
+          chown $u:$u /home/crew/$u/data.bin
+          [ $u != visitor ] && [ $m -gt $s ] && echo $u >> $V/over.ref
+        done
+        sort -o $V/over.ref $V/over.ref
+        rm -f /home/learner/over.txt
+  checks:
+    - id: enabled
+      description: User quota accounting is on for /home/crew now and in fstab
+      type: shell
+      on: tr-crew-1
+      skills: [linux.storage.quotas]
+      weight: 2
+      command: |
+        a=$(findmnt -n -o OPTIONS /home/crew 2>/dev/null); b=$(findmnt --fstab -n -o OPTIONS /home/crew 2>/dev/null)
+        echo ",$a," | grep -Eq ',(usrquota|uquota),' && echo ",$b," | grep -Eq ',(usrquota|uquota),' && echo enabled || echo "mount=$a fstab=$b"
+      expect: {match: exact, value: enabled}
+    - id: crew-limits
+      description: Every crew member has the soft and hard block limits
+      type: shell
+      on: tr-crew-1
+      skills: [linux.storage.quotas]
+      weight: 3
+      command: |
+        r=$(xfs_quota -x -c 'report -u -N -b' /home/crew 2>/dev/null)
+        bad=""; for u in $(getent group crew | cut -d: -f4 | tr ',' ' '); do
+          echo "$r" | awk -v u=$u -v s=$(({{soft}} * 1024)) -v h=$(({{hard}} * 1024)) '$1 == u && $3 == s && $4 == h {f = 1} END {exit !f}' || bad="$bad $u"
+        done
+        echo "wrong:${bad:- none}"
+      expect: {match: exact, value: "wrong: none"}
+    - id: visitor-unlimited
+      description: Users outside the group have no limit
+      type: shell
+      on: tr-crew-1
+      skills: [linux.storage.quotas]
+      weight: 1
+      command: |
+        xfs_quota -x -c 'report -u -N -b' /home/crew 2>/dev/null | awk '$1 == "visitor" {print "soft=" $3 " hard=" $4}'
+      expect: {match: exact, value: "soft=0 hard=0"}
+    - id: over-report
+      description: over.txt names exactly the crew members over their soft limit
+      type: shell
+      on: tr-crew-1
+      skills: [linux.storage.quotas]
+      weight: 2
+      command: |
+        have=$(sed 's/[[:space:]]//g; /^$/d' /home/learner/over.txt 2>/dev/null | sort | paste -sd,)
+        want=$(paste -sd, /var/lib/cloudtrain/over.ref)
+        [ "$have" = "$want" ] && echo correct || echo "have=$have"
+      expect: {match: exact, value: correct}
+    - id: data-kept
+      description: Nobody's data was deleted to get under the limit
+      type: shell
+      on: tr-crew-1
+      skills: [linux.storage.quotas]
+      weight: 1
+      command: |
+        n=0; for u in crewa crewb crewc crewd crewe visitor; do [ -s /home/crew/$u/data.bin ] && n=$((n + 1)); done; echo "files=$n"
+      expect: {match: exact, value: "files=6"}
+  hints:
+    - title: Enabling quotas on XFS
+      body: "Add uquota (or usrquota) to the fstab options, then umount and mount the filesystem again: XFS cannot switch quota accounting on with a remount."
+      cost: 1
+    - title: Setting limits
+      command: sudo xfs_quota -x -c 'limit -u bsoft=200m bhard=250m crewa' /home/crew
+      body: "limit -u sets the limits for a user; loop over the group members (getent group crew). report -u -h shows usage against the limits."
+      cost: 1
+    - title: Who is over
+      command: sudo xfs_quota -x -c 'report -u -h' /home/crew
+      body: "A user is over the soft limit when Used is greater than Soft. The report also lists users outside the group; only crew members count."
+      cost: 1
+  misconceptions:
+    - id: raw-units
+      description: Passes the limits as bare numbers.
+      feedback: "xfs_quota reads bare block limits in 512-byte units, so bsoft=200 is 100 KiB. Add the m suffix for mebibytes."
+      expectFail: [crew-limits]
+      mutation:
+        on: tr-crew-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo sed -i 's#^LABEL=CREW-HOMES /home/crew xfs defaults#LABEL=CREW-HOMES /home/crew xfs defaults,uquota#' /etc/fstab
+          sudo systemctl daemon-reload; sudo umount /home/crew; sudo mount /home/crew
+          for u in $(getent group crew | cut -d: -f4 | tr ',' ' '); do sudo xfs_quota -x -c "limit -u bsoft={{soft}} bhard={{hard}} $u" /home/crew; done
+          printf 'crewb\ncrewc\n' > /home/learner/over.txt
+    - id: everyone-limited
+      description: Sets the limits for every user on the filesystem.
+      feedback: "The ticket covers members of group crew only; visitor is not one and must stay unlimited."
+      expectFail: [visitor-unlimited]
+      mutation:
+        on: tr-crew-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo sed -i 's#^LABEL=CREW-HOMES /home/crew xfs defaults#LABEL=CREW-HOMES /home/crew xfs defaults,uquota#' /etc/fstab
+          sudo systemctl daemon-reload; sudo umount /home/crew; sudo mount /home/crew
+          for u in crewa crewb crewc crewd crewe visitor; do sudo xfs_quota -x -c "limit -u bsoft={{soft}}m bhard={{hard}}m $u" /home/crew; done
+          sudo cat /var/lib/cloudtrain/over.ref > /home/learner/over.txt 2>/dev/null || printf 'crewb\ncrewc\n' > /home/learner/over.txt
+    - id: remount-skipped
+      description: Edits fstab but only remounts, so accounting never starts.
+      feedback: "mount -o remount does not enable XFS quotas. Unmount the filesystem and mount it again with the option."
+      expectFail: [enabled, crew-limits]
+      mutation:
+        on: tr-crew-1
+        as: learner
+        run: |
+          sudo sed -i 's#^LABEL=CREW-HOMES /home/crew xfs defaults#LABEL=CREW-HOMES /home/crew xfs defaults,uquota#' /etc/fstab
+          sudo systemctl daemon-reload; sudo mount -o remount /home/crew
+          printf 'crewb\ncrewc\n' > /home/learner/over.txt
+  solution:
+    explanation: |
+      uquota in fstab plus umount and mount turns accounting on. xfs_quota -x limit -u sets
+      bsoft and bhard in mebibytes for each member of crew. report -u shows usage; crewb and
+      crewc are over the soft limit.
+    steps:
+      - on: tr-crew-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo sed -i 's#^LABEL=CREW-HOMES /home/crew xfs defaults#LABEL=CREW-HOMES /home/crew xfs defaults,uquota#' /etc/fstab
+          sudo systemctl daemon-reload; sudo umount /home/crew; sudo mount /home/crew
+          for u in $(getent group crew | cut -d: -f4 | tr ',' ' '); do sudo xfs_quota -x -c "limit -u bsoft={{soft}}m bhard={{hard}}m $u" /home/crew; done
+          sudo xfs_quota -x -c 'report -u -N -b' /home/crew | awk -v s=$(({{soft}} * 1024)) '$1 ~ /^crew/ && $2 > s {print $1}' | sort > /home/learner/over.txt
+          cat /home/learner/over.txt
+    alternatives:
+      - id: repquota-view
+        description: Same limits with the quota command file, reading usage with repquota-style xfs_quota report in human units.
+        steps:
+          - on: tr-crew-1
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo sed -i 's#^LABEL=CREW-HOMES /home/crew xfs defaults#LABEL=CREW-HOMES /home/crew xfs defaults,usrquota#' /etc/fstab
+              sudo systemctl daemon-reload; sudo umount /home/crew; sudo mount /home/crew
+              for u in $(getent group crew | cut -d: -f4 | tr ',' ' '); do echo "limit -u bsoft={{soft}}m bhard={{hard}}m $u"; done > /tmp/crew-quota.cmds
+              sudo xfs_quota -x -f /home/crew < /dev/null 2>/dev/null || true
+              while read -r c; do sudo xfs_quota -x -c "$c" /home/crew; done < /tmp/crew-quota.cmds
+              sudo xfs_quota -x -c 'report -u -N -b' /home/crew | awk -v s=$(({{soft}} * 1024)) '$1 ~ /^crew/ && $2 > s {print $1}' | sort > /home/learner/over.txt

@@ -1,0 +1,225 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: rsync-backup-timer
+  title: Mirror the depot manuals to the backup account every night
+  domain: linux
+  frameworks: [lpic2:maintenance, linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [rsync, ssh, systemd, timer, backup]
+  version: 1
+spec:
+  description: |
+    The depot manuals in **`/srv/depot/manuals`** on **`tr-bkp-1`** (`ssh tr-bkp-1`;
+    you have `sudo`) need a nightly off-box style mirror. The backup side is the local
+    account **`backup`**, reached over SSH as **`backup@127.0.0.1`**, which keeps its copy in
+    **`/srv/backup/manuals/`** (owned by `backup`). The `rsync` package is installed
+    and `sshd` is running.
+
+    1. Let **root** log in as `backup` **with a key** (no password, no prompt, host key
+       already known).
+    2. Create **`depot-backup.service`** (a one-shot unit) that runs `rsync` over SSH
+       to mirror the directory: **permissions preserved**, files removed at the source
+       **removed from the mirror** too.
+    3. Create **`depot-backup.timer`** that starts it **every night at {{at}}**
+       (`Persistent=true`) and enable it.
+    4. Prove a restore: copy the mirror back into **`/home/learner/restore-test/`**; it
+       must match the manuals as they are.
+  objectives:
+    - Set up key-based SSH between two accounts
+    - Mirror a tree with rsync (archive mode, delete)
+    - Schedule the job with a systemd timer
+    - Restore from the backup
+  params:
+    at:
+      type: choice
+      values: ["02:30", "03:15"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-bkp-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-bkp-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! command -v rsync >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q rsync >/dev/null
+        fi
+        systemctl disable --now depot-backup.timer >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/depot-backup.service /etc/systemd/system/depot-backup.timer; rm -rf /etc/systemd/system/depot-backup.*.d
+        rm -rf /root/.ssh /home/backup/.ssh /srv/backup /home/learner/restore-test
+        id backup >/dev/null 2>&1 || useradd -m -s /bin/bash backup
+        usermod -p '*' backup
+        install -d -o backup -g backup /srv/backup/manuals
+        rm -rf /srv/depot/manuals; mkdir -p /srv/depot/manuals/tools
+        echo "Tallowmere depot manuals" > /srv/depot/manuals/README; chmod 0644 /srv/depot/manuals/README
+        seq 1 200 | sed 's/^/signal code /' > /srv/depot/manuals/codes.csv; chmod 0640 /srv/depot/manuals/codes.csv
+        printf '#!/bin/sh\necho depot check\n' > /srv/depot/manuals/tools/check.sh; chmod 0755 /srv/depot/manuals/tools/check.sh
+        echo "master code 4711" > /srv/depot/manuals/vault.txt; chmod 0600 /srv/depot/manuals/vault.txt
+        (cd /srv/depot/manuals && find . -type f -printf '%m %P\n' | sort > $V/manuals.modes; find . -type f -exec sha256sum {} + | sort -k2 > $V/manuals.sha)
+  checks:
+    - id: timer
+      description: depot-backup.timer is enabled, active and fires nightly at the requested time
+      type: shell
+      on: tr-bkp-1
+      skills: [linux.services.backup, linux.systemd.timers]
+      weight: 2
+      command: |
+        systemctl daemon-reload
+        c=$(systemctl show -P TimersCalendar depot-backup.timer 2>/dev/null)
+        p=$(systemctl show -P Persistent depot-backup.timer 2>/dev/null)
+        e="$(systemctl is-enabled depot-backup.timer 2>/dev/null) $(systemctl is-active depot-backup.timer 2>/dev/null)"
+        echo "$c" | grep -q ' {{at}}:00' && [ "$p" = yes ] && echo "$e" || echo "calendar=$c persistent=$p"
+      expect: {match: exact, value: "enabled active"}
+    - id: transport
+      description: The unit runs rsync with archive and delete over ssh as backup@127.0.0.1
+      type: shell
+      on: tr-bkp-1
+      skills: [linux.services.backup]
+      weight: 1.5
+      command: |
+        u=$(systemctl cat depot-backup.service 2>/dev/null | grep -E '^ExecStart=' | head -1)
+        echo "$u" | grep -q 'rsync' || { echo "no-rsync"; exit 0; }
+        echo "$u" | grep -Eq -- '(-[a-zA-Z]*a|--archive|-[a-zA-Z]*p)' || { echo "no-archive"; exit 0; }
+        echo "$u" | grep -q -- '--delete' || { echo "no-delete-flag"; exit 0; }
+        echo "$u" | grep -Eq 'backup@(127\.0\.0\.1|localhost):/srv/backup/manuals' && echo ssh-transport || echo "not-ssh"
+      expect: {match: exact, value: ssh-transport}
+    - id: sync-works
+      description: Running the service mirrors all files with the same content and modes
+      type: shell
+      on: tr-bkp-1
+      skills: [linux.services.backup]
+      weight: 2.5
+      timeoutSec: 120
+      command: |
+        systemctl start depot-backup.service 2>/dev/null || { echo "service-failed"; exit 0; }
+        cd /srv/backup/manuals 2>/dev/null || { echo no-mirror; exit 0; }
+        m=$(find . -type f -printf '%m %P\n' | sort); s=$(find . -type f -exec sha256sum {} + | sort -k2)
+        [ "$m" = "$(cat /var/lib/cloudtrain/manuals.modes)" ] && [ "$s" = "$(cat /var/lib/cloudtrain/manuals.sha)" ] && echo mirrored || echo different
+      expect: {match: exact, value: mirrored}
+    - id: deletes-follow
+      description: A file removed at the source disappears from the mirror
+      type: shell
+      on: tr-bkp-1
+      skills: [linux.services.backup]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        echo canary > /srv/depot/manuals/canary.tmp
+        systemctl start depot-backup.service 2>/dev/null; [ -f /srv/backup/manuals/canary.tmp ] || { echo "not-copied"; exit 0; }
+        rm -f /srv/depot/manuals/canary.tmp
+        systemctl start depot-backup.service 2>/dev/null; [ -f /srv/backup/manuals/canary.tmp ] && echo "left-behind" || echo follows
+      expect: {match: exact, value: follows}
+    - id: restore
+      description: restore-test matches the manuals in content and modes
+      type: shell
+      on: tr-bkp-1
+      skills: [linux.services.backup]
+      weight: 2
+      command: |
+        cd /home/learner/restore-test 2>/dev/null || { echo no-restore; exit 0; }
+        m=$(find . -type f -printf '%m %P\n' | sort); s=$(find . -type f -exec sha256sum {} + | sort -k2)
+        [ "$m" = "$(cat /var/lib/cloudtrain/manuals.modes)" ] && [ "$s" = "$(cat /var/lib/cloudtrain/manuals.sha)" ] && echo restored || echo different
+      expect: {match: exact, value: restored}
+  hints:
+    - title: Key login for root
+      command: sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519
+      body: "Put the public key in /home/backup/.ssh/authorized_keys (owned by backup, mode 600) and record the host key with ssh-keyscan >> /root/.ssh/known_hosts, so the unit never prompts."
+      cost: 1
+    - title: The rsync call
+      body: "rsync -a --delete /srv/depot/manuals/ backup@127.0.0.1:/srv/backup/manuals/ — the trailing slashes matter: they copy the contents, not the directory itself."
+      cost: 1
+    - title: Timer
+      body: "A .timer next to the .service with OnCalendar=*-*-* HH:MM:00 and Persistent=true; enable it with systemctl enable --now depot-backup.timer."
+      cost: 1
+  misconceptions:
+    - id: no-delete
+      description: Mirrors with rsync -a but without --delete.
+      feedback: "Without --delete files removed at the source stay in the mirror, so it is a growing archive rather than a mirror."
+      expectFail: [transport, deletes-follow]
+      mutation:
+        on: tr-bkp-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo install -d -m 700 /root/.ssh; sudo ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519
+          sudo install -d -m 700 -o backup -g backup /home/backup/.ssh
+          sudo cat /root/.ssh/id_ed25519.pub | sudo tee /home/backup/.ssh/authorized_keys >/dev/null
+          sudo chown backup:backup /home/backup/.ssh/authorized_keys; sudo chmod 600 /home/backup/.ssh/authorized_keys
+          sudo sh -c 'ssh-keyscan -H 127.0.0.1 >> /root/.ssh/known_hosts 2>/dev/null'
+          printf '[Unit]\nDescription=Mirror depot manuals\n[Service]\nType=oneshot\nExecStart=/usr/bin/rsync -a /srv/depot/manuals/ backup@127.0.0.1:/srv/backup/manuals/\n' | sudo tee /etc/systemd/system/depot-backup.service >/dev/null
+          printf '[Unit]\nDescription=Nightly manuals mirror\n[Timer]\nOnCalendar=*-*-* {{at}}:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/depot-backup.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now depot-backup.timer
+          sudo systemctl start depot-backup.service
+          sudo rsync -a backup@127.0.0.1:/srv/backup/manuals/ /home/learner/restore-test/
+    - id: local-copy
+      description: Copies to the backup directory locally instead of over SSH.
+      feedback: "The backup side is reached as backup@127.0.0.1, so the transfer uses SSH and the files are written by that account, not by root."
+      expectFail: [transport]
+      mutation:
+        on: tr-bkp-1
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          printf '[Unit]\nDescription=Mirror depot manuals\n[Service]\nType=oneshot\nExecStart=/usr/bin/rsync -a --delete /srv/depot/manuals/ /srv/backup/manuals/\n' | sudo tee /etc/systemd/system/depot-backup.service >/dev/null
+          printf '[Unit]\nDescription=Nightly manuals mirror\n[Timer]\nOnCalendar=*-*-* {{at}}:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/depot-backup.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now depot-backup.timer
+          sudo systemctl start depot-backup.service
+          sudo rsync -a /srv/backup/manuals/ /home/learner/restore-test/
+  solution:
+    explanation: |
+      A key pair for root authorised for the backup account (and its host key recorded) lets
+      the one-shot unit run rsync -a --delete over SSH without a prompt; the timer calls it
+      every night; a restore is the same rsync with source and target swapped.
+    steps:
+      - on: tr-bkp-1
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo install -d -m 700 /root/.ssh; sudo ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519
+          sudo install -d -m 700 -o backup -g backup /home/backup/.ssh
+          sudo cat /root/.ssh/id_ed25519.pub | sudo tee /home/backup/.ssh/authorized_keys >/dev/null
+          sudo chown backup:backup /home/backup/.ssh/authorized_keys; sudo chmod 600 /home/backup/.ssh/authorized_keys
+          sudo sh -c 'ssh-keyscan -H 127.0.0.1 >> /root/.ssh/known_hosts 2>/dev/null'
+          printf '[Unit]\nDescription=Mirror depot manuals\n[Service]\nType=oneshot\nExecStart=/usr/bin/rsync -a --delete /srv/depot/manuals/ backup@127.0.0.1:/srv/backup/manuals/\n' | sudo tee /etc/systemd/system/depot-backup.service >/dev/null
+          printf '[Unit]\nDescription=Nightly manuals mirror\n[Timer]\nOnCalendar=*-*-* {{at}}:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/depot-backup.timer >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now depot-backup.timer
+          sudo systemctl start depot-backup.service
+          sudo rsync -a backup@127.0.0.1:/srv/backup/manuals/ /home/learner/restore-test/
+          ls -l /home/learner/restore-test
+    alternatives:
+      - id: ssh-options-and-archive-flags
+        description: Spell the flags out and pass the ssh options explicitly, restoring from the local mirror directory.
+        steps:
+          - on: tr-bkp-1
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              sudo install -d -m 700 /root/.ssh; sudo ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519
+              sudo install -d -m 700 -o backup -g backup /home/backup/.ssh
+              sudo cat /root/.ssh/id_ed25519.pub | sudo tee /home/backup/.ssh/authorized_keys >/dev/null
+              sudo chown backup:backup /home/backup/.ssh/authorized_keys; sudo chmod 600 /home/backup/.ssh/authorized_keys
+              printf '[Unit]\nDescription=Mirror depot manuals\n[Service]\nType=oneshot\nExecStart=/usr/bin/rsync --archive --delete -e "ssh -o StrictHostKeyChecking=accept-new" /srv/depot/manuals/ backup@127.0.0.1:/srv/backup/manuals/\n' | sudo tee /etc/systemd/system/depot-backup.service >/dev/null
+              printf '[Unit]\nDescription=Nightly manuals mirror\n[Timer]\nOnCalendar=*-*-* {{at}}:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/depot-backup.timer >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl enable --now depot-backup.timer
+              sudo systemctl start depot-backup.service
+              sudo rsync -a /srv/backup/manuals/ /home/learner/restore-test/

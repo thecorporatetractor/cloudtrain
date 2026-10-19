@@ -1,0 +1,206 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: vfat-xfs-ext4-mounts
+  title: Provision three volumes with different filesystems for the depot
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [lvm, vfat, ext4, xfs, fstab, ownership]
+  version: 1
+spec:
+  description: |
+    The depot server **`tr-store-2`** (`ssh tr-store-2`; you have `sudo`) has the volume
+    group **`vg-mix`** with free space. Following the provisioning ticket, create three
+    logical volumes in it, put the filesystems on them and mount them **now and at
+    every boot**:
+
+    | Mount point | LV (at least) | Filesystem | Ownership of the mounted tree |
+    |---|---|---|---|
+    | `/depot/usb` | `lv-usb`, 128 MiB | vfat | files owned by `usbsync:planners`, with `umask=007` |
+    | `/depot/logs` | `lv-logs`, 200 MiB | ext4 | `logwriter:logwriter`, mode `{{lmode}}` |
+    | `/depot/data` | `lv-data`, 320 MiB | xfs | `ledger:planners`, mode `{{dmode}}` |
+
+    The users and groups exist. The host is not rebooted here: persistence is judged from
+    `/etc/fstab` and a clean `findmnt --verify`.
+  objectives:
+    - Create volumes and three different filesystem types
+    - Apply ownership with chown/chmod on Linux filesystems and with mount options on vfat
+    - Make all the mounts persistent
+  params:
+    lmode:
+      type: choice
+      values: ["0750", "0770"]
+    dmode:
+      type: choice
+      values: ["2775", "0755"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-store-2
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-store-2
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        getent group planners >/dev/null || groupadd planners
+        for u in usbsync logwriter ledger; do id $u >/dev/null 2>&1 || useradd -r -M -s /sbin/nologin $u; done
+        usermod -aG planners usbsync; usermod -aG planners ledger
+        pvs /dev/vdc >/dev/null 2>&1 || { wipefs -a /dev/vdc >/dev/null; pvcreate -y /dev/vdc >/dev/null; }
+        vgs vg-mix >/dev/null 2>&1 || vgcreate vg-mix /dev/vdc >/dev/null
+        mkdir -p /depot
+  checks:
+    - id: usb
+      description: lv-usb is vfat, mounted at /depot/usb, files owned by usbsync:planners with mode 770
+      type: shell
+      on: tr-store-2
+      skills: [linux.storage.filesystems]
+      weight: 2
+      command: |
+        s=$(findmnt -n -o SOURCE /depot/usb 2>/dev/null)
+        [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vg-mix/lv-usb)" ] && [ "$(blkid -s TYPE -o value /dev/vg-mix/lv-usb)" = vfat ] || { echo "not-vfat-lv-usb"; exit 0; }
+        f=/depot/usb/.probe-$$; touch $f 2>/dev/null; o=$(stat -c %U:%G $f); rm -f $f
+        printf '%s %04d\n' "$o" "$(stat -c %a /depot/usb)"
+      expect: {match: exact, value: "usbsync:planners 0770"}
+    - id: logs
+      description: lv-logs is ext4, mounted at /depot/logs, owned by logwriter with the ticket mode
+      type: shell
+      on: tr-store-2
+      skills: [linux.storage.filesystems]
+      weight: 2
+      command: |
+        s=$(findmnt -n -o SOURCE /depot/logs 2>/dev/null)
+        [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vg-mix/lv-logs)" ] && [ "$(blkid -s TYPE -o value /dev/vg-mix/lv-logs)" = ext4 ] || { echo "not-ext4-lv-logs"; exit 0; }
+        printf '%s %04d\n' "$(stat -c %U:%G /depot/logs)" "$(stat -c %a /depot/logs)"
+      expect: {match: exact, value: "logwriter:logwriter {{lmode}}"}
+    - id: data
+      description: lv-data is XFS, mounted at /depot/data, owned by ledger:planners with the ticket mode
+      type: shell
+      on: tr-store-2
+      skills: [linux.storage.filesystems]
+      weight: 2
+      command: |
+        s=$(findmnt -n -o SOURCE /depot/data 2>/dev/null)
+        [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vg-mix/lv-data)" ] && [ "$(blkid -s TYPE -o value /dev/vg-mix/lv-data)" = xfs ] || { echo "not-xfs-lv-data"; exit 0; }
+        printf '%s %04d\n' "$(stat -c %U:%G /depot/data)" "$(stat -c %a /depot/data)"
+      expect: {match: exact, value: "ledger:planners {{dmode}}"}
+    - id: sizes
+      description: The volumes are at least the requested sizes
+      type: shell
+      on: tr-store-2
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: |
+        g() { lvs --noheadings --units m --nosuffix -o lv_size vg-mix/$1 2>/dev/null | tr -d ' ' | cut -d. -f1; }
+        u=$(g lv-usb); l=$(g lv-logs); d=$(g lv-data)
+        [ "${u:-0}" -ge 128 ] && [ "${l:-0}" -ge 200 ] && [ "${d:-0}" -ge 320 ] && echo sized || echo "usb=$u logs=$l data=$d"
+      expect: {match: exact, value: sized}
+    - id: persistent
+      description: fstab has all three mounts (vfat with uid, gid and umask) and verifies cleanly
+      type: shell
+      on: tr-store-2
+      skills: [linux.storage.mounts]
+      weight: 2
+      command: |
+        t() { findmnt --fstab -n -o FSTYPE /depot/$1 2>/dev/null; }
+        o=$(findmnt --fstab -n -o OPTIONS /depot/usb 2>/dev/null)
+        ok=1; [ "$(t usb)" = vfat ] && [ "$(t logs)" = ext4 ] && [ "$(t data)" = xfs ] || ok=0
+        echo ",$o," | grep -Eq ',uid=(usbsync|[0-9]+),' && echo ",$o," | grep -Eq ',gid=(planners|[0-9]+),' && echo ",$o," | grep -Eq ',(umask|dmask)=0?0?7,' || ok=0
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; v=$?
+        { [ "$v" = 0 ] || [ "$v" = 64 ]; } || ok=0
+        [ $ok = 1 ] && echo persistent || echo "fstab=$(t usb),$(t logs),$(t data) usbopts=$o verify=$v"
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Three volumes
+      command: sudo lvcreate -n lv-usb -L 128M vg-mix
+      body: "Repeat for lv-logs and lv-data. mkfs.vfat, mkfs.ext4 and mkfs.xfs create the filesystems."
+      cost: 0
+    - title: Ownership of a vfat tree
+      body: "FAT stores no owners. Mount options decide: uid=, gid= and umask= (here umask=007 gives directories 0770). chown has no effect."
+      cost: 1
+    - title: Ownership on ext4 and XFS
+      body: "Mount the filesystem once, then chown and chmod the top directory of the mounted tree; the metadata lives in the filesystem and persists."
+      cost: 1
+  misconceptions:
+    - id: chown-on-vfat
+      description: Mounts the vfat volume with defaults and tries chown/chmod on it.
+      feedback: "FAT has no owners or modes; chown is ignored (or refused). Use uid=, gid= and umask= in the mount options and in fstab."
+      expectFail: [usb, persistent]
+      mutation:
+        on: tr-store-2
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          for v in usb:128M logs:200M data:320M; do sudo lvcreate -y -n lv-${v%%:*} -L ${v##*:} vg-mix >/dev/null; done
+          sudo mkfs.vfat /dev/vg-mix/lv-usb >/dev/null; sudo mkfs.ext4 -q /dev/vg-mix/lv-logs; sudo mkfs.xfs -q /dev/vg-mix/lv-data
+          sudo mkdir -p /depot/usb /depot/logs /depot/data
+          printf '/dev/vg-mix/lv-usb /depot/usb vfat defaults 0 0\n/dev/vg-mix/lv-logs /depot/logs ext4 defaults 0 2\n/dev/vg-mix/lv-data /depot/data xfs defaults 0 0\n' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /depot/usb; sudo mount /depot/logs; sudo mount /depot/data
+          sudo chown usbsync:planners /depot/usb 2>/dev/null || true
+          sudo chown logwriter:logwriter /depot/logs; sudo chmod {{lmode}} /depot/logs
+          sudo chown ledger:planners /depot/data; sudo chmod {{dmode}} /depot/data
+    - id: hand-mounts-only
+      description: Mounts everything correctly by hand and writes nothing to fstab.
+      feedback: "Mounts made with the mount command vanish at reboot; every one needs a line in /etc/fstab."
+      expectFail: [persistent]
+      mutation:
+        on: tr-store-2
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          for v in usb:128M logs:200M data:320M; do sudo lvcreate -y -n lv-${v%%:*} -L ${v##*:} vg-mix >/dev/null; done
+          sudo mkfs.vfat /dev/vg-mix/lv-usb >/dev/null; sudo mkfs.ext4 -q /dev/vg-mix/lv-logs; sudo mkfs.xfs -q /dev/vg-mix/lv-data
+          sudo mkdir -p /depot/usb /depot/logs /depot/data
+          sudo mount -o uid=usbsync,gid=planners,umask=007 /dev/vg-mix/lv-usb /depot/usb
+          sudo mount /dev/vg-mix/lv-logs /depot/logs; sudo mount /dev/vg-mix/lv-data /depot/data
+          sudo chown logwriter:logwriter /depot/logs; sudo chmod {{lmode}} /depot/logs
+          sudo chown ledger:planners /depot/data; sudo chmod {{dmode}} /depot/data
+  solution:
+    explanation: |
+      Three lvcreate calls, three mkfs commands, and fstab lines that carry the vfat
+      ownership options. For ext4 and XFS the ownership and mode are set once on the
+      mounted root directory.
+    steps:
+      - on: tr-store-2
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo lvcreate -y -n lv-usb -L 128M vg-mix; sudo lvcreate -y -n lv-logs -L 200M vg-mix; sudo lvcreate -y -n lv-data -L 320M vg-mix
+          sudo mkfs.vfat /dev/vg-mix/lv-usb >/dev/null; sudo mkfs.ext4 -q /dev/vg-mix/lv-logs; sudo mkfs.xfs -q /dev/vg-mix/lv-data
+          sudo mkdir -p /depot/usb /depot/logs /depot/data
+          printf '/dev/vg-mix/lv-usb /depot/usb vfat uid=usbsync,gid=planners,umask=007 0 0\n/dev/vg-mix/lv-logs /depot/logs ext4 defaults 0 2\n/dev/vg-mix/lv-data /depot/data xfs defaults 0 0\n' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /depot/usb; sudo mount /depot/logs; sudo mount /depot/data
+          sudo chown logwriter:logwriter /depot/logs; sudo chmod {{lmode}} /depot/logs
+          sudo chown ledger:planners /depot/data; sudo chmod {{dmode}} /depot/data
+          findmnt -t vfat,ext4,xfs /depot/usb /depot/logs /depot/data
+    alternatives:
+      - id: by-uuid-numeric-ids
+        description: Mount by UUID and give the vfat options as numeric ids.
+        steps:
+          - on: tr-store-2
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo lvcreate -y -n lv-usb -l 32 vg-mix; sudo lvcreate -y -n lv-logs -l 50 vg-mix; sudo lvcreate -y -n lv-data -l 80 vg-mix
+              sudo mkfs.vfat /dev/vg-mix/lv-usb >/dev/null; sudo mkfs.ext4 -q /dev/vg-mix/lv-logs; sudo mkfs.xfs -q /dev/vg-mix/lv-data
+              sudo mkdir -p /depot/usb /depot/logs /depot/data
+              for p in usb:vfat logs:ext4 data:xfs; do n=${p%%:*}; t=${p##*:}; o=defaults; [ $n = usb ] && o="uid=$(id -u usbsync),gid=$(getent group planners | cut -d: -f3),umask=007"; echo "UUID=$(sudo blkid -s UUID -o value /dev/vg-mix/lv-$n) /depot/$n $t $o 0 0" | sudo tee -a /etc/fstab >/dev/null; done
+              sudo systemctl daemon-reload
+              sudo mount /depot/usb; sudo mount /depot/logs; sudo mount /depot/data
+              sudo chown logwriter:logwriter /depot/logs; sudo chmod {{lmode}} /depot/logs
+              sudo chown ledger:planners /depot/data; sudo chmod {{dmode}} /depot/data

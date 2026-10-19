@@ -1,0 +1,198 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: io-latency-hunt
+  title: Find what is starving the ledger disk and throttle it
+  domain: linux
+  frameworks: [lfcs:storage, linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [iostat, pidstat, io, cgroup, performance]
+  version: 1
+spec:
+  description: |
+    Ledger writes on **`tr-ledger-2`** (`ssh tr-ledger-2`; you have `sudo`) have become
+    slow. Three disks are in use: the ledger (`/srv/ledger-io`) and two data areas
+    (`/srv/export` and `/srv/scratch`), each on its own virtual disk. One systemd service
+    is saturating one disk.
+
+    1. Find the culprit with `iostat -x` (which device is busy) and per-process I/O
+       (`pidstat -d`, or `/proc/<pid>/io`). Write two lines to
+       **`/home/learner/answers/io.txt`**:
+
+       ```
+       unit=<the service name, without .service>
+       device=<the disk it writes to, e.g. vdd>
+       ```
+    2. **Throttle** it so that it can no longer starve the others, **without stopping or
+       killing it**: limit its write bandwidth on that device to at most **10 MiB/s** with a
+       systemd resource-control property. (`ionice` classes do nothing on virtio disks that
+       use the `none` I/O scheduler, so use the cgroup I/O limit.)
+  objectives:
+    - Locate a saturated device with iostat and the process behind it
+    - Attribute I/O to a systemd unit
+    - Limit a unit's write bandwidth with IOWriteBandwidthMax
+  params:
+    culprit:
+      type: choice
+      values: [tr-export-compact, tr-archive-sync]
+    cdir:
+      type: choice
+      values: [/srv/export, /srv/scratch]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ledger-2
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ledger-2
+      timeoutSec: 240
+      run: |
+        set -eu
+        for n in 1 2 3; do d=$(readlink -f /dev/disk/by-id/virtio-ct-data$n); [ "$d" = /dev/vd$(echo c d e | cut -d' ' -f$n) ]; done
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        rpm -q sysstat >/dev/null 2>&1 || dnf -y -q install sysstat >/dev/null
+        for u in tr-export-compact tr-archive-sync tr-ledger-io-writer tr-fares-report; do systemctl stop $u.service 2>/dev/null || true; rm -f /etc/systemd/system/$u.service; rm -rf /etc/systemd/system/$u.service.d; done
+        if ! findmnt -n /srv/ledger-io >/dev/null; then
+          for p in c:/srv/ledger-io d:/srv/export e:/srv/scratch; do
+            dev=/dev/vd${p%%:*}; m=${p##*:}
+            wipefs -a $dev >/dev/null 2>&1 || true; mkfs.xfs -q -f $dev
+            mkdir -p $m; echo "$dev $m xfs defaults 0 0" >> /etc/fstab
+          done
+          systemctl daemon-reload
+          mount /srv/ledger-io; mount /srv/export; mount /srv/scratch
+        fi
+        printf '%s\n' '#!/bin/bash' 'while :; do dd if=/dev/zero of={{cdir}}/work.tmp bs=1M count=64 oflag=direct status=none; done' > /usr/local/bin/{{culprit}}
+        printf '%s\n' '#!/bin/bash' 'while :; do echo "$(date +%s) ledger entry" >> /srv/ledger-io/ledger.log; sync /srv/ledger-io/ledger.log; sleep 0.2; done' > /usr/local/bin/tr-ledger-io-writer
+        printf '%s\n' '#!/bin/bash' 'while :; do awk "BEGIN {for (i = 0; i < 200000; i++) x += i}"; sleep 2; done' > /usr/local/bin/tr-fares-report
+        chmod 0755 /usr/local/bin/{{culprit}} /usr/local/bin/tr-ledger-io-writer /usr/local/bin/tr-fares-report
+        for u in {{culprit}} tr-ledger-io-writer tr-fares-report; do
+          printf '[Unit]\nDescription=Tallowmere %s\n[Service]\nIOAccounting=yes\nExecStart=/usr/local/bin/%s\n[Install]\nWantedBy=multi-user.target\n' $u $u > /etc/systemd/system/$u.service
+        done
+        systemctl daemon-reload
+        systemctl start {{culprit}}.service tr-ledger-io-writer.service tr-fares-report.service
+        sleep 2
+        systemctl show -P MainPID {{culprit}}.service > $V/culprit.pid
+        install -d -o learner -g learner /home/learner/answers; rm -f /home/learner/answers/io.txt
+  checks:
+    - id: culprit-named
+      description: io.txt names the unit that saturates a disk
+      type: shell
+      on: tr-ledger-2
+      skills: [linux.performance.disk-io]
+      weight: 2
+      command: sed -n 's/^unit=//p' /home/learner/answers/io.txt 2>/dev/null | head -1 | sed 's/\.service$//; s/[[:space:]]//g'
+      expect: {match: exact, value: "{{culprit}}"}
+    - id: device-named
+      description: io.txt names the disk behind the culprit's data area
+      type: shell
+      on: tr-ledger-2
+      skills: [linux.performance.disk-io]
+      weight: 2
+      command: |
+        want=$(findmnt -n -o SOURCE {{cdir}} | sed 's#^/dev/##')
+        have=$(sed -n 's/^device=//p' /home/learner/answers/io.txt 2>/dev/null | head -1 | sed 's#^/dev/##; s/[[:space:]]//g')
+        [ -n "$have" ] && [ "$have" = "$want" ] && echo device-ok || echo "device=$have"
+      expect: {match: exact, value: device-ok}
+    - id: limit-set
+      description: The unit has a write limit of at most 10 MiB/s on that device
+      type: shell
+      on: tr-ledger-2
+      skills: [linux.performance.disk-io]
+      weight: 2.5
+      command: |
+        dev=$(findmnt -n -o SOURCE {{cdir}})
+        v=$(systemctl show -P IOWriteBandwidthMax {{culprit}}.service 2>/dev/null | tr ';' '\n' | awk -v d="$dev" '$1 == d {print $2}' | head -1)
+        [ -n "$v" ] && [ "$v" -gt 0 ] && [ "$v" -le 10485760 ] && echo limited || echo "limit=${v:-none}"
+      expect: {match: exact, value: limited}
+    - id: rate-low
+      description: The unit now writes at 12 MiB/s or less, measured over four seconds
+      type: shell
+      on: tr-ledger-2
+      skills: [linux.performance.disk-io]
+      weight: 1.5
+      timeoutSec: 40
+      command: |
+        f=/sys/fs/cgroup/system.slice/{{culprit}}.service/io.stat
+        [ -r $f ] || { echo no-cgroup; exit 0; }
+        w() { awk '{for (i = 1; i <= NF; i++) if ($i ~ /^wbytes=/) {sub("wbytes=", "", $i); s += $i}} END {print s + 0}' $f; }
+        a=$(w); sleep 4; b=$(w); r=$(( (b - a) / 4 / 1048576 ))
+        [ $r -le 12 ] && echo throttled || echo "rate=${r}MiB/s"
+      expect: {match: exact, value: throttled}
+    - id: still-running
+      description: The culprit was neither stopped nor restarted
+      type: shell
+      on: tr-ledger-2
+      skills: [linux.performance.disk-io]
+      weight: 1.5
+      command: |
+        [ "$(systemctl show -P MainPID {{culprit}}.service)" = "$(cat /var/lib/cloudtrain/culprit.pid)" ] && [ "$(systemctl is-active {{culprit}}.service)" = active ] && echo running || echo changed
+      expect: {match: exact, value: running}
+  hints:
+    - title: Which device
+      command: iostat -x 2 3
+      body: "Look at w/s, wkB/s and %util per device (vdc, vdd, vde). The busy disk is not the ledger disk."
+      cost: 0
+    - title: Which process
+      command: pidstat -d 2 3
+      body: "pidstat -d prints kB_wr/s per process; systemd-cgls or ps -o unit shows the service of that PID. /proc/PID/io has the raw counters."
+      cost: 1
+    - title: Throttle
+      command: sudo systemctl set-property UNIT.service IOWriteBandwidthMax="/dev/vdX 8M"
+      body: "set-property writes a drop-in and applies it to the running unit. Use the device path of the filesystem the unit writes to."
+      cost: 2
+  misconceptions:
+    - id: stopped-it
+      description: Stops the service instead of throttling it.
+      feedback: "The job has to keep running, just slower. Use IOWriteBandwidthMax rather than stopping or killing the unit."
+      expectFail: [limit-set, rate-low, still-running]
+      mutation:
+        on: tr-ledger-2
+        as: learner
+        run: |
+          printf 'unit={{culprit}}\ndevice=%s\n' "$(findmnt -n -o SOURCE {{cdir}} | sed 's#^/dev/##')" > /home/learner/answers/io.txt
+          sudo systemctl stop {{culprit}}.service
+    - id: wrong-device
+      description: Limits the ledger disk instead of the disk the culprit writes to.
+      feedback: "A bandwidth limit names a block device; it must be the one the unit actually writes to ({{cdir}}), not the ledger disk."
+      expectFail: [device-named, limit-set, rate-low]
+      mutation:
+        on: tr-ledger-2
+        as: learner
+        run: |
+          printf 'unit={{culprit}}\ndevice=vdc\n' > /home/learner/answers/io.txt
+          sudo systemctl set-property {{culprit}}.service IOWriteBandwidthMax="/dev/vdc 8M"
+  solution:
+    explanation: |
+      iostat -x shows one non-ledger disk at full utilisation; pidstat -d shows dd writing
+      about 100 MB/s and its cgroup is the culprit unit. IOWriteBandwidthMax on that unit
+      and device limits it through the cgroup v2 io controller while it keeps running.
+    steps:
+      - on: tr-ledger-2
+        as: learner
+        run: |
+          set -e
+          iostat -x 1 2 | tail -12
+          pidstat -d 1 2 | tail -8
+          dev=$(findmnt -n -o SOURCE {{cdir}})
+          printf 'unit={{culprit}}\ndevice=%s\n' "${dev#/dev/}" > /home/learner/answers/io.txt
+          sudo systemctl set-property {{culprit}}.service IOWriteBandwidthMax="$dev 8M"
+          systemctl show -p IOWriteBandwidthMax {{culprit}}.service
+    alternatives:
+      - id: runtime-property
+        description: Apply the limit only to the running unit with --runtime and a byte count.
+        steps:
+          - on: tr-ledger-2
+            as: learner
+            run: |
+              set -e
+              dev=$(findmnt -n -o SOURCE {{cdir}})
+              printf 'unit={{culprit}}.service\ndevice=%s\n' "${dev#/dev/}" > /home/learner/answers/io.txt
+              sudo systemctl set-property --runtime {{culprit}}.service IOWriteBandwidthMax="$dev 5242880"

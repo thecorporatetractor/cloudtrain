@@ -1,0 +1,204 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iscsi-attach-volume
+  title: Attach the SAN log volume over iSCSI and mount it at boot
+  domain: linux
+  frameworks: [lfcs:storage, lpic2:advanced-storage]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [iscsi, iscsiadm, san, fstab, netdev]
+  version: 1
+spec:
+  description: |
+    The storage host **`tr-san-1`** exports one iSCSI LUN (target name suffix
+    **`{{tname}}`**) that holds an ext4 filesystem labelled `SAN-LOGS` with the signalling
+    logs. On **`tr-iscsi-cl`** (`ssh tr-iscsi-cl`; you have `sudo`; the initiator tools are
+    installed, and the target already allows this host's initiator name):
+
+    1. **Discover** the targets offered by `tr-san-1` (portal on TCP 3260) and **log in** to
+       the `{{tname}}` target.
+    2. Make the login **persistent**: the node record must start automatically at boot.
+    3. Mount the LUN's filesystem at **`/srv/san-logs`** through **`/etc/fstab`**, by UUID,
+       with **`_netdev`** (and `nofail`), and now. Disk letters of iSCSI devices change
+       between boots, so a device path like `/dev/sdb` is not acceptable.
+  objectives:
+    - Discover and log in to an iSCSI target with iscsiadm
+    - Make the session persistent with node.startup
+    - Mount the LUN by UUID with network-aware options
+  params:
+    tname:
+      type: choice
+      values: [san-logs, san-signal]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-san-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-iscsi-cl
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-san-1
+      timeoutSec: 300
+      run: |
+        set -eu
+        rpm -q targetcli >/dev/null 2>&1 || dnf -y -q install targetcli >/dev/null
+        mkdir -p /srv/san
+        T=iqn.2026-10.test.tallowmere:{{tname}}; I=iqn.2026-10.test.tallowmere:tr-iscsi-cl
+        systemctl enable --now target >/dev/null 2>&1
+        targetcli clearconfig confirm=True >/dev/null 2>&1 || true
+        rm -f /srv/san/lun0.img
+        truncate -s 300M /srv/san/lun0.img; mkfs.ext4 -q -F -L SAN-LOGS /srv/san/lun0.img
+        m=$(mktemp -d); mount -o loop /srv/san/lun0.img $m; echo "signalling log {{tname}}" > $m/EVENTS; umount $m; rmdir $m
+        targetcli /backstores/fileio create lun0 /srv/san/lun0.img >/dev/null
+        targetcli /iscsi create $T >/dev/null
+        targetcli /iscsi/$T/tpg1/luns create /backstores/fileio/lun0 >/dev/null
+        targetcli /iscsi/$T/tpg1/acls create $I >/dev/null
+        targetcli saveconfig >/dev/null
+        firewall-cmd -q --permanent --add-port=3260/tcp; firewall-cmd -q --reload
+    - on: tr-iscsi-cl
+      timeoutSec: 300
+      run: |
+        set -eu
+        rpm -q iscsi-initiator-utils >/dev/null 2>&1 || dnf -y -q install iscsi-initiator-utils >/dev/null
+        umount /srv/san-logs 2>/dev/null || true
+        iscsiadm -m node -u >/dev/null 2>&1 || true; iscsiadm -m node -o delete >/dev/null 2>&1 || true
+        sed -i '\#/srv/san-logs#d' /etc/fstab
+        echo "InitiatorName=iqn.2026-10.test.tallowmere:tr-iscsi-cl" > /etc/iscsi/initiatorname.iscsi
+        sed -i 's/^node.startup *=.*/node.startup = manual/' /etc/iscsi/iscsid.conf
+        mkdir -p /srv/san-logs
+        systemctl enable --now iscsid >/dev/null 2>&1; systemctl restart iscsid
+        systemctl daemon-reload
+  checks:
+    - id: logged-in
+      description: A session to the target is active
+      type: shell
+      on: tr-iscsi-cl
+      skills: [linux.storage.block-network]
+      weight: 2
+      command: iscsiadm -m session 2>/dev/null | grep -c 'iqn.2026-10.test.tallowmere:{{tname}}' | sed 's/^/sessions=/'
+      expect: {match: exact, value: "sessions=1"}
+    - id: startup-automatic
+      description: The node record starts automatically
+      type: shell
+      on: tr-iscsi-cl
+      skills: [linux.storage.block-network]
+      weight: 2
+      command: iscsiadm -m node -T iqn.2026-10.test.tallowmere:{{tname}} -o show 2>/dev/null | awk -F' = ' '$1 == "node.startup" {print $2}'
+      expect: {match: exact, value: automatic}
+    - id: mounted
+      description: The SAN-LOGS filesystem is mounted at /srv/san-logs and readable
+      type: shell
+      on: tr-iscsi-cl
+      skills: [linux.storage.block-network]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        s=$(readlink -f "$(findmnt -n -o SOURCE /srv/san-logs 2>/dev/null)" 2>/dev/null)
+        l=$(blkid -s LABEL -o value "$s" 2>/dev/null)
+        e=$(timeout 10 cat /srv/san-logs/EVENTS 2>/dev/null)
+        [ "$l" = SAN-LOGS ] && [ "$e" = "signalling log {{tname}}" ] && echo mounted || echo "label=$l"
+      expect: {match: exact, value: mounted}
+    - id: fstab
+      description: fstab mounts it by UUID with _netdev and nofail and parses cleanly
+      type: shell
+      on: tr-iscsi-cl
+      skills: [linux.storage.block-network, linux.storage.network-mounts]
+      weight: 2
+      command: |
+        s=$(findmnt --fstab -n -o SOURCE /srv/san-logs 2>/dev/null); o=$(findmnt --fstab -n -o OPTIONS /srv/san-logs 2>/dev/null)
+        findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; v=$?
+        case "$s" in UUID=*|/dev/disk/by-uuid/*) w=uuid;; *) w="other:$s";; esac
+        echo ",$o," | grep -q ',_netdev,' && echo ",$o," | grep -q ',nofail,' && [ "$w" = uuid ] && { [ $v = 0 ] || [ $v = 64 ]; } && echo configured || echo "source=$w opts=$o verify=$v"
+      expect: {match: exact, value: configured}
+  hints:
+    - title: Discover and log in
+      command: sudo iscsiadm -m discovery -t sendtargets -p tr-san-1 && sudo iscsiadm -m node -T TARGET -p tr-san-1 --login
+      body: "Discovery creates node records in /var/lib/iscsi; login starts a session and the LUN shows up as a new /dev/sdX."
+      cost: 0
+    - title: Persistence
+      command: sudo iscsiadm -m node -T TARGET -o update -n node.startup -v automatic
+      body: "node.startup in the record decides whether iscsid logs in again at boot. The default in iscsid.conf only affects records created later."
+      cost: 1
+    - title: Mounting
+      body: "lsblk -f and blkid find the new device and its UUID. Use UUID=... in fstab with _netdev,nofail so the boot waits for the network and is not blocked if the SAN is away."
+      cost: 1
+  misconceptions:
+    - id: device-letter
+      description: Puts /dev/sdb into fstab.
+      feedback: "iSCSI disks are named in order of login, which changes between boots. Use the filesystem UUID (blkid) and _netdev."
+      expectFail: [fstab]
+      mutation:
+        on: tr-iscsi-cl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo iscsiadm -m discovery -t sendtargets -p tr-san-1 >/dev/null
+          sudo iscsiadm -m node -T iqn.2026-10.test.tallowmere:{{tname}} -p tr-san-1 --login >/dev/null
+          sudo iscsiadm -m node -T iqn.2026-10.test.tallowmere:{{tname}} -o update -n node.startup -v automatic
+          sleep 3; d=$(readlink -f /dev/disk/by-label/SAN-LOGS)
+          echo "$d /srv/san-logs ext4 _netdev,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/san-logs
+    - id: manual-startup
+      description: Logs in and mounts but leaves the node record on manual startup.
+      feedback: "After a reboot nothing logs in again, so the mount fails. Set node.startup to automatic on the node record."
+      expectFail: [startup-automatic]
+      mutation:
+        on: tr-iscsi-cl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo iscsiadm -m discovery -t sendtargets -p tr-san-1 >/dev/null
+          sudo iscsiadm -m node -T iqn.2026-10.test.tallowmere:{{tname}} -p tr-san-1 --login >/dev/null
+          sleep 3
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/disk/by-label/SAN-LOGS) /srv/san-logs ext4 _netdev,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/san-logs
+  solution:
+    explanation: |
+      sendtargets discovery creates the node records, --login opens the session, node.startup
+      automatic makes iscsid repeat the login at boot, and an fstab line by UUID with _netdev
+      and nofail mounts the filesystem once the network and the session are up.
+    steps:
+      - on: tr-iscsi-cl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          T=iqn.2026-10.test.tallowmere:{{tname}}
+          sudo iscsiadm -m discovery -t sendtargets -p tr-san-1
+          sudo iscsiadm -m node -T $T -p tr-san-1 --login
+          sudo iscsiadm -m node -T $T -o update -n node.startup -v automatic
+          sleep 3
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/disk/by-label/SAN-LOGS) /srv/san-logs ext4 _netdev,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/san-logs
+          findmnt /srv/san-logs
+    alternatives:
+      - id: by-path-then-uuid
+        description: Log in with the portal form, enable iscsi.service for boot, mount by the by-uuid path.
+        steps:
+          - on: tr-iscsi-cl
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo iscsiadm -m discovery -t st -p tr-san-1:3260 >/dev/null
+              sudo iscsiadm -m node -p tr-san-1:3260 -T iqn.2026-10.test.tallowmere:{{tname}} -l
+              sudo iscsiadm -m node -T iqn.2026-10.test.tallowmere:{{tname}} --op update -n node.startup -v automatic
+              sudo systemctl enable iscsi.service >/dev/null 2>&1 || true
+              sleep 3
+              echo "/dev/disk/by-uuid/$(sudo blkid -s UUID -o value /dev/disk/by-label/SAN-LOGS) /srv/san-logs ext4 _netdev,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount /srv/san-logs
