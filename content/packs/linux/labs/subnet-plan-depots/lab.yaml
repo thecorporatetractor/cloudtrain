@@ -23,7 +23,7 @@ spec:
        **first usable host address of depot 3's subnet** with the right prefix length
        (`ip addr add`). It is already up and has no address.
 
-    Do not touch `eth0`.
+    Do not touch the management interface (`eth0` or `enp1s0`).
   objectives:
     - Split a /22 into four equal subnets and name their network addresses
     - Work out the first usable host address of a subnet
@@ -50,7 +50,10 @@ spec:
       run: |
         set -eu
         install -d -m 0700 /var/lib/cloudtrain
-        [ "$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" = eth0 ] || { echo "this lab expects the management NIC to be eth0 (default route is on $(ip -4 route show default | head -1))" >&2; exit 1; }
+        # remember which interface carries the default route (eth0 or a predictable name such as enp1s0)
+        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, > /var/lib/tr-mgmt-if
+        grep -q . /var/lib/tr-mgmt-if
+        ! grep -qw eth1 /var/lib/tr-mgmt-if
         # eth1 is a veth end standing in for a second NIC; eth0 is never touched
         for f in /etc/netplan/*.yaml; do
           [ -f "$f" ] || continue
@@ -115,15 +118,16 @@ spec:
         EOP
       expect: {match: exact, value: ok}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the management interface
       type: shell
       on: tr-net-01
       skills: [linux.net.ip-config]
       weight: 0.5
       command: |
         ip -4 -o addr show dev eth1 scope global | grep -q inet || { echo not-configured; exit 0; }
-        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+        now=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        if [ "$now" = "$(cat /var/lib/tr-mgmt-if)" ]; then echo unchanged; else echo "$now"; fi
+      expect: {match: exact, value: unchanged}
   hints:
     - title: How many bits
       body: "Four equal subnets need two more network bits: a /22 becomes four /24s. Their network addresses step by 256 in the third octet (or the bit pattern of your supernet)."
