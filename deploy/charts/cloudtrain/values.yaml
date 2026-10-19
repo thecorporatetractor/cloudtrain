@@ -183,10 +183,32 @@ orchestrator:
   storageClass: ""
   # RuntimeClass for lab container nodes (e.g. kata); "" = cluster default.
   runtimeClass: ""
-  # Prototype (docs/kata-spike.md), off by default: RuntimeClass per catalog
-  # image tier, e.g. {B: kata-clh} runs tier-B container nodes in Kata. A tier
-  # whose RuntimeClass is missing at startup is dropped; its systemd images then
-  # fail (run those labs as KubeVirt VMs).
+  # Tier sandboxes (docs/kata-spike.md, docs/any-kubernetes.md), off by default:
+  # catalog image tier -> sandbox RuntimeClass. Container nodes of that tier's
+  # images run in the RuntimeClass; systemd and privileged images (deb-sys,
+  # el-sys) run privileged ONLY there, never on the host kernel. The manager
+  # checks each tier at startup and every 30 s (RuntimeClass exists, its handler
+  # is a VM sandbox, a schedulable node matches it, labctl preflight did not fail
+  # it); sessions show the result in their Sandboxed condition. While a tier is
+  # unavailable, fallback kubevirt runs nodes whose catalog image has a
+  # vmFallback (deb-sys -> ubuntu-vm, el-sys -> el-vm) as that KubeVirt VM; fail
+  # leaves them to fail. Rendered into the <release>-orchestrator-sandboxes
+  # ConfigMap (--sandboxes-config).
+  #   sandboxes:
+  #     B:
+  #       runtimeClass: kata-clh-runtime-rs   # AKS: kata-vm-isolation, GKE: microvm
+  #       fallback: kubevirt                  # kubevirt (default) | fail
+  #       requiredFeatures: [dummy, gre, bond, vlan, wireguard, netem, md]   # labctl preflight; empty = all
+  sandboxes: {}
+  # ConfigMap in the release namespace with labctl preflight's sandbox verdict
+  # (labctl preflight --sandboxes-config configmap:<ns>/<release>-orchestrator-sandboxes
+  # --probe --sandbox-configmap out.yaml --sandbox-configmap-name <ns>/<this>;
+  # kubectl apply -f out.yaml; restart the manager). Mounted optionally when
+  # sandboxes are set: a tier it failed is unavailable, a non-Kata handler it
+  # proved a VM (e.g. GKE microvm) is trusted.
+  sandboxPreflightConfigMap: lab-sandbox-preflight
+  # Deprecated (the phase-0 prototype): {B: kata-clh} = sandboxes B with fallback
+  # fail. Exclusive with sandboxes.
   tierRuntimeClasses: {}
   vclusterPodSecurity: baseline
   catalog:

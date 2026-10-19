@@ -524,7 +524,7 @@ func (v *verifier) run(ctx context.Context, r runSpec) (rep RunReport) {
 		fail("resolve: %v", err)
 		return rep
 	}
-	ex := &controller.NodeExecutor{Drivers: v.rt.Registry, Session: sess, Template: spec}
+	ex := &controller.NodeExecutor{Drivers: v.rt.Registry, Session: sess, Template: controller.EffectiveTemplate(spec, sess)}
 	for i, a := range stepsFor(r, spec) {
 		sctx, cancel := context.WithTimeout(ctx, controller.ActionRequest(a).Timeout+time.Minute)
 		res, err := ex.RunAction(sctx, a)

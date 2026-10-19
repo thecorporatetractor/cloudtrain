@@ -181,6 +181,7 @@ export async function capacity(ps: PlatformService, p: Principal, info: ClusterI
       cluster: { context: ps.config.kubeContext, reachable: true },
       nodes,
       vms: { running: vms.running, total: vms.total },
+      sandboxes: { running: nodes.reduce((a, n) => a + (n.sandboxes ?? 0), 0), nodes: nodes.filter((n) => n.sandbox).length },
       warmPools,
       sessions: { total: sessions.length, byPhase, byOrg: [...byOrgId].map(([orgId, count]) => ({ orgId, name: names.find((n) => n.id === orgId)?.name ?? orgId, count })) },
     };

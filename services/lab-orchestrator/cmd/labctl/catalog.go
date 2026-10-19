@@ -129,6 +129,12 @@ func catalogCheck(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	errs := drivers.CheckPublished(cats, names, strings.Split(*platform, ","))
+	// vmFallback refs resolve in the merged catalog (an overlay may add them).
+	if merged, err := drivers.LoadCatalog(strings.Split(*cat, ",")...); err != nil {
+		errs = append(errs, err.Error())
+	} else if err := merged.CheckVMFallbacks(); err != nil {
+		errs = append(errs, err.Error())
+	}
 	for _, e := range errs {
 		fmt.Fprintln(stderr, "error:", e)
 	}

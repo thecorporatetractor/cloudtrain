@@ -73,6 +73,14 @@ check "rbac: sessions namespace is a lab namespace" q 'select(.kind == "Namespac
 render -f "$CHART/examples/values-kind.yaml" --set orchestrator.rbac.ovnCentral.enabled=false --set orchestrator.rbac.admissionPolicy=false >"$OUT/rbac-off.yaml"
 check "rbac: ovn-central off drops the kube-system Role" bash -c "! yq -e 'select(.kind == \"Role\" and .metadata.namespace == \"kube-system\")' '$OUT/rbac-off.yaml' && yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-orchestrator\") | .spec.template.spec.containers[0].args[] | select(. == \"--ovn-central=\")' '$OUT/rbac-off.yaml' && ! grep -q '^kind: ValidatingAdmissionPolicy' '$OUT/rbac-off.yaml'"
 
+# Tier sandboxes: off by default (no flag, no ConfigMap, no mount); set, a
+# SandboxConfig ConfigMap the manager reads and the optional preflight mount.
+check "sandboxes off by default" bash -c "! yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-orchestrator\") | .spec.template.spec | (.containers[0].args[] | select(test(\"sandbox|tier-runtime\"))), (.volumes[] | select(.name | test(\"sandbox\")))' '$OUT/values-kind.yaml' && ! yq -e 'select(.kind == \"ConfigMap\" and .metadata.name == \"ct-cloudtrain-orchestrator-sandboxes\")' '$OUT/values-kind.yaml'"
+render -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata-clh-runtime-rs --set orchestrator.sandboxes.B.fallback=kubevirt >"$OUT/sandboxes.yaml"
+check "sandboxes ConfigMap" q 'select(.kind == "ConfigMap" and .metadata.name == "ct-cloudtrain-orchestrator-sandboxes") | .data["sandboxes.yaml"] | from_yaml | (.kind == "SandboxConfig" and .tiers.B.runtimeClass == "kata-clh-runtime-rs" and .tiers.B.fallback == "kubevirt")' "$OUT/sandboxes.yaml"
+check "sandboxes manager flags" q '[select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--sandboxes-config=/etc/cloudtrain/sandboxes/sandboxes.yaml" or . == "--sandbox-preflight=/etc/cloudtrain/sandbox-preflight/preflight.yaml")] | length == 2' "$OUT/sandboxes.yaml"
+check "sandbox preflight ConfigMap optional" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.volumes[] | select(.name == "sandbox-preflight") | (.configMap.name == "lab-sandbox-preflight" and .configMap.optional == true)' "$OUT/sandboxes.yaml"
+
 # Web runtime config and CSP sources go in as environment variables.
 render -f "$CHART/examples/values-kind.yaml" --set web.runtimeConfig.apiBase=https://api.example.com --set 'web.csp.connectSrc=https://api.example.com wss://api.example.com' >"$OUT/web.yaml"
 check "web CT_API_BASE" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-web") | .spec.template.spec.containers[0].env[] | select(.name == "CT_API_BASE") | .value == "https://api.example.com"' "$OUT/web.yaml"
@@ -89,6 +97,9 @@ refuse "gatewayAPI without parent" "parentRefs or createGateway" -f "$CHART/exam
 refuse "bad mirror" "mirrors" -f "$CHART/examples/values-kind.yaml" --set 'orchestrator.images.mirrors[0]=ghcr.io'
 refuse "bad ovn-central selector" "selector" -f "$CHART/examples/values-kind.yaml" --set orchestrator.rbac.ovnCentral.selector=ovn-central
 refuse "unknown value" "additional properties" -f "$CHART/examples/values-kind.yaml" --set gateway.typo=1
+refuse "bad sandbox fallback" "fallback" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata --set orchestrator.sandboxes.B.fallback=host
+refuse "bad sandbox tier" "invalid propertyName" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.Z.runtimeClass=kata
+refuse "sandboxes and tierRuntimeClasses" "exclusive" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata --set orchestrator.tierRuntimeClasses.B=kata
 
 # Dev sign-in-as is never set by the chart.
 if grep -rq "CT_DEV_IMPERSONATE" "$OUT"/*.yaml; then fail "no CT_DEV_IMPERSONATE"; else pass "no CT_DEV_IMPERSONATE"; fi

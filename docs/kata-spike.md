@@ -5,7 +5,11 @@ There is a small prototype behind a default-off flag (section 6). It is not
 a production feature. **Phase 1** (section 10) made it a reproducible, opt-in
 dev profile: the lab guest kernel build and its published artifact, the
 `deb-sys`/`el-sys` images, `KIND_PROFILE=kata` and the preflight sandbox
-section. The orchestrator's default is unchanged.
+section. **Phase 2** (section 11) made the orchestrator side a product feature:
+`orchestrator.sandboxes` (Helm, ConfigMap, `--sandboxes`), startup and periodic
+validation, the KubeVirt `vmFallback` rewrite, the preflight ConfigMap and tier-B
+capacity in the gateway. The orchestrator's default is unchanged: without
+sandboxes nothing differs.
 
 Tier B in `content/curriculum.yaml` is "Kata pod with capabilities". The
 substrate is a Kata RuntimeClass with a custom guest kernel, and privileged
@@ -33,7 +37,7 @@ reproduce steps are in section 9.
 | Does Multus/Kube-OVN secondary networking attach? | **Yes.** A Multus NAD of type kube-ovn attaches `net1` with the OVN port's MAC, and the guest gets MTU 1400. 1400-byte frames with DF pass both ways. Primary placement with `ovn.kubernetes.io/logical_switch` (the orchestrator's primary mode) also works. Tested with clh and QEMU runtime-rs. |
 | Does `labctl verify` pass with `runtimeClassName` set? | **Yes.** The full verifier cycle passed for `systemd-service-lifecycle` with `tr-pis-01` as a deb-sys pod on `kata-clh-runtime-rs` (lab kernel): 2 seeds, 3 mutations and 1 alternative, all clean. Sessions were Ready in **25-45 s**, against 55-60 s for the same lab on KubeVirt in the same cluster. The first run failed because setup raced systemd's boot. A readiness probe on systemd nodes fixed it (section 4.5). |
 | Lab kernel features | **The stock Kata guest kernel is not enough** for tier B: it has no dummy, GRE, bonding, WireGuard, 802.1Q, netem or md. A lab guest kernel (the same 6.18.35 with Kata's config plus about 40 options, built in 5 minutes) passes every probe. On managed Kata (AKS, GKE) the guest kernel is the provider's, and neither documents a way to replace it. |
-| 3. Orchestrator change | Sketch in section 6. A prototype is included: `--tier-runtime-classes` (default off), RuntimeClass detection at startup, a catalog `systemd: true` flag (privileged only inside a sandbox) and Helm `orchestrator.tierRuntimeClasses`. |
+| 3. Orchestrator change | Sketch in section 6, prototype in phase 0 (`--tier-runtime-classes`). **Implemented in phase 2** (section 11): `orchestrator.sandboxes` per tier (RuntimeClass, fallback, required features), validation at startup and every 30 s, privileged only inside a verified VM sandbox, the KubeVirt `vmFallback` rewrite, the `Sandboxed` session condition, and the preflight verdict as a ConfigMap the manager reads. |
 
 **Recommendation:** adopt Kata for tier B on self-managed clusters (vCenter,
 bare metal, kind/ct-testvm). Use **Cloud Hypervisor on runtime-rs**
@@ -441,9 +445,12 @@ request + overhead instead of KVM devices.
 
 ### 6.4 Helm
 
-- `cloudtrain` chart: `orchestrator.tierRuntimeClasses` (prototype, map
-  tier -> RuntimeClass, schema-validated tiers A/B/C/K/V/N) renders
-  `--tier-runtime-classes`. The final form is `orchestrator.sandboxes` above.
+- `cloudtrain` chart: `orchestrator.sandboxes` (phase 2, the form above,
+  schema-validated) renders the `<release>-orchestrator-sandboxes` ConfigMap
+  (`--sandboxes-config`) and mounts the optional preflight ConfigMap
+  (`orchestrator.sandboxPreflightConfigMap`, `--sandbox-preflight`). The
+  prototype's `orchestrator.tierRuntimeClasses` stays as a deprecated alias
+  (fallback fail).
 - Prerequisites chart (any-kubernetes.md section 5): `kata.enabled` installs
   kata-deploy pinned to 4.2.0 with `shims: {clh-runtime-rs}` only,
   `snapshotter.setup: []` and `runtimeClasses.createDefault: false`. It also
@@ -455,9 +462,9 @@ request + overhead instead of KVM devices.
   `values-vcenter.yaml` / `values-baremetal.yaml` `kata-clh-runtime-rs`,
   `values-kind.yaml` off (or on for the ct-testvm Kata CI profile).
 
-### 6.5 What the prototype in this PR does
+### 6.5 What the phase-0 prototype did
 
-Everything is off unless `--tier-runtime-classes` is set.
+Superseded by phase 2 (section 11). Everything was off unless `--tier-runtime-classes` was set.
 
 | File | Change |
 |---|---|
@@ -468,8 +475,9 @@ Everything is off unless `--tier-runtime-classes` is set.
 | `deploy/charts/cloudtrain` | `orchestrator.tierRuntimeClasses` value, schema, arg |
 | `deploy/scripts/orchestrator-deploy.sh` | `TIER_RUNTIME_CLASSES` env |
 
-The fallback rewrite (6.2), the preflight section (6.3) and the kata-deploy
-packaging (6.4) are not implemented.
+The fallback rewrite (6.2) and the preflight ConfigMap (6.3) came in phase 2;
+the preflight section in phase 1; the kata-deploy packaging in a prerequisites
+chart (6.4) is still open.
 
 ## 7. Managed clouds
 
@@ -493,7 +501,7 @@ On AKS and GKE, use the provider's sandbox after preflight. Keep KubeVirt as
 the fallback, and as the substrate for everything that needs reboots, modules
 or SELinux.
 
-Next steps, in order (status after Phase 1, section 10):
+Next steps, in order (status after Phase 2, sections 10 and 11):
 
 1. **Images:** *partly done.* `deb-sys:24.04` and `el-sys:10` exist
    (`tools/images/linux-pod/sys/`, `build-linux-pod.sh deb-sys|el-sys`, catalog
@@ -517,11 +525,16 @@ Next steps, in order (status after Phase 1, section 10):
 4. **Upstream:** file the kata-agent exec `EBUSY` issue for systemd containers
    (runc-style fallback to the init process's cgroup), so the image workaround
    can go. **Open, waits on the owner.**
-5. **Orchestrator:** *preflight done* (`labctl preflight` sandbox section:
-   RuntimeClasses, tier map, own kernel, lab features, guest sizing, systemd
-   exec; not yet the Multus `net1` 1400 DF probe or the ConfigMap the manager
-   would read). **Open:** `orchestrator.sandboxes`, the `vmFallback` rewrite
-   (6.2), container-node ssh keys and tier-B capacity accounting in the gateway.
+5. **Orchestrator:** *done* (phase 2, section 11): `orchestrator.sandboxes`
+   (Helm, ConfigMap, `--sandboxes`), validation at startup and every 30 s with
+   the `Sandboxed` session condition, the `vmFallback` rewrite (6.2), the
+   preflight extras (the lab link probe from a sandboxed pod: MTU and 1400 DF
+   both ways; `--sandbox-configmap` writes the verdict the manager reads), and
+   tier-B capacity in the gateway (`sandbox`/`sandboxes` per node, RuntimeClass
+   overhead in requests). **Open:** container-node ssh keys (with 1), the
+   kata-deploy packaging in a prerequisites chart (6.4), and per-lab
+   `requiredFeatures` (a lab that needs a feature the cluster's guest kernel
+   lacks falls back per lab, not per cluster; section 7).
 6. **Content:** re-tier the 150 tier-B labs. Reboot, module, GRUB and SELinux
    labs move to tier C. The rest get a Kata variant verified on the kata
    profile and keep passing on the VM fallback. **Open;** `tools/kata/lab-variant.sh`
@@ -542,7 +555,7 @@ tools/slots/run.sh vm -- deploy/scripts/dev-up.sh                      # vhost_v
 tools/images/load.sh jumphost linux-pod-deb-sys linux-pod-el-sys ubuntu-vm
 SESSION_SELECTOR=labs.cloudtrain.dev/verify=true LOAD_LAB_IMAGES=0 deploy/scripts/orchestrator-deploy.sh
 tools/kata/lab-variant.sh content/packs/linux/labs/netem-impaired-link labs
-bin/labctl preflight --context kind-ct-kata2 --tier-runtime-classes B=kata-clh-runtime-rs --probe --systemd-image cloudtrain/deb-sys:24.04
+bin/labctl preflight --context kind-ct-kata2 --sandboxes B=kata-clh-runtime-rs --probe --systemd-image cloudtrain/deb-sys:24.04 --sandbox-configmap pf.yaml
 tools/slots/run.sh vm -- bin/labctl verify --context kind-ct-kata2 --parallel 1 --grade-timeout 15m labs/*
 kind delete cluster --name ct-kata2
 ```
@@ -637,3 +650,61 @@ issue (4, waits on the owner), `orchestrator.sandboxes`, the `vmFallback`
 rewrite and gateway capacity accounting (5), re-tiering the content (6), and
 the managed-cloud probes (7).
 
+
+## 11. Phase 2: tier sandboxes as a product feature (2026-10-19)
+
+Phase 2 turns the prototype into an opt-in feature. **The default does not change:**
+with no sandboxes configured, the manager behaves as before (tier-B container nodes
+on the default runtime, `systemd: true` images refused).
+
+| Piece | Where |
+|---|---|
+| Configuration | `orchestrator.sandboxes` (Helm; schema-checked) rendered into the `<release>-orchestrator-sandboxes` ConfigMap (`--sandboxes-config`, kind `SandboxConfig`), or `--sandboxes B=kata-clh-runtime-rs[:kubevirt\|:fail]`; per tier `runtimeClass`, `fallback` (default `kubevirt`), `requiredFeatures`. `--tier-runtime-classes` stays as a deprecated alias (fallback `fail`) |
+| Validation | `internal/drivers/sandbox.go`: at startup and every 30 s (`--sandbox-recheck`) per tier: RuntimeClass exists, a schedulable node matches its selector, the preflight verdict did not fail it (`Available`), and its handler is a VM sandbox (`VMTrusted`: `kata*`, or proven by preflight; `runc`/`crun`/`youki`/gVisor never). Each change is logged; API errors keep the previous verdict |
+| Safety rule | systemd and privileged catalog images (`systemd: true`, new `privileged: true`) get a privileged container only when the tier is `Available` and `VMTrusted`, decided where the pod is created, with an uncached re-check of the RuntimeClass right before; otherwise the node falls back to its VM twin or fails with `ErrUnsupported`. Never privileged on the host |
+| `vmFallback` | catalog `vmFallback` (`deb-sys:24.04` -> `ubuntu-vm:24.04`, `el-sys:10` -> `el-vm:10`); `PlanSandboxes` rewrites the resolved template in the controller: driver `vm`, the twin image, the same cpu/memory (min 1024 MiB), access `ssh` + `console`. All or nothing per session; not for the entry node, linked nodes or `web` access. A session keeps the substrate it started on (recorded in `status.topology`); `labctl verify` and exam grading follow the recorded nodes (`EffectiveTemplate`). Without KubeVirt, `kubevirt` becomes `fail` |
+| Status | LabSession condition `Sandboxed` (`Sandboxed` / `VMFallback` / `SandboxUnavailable`) and an event on change; pod annotation `labs.cloudtrain.dev/sandbox` |
+| Preflight | `labctl preflight --sandboxes ... \| --sandboxes-config <file\|configmap:ns/name> --probe`: new lab link probe from a sandboxed pod (Multus/Kube-OVN link to a runc pod: link MTU, 1400-byte frames with DF both ways, eth0), boot-id check; `--sandbox-configmap` writes the verdict per tier (kind `SandboxPreflight`) as the ConfigMap the manager mounts (`--sandbox-preflight`, optional) |
+| Gateway | `GET /api/platform/capacity`: per node `sandbox` (Kata node) and `sandboxes` (sandboxed lab pods, apart from VMs), RuntimeClass overhead in requested CPU/memory; totals in `sandboxes` |
+| Tests | unit tests (drivers, controller, labctl, gateway) and an envtest (`make test-envtest`, now in CI): RuntimeClass admission, deleted and runc-handler RuntimeClasses, the VM fallback, sandboxes off |
+
+### Verification on ct-testvm
+
+Separate cluster `ct-kata3` (`KIND_PROFILE=kata`, 1 control plane + 1 worker, own
+kubeconfig, `/srv/ct-work/dev/kata3`); `cloudtrain-dev` and the batch runner were not
+touched. Labs: the Kata variants (`tools/kata/lab-variant.sh`) of the tier-B labs
+`systemd-service-lifecycle` and `netem-impaired-link`. `labctl verify --parallel 1
+--grade-timeout 15m`.
+
+- **Preflight** (`--sandboxes B=kata-clh-runtime-rs --probe --systemd-image
+  cloudtrain/deb-sys:24.04 --sandbox-configmap`): every check passed, including the new
+  `probe kata-clh-runtime-rs link`: "lab link eth1 MTU 1400 in the sandbox; 1400-byte
+  frames with DF both ways over the link and on eth0 (runc <-> kata-clh-runtime-rs)". The
+  ConfigMap (`result: pass, vm: true, kernel: 6.18.35-ct1`) was applied and the manager
+  logged `preflight: true`.
+- **Sandboxes configured** (`--sandboxes=B=kata-clh-runtime-rs`): 2 labs, 11 runs, 0
+  failed, Ready in 20-80 s. Every `tr-*` pod ran in `kata-clh-runtime-rs`, privileged,
+  annotation `kata-clh-runtime-rs`; condition `Sandboxed=True`; no VMI.
+- **Sandboxes configured, RuntimeClass deleted:** the manager logged `tier sandbox
+  unavailable ... reason: RuntimeClass kata-clh-runtime-rs not found` within a minute.
+  The same 2 labs, 11 runs, 0 failed, Ready in 50-60 s, with the same grades as on Kata
+  (100 / 67 / 42 / 100 and 100 / 78 / 67 / 78 / 100). Every session recorded
+  `tr-*: driver vm, image ubuntu-vm:24.04`, condition `Sandboxed=False` reason
+  `VMFallback`; 11 VMIs, no tier-B pod.
+- **Sandboxes unset** (`SANDBOXES=`, the RuntimeClass restored): the manager logged
+  `tier sandboxes: off`, with no sandbox flag, volume or condition. The unchanged VM labs
+  `systemd-service-lifecycle` and `netem-impaired-link` passed 11/11 runs (Ready 55-65 s,
+  the same grades). The Kata variant failed all 6 runs before any pod was created
+  (`image deb-sys:24.04 needs a privileged container, which runs only inside a sandbox
+  RuntimeClass ...; no sandbox is configured for tier "B"`), as on main.
+
+Reviewed independently for ways a privileged pod could reach the host kernel: the first
+review asked for the decision in the pod create path, separate "usable" and "VM-trusted"
+states, sticky VM twins, all-or-nothing twins, and a deny-list of host runtimes; the second
+review approved. The cluster was deleted afterwards.
+
+Still open (phase 3): an admission policy in session namespaces that rejects privileged
+pods unless their `runtimeClassName` is a configured sandbox (defence in depth), the
+privileged `net-init` init container of wired pods without a sandbox, ssh keys in
+container nodes, the kata-deploy prerequisites chart, per-lab `requiredFeatures`, a
+nightly verify on the kata profile, re-tiering the content, and the managed-cloud probes.

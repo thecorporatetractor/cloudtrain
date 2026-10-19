@@ -98,7 +98,7 @@ test). It should be the same as the `docker stop` case plus host-prep reloading 
 | `kubeovn-primary` (default) | `cloudtrain-dev` | Kube-OVN | primary | `--network-mode=primary` |
 | `managed-cni` | `cloudtrain-mcni` | Cilium (`deploy/cilium/values.yaml`), stands in for a managed cloud's CNI | non-primary behind Multus (`deploy/kube-ovn/values-secondary.yaml`) | `--network-mode=secondary` |
 | `managed-cni-calico` | `cloudtrain-calico` | Calico VXLAN (`deploy/calico/kind.sed` over the pinned upstream `calico-vxlan.yaml`, `CALICO_VERSION`), a second managed-CNI stand-in | non-primary behind Multus, as `managed-cni` | `--network-mode=secondary` |
-| `kata` | `cloudtrain-kata` | Kube-OVN, as the default, plus Kata Containers for tier-B sandboxes (below) | primary | `--tier-runtime-classes B=kata-clh-runtime-rs` |
+| `kata` | `cloudtrain-kata` | Kube-OVN, as the default, plus Kata Containers for tier-B sandboxes (below) | primary | `--sandboxes B=kata-clh-runtime-rs` |
 
 ```bash
 task dev:up KIND_PROFILE=managed-cni              # control plane + 2 workers (deploy/kind/cluster-managed-cni.yaml)
@@ -142,15 +142,21 @@ containers start (WSL2 kernels may lack it). `dev-up.sh` then runs
 ```bash
 task image:build:linux-pod FAMILY=deb-sys        # tier-B systemd image (el-sys too)
 task dev:up KIND_PROFILE=kata                    # cluster cloudtrain-kata
-task orchestrator:deploy KIND_PROFILE=kata       # --tier-runtime-classes B=kata-clh-runtime-rs
+task orchestrator:deploy KIND_PROFILE=kata       # --sandboxes B=kata-clh-runtime-rs (fallback kubevirt)
 tools/kata/lab-variant.sh content/packs/linux/labs/netem-impaired-link /tmp/kata-labs
 task lab:verify KIND_PROFILE=kata -- --parallel 1 /tmp/kata-labs/netem-impaired-link-kata
-labctl preflight --context kind-cloudtrain-kata --tier-runtime-classes B=kata-clh-runtime-rs \
-  --probe --systemd-image cloudtrain/deb-sys:24.04
+labctl preflight --context kind-cloudtrain-kata --sandboxes B=kata-clh-runtime-rs \
+  --probe --systemd-image cloudtrain/deb-sys:24.04 --sandbox-configmap /tmp/sandbox-preflight.yaml
+SANDBOX_PREFLIGHT=/tmp/sandbox-preflight.yaml task orchestrator:deploy KIND_PROFILE=kata   # the manager reads the verdict
 ```
 
-`TIER_RUNTIME_CLASSES=` (empty) deploys the orchestrator without the flag, the default
-behaviour: tier-B container nodes then run on runc and `systemd: true` images are refused.
+`SANDBOXES=` (empty) deploys the orchestrator without sandboxes, the default behaviour:
+tier-B container nodes then run on runc and `systemd: true` images are refused.
+`SANDBOXES=B=kata-clh-runtime-rs:fail` keeps the sandbox but turns the KubeVirt fallback
+off. Deleting the RuntimeClass (`kubectl delete runtimeclass kata-clh-runtime-rs`) makes
+the manager fall back within 30 s: new sessions run the tier-B nodes as their catalog
+`vmFallback` VMs (condition `Sandboxed=False`, reason `VMFallback`); see
+[deploy.md](deploy.md#tier-sandboxes-kata).
 `tools/kata/lab-variant.sh` writes a lab's Kata variant: its `ubuntu-vm`/`el-vm` nodes
 become `deb-sys`/`el-sys` pods, nothing else changes; labs with extra disks or reboots stay
 on KubeVirt. On the verify VM the profile runs next to the batch runner's cluster with
@@ -673,8 +679,10 @@ Status and measurements: `docs/handoffs/foundations.md`.
   `init` leaf cgroup that keeps `kubectl exec` working, loop and device-mapper nodes), sshd,
   chrony, nftables, LVM/mdadm, kmod and the lab kernel's `modules.builtin`; learner has
   passwordless sudo. Catalog `systemd: true`: they run privileged only inside a Kata sandbox
-  (`--tier-runtime-classes`, `KIND_PROFILE=kata`); without one the session fails. Today's
-  tier-B labs still run as tier-C VMs; `KIND_PROFILE=kata` verifies their Kata variants.
+  (`--sandboxes`, Helm `orchestrator.sandboxes`, `KIND_PROFILE=kata`). With sandboxes
+  configured but Kata unavailable they run as their `vmFallback` VM (`ubuntu-vm:24.04`,
+  `el-vm:10`); without sandboxes the session fails. Today's tier-B labs still run as tier-C
+  VMs; `KIND_PROFILE=kata` verifies their Kata variants.
 - **Tier C, VMs** (`el-vm:10`, `ubuntu-vm:24.04`, `task image:build:el-vm|ubuntu-vm`). The
   mirror snapshot is baked in as the only, local repo (`/opt/cloudtrain/repo/<el10|noble>`),
   because lab VPCs have no route to cluster services. Extra blank disks: topology

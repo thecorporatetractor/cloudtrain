@@ -72,10 +72,10 @@ type ContainerDriver struct {
 	ImagePullSecrets []string
 	// RuntimeClassName, e.g. "kata"; empty uses the cluster default.
 	RuntimeClassName string
-	// TierRuntimeClasses maps a catalog image tier to the RuntimeClass of its
-	// container nodes (e.g. B -> kata-clh); it overrides RuntimeClassName.
-	// Empty (the default) changes nothing. See sandbox.go.
-	TierRuntimeClasses map[string]string
+	// Sandboxes maps catalog image tiers to sandbox RuntimeClasses (e.g. B
+	// -> kata-clh-runtime-rs); a tier's RuntimeClass overrides
+	// RuntimeClassName. nil (the default) changes nothing. See sandbox.go.
+	Sandboxes *Sandboxes
 	// ClusterDomain for Service DNS names (default "cluster.local").
 	ClusterDomain string
 	// Executor runs Exec requests; nil makes Exec return ErrNotImplemented.
@@ -356,15 +356,66 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 	if err := d.decoratePod(ref, pod, false); err != nil {
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
-	if err := d.applySandbox(ref, pod); err != nil {
-		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+	// The sandbox decision is made where the pod is created, once: a running
+	// pod keeps its RuntimeClass (pods are immutable) whatever happens to the
+	// sandbox later.
+	prepare := func() error {
+		privTier, err := d.applySandbox(ctx, ref, pod)
+		if err != nil {
+			return err
+		}
+		d.applyUserNamespace(ref, pod)
+		d.applyLabPeer(ref, pod)
+		if privTier != "" {
+			// Last check before a privileged container is created: the
+			// RuntimeClass still exists and is still a VM sandbox.
+			st := d.Sandboxes.Verify(ctx, privTier)
+			if st.Transient {
+				return fmt.Errorf("node %s: tier %s sandbox: %s", ref.Node.Name, privTier, st.Reason)
+			}
+			if !st.Privileged() {
+				return fmt.Errorf("node %s: image %s needs a privileged container, which runs only inside a sandbox; the tier %s sandbox became unavailable (%s): %w",
+					ref.Node.Name, ref.Node.Image, privTier, st.Reason, ErrUnsupported)
+			}
+		}
+		return nil
 	}
-	d.applyUserNamespace(ref, pod)
-	d.applyLabPeer(ref, pod)
-	if err := d.createIfAbsent(ctx, ref, pod); err != nil {
+	if err := d.createPodIfAbsent(ctx, ref, pod, prepare); err != nil {
+		if IsPermanent(err) && !errors.Is(err, ErrConflict) {
+			return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+		}
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("pod: %w", err)
 	}
 	return d.Status(ctx, ref)
+}
+
+// createPodIfAbsent is createIfAbsent for the node pod: prepare (the sandbox
+// decision) runs only when the pod is really about to be created. A refusal
+// for a pod that exists after all (a stale cache) is not one: it keeps
+// running as it was created.
+func (d *ContainerDriver) createPodIfAbsent(ctx context.Context, ref NodeRef, pod *corev1.Pod, prepare func() error) error {
+	existing := &corev1.Pod{}
+	err := d.Client.Get(ctx, client.ObjectKeyFromObject(pod), existing)
+	if err == nil {
+		if !d.owns(ref, existing) {
+			return d.conflict(ref, existing)
+		}
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+	if perr := prepare(); perr != nil {
+		r := d.Reader
+		if r == nil {
+			r = d.Client
+		}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(pod), existing); gerr == nil && d.owns(ref, existing) {
+			return nil
+		}
+		return perr
+	}
+	return d.createIfAbsent(ctx, ref, pod)
 }
 
 // Status maps the Pod state onto a node phase.

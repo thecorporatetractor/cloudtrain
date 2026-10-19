@@ -1,4 +1,4 @@
-import { CoreV1Api, CustomObjectsApi, type KubeConfig } from '@kubernetes/client-node';
+import { CoreV1Api, CustomObjectsApi, type KubeConfig, type V1Node, type V1Pod } from '@kubernetes/client-node';
 import type { CapacityNode, WarmPoolInfo } from '@cloudtrain/api-types';
 import { LABS_GROUP, LABS_VERSION, type LabSession } from './types.js';
 
@@ -28,6 +28,47 @@ export function memMiB(q: string | undefined): number {
   return Math.round(m[2] ? n * (f[m[2]] ?? 0) : n / 1048576);
 }
 
+/** kata-deploy (and the managed Kata node pools' runtime) label nodes that run Kata sandboxes. */
+export const KATA_NODE_LABEL = 'katacontainers.io/kata-runtime';
+/** The orchestrator's sandbox decision on a lab pod ("<RuntimeClass>" or "none: <reason>"). */
+export const SANDBOX_ANNOTATION = 'labs.cloudtrain.dev/sandbox';
+
+/** A lab pod that runs in a tier sandbox (a Kata VM per pod), not on the node's kernel. */
+export function isSandboxPod(p: V1Pod): boolean {
+  const a = p.metadata?.annotations?.[SANDBOX_ANNOTATION];
+  return !!p.spec?.runtimeClassName && !!a && !a.startsWith('none');
+}
+
+/**
+ * Per-node capacity. A sandboxed pod (tier B on Kata) reserves its requests plus the
+ * RuntimeClass overhead (pod.spec.overhead, the VMM and guest kernel), so requested
+ * memory counts both; sandboxes are counted apart from KubeVirt VMs (they need no
+ * devices.kubevirt.io/kvm slot, only a Kata node).
+ */
+export function summarizeNode(n: V1Node, pods: V1Pod[], vmsOnNode: number): CapacityNode {
+  const name = n.metadata?.name ?? '';
+  const on = pods.filter((p) => p.spec?.nodeName === name);
+  const req = (k: 'cpu' | 'memory') =>
+    on.reduce((a, p) => {
+      const of = (q: string | undefined) => (k === 'cpu' ? cpuOf(q) : memMiB(q));
+      const containers = (p.spec?.containers ?? []).reduce((b, c) => b + of(c.resources?.requests?.[k]), 0);
+      return a + containers + of(p.spec?.overhead?.[k]);
+    }, 0);
+  const labels = n.metadata?.labels ?? {};
+  return {
+    name,
+    roles: Object.keys(labels).filter((l) => l.startsWith('node-role.kubernetes.io/')).map((l) => l.split('/')[1]!),
+    ready: (n.status?.conditions ?? []).some((c) => c.type === 'Ready' && c.status === 'True'),
+    kvm: Number(n.status?.allocatable?.['devices.kubevirt.io/kvm'] ?? 0) > 0 || labels['kubevirt.io/schedulable'] === 'true',
+    sandbox: labels[KATA_NODE_LABEL] === 'true',
+    cpu: { capacity: cpuOf(n.status?.capacity?.cpu), allocatable: cpuOf(n.status?.allocatable?.cpu), requested: Math.round(req('cpu') * 100) / 100 },
+    memoryMiB: { capacity: memMiB(n.status?.capacity?.memory), allocatable: memMiB(n.status?.allocatable?.memory), requested: req('memory') },
+    pods: on.length,
+    vms: vmsOnNode,
+    sandboxes: on.filter(isSandboxPod).length,
+  };
+}
+
 export class KubeClusterInfo implements ClusterInfo {
   private readonly core: CoreV1Api;
   private readonly custom: CustomObjectsApi;
@@ -38,22 +79,7 @@ export class KubeClusterInfo implements ClusterInfo {
 
   async nodes(): Promise<CapacityNode[]> {
     const [nodes, pods, vms] = await Promise.all([this.core.listNode(), this.core.listPodForAllNamespaces({ fieldSelector: 'status.phase!=Succeeded,status.phase!=Failed' }), this.vms()]);
-    return nodes.items.map((n) => {
-      const name = n.metadata?.name ?? '';
-      const on = pods.items.filter((p) => p.spec?.nodeName === name);
-      const req = (k: 'cpu' | 'memory') => on.reduce((a, p) => a + (p.spec?.containers ?? []).reduce((b, c) => b + (k === 'cpu' ? cpuOf(c.resources?.requests?.cpu) : memMiB(c.resources?.requests?.memory)), 0), 0);
-      const labels = n.metadata?.labels ?? {};
-      return {
-        name,
-        roles: Object.keys(labels).filter((l) => l.startsWith('node-role.kubernetes.io/')).map((l) => l.split('/')[1]!),
-        ready: (n.status?.conditions ?? []).some((c) => c.type === 'Ready' && c.status === 'True'),
-        kvm: Number(n.status?.allocatable?.['devices.kubevirt.io/kvm'] ?? 0) > 0 || labels['kubevirt.io/schedulable'] === 'true',
-        cpu: { capacity: cpuOf(n.status?.capacity?.cpu), allocatable: cpuOf(n.status?.allocatable?.cpu), requested: Math.round(req('cpu') * 100) / 100 },
-        memoryMiB: { capacity: memMiB(n.status?.capacity?.memory), allocatable: memMiB(n.status?.allocatable?.memory), requested: req('memory') },
-        pods: on.length,
-        vms: vms.byNode[name] ?? 0,
-      };
-    });
+    return nodes.items.map((n) => summarizeNode(n, pods.items, vms.byNode[n.metadata?.name ?? ''] ?? 0));
   }
 
   async vms() {

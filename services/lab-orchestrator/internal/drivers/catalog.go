@@ -39,12 +39,23 @@ type CatalogImage struct {
 	// the cluster supports it (see userns.go).
 	UserNamespace bool `json:"userNamespace,omitempty"`
 	// Tier is the curriculum environment tier (A, B, C, K, V, N). With the
-	// manager's --tier-runtime-classes it picks the RuntimeClass of container
-	// nodes (see sandbox.go); otherwise informational.
+	// manager's sandboxes (--sandboxes, Helm orchestrator.sandboxes) it picks
+	// the sandbox RuntimeClass of container nodes (see sandbox.go); otherwise
+	// informational.
 	Tier string `json:"tier,omitempty"`
 	// Systemd marks a container image whose entrypoint is systemd (PID 1). It
-	// runs privileged, and only inside a tier sandbox RuntimeClass (Kata).
+	// runs privileged, and only inside a tier sandbox RuntimeClass (Kata);
+	// readiness waits for systemd's boot.
 	Systemd bool `json:"systemd,omitempty"`
+	// Privileged marks a container image that needs a privileged container
+	// (e.g. rootful dockerd). Like systemd images it runs only inside a tier
+	// sandbox RuntimeClass, never privileged on the host.
+	Privileged bool `json:"privileged,omitempty"`
+	// VMFallback is the catalog ref of the image's KubeVirt VM twin
+	// (containerDisk), e.g. ubuntu-vm:24.04 for deb-sys:24.04: with a tier
+	// sandbox configured but unavailable (fallback kubevirt), the manager
+	// runs the image's container nodes as that VM instead (sandbox.go).
+	VMFallback string `json:"vmFallback,omitempty"`
 	// Mirrors lists the in-cluster mirror services the image is configured to
 	// use (informational, e.g. [dnf, apt, pypi]; see deploy/mirrors).
 	Mirrors []string `json:"mirrors,omitempty"`
@@ -101,6 +112,9 @@ func ParseCatalog(data []byte) (*ImageCatalog, error) {
 		}
 		if img.Kind != ImageKindContainer && img.Kind != ImageKindContainerDisk {
 			return nil, fmt.Errorf("image catalog: %s has unknown kind %q", ref, img.Kind)
+		}
+		if img.VMFallback != "" && img.Kind != ImageKindContainer {
+			return nil, fmt.Errorf("image catalog: %s: vmFallback applies to container images only", ref)
 		}
 		if img.DiskSize != "" {
 			q, err := resource.ParseQuantity(img.DiskSize)
@@ -227,6 +241,25 @@ func (c *ImageCatalog) Resolve(ref, kind string) (CatalogImage, error) {
 		return CatalogImage{}, fmt.Errorf("image %q is a %s, this node needs a %s: %w", ref, img.Kind, kind, ErrUnsupported)
 	}
 	return img, nil
+}
+
+// CheckVMFallbacks reports vmFallback refs that are not containerDisk entries
+// of the (merged) catalog.
+func (c *ImageCatalog) CheckVMFallbacks() error {
+	var bad []string
+	for ref, img := range c.Images {
+		if img.VMFallback == "" {
+			continue
+		}
+		if t, ok := c.Images[img.VMFallback]; !ok || t.Kind != ImageKindContainerDisk {
+			bad = append(bad, fmt.Sprintf("%s: vmFallback %s is not a containerDisk in the catalog", ref, img.VMFallback))
+		}
+	}
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		return fmt.Errorf("image catalog: %s", strings.Join(bad, "; "))
+	}
+	return nil
 }
 
 func containsString(list []string, s string) bool {

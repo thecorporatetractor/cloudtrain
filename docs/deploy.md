@@ -133,6 +133,8 @@ namespace and with them running labs (`helm.sh/resource-policy: keep`).
 | `orchestrator.catalog.releaseOverlay` | | `catalog-release.yaml` content |
 | `orchestrator.images.mirrors`, `.registry`, `.pullSecrets` | | where lab images are pulled from ([Images and registries](#images-and-registries)) |
 | `orchestrator.storageClass`, `.vmDisks`, `.runtimeClass` | default class, `persistent`, cluster default | lab storage and runtime |
+| `orchestrator.sandboxes` | `{}` (off) | tier sandboxes: per catalog tier a `runtimeClass`, `fallback` (`kubevirt` or `fail`) and `requiredFeatures` ([Tier sandboxes](#tier-sandboxes-kata)) |
+| `orchestrator.sandboxPreflightConfigMap` | `lab-sandbox-preflight` | the ConfigMap with `labctl preflight`'s sandbox verdict, mounted optionally when sandboxes are set |
 | `orchestrator.watchNamespace`, `.sessionSelector` | all | scope the manager (one manager per session) |
 | `orchestrator.rbac.admissionPolicy` | `true` | the ValidatingAdmissionPolicy that limits the manager's cluster-wide writes ([Orchestrator RBAC](#orchestrator-rbac)) |
 | `orchestrator.rbac.ovnCentral.enabled`, `.namespace`, `.selector` | `true`, `kube-system`, `app=ovn-central` | exec into Kube-OVN's ovn-central for 802.1Q on lab links; `false` drops that Role |
@@ -386,6 +388,78 @@ ClusterRoles, ClusterRoleBindings, namespaces, VPCs and subnets cluster-wide.
 and subnets, and creates a probe namespace with pods and a session network. In
 practice it runs as a cluster administrator (the verify VM, CI); a dedicated role
 would need all of the above.
+## Tier sandboxes (Kata)
+
+Off by default. With `orchestrator.sandboxes` set, container nodes whose catalog image
+has that tier (`deb-sys:24.04`, `el-sys:10`: tier B) run in the tier's sandbox
+RuntimeClass, a Kata VM per pod ([kata-spike.md](kata-spike.md)):
+
+```yaml
+orchestrator:
+  sandboxes:
+    B:
+      runtimeClass: kata-clh-runtime-rs   # kata-deploy; AKS: kata-vm-isolation; GKE: microvm
+      fallback: kubevirt                  # kubevirt (default) | fail
+      requiredFeatures: [dummy, gre, bond, vlan, wireguard, netem, md]   # checked by labctl preflight; empty = all
+```
+
+The chart renders it into the `<release>-orchestrator-sandboxes` ConfigMap
+(`--sandboxes-config`); the flag form is `--sandboxes B=kata-clh-runtime-rs[:kubevirt|:fail]`.
+
+- **Safety rule.** Images marked `systemd: true` or `privileged: true` in the catalog get a
+  privileged container only inside an available sandbox. Without one they are never run
+  privileged on the host: they fall back to their KubeVirt VM twin, or the node fails
+  with a clear message. A RuntimeClass counts as a sandbox only if its handler is a Kata
+  handler (`kata*`) or `labctl preflight --probe` proved it boots its own kernel; the
+  name alone is never trusted, and host runtimes (`runc`, `crun`, `youki`, gVisor) are
+  refused whatever a preflight file says. The decision is made where the pod is created,
+  with an uncached re-check of the RuntimeClass right before a privileged pod is created.
+  Who can write the preflight ConfigMap in the manager's namespace can make a non-Kata VM
+  handler trusted: keep that namespace to platform administrators.
+- **Availability.** At startup and every 30 s (`--sandbox-recheck`) the manager checks each
+  tier: the RuntimeClass exists, its handler is a VM sandbox, its node selector matches a
+  schedulable node, and the preflight verdict (if mounted) did not fail it. It logs each
+  change (`tier sandbox available` / `tier sandbox unavailable`).
+- **Fallback.** While a tier is unavailable, `fallback: kubevirt` rewrites that tier's
+  container nodes to the image's catalog `vmFallback` (`deb-sys:24.04` -> `ubuntu-vm:24.04`,
+  `el-sys:10` -> `el-vm:10`): driver `vm`, the same cpu and memory (at least 1024 MiB),
+  `ssh` and `console` access, which is what those labs get on KubeVirt today (including the
+  exam's reboot before grading). Not rewritten: the entry node, nodes on topology links and
+  nodes with `web` access; and the rewrite is all or nothing per session, since pods reach
+  each other as lab peers and a VM is not one. A node that is not rewritten keeps failing
+  with the reason in the condition. `fallback: fail` rewrites nothing, and without KubeVirt
+  installed the manager treats `kubevirt` as `fail`. A systemd or privileged image also
+  falls back when the RuntimeClass exists but its handler is not a trusted VM (unprivileged
+  tier pods still use such a RuntimeClass). A session keeps the substrate it started on: a
+  sandbox that comes back or disappears later, a manager restarted without sandboxes or a
+  changed catalog never moves a running node (a VM twin stays a VM; a sandboxed pod whose
+  pod must be recreated while the sandbox is gone is refused, not moved).
+- **Visible per session.** The LabSession condition `Sandboxed` is `True` (reason
+  `Sandboxed`) when every tier-B node runs in its sandbox, `False` with reason
+  `VMFallback` (nodes listed with their VM image) or `SandboxUnavailable` otherwise, plus
+  an event when it changes. `status.topology` records the rewritten nodes. Lab pods carry
+  the annotation `labs.cloudtrain.dev/sandbox`.
+- **Preflight.** Prove the sandbox and give the manager the verdict:
+
+  ```bash
+  labctl preflight --sandboxes-config configmap:cloudtrain/ct-cloudtrain-orchestrator-sandboxes \
+    --probe --systemd-image cloudtrain/deb-sys:24.04 \
+    --sandbox-configmap preflight.yaml --sandbox-configmap-name cloudtrain/lab-sandbox-preflight
+  kubectl apply -f preflight.yaml && kubectl -n cloudtrain rollout restart deploy/ct-cloudtrain-orchestrator
+  ```
+
+  The probe boots a pod per RuntimeClass and checks its own kernel, the lab kernel
+  features, guest sizing, a lab link (Multus/Kube-OVN, MTU and 1400-byte frames with DF
+  both ways between a runc pod and a sandboxed pod) and systemd boot with `kubectl exec`.
+  A tier it fails is unavailable to the manager (its labs fall back); a non-Kata handler it
+  proves (e.g. GKE `microvm`) becomes trusted.
+- **Capacity.** The gateway's capacity view (`GET /api/platform/capacity`) marks Kata nodes
+  (`sandbox`), counts sandboxed lab pods per node (`sandboxes`) apart from KubeVirt VMs, and
+  includes the RuntimeClass overhead in requested CPU and memory.
+- The deprecated `orchestrator.tierRuntimeClasses` (`--tier-runtime-classes`, the
+  prototype) still works as sandboxes with `fallback: fail`; it cannot be combined with
+  `orchestrator.sandboxes`.
+
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.

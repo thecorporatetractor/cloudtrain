@@ -15,9 +15,12 @@ import (
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +43,8 @@ func main() {
 		sessionSelector, leaderElectionID, netToolsImage                                                          string
 		storageClass, homeStorageClass, vmDiskStorageClass, vmDiskVolumeMode, vmDiskAccessModes, storagePreflight string
 		vmDisks, userNamespaces, vclusterPodSecurity, tierRuntimeClasses                                          string
+		sandboxesFlag, sandboxesConfig, sandboxPreflight                                                          string
+		sandboxTTL                                                                                                time.Duration
 		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag                                               string
 		sessionClusterRole, serviceAccount                                                                        string
 		labMTU                                                                                                    int
@@ -62,7 +67,11 @@ func main() {
 	flag.StringVar(&imagePullSecrets, "image-pull-secrets", "", "Secrets in the session namespace that lab pods (and ephemeral VM containerDisks: the first one) pull with, comma separated; added to the catalog's imagePullSecrets")
 	flag.StringVar(&netToolsImage, "net-tools-image", "nettools:1", "catalog image for link init/sidecar containers (iproute2, tc, tcpdump)")
 	flag.StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for container nodes (e.g. kata); empty = cluster default")
-	flag.StringVar(&tierRuntimeClasses, "tier-runtime-classes", "", "prototype (docs/kata-spike.md): RuntimeClass per catalog image tier, <tier>=<RuntimeClass> comma separated (e.g. B=kata-clh); overrides --runtime-class for those images, mappings whose RuntimeClass is missing are dropped at startup; empty = off")
+	flag.StringVar(&sandboxesFlag, "sandboxes", "", "tier sandboxes (docs/kata-spike.md): <tier>=<RuntimeClass>[:kubevirt|:fail] comma separated, e.g. B=kata-clh-runtime-rs; container nodes of that tier's catalog images run in the RuntimeClass (systemd and privileged images only there); while it is unavailable, fallback kubevirt (default) runs nodes whose image has a catalog vmFallback as that KubeVirt VM, fail leaves them to fail. Overrides tiers of --sandboxes-config; empty = off")
+	flag.StringVar(&sandboxesConfig, "sandboxes-config", "", "SandboxConfig file (Helm orchestrator.sandboxes; a ConfigMap mount, sandboxes.yaml): tiers with runtimeClass, fallback, requiredFeatures; a missing file = no tiers")
+	flag.StringVar(&sandboxPreflight, "sandbox-preflight", "", "SandboxPreflight file written by labctl preflight --sandbox-configmap (a ConfigMap mount, preflight.yaml): a tier the preflight failed is unavailable, a handler it proved a VM is trusted; a missing file = none")
+	flag.DurationVar(&sandboxTTL, "sandbox-recheck", drivers.DefaultSandboxTTL, "how often the tier sandboxes' availability (RuntimeClass, handler, schedulable nodes) is re-checked")
+	flag.StringVar(&tierRuntimeClasses, "tier-runtime-classes", "", "deprecated (the phase-0 prototype): the same as --sandboxes with fallback fail, e.g. B=kata-clh")
 	flag.StringVar(&catalogPaths, "image-catalog", "/etc/cloudtrain/catalog", "image catalog files or directories, comma separated; later ones override earlier ones")
 	flag.StringVar(&adminImageRef, "admin-image-ref", "jumphost:1", "catalog ref of the entry node's admin sidecar image")
 	flag.StringVar(&helmBin, "helm", "helm", "helm binary used to install virtual clusters")
@@ -228,23 +237,40 @@ func main() {
 		log.Error(nil, "--user-namespaces must be auto, true or false", "value", userNamespaces)
 		os.Exit(1)
 	}
-	tierRCs, err := drivers.ParseTierRuntimeClasses(tierRuntimeClasses)
+	sandboxes, err := loadSandboxes(sandboxesFlag, tierRuntimeClasses, sandboxesConfig, sandboxPreflight)
 	if err != nil {
-		log.Error(err, "invalid --tier-runtime-classes")
+		log.Error(err, "invalid sandbox configuration")
 		os.Exit(1)
 	}
-	if len(tierRCs) > 0 {
+	if sandboxes.Enabled() {
 		direct, err := client.New(cfg, client.Options{Scheme: scheme})
 		if err != nil {
-			log.Error(err, "unable to create client for RuntimeClass detection")
+			log.Error(err, "unable to create client for sandbox detection")
 			os.Exit(1)
 		}
-		var dropped map[string]string
-		tierRCs, dropped = drivers.DetectTierRuntimeClasses(context.Background(), direct, tierRCs)
-		for t, why := range dropped {
-			log.Info("tier sandbox unavailable; its systemd images fail, the others use the default runtime", "tier", t, "reason", why)
+		sandboxes.Reader, sandboxes.TTL, sandboxes.Log = direct, sandboxTTL, ctrl.Log.WithName("sandboxes")
+		// The KubeVirt fallback needs KubeVirt: without it a tier falls
+		// back to "fail" (the node keeps failing with a clear message).
+		if !kubeVirtServed(cfg) {
+			for t, v := range sandboxes.Tiers {
+				if v.FallbackMode() == drivers.SandboxFallbackKubeVirt {
+					v.Fallback = drivers.SandboxFallbackFail
+					sandboxes.Tiers[t] = v
+					log.Info("KubeVirt is not installed: tier sandbox fallback kubevirt becomes fail", "tier", t)
+				}
+			}
 		}
-		log.Info("tier sandboxes", "enabled", drivers.FormatTiers(tierRCs))
+		if err := catalog.CheckVMFallbacks(); err != nil {
+			log.Error(err, "catalog vmFallback refs are broken: those images cannot fall back to a VM")
+		}
+		// Startup validation: every tier is checked and logged; an
+		// unavailable tier is dropped from sandboxing (fallback or refusal)
+		// until a re-check finds it, and sessions show it in their Sandboxed
+		// condition.
+		states := sandboxes.Check(context.Background())
+		log.Info("tier sandboxes", "tiers", drivers.FormatSandboxStates(states), "preflight", sandboxes.Preflight != nil)
+	} else {
+		log.Info("tier sandboxes: off (no --sandboxes or sandbox config)")
 	}
 	netMode, err := network.ParseMode(networkModeFlag)
 	if err != nil {
@@ -279,7 +305,7 @@ func main() {
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, ImageMirrors: mirrors, ImagePullSecrets: pullSecrets,
-		RuntimeClassName: runtimeClass, TierRuntimeClasses: tierRCs, AdminImageRef: adminImageRef,
+		RuntimeClassName: runtimeClass, Sandboxes: sandboxes, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
 		VClusterPodSecurity: vclusterPodSecurity,
 		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass, HomeStorageClass: homeStorageClass,
@@ -328,6 +354,7 @@ func main() {
 		Recorder:         mgr.GetEventRecorder("lab-orchestrator"),
 		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
 		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics, Access: sessionAccess,
+		Sandboxes: sandboxes, Catalog: catalog,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
 		os.Exit(1)
@@ -357,6 +384,73 @@ func main() {
 		log.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+// loadSandboxes merges the sandbox config file and the flags (--sandboxes
+// overrides the file's tiers; the deprecated --tier-runtime-classes is
+// exclusive with --sandboxes) and reads the optional preflight verdict.
+// Nothing configured returns nil: sandboxes off, the default.
+func loadSandboxes(flagValue, legacy, configPath, preflightPath string) (*drivers.Sandboxes, error) {
+	if flagValue != "" && legacy != "" {
+		return nil, fmt.Errorf("--sandboxes and the deprecated --tier-runtime-classes are exclusive")
+	}
+	tiers := map[string]drivers.SandboxTier{}
+	b, err := drivers.LoadSandboxFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > 0 {
+		c, err := drivers.ParseSandboxConfig(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", configPath, err)
+		}
+		for t, v := range c.Tiers {
+			tiers[t] = v
+		}
+	}
+	parse, v := drivers.ParseSandboxFlag, flagValue
+	if legacy != "" {
+		parse, v = drivers.ParseTierRuntimeClasses, legacy
+	}
+	fl, err := parse(v)
+	if err != nil {
+		return nil, err
+	}
+	for t, v := range fl {
+		tiers[t] = v
+	}
+	if len(tiers) == 0 {
+		return nil, nil
+	}
+	sb := &drivers.Sandboxes{Tiers: tiers}
+	if b, err = drivers.LoadSandboxFile(preflightPath); err != nil {
+		return nil, err
+	}
+	if len(b) > 0 {
+		if sb.Preflight, err = drivers.ParseSandboxPreflight(b); err != nil {
+			return nil, fmt.Errorf("%s: %w", preflightPath, err)
+		}
+	}
+	return sb, nil
+}
+
+// kubeVirtServed reports whether the API serves kubevirt.io/v1
+// VirtualMachines (an error counts as served: the VM driver then reports it).
+func kubeVirtServed(cfg *rest.Config) bool {
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return true
+	}
+	res, err := dc.ServerResourcesForGroupVersion("kubevirt.io/v1")
+	if err != nil {
+		return !apierrors.IsNotFound(err)
+	}
+	for _, r := range res.APIResources {
+		if r.Name == "virtualmachines" {
+			return true
+		}
+	}
+	return false
 }
 
 // uncached: kinds the manager reads straight from the API server.

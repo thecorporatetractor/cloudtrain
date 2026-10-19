@@ -211,6 +211,7 @@ if is go || is content; then
   if is go; then
     run "go vet" go vet ./...
     run "go test -race" go test -race ./...
+    run "envtest" make test-envtest
     run "make build" make build
     run "make generate drift" generate_drift
     run "labctl catalog check" bin/labctl catalog check \

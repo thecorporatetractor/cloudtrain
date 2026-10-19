@@ -535,7 +535,7 @@ func (x *examRunner) envExecutor(ctx context.Context, ns, name string) (*control
 	if err != nil {
 		return nil, err
 	}
-	return &controller.NodeExecutor{Drivers: x.v.rt.Registry, Session: ls, Template: spec}, nil
+	return &controller.NodeExecutor{Drivers: x.v.rt.Registry, Session: ls, Template: controller.EffectiveTemplate(spec, ls)}, nil
 }
 
 // solve applies each drawn task's reference solution on its environment.
