@@ -2,7 +2,10 @@
 
 Status: spike, 2026-10-19. Evidence from ct-testvm, plus a design sketch.
 There is a small prototype behind a default-off flag (section 6). It is not
-a production feature.
+a production feature. **Phase 1** (section 10) made it a reproducible, opt-in
+dev profile: the lab guest kernel build and its published artifact, the
+`deb-sys`/`el-sys` images, `KIND_PROFILE=kata` and the preflight sandbox
+section. The orchestrator's default is unchanged.
 
 Tier B in `content/curriculum.yaml` is "Kata pod with capabilities". The
 substrate is a Kata RuntimeClass with a custom guest kernel, and privileged

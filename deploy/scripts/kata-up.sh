@@ -35,7 +35,9 @@ for node in "${NODES[@]}"; do
     log "installing dbus in $node (Debian snapshot $KATA_NODE_DEBIAN_SNAPSHOT)"
     docker exec -e SNAP="$KATA_NODE_DEBIAN_SNAPSHOT" "$node" sh -c '
       set -e; d=$(mktemp -d); a="-qq -o Dir::Etc::SourceList=$d/sources.list -o Dir::Etc::SourceParts=/dev/null -o Acquire::Check-Valid-Until=false"
-      printf "deb http://snapshot.debian.org/archive/debian/%s trixie trixie-updates main\ndeb http://snapshot.debian.org/archive/debian-security/%s trixie-security main\n" "$SNAP" "$SNAP" > "$d/sources.list"
+      for s in "debian/$SNAP trixie" "debian/$SNAP trixie-updates" "debian-security/$SNAP trixie-security"; do
+        echo "deb http://snapshot.debian.org/archive/${s% *} ${s#* } main"
+      done > "$d/sources.list"
       apt-get $a -o Acquire::Retries=3 update
       DEBIAN_FRONTEND=noninteractive apt-get $a install -y --no-install-recommends dbus >/dev/null
       rm -rf "$d" /var/lib/apt/lists/*' || die "dbus install in $node failed"
@@ -52,6 +54,11 @@ if ! echo "$KATA_DEPLOY_CHART_SHA256  $CHART" | sha256sum -c --status 2>/dev/nul
   helm pull oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy --version "$KATA_DEPLOY_VERSION" -d "$MANIFEST_CACHE" >/dev/null
   echo "$KATA_DEPLOY_CHART_SHA256  $CHART" | sha256sum -c --status \
     || die "kata-deploy chart sha256 $(sha256sum "$CHART" | cut -d' ' -f1) != KATA_DEPLOY_CHART_SHA256"
+fi
+# An interrupted install leaves the release pending-*, which blocks every later upgrade.
+if helm --kube-context "$KUBECONTEXT" -n kube-system status kata-deploy -o json 2>/dev/null | jq -e '.info.status | startswith("pending")' >/dev/null; then
+  warn "kata-deploy release is stuck in a pending state; uninstalling it first"
+  helm --kube-context "$KUBECONTEXT" -n kube-system uninstall kata-deploy --wait --timeout 10m >/dev/null
 fi
 log "installing kata-deploy $KATA_DEPLOY_VERSION ($KATA_RUNTIME_CLASS)"
 helm --kube-context "$KUBECONTEXT" upgrade --install kata-deploy "$CHART" --namespace kube-system \

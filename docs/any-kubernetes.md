@@ -397,7 +397,7 @@ fail with the fix:
 | CIDR overlap | node, pod and service CIDRs vs `192.168.99.0/24`, `192.168.100.0/24`, `198.18.0.0/15` |
 | StorageClass | default class, configured classes exist, volume mode, snapshot class, CDI StorageProfile complete (from the storage branch) |
 | User namespaces | `runtimeHandlers[].features.userNamespaces` on lab nodes (the existing `DetectUserNamespaces`), `ProcMountType` usable (dry-run pod) |
-| RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes |
+| RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes. **Sandbox section implemented** (`labctl preflight --tier-runtime-classes B=<rc> [--probe] [--systemd-image <img>]`, section 11): Kata RuntimeClasses, the manager's tier map, and with `--probe` a pod per sandbox that must boot its own kernel with the lab features (dummy, GRE, bond, VLAN, WireGuard, netem, md), a guest sized to the pod limit, and a systemd image that boots and accepts `kubectl exec` |
 | Pod Security / admission | session namespace accepts a privileged `net-init` (server-side dry-run), no policy engine rejects it |
 | Registry | every catalog image resolvable from a node (dry-run pull Job) |
 | Versions | Kubernetes minor within the KubeVirt/CDI support range |
