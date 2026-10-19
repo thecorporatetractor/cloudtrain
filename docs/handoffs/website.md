@@ -23,10 +23,14 @@ plans: plans and pricing come next, then Stripe in test mode behind a flag.
   `flags.checkoutEnabled: false` (paid calls to action lead to contact until PR 3 turns
   Stripe on). Default plans Free, Pro and Team carry placeholder prices
   (`plans.placeholder: true`, `pricing.placeholderNote`).
-- **PR 3, Stripe test mode:** `CT_BILLING_ENABLED` (default off), Checkout Sessions,
-  Customer Portal, webhook with signature verification and idempotent handling, Postgres
-  tables with RLS for customers, subscriptions, entitlements and billing events, account
-  and org billing pages, `stripe:sync` for Products and Prices by lookup key.
+- **PR 3, Stripe test mode (merged):** `CT_BILLING_ENABLED` (default off; test mode only,
+  live keys refused), `/api/billing/*`: summaries, Checkout Sessions (subscription mode, org
+  and user in metadata), Customer Portal, signed webhook with idempotent handling by event
+  id, migration `0007_billing` (customers, subscriptions, entitlements, events; RLS; no card
+  data), `/account/billing` and `/admin/billing` pages, `pnpm --filter @cloudtrain/gateway
+  stripe:sync` (Products and Prices by lookup key, run against the test account),
+  `docs/billing.md` with the go-live checklist. Entitlements are recorded and shown, not
+  enforced (`BillingService.assertLabStart`, TODO).
 
 ## How to resume
 

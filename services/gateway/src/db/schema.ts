@@ -432,6 +432,61 @@ export interface LearnerGoalsTable {
   updated_at: Generated<Date>;
 }
 
+export interface BillingCustomersTable {
+  id: Generated<string>;
+  org_id: string;
+  user_id: string | null;
+  scope_key: Generated<string>;
+  stripe_customer_id: string;
+  email: string | null;
+  livemode: Generated<boolean>;
+  created_at: Generated<Date>;
+}
+
+export interface BillingSubscriptionsTable {
+  id: Generated<string>;
+  org_id: string;
+  user_id: string | null;
+  customer_id: string;
+  stripe_subscription_id: string;
+  plan_id: string;
+  price_lookup_key: string | null;
+  billing_interval: 'monthly' | 'yearly';
+  seats: Generated<number>;
+  status: string;
+  current_period_end: Date | null;
+  cancel_at_period_end: Generated<boolean>;
+  livemode: Generated<boolean>;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
+export interface BillingEntitlementsTable {
+  org_id: string;
+  user_id: string | null;
+  scope_key: Generated<string>;
+  plan_id: string;
+  /** PlanEntitlements as JSON (written with JSON.stringify). */
+  entitlements: unknown;
+  source: 'subscription' | 'default' | 'manual';
+  subscription_id: string | null;
+  updated_at: Generated<Date>;
+}
+
+export interface BillingEventsTable {
+  id: Generated<string>;
+  stripe_event_id: string;
+  type: string;
+  org_id: string | null;
+  user_id: string | null;
+  livemode: Generated<boolean>;
+  received_at: Generated<Date>;
+  processed_at: Date | null;
+  status: Generated<'received' | 'processed' | 'ignored' | 'failed'>;
+  error: string | null;
+  summary: Generated<unknown>;
+}
+
 export interface DB {
   orgs: OrgsTable;
   users: UsersTable;
@@ -465,6 +520,10 @@ export interface DB {
   ctf_events: CtfEventsTable;
   ctf_event_teams: CtfEventTeamsTable;
   ctf_event_participants: CtfEventParticipantsTable;
+  billing_customers: BillingCustomersTable;
+  billing_subscriptions: BillingSubscriptionsTable;
+  billing_entitlements: BillingEntitlementsTable;
+  billing_events: BillingEventsTable;
 }
 
 export type CtfEventRow = Selectable<CtfEventsTable>;

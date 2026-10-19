@@ -182,6 +182,7 @@ try {
     ['none', '/catalog', 'Everything you can practise', 'catalog-public'],
     ['none', '/catalog/paths/cks-readiness', 'Network policy and least privilege', 'catalog-path-public'],
     ['none', '/pricing', 'Compare entitlements', 'pricing'],
+    ['learner', '/account/billing', 'Plans for you', 'billing'],
   ];
   for (const [persona, url, waitFor, name] of views) {
     const s = await session('dark', persona);

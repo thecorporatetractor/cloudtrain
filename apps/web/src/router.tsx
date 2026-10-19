@@ -58,6 +58,8 @@ const Faq = lazyRouteComponent(() => import('./routes/site/Pages'), 'Faq');
 const Contact = lazyRouteComponent(() => import('./routes/site/Pages'), 'Contact');
 const Terms = lazyRouteComponent(() => import('./routes/site/Pages'), 'Terms');
 const Privacy = lazyRouteComponent(() => import('./routes/site/Pages'), 'Privacy');
+const AccountBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AccountBilling');
+const AdminBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AdminBilling');
 
 function Pending() {
   return (
@@ -103,6 +105,19 @@ export const signInRoute = createRoute({
 });
 
 /* ------------------------------------------------------------------ learner */
+
+export interface BillingSearch {
+  plan?: string;
+  interval?: 'monthly' | 'yearly';
+  checkout?: 'success' | 'cancelled';
+}
+const billingSearch = (s: Record<string, unknown>): BillingSearch => ({
+  ...(str(s.plan) ? { plan: str(s.plan) } : {}),
+  ...(s.interval === 'monthly' || s.interval === 'yearly' ? { interval: s.interval } : {}),
+  ...(s.checkout === 'success' || s.checkout === 'cancelled' ? { checkout: s.checkout } : {}),
+});
+/** The signed-in person's plan, entitlements and subscription (docs/billing.md). */
+export const accountBillingRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/billing', validateSearch: billingSearch, component: AccountBilling });
 
 export interface CatalogSearch {
   domain?: Domain;
@@ -325,6 +340,8 @@ export const adminAuditRoute = createRoute({
   component: AdminAudit,
 });
 export const adminSettingsRoute = createRoute({ getParentRoute: () => adminRoute, path: '/settings', component: AdminSettings });
+/** The organisation's plan, seats and billing events (billing.manage). */
+export const adminBillingRoute = createRoute({ getParentRoute: () => adminRoute, path: '/billing', validateSearch: billingSearch, component: AdminBilling });
 
 /* ------------------------------------------------------------------ platform */
 
@@ -354,6 +371,7 @@ const routeTree = rootRoute.addChildren([
   termsRoute,
   privacyRoute,
   catalogRoute,
+  accountBillingRoute,
   labRoute,
   workspaceRoute,
   skillsRoute,
@@ -377,7 +395,7 @@ const routeTree = rootRoute.addChildren([
   cohortsRoute,
   cohortBoardRoute,
   observeRoute,
-  adminRoute.addChildren([adminIndexRoute, adminUsersRoute, adminTeamsRoute, adminSsoRoute, adminContentRoute, adminSessionsRoute, adminUsageRoute, adminAuditRoute, adminSettingsRoute]),
+  adminRoute.addChildren([adminIndexRoute, adminUsersRoute, adminTeamsRoute, adminSsoRoute, adminContentRoute, adminSessionsRoute, adminUsageRoute, adminAuditRoute, adminSettingsRoute, adminBillingRoute]),
   platformRoute.addChildren([platformOrgsRoute, platformCapacityRoute, platformContentRoute]),
 ]);
 

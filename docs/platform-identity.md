@@ -49,6 +49,7 @@ the web only hides UI, it never enforces.
 | `user.manage`, `team.manage`, `role.assign` | | | | | ✓ |
 | `sso.manage`, `settings.manage`, `quota.manage` | | | | | ✓ |
 | `audit.read` | | | | | ✓ |
+| `billing.manage` (plan, seats, checkout, portal, billing events; `docs/billing.md`) | | | | | ✓ |
 
 `platform_admin` holds every permission plus `org.manage`, `capacity.read`,
 `support.access` at platform scope.

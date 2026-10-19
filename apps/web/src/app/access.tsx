@@ -27,7 +27,7 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   '/team': { any: ['progress.read.team'], when: (me) => me.managedTeams.length > 0, label: 'Team dashboard' },
   '/cohorts': { any: ['cohort.manage'], label: 'Cohorts' },
   '/studio': { any: ['studio.author'], label: 'Scenario Studio' },
-  '/admin': { any: ['user.manage', 'team.manage', 'sso.manage', 'content.visibility', 'quota.manage', 'audit.read', 'settings.manage'], label: 'Administration' },
+  '/admin': { any: ['user.manage', 'team.manage', 'sso.manage', 'content.visibility', 'quota.manage', 'audit.read', 'settings.manage', 'billing.manage'], label: 'Administration' },
   '/admin/users': { any: ['user.manage'], label: 'Users' },
   '/admin/teams': { any: ['team.manage'], label: 'Teams' },
   '/admin/sso': { any: ['sso.manage'], label: 'Single sign-on' },
@@ -36,6 +36,7 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   '/admin/usage': { any: ['quota.manage'], label: 'Usage & quotas' },
   '/admin/audit': { any: ['audit.read'], label: 'Audit log' },
   '/admin/settings': { any: ['settings.manage'], label: 'Settings' },
+  '/admin/billing': { any: ['billing.manage'], label: 'Plan & billing' },
   '/platform': { any: ['org.manage', 'capacity.read'], label: 'Platform' },
   '/platform/capacity': { any: ['capacity.read'], label: 'Capacity' },
 };

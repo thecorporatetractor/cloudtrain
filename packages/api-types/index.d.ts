@@ -462,3 +462,7 @@ export * from './exam.js';
 // ---- Public website (read-only, no sign-in) ----
 
 export * from './public.js';
+
+// ---- Billing (Stripe, test mode, behind CT_BILLING_ENABLED) ----
+
+export * from './billing.js';

@@ -13,6 +13,7 @@ const TABS: { to: string; label: string; exact?: boolean }[] = [
   { to: '/admin/usage', label: 'Usage & quotas' },
   { to: '/admin/audit', label: 'Audit log' },
   { to: '/admin/settings', label: 'Settings' },
+  { to: '/admin/billing', label: 'Plan & billing' },
 ];
 
 export function AdminLayout() {

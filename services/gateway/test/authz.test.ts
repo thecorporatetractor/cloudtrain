@@ -27,6 +27,7 @@ const TABLE: Record<Permission, Record<OrgRole, string>> = {
   'settings.manage': { learner: '', manager: '', instructor: '', author: '', org_admin: 'org' },
   'quota.manage': { learner: '', manager: '', instructor: '', author: '', org_admin: 'org' },
   'audit.read': { learner: '', manager: '', instructor: '', author: '', org_admin: 'org' },
+  'billing.manage': { learner: '', manager: '', instructor: '', author: '', org_admin: 'org' },
   'org.manage': { learner: '', manager: '', instructor: '', author: '', org_admin: '' },
   'capacity.read': { learner: '', manager: '', instructor: '', author: '', org_admin: '' },
   'support.access': { learner: '', manager: '', instructor: '', author: '', org_admin: '' },
