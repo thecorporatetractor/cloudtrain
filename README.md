@@ -262,17 +262,25 @@ Report vulnerabilities privately through GitHub Security Advisories; see
 
 ## License
 
-CloudTrain is **source-available**, not open source.
+CloudTrain is **source-available**, not open source. See
+[docs/licensing.md](docs/licensing.md) for the plain-language model, what is
+free, what needs a license key, and FAQs.
 
-- **Software:** [Business Source License 1.1](LICENSE). You may use, modify and
-  run it for any non-production purpose. Production use is free **only for
-  training your own organisation's personnel**. Offering CloudTrain-based
-  training, labs or assessments to third parties (hosted, managed, embedded, or
-  as a commercial training service) needs a commercial license from AzarGuard.
-  Each version becomes Apache-2.0 four years after its first public release.
+- **Software:** [Business Source License 1.1](LICENSE). Self-hosting is free for
+  any purpose, including training your own organisation's employees and
+  contractors, as long as you do not offer CloudTrain, its labs or assessments
+  to third parties as a hosted, managed, embedded or commercial service, or
+  resell it. [Premium enterprise features](docs/licensing.md#premium-features)
+  (SSO with external identity providers, SCIM and others) need a license key in
+  production; removing or bypassing the key checks is not permitted. Each
+  version becomes Apache-2.0 four years after its first public release.
 - **Lab content** (`content/`: labs, skill graph, framework mappings):
-  [CC BY-NC 4.0](content/LICENSE). Share and adapt it with credit to
-  "CloudTrain by AzarGuard", for non-commercial purposes only.
+  [CC BY-NC 4.0](content/LICENSE), with an
+  [additional permission](content/LICENSE-ADDITIONAL-PERMISSION.md) to train
+  your own organisation's personnel on a self-hosted installation, also in a
+  commercial organisation. Credit "CloudTrain by AzarGuard" when you share it.
+- **Hosted service:** AzarGuard's hosted CloudTrain is paid per compute
+  consumed, plus subscription tiers for the premium features.
 - **Third-party software:** see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and [NOTICE](NOTICE).
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md); contributors sign the [CLA](CLA.md).
 
