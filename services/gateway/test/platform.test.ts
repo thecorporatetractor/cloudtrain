@@ -117,7 +117,8 @@ describe.skipIf(!available)('platform API', () => {
     const hours = await as(h, Q.mei).post('/api/labs/gateway-smoke/sessions');
     expect(hours.statusCode).toBe(429);
     expect(hours.json().details.quota).toBe('monthly_lab_hours');
-    await priya.put('/api/admin/quotas', { maxConcurrentSessions: 20, monthlyLabHours: 600, maxSessionMinutes: 120 });
+    // Room for the seeded attempts on any day of the month (they add up to several hundred hours by month end).
+    await priya.put('/api/admin/quotas', { maxConcurrentSessions: 20, monthlyLabHours: 5000, maxSessionMinutes: 120 });
     expect((await priya.put('/api/admin/quotas', { maxSessionMinutes: 1 })).statusCode).toBe(422);
   });
 
@@ -216,7 +217,7 @@ describe.skipIf(!available)('platform API', () => {
     const store = h.store;
     await store.create({ userId: Q.jonah, orgId: h.orgs.quillmoor, tokens: { access_token: 'x', expires_in: 300 } });
     const s = await as(h, Q.jonah).post('/api/labs/gateway-smoke/sessions');
-    expect(s.statusCode).toBe(201);
+    expect(s.statusCode, s.body).toBe(201);
     const r = await as(h, Q.priya).patch(`/api/admin/users/${Q.jonah}`, { status: 'deactivated' });
     expect(r.json()).toMatchObject({ user: { status: 'deactivated' }, revokedSessions: 1, terminatedLabs: 1 });
     expect((await as(h, Q.jonah).get('/api/me')).statusCode).toBe(401);

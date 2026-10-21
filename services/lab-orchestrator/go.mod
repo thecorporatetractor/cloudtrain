@@ -2,7 +2,7 @@ module github.com/cloudtrain/cloudtrain/services/lab-orchestrator
 
 go 1.27.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/go-logr/logr v1.4.4
