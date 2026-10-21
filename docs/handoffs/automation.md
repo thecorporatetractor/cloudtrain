@@ -222,7 +222,7 @@ Adaptations and blockers:
 - ov-devcontainer-workflow: blocked: needs code-server in ansible-ctl and a gateway web-access proxy.
 - ov-vault-db-credentials: no DB module in the mirror; vaulted value goes to a credentials file.
 - ov-build-publish-collection: adapted: no Galaxy server image yet; publish = upload to an HTTP share (ov-share).
-- ov-delegate-lb-drain: needs haproxy from the el10 mirror in an el-lab pod (own setup step, 600 s; ov-lb1 has cpu 0.5 / 512 MiB); if it does not install, move to VMs.
+- ov-delegate-lb-drain: haproxy is baked into el-lab:10. ov-lb1 is a wired pod (session VPC, no route to the mirror), so it cannot `dnf install` at setup.
 - ov-tags-partial-runs: removes the preinstalled tree package (no mirror dependency); the certificate uses openssl, not community.crypto (no python cryptography in the pods).
 
 Known limits (all tier-A Ansible labs): the learner is root on the managed nodes, so node state could be set by hand

@@ -662,6 +662,10 @@ Status and measurements: `docs/handoffs/foundations.md`.
   kernel 6.18); idmapped PVC mounts keep uid 1000 on the node. Fallback: host users, with
   the reason in the pod annotation `labs.cloudtrain.dev/user-namespace`. PID 1 is tini,
   learner (uid 1000) has no sudo rights, package sources point only at the mirror.
+  Wired pods are the exception: they live in the session VPC, which (like the VMs' lab
+  network) has no route to cluster services, so they cannot reach the mirror. A wired node
+  must find every package it needs already in its image (el-lab:10 bakes in haproxy for
+  this reason); do not `dnf`/`apt-get install` on it at setup.
 - **Learner sudo (opt-in, security trade-off).** Entry nodes run with
   `allowPrivilegeEscalation: false`, so `no_new_privs` blocks every setuid/setgid program
   (`sudo`, `crontab`, `passwd`, `su`). A lab that teaches root administration sets
