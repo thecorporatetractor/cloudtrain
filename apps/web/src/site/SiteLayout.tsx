@@ -10,7 +10,12 @@ import { Dropdown, Tooltip } from '@/components/ui';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { APP_URL, STATIC_SITE } from '@/lib/siteMode';
 import { cn } from '@/lib/utils';
+import { ComingSoon } from './ComingSoon';
+import { ComingSoonChrome } from './ComingSoonChrome';
+import { isComingSoon, keepsOwnPage, launchKnown } from './launch';
 import { linkKey, SiteAnchor } from './util';
+
+
 
 /*
  * Chrome of the public website: a sticky header with the primary navigation,
@@ -104,6 +109,22 @@ function useSiteScroll() {
 
 export function SiteLayout({ children }: { children: ReactNode }) {
   useSiteScroll();
+  const site = useSite().data;
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  // Until the configuration says which website this is, neither chrome is drawn (no flash of the other one).
+  if (!launchKnown(site)) {
+    return (
+      <div className="site">
+        <main id="main" className="site-main" tabIndex={-1}>
+          {children}
+        </main>
+      </div>
+    );
+  }
+  // Pre-launch (src/site/launch.ts): one standalone page in its own chrome; only the legal pages keep theirs.
+  if (isComingSoon(site)) {
+    return <ComingSoonChrome themeMenu={<ThemeMenu />}>{keepsOwnPage(pathname) ? children : <ComingSoon />}</ComingSoonChrome>;
+  }
   return (
     <div className="site">
       <a href="#main" className="skip-link">
@@ -154,6 +175,34 @@ function SiteBrand({ height = 22 }: { height?: number }) {
   return <BrandLockup height={height} title={brand} />;
 }
 
+/** The theme switcher of the website header. */
+export function ThemeMenu() {
+  const { theme, setTheme } = useTheme();
+  return (
+    <Dropdown.Root>
+      <Tooltip content="Theme">
+        <Dropdown.Trigger asChild>
+          <button type="button" className="site-icon-btn" aria-label={`Theme: ${theme}`}>
+            {themeIcon[theme]}
+          </button>
+        </Dropdown.Trigger>
+      </Tooltip>
+      <Dropdown.Content align="end" sideOffset={8}>
+        <Dropdown.Label>Appearance</Dropdown.Label>
+        <Dropdown.RadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
+          {THEMES.map((t) => (
+            <Dropdown.RadioItem key={t.id} value={t.id}>
+              {themeIcon[t.id]}
+              <span className="grow">{t.label}</span>
+              <span className="subtle xs">{t.hint}</span>
+            </Dropdown.RadioItem>
+          ))}
+        </Dropdown.RadioGroup>
+      </Dropdown.Content>
+    </Dropdown.Root>
+  );
+}
+
 function SiteHeader() {
   const site = useSite().data;
   const brand = useBrandName();
@@ -178,27 +227,7 @@ function SiteHeader() {
           })}
         </nav>
         <div className="site-header-actions">
-          <Dropdown.Root>
-            <Tooltip content="Theme">
-              <Dropdown.Trigger asChild>
-                <button type="button" className="site-icon-btn" aria-label={`Theme: ${theme}`}>
-                  {themeIcon[theme]}
-                </button>
-              </Dropdown.Trigger>
-            </Tooltip>
-            <Dropdown.Content align="end" sideOffset={8}>
-              <Dropdown.Label>Appearance</Dropdown.Label>
-              <Dropdown.RadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
-                {THEMES.map((t) => (
-                  <Dropdown.RadioItem key={t.id} value={t.id}>
-                    {themeIcon[t.id]}
-                    <span className="grow">{t.label}</span>
-                    <span className="subtle xs">{t.hint}</span>
-                  </Dropdown.RadioItem>
-                ))}
-              </Dropdown.RadioGroup>
-            </Dropdown.Content>
-          </Dropdown.Root>
+          <ThemeMenu />
           <SessionButton className="site-session-btn" />
           <DialogPrimitive.Root open={open} onOpenChange={setOpen}>
             <DialogPrimitive.Trigger asChild>

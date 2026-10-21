@@ -1262,6 +1262,162 @@ export interface Site {
     checkoutEnabled?: boolean;
   };
   /**
+   * Launch state of the public website. `coming-soon` renders one standalone landing (what the platform is, how pricing works, the waitlist, questions and the legal links) on every website path except the legal pages, and hides sign-in, checkout and every link into the platform. `live` renders the full website. A static build can override the mode (build-site --launch).
+   */
+  launch?: {
+    /**
+     * coming-soon: the standalone pre-launch landing; live: the full website.
+     */
+    mode: "coming-soon" | "live";
+    eyebrow?: string;
+    /**
+     * Coming-soon headline; defaults to hero.title.
+     */
+    title?: string;
+    /**
+     * Coming-soon lead; defaults to hero.subtitle.
+     */
+    subtitle?: string;
+    /**
+     * A short status line, e.g. 'Private beta, opening 2027'.
+     */
+    status?: string;
+    /**
+     * Label of the button that scrolls to the waitlist.
+     */
+    ctaLabel?: string;
+    /**
+     * What the platform is, in a few blocks.
+     *
+     * @minItems 2
+     * @maxItems 6
+     */
+    points?:
+      | [
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          }
+        ]
+      | [
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          }
+        ]
+      | [
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          }
+        ]
+      | [
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          }
+        ]
+      | [
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          },
+          {
+            icon?: Icon;
+            title: string;
+            body: string;
+          }
+        ];
+    /**
+     * FAQ groups shown on the coming-soon page; absent: the featured questions and the pricing group.
+     *
+     * @maxItems 6
+     */
+    faqGroups?:
+      | []
+      | [string]
+      | [string, string]
+      | [string, string, string]
+      | [string, string, string, string]
+      | [string, string, string, string, string]
+      | [string, string, string, string, string, string];
+  };
+  /**
    * Pricing page copy around the plans.
    */
   pricing?: {
@@ -1276,6 +1432,673 @@ export interface Site {
      * FAQ group shown under the plans (entries of `faq` with this `group`).
      */
     faqGroup?: string;
+    /**
+     * How pricing works: the model in steps, copy for the compute tiers (rates come from plans.compute), worked examples and the estimator. Shown on the pricing page, the coming-soon page and, briefly, the landing page.
+     */
+    model?: {
+      eyebrow?: string;
+      title: string;
+      intro?: string;
+      /**
+       * @minItems 2
+       * @maxItems 6
+       */
+      steps:
+        | [
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            }
+          ]
+        | [
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            }
+          ]
+        | [
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            }
+          ]
+        | [
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            }
+          ]
+        | [
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            },
+            {
+              icon?: Icon;
+              title: string;
+              body: string;
+            }
+          ];
+      /**
+       * Copy for the compute tiers; the rates are plans.compute.tiers.
+       */
+      tiers?: {
+        pod?: {
+          name: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          examples?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+        };
+        vm?: {
+          name: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          examples?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+        };
+        heavy?: {
+          name: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          examples?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+        };
+      };
+      /**
+       * Worked examples: a lab of a tier run for so many minutes; the cost is computed from plans.compute.
+       *
+       * @maxItems 6
+       */
+      examples?:
+        | []
+        | [
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            }
+          ]
+        | [
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            }
+          ]
+        | [
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            }
+          ]
+        | [
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            }
+          ]
+        | [
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            }
+          ]
+        | [
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            },
+            {
+              title: string;
+              body?: string;
+              tier: "pod" | "vm" | "heavy";
+              minutes: number;
+              /**
+               * Sessions a month, for a monthly figure.
+               */
+              sessions?: number;
+            }
+          ];
+      estimator?: {
+        title?: string;
+        note?: string;
+        defaultTier?: "pod" | "vm" | "heavy";
+        defaultMinutes?: number;
+        defaultSessions?: number;
+      };
+      /**
+       * Shown where a rate would be while plans.compute is not configured.
+       */
+      pendingNote?: string;
+      /**
+       * The ways to run CloudTrain, side by side (e.g. self-host free, hosted pay-for-compute, enterprise features by subscription or license key). Copy only; amounts come from plans.
+       *
+       * @minItems 1
+       * @maxItems 4
+       */
+      paths?:
+        | [
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            }
+          ]
+        | [
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            },
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            }
+          ]
+        | [
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            },
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            },
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            }
+          ]
+        | [
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            },
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            },
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            },
+            {
+              /**
+               * `hosted` shows the compute rates under it.
+               */
+              id: string;
+              icon?: Icon;
+              eyebrow?: string;
+              title: string;
+              /**
+               * Short price line, e.g. 'Free' or 'Per minute of compute'.
+               */
+              price?: string;
+              body: string;
+              /**
+               * @maxItems 6
+               */
+              points?:
+                | []
+                | [string]
+                | [string, string]
+                | [string, string, string]
+                | [string, string, string, string]
+                | [string, string, string, string, string]
+                | [string, string, string, string, string, string];
+              cta?: Cta;
+            }
+          ];
+    };
   };
   /**
    * Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat). Learners pay for the compute their lab sessions use on top of any plan (`compute`); plans unlock premium labs (`premium`); the free plan gives a trial lab (`free`).
@@ -1430,6 +2253,338 @@ export interface Site {
     body?: string;
     primaryCta?: Cta;
     secondaryCta?: Cta;
+  };
+  /**
+   * Customer logos and quotes. While `placeholder` is true every slot is labelled as a placeholder; never ship invented quotes as real ones.
+   */
+  socialProof?: {
+    placeholder?: boolean;
+    eyebrow?: string;
+    title?: string;
+    note?: string;
+    /**
+     * @maxItems 8
+     */
+    logos?:
+      | []
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ]
+      | [
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          },
+          {
+            name: string;
+            image?: Href;
+            imageDark?: Href;
+          }
+        ];
+    /**
+     * @maxItems 6
+     */
+    quotes?:
+      | []
+      | [
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          }
+        ]
+      | [
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          }
+        ]
+      | [
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          }
+        ]
+      | [
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          }
+        ]
+      | [
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          }
+        ]
+      | [
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          },
+          {
+            quote: string;
+            name: string;
+            role?: string;
+          }
+        ];
   };
   /**
    * Early-access waitlist: a call-to-action section with a short form on the landing page (POST /api/public/waitlist). Entries are stored in the gateway database; no email is sent. The consent checkbox links to the privacy page (legal.privacy).
