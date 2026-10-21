@@ -2,7 +2,7 @@ import path from 'node:path';
 import { sql, type Kysely } from 'kysely';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import type { SiteConfig } from '@cloudtrain/api-types';
+import type { LabAccess, SiteConfig } from '@cloudtrain/api-types';
 import { buildApp } from '../src/app.js';
 import { computeTierOf, PricingModel } from '../src/billing/compute.js';
 import { BillingService } from '../src/billing/service.js';
@@ -461,7 +461,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     const selfhosted = new BillingService({ db: h.t.db, site, stripe: new StripeApi(KEY, stripe.fetch), webhookSecret: SECRET, webUrl: 'http://web.test', enforce: true, earlyAccess: false, labs: content.labs, now: () => clock });
     const p = (await import('../src/platform/identity.js')).loadPrincipal;
     const lucas = (await p(h.t.db, Q.lucas, h.orgs.quillmoor))!;
-    const [heavy] = await selfhosted.annotate(lucas, [{ id: HARD_HEAVY }]);
+    const [heavy] = await selfhosted.annotate<{ id: string; access?: LabAccess }>(lucas, [{ id: HARD_HEAVY }]);
     expect(heavy!.access).not.toHaveProperty('requiredPlan');
     expect(heavy!.access?.locked?.reason).not.toBe('plan_required');
   });

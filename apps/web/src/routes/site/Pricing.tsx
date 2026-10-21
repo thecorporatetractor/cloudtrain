@@ -115,7 +115,7 @@ export function Pricing() {
               <div className="section-header">
                 <div>
                   <h2 id="compare">Compare plans</h2>
-                  <p className="muted small">Premium labs, concurrent labs, environment tiers, exam simulations and events per plan. Compute is billed on top of every plan.</p>
+                  <p className="muted small">Early access, concurrent labs, environment tiers, exam simulations and events per plan; every public lab is open on every plan. Compute is billed on top of every plan.</p>
                 </div>
               </div>
               <Card className="card-flush site-compare-wrap">
