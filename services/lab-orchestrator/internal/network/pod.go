@@ -160,7 +160,12 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 	}
 	ends := p.EndsOf(node)
 	if len(ends) > 0 {
-		var nets []map[string]any
+		// Keep attachments set before (the entry node's access NAD, which
+		// reaches the session's VMs): the link attachments come after them.
+		nets, err := parseNetworks(pod.Annotations[AnnotationNetworks], p.Session.Namespace)
+		if err != nil {
+			return err
+		}
 		for _, ne := range ends {
 			att := map[string]any{}
 			for k, v := range ne.Link.Segment.Attachment(p.Session.Namespace, ne.End.Interface) {
@@ -378,4 +383,39 @@ func NetemArgs(im *labsv1.LinkImpairment) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// parseNetworks reads a Multus network-selection annotation in either form
+// (a JSON list of attachments, or comma-separated [namespace/]name[@interface])
+// as a list of attachments; namespace defaults to the pod's.
+func parseNetworks(v, namespace string) ([]map[string]any, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(v, "[") {
+		var nets []map[string]any
+		if err := json.Unmarshal([]byte(v), &nets); err != nil {
+			return nil, fmt.Errorf("network: annotation %s: %w", AnnotationNetworks, err)
+		}
+		return nets, nil
+	}
+	var nets []map[string]any
+	for _, e := range strings.Split(v, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		att := map[string]any{"namespace": namespace}
+		if name, iface, ok := strings.Cut(e, "@"); ok {
+			e = name
+			att["interface"] = iface
+		}
+		if ns, name, ok := strings.Cut(e, "/"); ok {
+			att["namespace"], e = ns, name
+		}
+		att["name"] = e
+		nets = append(nets, att)
+	}
+	return nets, nil
 }

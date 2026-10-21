@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -602,5 +603,36 @@ func TestEnsureVLANPassthru(t *testing.T) {
 	}
 	if err := c.Get(ctx, client.ObjectKey{Name: p2.Links[0].Segment.Subnet}, sub); err != nil || sub.GetAnnotations()[AnnotationVLANPassthru] != "" {
 		t.Errorf("marked after failure: %v %v", sub.GetAnnotations(), err)
+	}
+}
+
+// A wired entry node keeps the access attachment the entry driver set (it
+// reaches the session's VMs); the link attachments follow it.
+func TestDecoratePodKeepsEarlierAttachments(t *testing.T) {
+	p, err := Build(sess, ospfTopology())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, prior := range []string{"ct-abc-access", sess.Namespace + "/ct-abc-access", `[{"name":"ct-abc-access","namespace":"` + sess.Namespace + `"}]`} {
+		host := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationNetworks: prior}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
+		if err := p.DecoratePod("wh-host", host, "node", PodOptions{ToolsImage: "t"}); err != nil {
+			t.Fatal(err)
+		}
+		var nets []map[string]any
+		if err := json.Unmarshal([]byte(host.Annotations[AnnotationNetworks]), &nets); err != nil {
+			t.Fatal(err)
+		}
+		if len(nets) < 2 || nets[0]["name"] != "ct-abc-access" || nets[0]["namespace"] != sess.Namespace {
+			t.Errorf("prior %q: networks %v", prior, nets)
+		}
+		for _, n := range nets[1:] {
+			if n["interface"] == nil {
+				t.Errorf("prior %q: link attachment without interface: %v", prior, n)
+			}
+		}
+	}
+	if _, err := parseNetworks("[{", "x"); err == nil {
+		t.Error("broken JSON accepted")
 	}
 }
