@@ -43,6 +43,7 @@ import type {
 } from '@/api/types';
 import { labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks } from './fixtures/skills';
+import { mockEntitlements } from './license';
 import {
   ORG_ACME,
   ORG_QUILLMOOR,
@@ -173,6 +174,7 @@ function buildMe(s: MockSession): Me | undefined {
       ? { method: 'dev-impersonation', impersonated: true, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() }
       : { method: 'dev', idp: s.orgId === ORG_QUILLMOOR.id && !p.platformAdmin ? 'quillmoor-entra' : undefined, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() },
     supportAccess,
+    entitlements: mockEntitlements({ platformAdmin: !!p.platformAdmin, permissions: permissionsFor(roles) }),
   };
 }
 

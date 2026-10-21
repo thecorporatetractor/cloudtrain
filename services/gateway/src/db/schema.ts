@@ -593,6 +593,7 @@ export interface DB {
   billing_seats: BillingSeatsTable;
   billing_limits: BillingLimitsTable;
   waitlist_entries: WaitlistEntriesTable;
+  platform_licenses: PlatformLicensesTable;
 }
 
 /** Early-access waitlist (0008_waitlist): not tenant data, no org_id. */
@@ -604,6 +605,17 @@ export interface WaitlistEntriesTable {
   interest: 'enterprise' | 'individual' | null;
   consent_at: Timestamp;
   created_at: CreatedAt;
+}
+
+/** Uploaded self-hosted license keys (0010_license): platform scope, no org_id. */
+export interface PlatformLicensesTable {
+  id: Generated<string>;
+  license_id: string;
+  token: string;
+  installed_by: string | null;
+  installed_at: CreatedAt;
+  removed_at: Date | null;
+  removed_by: string | null;
 }
 
 export type CtfEventRow = Selectable<CtfEventsTable>;

@@ -27,6 +27,8 @@ import { loadSiteConfig } from './site/config.js';
 import { BillingService } from './billing/service.js';
 import { StripeApi, maskKey } from './billing/stripe.js';
 import { PgWaitlistStore } from './waitlist/store.js';
+import { LicenseManager } from './license/manager.js';
+import { Entitlements } from './entitlements/service.js';
 
 async function main() {
   const config = loadConfig();
@@ -60,6 +62,25 @@ async function main() {
     ...(config.sessionTtlMinutes ? { sessionTtlMinutes: config.sessionTtlMinutes } : {}),
   });
   let log: PlatformService['log'];
+  // Billing (Stripe, test mode only, behind CT_BILLING_ENABLED): plans from the site configuration.
+  // Pay for compute: lab sessions are metered and reported to a Stripe Billing Meter; the
+  // lab-start gate is on with billing unless CT_BILLING_ENFORCE=0 (docs/billing.md).
+  const billing = new BillingService({
+    db,
+    site,
+    ...(config.billing.enabled ? { stripe: new StripeApi(config.billing.secretKey), webhookSecret: config.billing.webhookSecret } : {}),
+    enforce: config.billing.enforce,
+    labs: content.labs,
+    mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
+    webUrl: config.webUrl,
+    log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
+  });
+
+  // Premium features (docs/licensing-keys.md): plans on the hosted edition, the offline
+  // license key on self-hosted (community edition without one). Never phones home.
+  const license = await new LicenseManager({ edition: config.edition, source: config.license, db, log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) } }).init();
+  const entitlements = new Entitlements({ edition: config.edition, license, db, ...(config.edition === 'hosted' || config.billing.enabled ? { plans: billing } : {}) });
+
   const platform = new PlatformService({
     db,
     content,
@@ -67,6 +88,7 @@ async function main() {
     mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
     store,
     kc: kcAdmin,
+    entitlements,
     config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace },
     log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
   });
@@ -90,20 +112,6 @@ async function main() {
   // CTF events: event sessions answer for their team (or entrant), with the event's scoring.
   const events = new EventService(platform, sessions);
   const answers = new AnswerService(sessions, new PgAnswerStore(platform), { ratePerMinute: config.answerRatePerMinute, resolve: events.resolveScope });
-
-  // Billing (Stripe, test mode only, behind CT_BILLING_ENABLED): plans from the site configuration.
-  // Pay for compute: lab sessions are metered and reported to a Stripe Billing Meter; the
-  // lab-start gate is on with billing unless CT_BILLING_ENFORCE=0 (docs/billing.md).
-  const billing = new BillingService({
-    db,
-    site,
-    ...(config.billing.enabled ? { stripe: new StripeApi(config.billing.secretKey), webhookSecret: config.billing.webhookSecret } : {}),
-    enforce: config.billing.enforce,
-    labs: content.labs,
-    mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
-    webUrl: config.webUrl,
-    log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
-  });
 
   const app = await buildApp({
     content,
@@ -135,6 +143,9 @@ async function main() {
   app.log.info({ file: config.siteConfigFile, brand: site.brand.name, flags: site.flags, plans: site.plans?.items.map((p) => p.id) ?? [] }, 'public website config loaded');
   if (config.billing.enabled) app.log.info({ mode: 'test', key: maskKey(config.billing.secretKey), checkoutEnabled: !!site.flags.checkoutEnabled, enforce: config.billing.enforce }, 'billing: Stripe TEST MODE on (CT_BILLING_ENABLED=1)');
   else app.log.info({}, 'billing: off (CT_BILLING_ENABLED unset); plans are informational');
+  app.log.info({ edition: config.edition, license: license.state(), features: license.features() }, `edition: ${config.edition}`);
+  if (config.edition === 'hosted' && !config.billing.enabled) app.log.warn({}, 'CT_EDITION=hosted without CT_BILLING_ENABLED=1: compute is not metered or billed and no plan grants premium features');
+  if (license.isDev) app.log.warn({ publicUrl: config.publicUrl }, 'DEV ONLY: CT_DEV_LICENSE=1, a development license with every premium feature is in force');
   app.log.info({ issuer: config.oidc.issuer, publicUrl: config.publicUrl, webUrl: config.webUrl, platformIdps: config.platformIdps, domainVerifyBypass: config.devDomainVerifyBypass }, 'auth: OIDC (BFF)');
 
   const sweep = config.sweepIntervalMs > 0 ? setInterval(() => void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed')), config.sweepIntervalMs) : undefined;

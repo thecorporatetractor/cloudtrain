@@ -344,6 +344,26 @@ export class BillingService {
     return { ...org, level: Math.max(own.level, this.pricing.level(orgPlan)), seat: { plan: orgPlan! } };
   }
 
+  /**
+   * The plans behind premium features (src/entitlements): the organisation's plan
+   * (an active subscription or a manual grant), the person's own plan, and whether
+   * they hold a seat of the organisation plan.
+   */
+  async plansOf(orgId: string, userId?: string): Promise<{ org?: SitePlan; user?: SitePlan; seated: boolean }> {
+    return withTenant(this.d.db, { orgId, userId: userId ?? null }, async (tx) => {
+      const keys = userId ? ['', userId] : [''];
+      const rows = await tx.selectFrom('billing_entitlements').select(['scope_key', 'plan_id', 'source']).where('org_id', '=', orgId).where('scope_key', 'in', keys).execute();
+      const planOf = (key: string) => {
+        const r = rows.find((x) => x.scope_key === key);
+        return r && r.source !== 'default' ? this.plan(r.plan_id) : undefined;
+      };
+      const org = planOf('');
+      const user = userId ? planOf(userId) : undefined;
+      const seated = !!org && !!userId && !!(await tx.selectFrom('billing_seats').select('user_id').where('org_id', '=', orgId).where('user_id', '=', userId).executeTakeFirst());
+      return { ...(org ? { org } : {}), ...(user ? { user } : {}), seated };
+    });
+  }
+
   private dunningView(since: Date | null): BillingDunning {
     const graceDays = this.pricing.graceDays;
     if (!since) return { state: 'ok', graceDays };

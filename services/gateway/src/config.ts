@@ -1,6 +1,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { Edition } from '@cloudtrain/api-types';
 import { isLiveKey, isTestKey } from './billing/stripe.js';
+import type { LicenseSourceConfig } from './license/manager.js';
 
 /** Repository root, resolved from this file (src/ or dist/ under services/gateway). */
 export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -94,6 +96,13 @@ export interface Config {
    * to return a config with it on in production or on a non-loopback URL.
    */
   devImpersonate: boolean;
+  /**
+   * CT_EDITION: `selfhosted` (default) or `hosted`. Hosted takes premium features from
+   * plans and meters compute; self-hosted takes them from a license key (docs/licensing-keys.md).
+   */
+  edition: Edition;
+  /** CT_LICENSE_KEY / CT_LICENSE_FILE / CT_DEV_LICENSE (development only). */
+  license: LicenseSourceConfig;
 }
 
 export interface BillingConfig {
@@ -164,6 +173,42 @@ export function devImpersonationEnabled(env: NodeJS.ProcessEnv, publicUrl: strin
     if (!isLoopbackUrl(u)) throw new Error(`CT_DEV_IMPERSONATE=1 needs ${k} on localhost or 127.0.0.1 (got ${u}); refusing to start`);
   }
   return true;
+}
+
+/** CT_EDITION: `selfhosted` (default) or `hosted`; anything else is an error. */
+export function editionFrom(v: string | undefined): Edition {
+  const e = (v ?? '').trim() || 'selfhosted';
+  if (e !== 'selfhosted' && e !== 'hosted') throw new Error(`CT_EDITION must be hosted or selfhosted (got ${JSON.stringify(v)}); refusing to start`);
+  return e;
+}
+
+/**
+ * The license source. CT_DEV_LICENSE=1 signs a development license with a key pair
+ * that exists only in the gateway process: refused with NODE_ENV=production or on a
+ * non-loopback URL, exactly like CT_DEV_IMPERSONATE. CT_LICENSE_KEY wins over
+ * CT_LICENSE_FILE, and both over CT_DEV_LICENSE; none = the license uploaded on
+ * /platform/license, if any.
+ */
+export function licenseSourceFrom(env: NodeJS.ProcessEnv, publicUrl: string, webUrl: string): LicenseSourceConfig {
+  const v = env.CT_DEV_LICENSE;
+  if (v !== undefined && v !== '' && v !== '0' && v !== '1') throw new Error(`CT_DEV_LICENSE must be 1 or 0 (got ${JSON.stringify(v)}); refusing to start`);
+  const key = env.CT_LICENSE_KEY?.trim();
+  const file = env.CT_LICENSE_FILE?.trim();
+  // A real license wins over the development one (task dev:gateway turns CT_DEV_LICENSE on by default).
+  if (key) return { key };
+  if (file) return { file };
+  const dev = v === '1';
+  if (dev) {
+    if (env.NODE_ENV === 'production') throw new Error('CT_DEV_LICENSE=1 is set with NODE_ENV=production: the development license is for local development only; refusing to start');
+    for (const [k, u] of [
+      ['CT_PUBLIC_URL', publicUrl],
+      ['CT_WEB_URL', webUrl],
+    ] as const) {
+      if (!isLoopbackUrl(u)) throw new Error(`CT_DEV_LICENSE=1 needs ${k} on localhost or 127.0.0.1 (got ${u}); refusing to start`);
+    }
+    return { dev: true };
+  }
+  return {};
 }
 
 /**
@@ -275,5 +320,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(num(env.CT_EXAM_DURATION_MINUTES, 0) > 0 ? { examDurationMinutes: num(env.CT_EXAM_DURATION_MINUTES, 0) } : {}),
     devImpersonate,
     billing: billingConfig(env),
+    edition: editionFrom(env.CT_EDITION),
+    license: ((l) => (l.file ? { ...l, file: fromRoot(l.file) } : l))(licenseSourceFrom(env, publicUrl, webUrl)),
   };
 }

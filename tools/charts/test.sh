@@ -103,6 +103,8 @@ refuse "sandboxes and tierRuntimeClasses" "exclusive" -f "$CHART/examples/values
 
 # Dev sign-in-as is never set by the chart.
 if grep -rq "CT_DEV_IMPERSONATE" "$OUT"/*.yaml; then fail "no CT_DEV_IMPERSONATE"; else pass "no CT_DEV_IMPERSONATE"; fi
+# Nor the development license (docs/licensing-keys.md).
+if grep -rq "CT_DEV_LICENSE" "$OUT"/*.yaml; then fail "no CT_DEV_LICENSE"; else pass "no CT_DEV_LICENSE"; fi
 
 echo "rendered manifests: $OUT"
 ((fails == 0)) || { echo "$fails chart test(s) failed" >&2; exit 1; }
