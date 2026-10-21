@@ -387,7 +387,7 @@ func TestRemoteExecRouting(t *testing.T) {
 		got = append(got, strings.Join(call, " "))
 	}
 	want := []string{
-		entry + " admin env KUBECONFIG=/root/.kube/qm-yard.conf kubectl apply -f -",
+		entry + " admin env KUBECONFIG=/root/.kube/qm-yard.conf /bin/sh -c " + kubeApplyScript + " sh kubectl apply",
 		entry + ` admin ssh -T yard-wk-1 '/bin/sh' '-c' 'echo '\''hi'\'''`,
 	}
 	for i, w := range want {

@@ -184,6 +184,15 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// A session being deleted that no longer carries the cleanup finalizer
+	// is done (its teardown ran and it released the access hold); a cached
+	// copy of it is still reconciled once more. Holding the binding again
+	// here would keep it, and the namespace, Terminating with nobody left
+	// to release it.
+	if !s.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(s, Finalizer) {
+		return ctrl.Result{}, nil
+	}
+
 	// Access first: every driver call below acts in the session namespace.
 	// Teardown tries even without it (a terminating namespace takes no new
 	// RoleBinding, but the one from provisioning is still there).
@@ -209,6 +218,14 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 			controllerutil.RemoveFinalizer(s, Finalizer)
 			if err := r.Update(ctx, s); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Sessions of one namespace torn down at the same time (an exam
+			// attempt's, or a deleted namespace's) each saw the others still
+			// holding the cleanup finalizer before they dropped their own, so
+			// none released the binding. Check again now that this one is
+			// gone: the last session to drop its finalizer sees no others.
+			if err := r.releaseAccess(ctx, s); err != nil {
 				return ctrl.Result{}, err
 			}
 		}

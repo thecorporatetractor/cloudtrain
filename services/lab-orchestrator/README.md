@@ -144,7 +144,9 @@ Action / check routing (`controller.NodeExecutor`):
 | `<cluster>` (both modes) | admin sidecar, `KUBECONFIG=/root/.kube/<cluster>.conf` | learner shell with a private kubeconfig copy switched to `cluster.context` (the learner's current context is untouched) |
 | `<cluster>/<member>`, `<vm>` | admin sidecar: `ssh root@<host>` | learner shell: `ssh <host>` (learner account, sudo) |
 
-`apply` always targets the cluster (`kubectl apply -f -`).
+`apply` always targets the cluster (`kubectl apply -f -`). It is retried for up to a
+minute while the API server refuses a Pod because the namespace's `default`
+ServiceAccount does not exist yet (a manifest that creates a Namespace and a Pod in it).
 
 ## Lab network and netdev
 
