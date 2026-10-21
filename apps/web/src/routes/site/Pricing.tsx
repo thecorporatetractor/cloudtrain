@@ -1,22 +1,22 @@
 import { Link } from '@tanstack/react-router';
-import { ArrowRight, Check, Cpu, Gift, LayoutDashboard, LogIn, Minus, ShieldCheck, Users } from 'lucide-react';
+import { ArrowRight, Check, LayoutDashboard, LogIn, Minus, ShieldCheck, Users } from 'lucide-react';
 import { useState } from 'react';
 import { useMe } from '@/api/client';
 import { useSite } from '@/api/public';
 import type { PlanInterval, SiteConfig, SitePlan } from '@/api/types';
 import { Badge, Card, PageSkeleton, Segmented } from '@/components/ui';
-import { formatMinor, siteComputeRates } from '@/lib/billing';
 import { ENTITLEMENT_ROWS, entitlementSummary, formatAmount, perMonth, priceFor, yearlySaving } from '@/lib/plans';
+import { earlyAccessFor as earlyAccess } from '@/lib/pricingModel';
 import { cn } from '@/lib/utils';
+import { PricingExplained } from '@/site/ComingSoon';
 import { SiteAnchor, useDocumentTitle } from '@/site/util';
 import { Cta } from './Landing';
 
 /**
  * Pricing: the configured plans (free, individual monthly/yearly, organisation
- * per seat) as cards with an interval switch, the pay-for-compute rates and the
- * free trial, a comparison of entitlements and premium labs, the placeholder
- * note while prices are not final, the plan FAQ and the alignment notice. Calls
- * to action lead to sign-in, checkout (when enabled) or contact.
+ * per seat) as cards with an interval switch, a comparison of entitlements, the
+ * placeholder note while prices are not final, the plan FAQ and the alignment
+ * notice. Calls to action lead to sign-in, checkout (when enabled) or contact.
  */
 export function Pricing() {
   const site = useSite();
@@ -37,143 +37,173 @@ export function Pricing() {
   const faq = p?.faqGroup ? (s?.faq ?? []).filter((f) => f.group === p.faqGroup) : [];
 
   return (
-    <div className="site-container site-page">
-      <header className="site-page-head site-page-head-stack" style={{ alignItems: 'center', textAlign: 'center', margin: '0 auto 28px' }}>
-        <div className="page-eyebrow">Pricing</div>
-        <h1 className="site-h1">{p?.headline ?? 'Plans'}</h1>
-        {p?.intro && <p className="muted site-lead-sm">{p.intro}</p>}
-        {anyYearly && (
-          <div className="row" style={{ gap: 10, marginTop: 8 }}>
-            <Segmented<PlanInterval> label="Billing interval" value={interval} onChange={setInterval} options={[{ value: 'monthly', label: 'Monthly' }, { value: 'yearly', label: 'Yearly' }]} />
-            {interval === 'yearly' && savingBadge(plans)}
-          </div>
-        )}
-      </header>
+    <>
+      <div className="site-container site-page site-page-before">
+        <header
+          className="site-page-head site-page-head-stack"
+          style={{
+            alignItems: 'center',
+            textAlign: 'center',
+            margin: '0 auto 28px',
+          }}
+        >
+          <div className="page-eyebrow">Pricing</div>
+          <h1 className="site-h1">{p?.headline ?? 'Plans'}</h1>
+          {p?.intro && <p className="muted site-lead-sm">{p.intro}</p>}
+        </header>
 
-      {s && !s.flags.showPricing && (
-        <Card className="site-pricing-soon" style={{ marginBottom: 28 }}>
-          <div className="stack" style={{ gap: 8 }}>
-            <Badge tone="warn">Not published yet</Badge>
-            <h2>Plans are being finalised</h2>
-            <p className="muted small" style={{ maxWidth: 520 }}>
-              The plans below are a preview. Talk to us about a pilot.
-            </p>
-          </div>
-          {p?.contactCta && <Cta cta={p.contactCta} size="md" />}
-        </Card>
-      )}
-
-      {plans && plans.items.length > 0 ? (
-        <>
-          {placeholder && p?.placeholderNote && (
-            <p className="site-callout small" role="note" style={{ justifyContent: 'center' }}>
-              <Badge tone="warn">Placeholder prices</Badge> {p.placeholderNote}
-            </p>
-          )}
-          <div className={cn('site-plans', plans.items.length === 2 && 'site-plans-2', plans.items.length >= 4 && 'site-plans-4')}>
-            {plans.items.map((pl) => (
-              <PlanCard key={pl.id} plan={pl} currency={plans.currency} interval={interval} site={s!} />
-            ))}
-          </div>
-          <p className="xs subtle" style={{ textAlign: 'center', marginTop: 14 }}>
-            {[plans.taxNote, plans.billingNote].filter(Boolean).join(' ')}
-            {anyYearly && interval === 'yearly' ? ' Yearly prices are shown per month and billed once a year.' : ''}
-          </p>
-
-          <ComputeSection site={s!} />
-
-          <section className="page-section" aria-labelledby="compare">
-            <div className="section-header">
-              <div>
-                <h2 id="compare">Compare plans</h2>
-                <p className="muted small">Premium labs, lab hours, concurrent labs, environment tiers, exam simulations and events per plan. Compute is billed on top of every plan.</p>
-              </div>
+        {s && !s.flags.showPricing && (
+          <Card className="site-pricing-soon" style={{ marginBottom: 28 }}>
+            <div className="stack" style={{ gap: 8 }}>
+              <Badge tone="warn">Not published yet</Badge>
+              <h2>Plans are being finalised</h2>
+              <p className="muted small" style={{ maxWidth: 520 }}>
+                The plans below are a preview. Talk to us about a pilot.
+              </p>
             </div>
-            <Card className="card-flush site-compare-wrap">
-              <table className="table site-compare">
-                <thead>
-                  <tr>
-                    <th scope="col">Entitlement</th>
-                    {plans.items.map((pl) => (
-                      <th key={pl.id} scope="col">
-                        {pl.name}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {(plans.premium?.length ?? 0) > 0 && (
+            {p?.contactCta && <Cta cta={p.contactCta} size="md" />}
+          </Card>
+        )}
+
+      </div>
+
+      {s && <PricingExplained site={s} id="how-pricing-works" />}
+
+      <div className="site-container site-page site-page-after">
+        {plans && plans.items.length > 0 ? (
+          <>
+            <div className="row-between" style={{ marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
+              <h2 className="site-h2">Hosted plans</h2>
+              {anyYearly && (
+                <div className="row" style={{ gap: 10, marginTop: 8 }}>
+                  <Segmented<PlanInterval>
+                    label="Billing interval"
+                    value={interval}
+                    onChange={setInterval}
+                    options={[
+                      { value: 'monthly', label: 'Monthly' },
+                      { value: 'yearly', label: 'Yearly' },
+                    ]}
+                  />
+                  {interval === 'yearly' && savingBadge(plans)}
+                </div>
+              )}
+            </div>
+            {placeholder && p?.placeholderNote && (
+              <p className="site-callout small" role="note" style={{ justifyContent: 'center' }}>
+                <Badge tone="warn">Placeholder prices</Badge> {p.placeholderNote}
+              </p>
+            )}
+            <div className={cn('site-plans', plans.items.length === 2 && 'site-plans-2', plans.items.length >= 4 && 'site-plans-4')}>
+              {plans.items.map((pl) => (
+                <PlanCard key={pl.id} plan={pl} currency={plans.currency} interval={interval} site={s!} />
+              ))}
+            </div>
+            <p className="xs muted" style={{ textAlign: 'center', marginTop: 14 }}>
+              {[plans.taxNote, plans.billingNote].filter(Boolean).join(' ')}
+              {anyYearly && interval === 'yearly' ? ' Yearly prices are shown per month and billed once a year.' : ''}
+            </p>
+          </>
+        ) : null}
+      </div>
+
+
+      <div className="site-container site-page site-page-after">
+        {plans && plans.items.length > 0 ? (
+          <>
+            <section className="page-section" aria-labelledby="compare">
+              <div className="section-header">
+                <div>
+                  <h2 id="compare">Compare plans</h2>
+                  <p className="muted small">Premium labs, concurrent labs, environment tiers, exam simulations and events per plan. Compute is billed on top of every plan.</p>
+                </div>
+              </div>
+              <Card className="card-flush site-compare-wrap">
+                <table className="table site-compare">
+                  <thead>
                     <tr>
-                      <th scope="row">Premium labs</th>
+                      <th scope="col">Entitlement</th>
                       {plans.items.map((pl) => (
-                        <td key={pl.id} className={cn(premiumUnlocked(plans, pl).length === 0 && 'subtle')}>
-                          <span className="row" style={{ gap: 6 }}>
-                            {premiumUnlocked(plans, pl).length ? <Check size={13} className="text-ok" aria-hidden /> : <Minus size={13} aria-hidden />}
-                            {premiumUnlocked(plans, pl).length ? premiumUnlocked(plans, pl).join(' and ') : pl.kind === 'free' && plans.free?.trialLabs.length ? 'Trial lab only, free' : 'Standard labs'}
-                          </span>
-                        </td>
+                        <th key={pl.id} scope="col">
+                          {pl.name}
+                        </th>
                       ))}
                     </tr>
-                  )}
-                  {ENTITLEMENT_ROWS.map((row) => (
-                    <tr key={row.key}>
-                      <th scope="row">{row.label}</th>
-                      {plans.items.map((pl) => (
-                        <td key={pl.id} className={cn(!row.has(pl.entitlements) && 'subtle')}>
-                          <span className="row" style={{ gap: 6 }}>
-                            {row.has(pl.entitlements) ? <Check size={13} className="text-ok" aria-hidden /> : <Minus size={13} aria-hidden />}
-                            {row.value(pl.entitlements)}
-                          </span>
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                  <tr>
-                    <th scope="row">Who it is for</th>
-                    {plans.items.map((pl) => (
-                      <td key={pl.id}>{pl.kind === 'organisation' ? `Organisations${pl.perSeat ? ', per seat' : ''}${pl.minSeats ? ` (from ${pl.minSeats})` : ''}` : pl.kind === 'individual' ? 'One person' : 'Anyone'}</td>
+                  </thead>
+                  <tbody>
+                    {earlyAccess(plans) && (
+                      <tr>
+                        <th scope="row">Early-access labs</th>
+                        {plans.items.map((pl) => (
+                          <td key={pl.id} className={cn(!earlyAccess(plans)!(pl) && 'subtle')}>
+                            <span className="row" style={{ gap: 6 }}>
+                              {earlyAccess(plans)!(pl) ? <Check size={13} className="text-ok" aria-hidden /> : <Minus size={13} aria-hidden />}
+                              {earlyAccess(plans)!(pl) ? 'Included' : 'Public labs only'}
+                            </span>
+                          </td>
+                        ))}
+                      </tr>
+                    )}
+                    {ENTITLEMENT_ROWS.map((row) => (
+                      <tr key={row.key}>
+                        <th scope="row">{row.label}</th>
+                        {plans.items.map((pl) => (
+                          <td key={pl.id} className={cn(!row.has(pl.entitlements) && 'subtle')}>
+                            <span className="row" style={{ gap: 6 }}>
+                              {row.has(pl.entitlements) ? <Check size={13} className="text-ok" aria-hidden /> : <Minus size={13} aria-hidden />}
+                              {row.value(pl.entitlements)}
+                            </span>
+                          </td>
+                        ))}
+                      </tr>
                     ))}
-                  </tr>
-                </tbody>
-              </table>
-            </Card>
+                    <tr>
+                      <th scope="row">Who it is for</th>
+                      {plans.items.map((pl) => (
+                        <td key={pl.id}>{pl.kind === 'organisation' ? `Organisations${pl.perSeat ? ', per seat' : ''}${pl.minSeats ? ` (from ${pl.minSeats})` : ''}` : pl.kind === 'individual' ? 'One person' : 'Anyone'}</td>
+                      ))}
+                    </tr>
+                  </tbody>
+                </table>
+              </Card>
+            </section>
+          </>
+        ) : (
+          <Card className="site-pricing-soon">
+            <div className="stack" style={{ gap: 8 }}>
+              <h2>No plans configured</h2>
+              <p className="muted small">Add `plans` to the site configuration, or talk to us.</p>
+            </div>
+            {p?.contactCta && <Cta cta={p.contactCta} size="md" />}
+          </Card>
+        )}
+
+        {faq.length > 0 && (
+          <section className="page-section site-page-narrow" aria-labelledby="plan-faq" style={{ marginLeft: 'auto', marginRight: 'auto' }}>
+            <div className="section-header">
+              <h2 id="plan-faq">Questions about plans</h2>
+              <Link to="/faq" className="link-quiet small">
+                All questions <ArrowRight size={12} aria-hidden />
+              </Link>
+            </div>
+            <div className="site-faq">
+              {faq.map((f) => (
+                <details key={f.q} className="site-faq-item">
+                  <summary>{f.q}</summary>
+                  <p className="small muted">{f.a}</p>
+                </details>
+              ))}
+            </div>
           </section>
-        </>
-      ) : (
-        <Card className="site-pricing-soon">
-          <div className="stack" style={{ gap: 8 }}>
-            <h2>No plans configured</h2>
-            <p className="muted small">Add `plans` to the site configuration, or talk to us.</p>
-          </div>
-          {p?.contactCta && <Cta cta={p.contactCta} size="md" />}
-        </Card>
-      )}
+        )}
 
-      {faq.length > 0 && (
-        <section className="page-section site-page-narrow" aria-labelledby="plan-faq" style={{ marginLeft: 'auto', marginRight: 'auto' }}>
-          <div className="section-header">
-            <h2 id="plan-faq">Questions about plans</h2>
-            <Link to="/faq" className="link-quiet small">
-              All questions <ArrowRight size={12} aria-hidden />
-            </Link>
-          </div>
-          <div className="site-faq">
-            {faq.map((f) => (
-              <details key={f.q} className="site-faq-item">
-                <summary>{f.q}</summary>
-                <p className="small muted">{f.a}</p>
-              </details>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {s?.legal.alignmentNotice && (
-        <p className="site-notice xs subtle" style={{ marginTop: 32 }}>
-          <ShieldCheck size={12} aria-hidden /> {s.legal.alignmentNotice}
-        </p>
-      )}
-    </div>
+        {s?.legal.alignmentNotice && (
+          <p className="site-notice xs subtle" style={{ marginTop: 32 }}>
+            <ShieldCheck size={12} aria-hidden /> {s.legal.alignmentNotice}
+          </p>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -197,7 +227,8 @@ export function PlanPrice({ plan, currency, interval }: { plan: SitePlan; curren
     <div className="site-plan-price">
       <span className="site-plan-amount tnum">{formatAmount(shown, currency)}</span>
       <span className="site-plan-per xs subtle">
-        {plan.perSeat ? 'per seat ' : ''}per month{price.interval === 'yearly' ? ', billed yearly' : ''}
+        {plan.perSeat ? 'per seat ' : ''}per month
+        {price.interval === 'yearly' ? ', billed yearly' : ''}
         {plan.perSeat && plan.minSeats ? ` · from ${plan.minSeats} seats` : ''}
       </span>
     </div>
@@ -278,71 +309,5 @@ export function PlanCta({ plan, interval, site, size = 'md' }: { plan: SitePlan;
     <SiteAnchor to={plan.cta.to ?? site.pricing?.contactCta?.to ?? '/contact'} className={cls}>
       {plan.cta.action === 'checkout' ? (site.pricing?.contactCta?.label ?? 'Talk to us') : plan.cta.label} <ArrowRight size={13} aria-hidden />
     </SiteAnchor>
-  );
-}
-
-/** Names of the premium tiers a plan unlocks (rule plans whose level is at most this plan's). */
-function premiumUnlocked(plans: NonNullable<SiteConfig['plans']>, plan: SitePlan): string[] {
-  const level = plan.level ?? (plan.kind === 'free' ? 0 : 1);
-  const names = new Set<string>();
-  for (const rule of plans.premium ?? []) {
-    const rp = plans.items.find((p) => p.id === rule.plan);
-    const rl = rp ? (rp.level ?? (rp.kind === 'free' ? 0 : 1)) : Infinity;
-    if (rp && rl <= level) names.add(`${rp.name} labs`);
-  }
-  return [...names];
-}
-
-/** Pay for compute: the rate per environment tier and the free trial. */
-function ComputeSection({ site }: { site: SiteConfig }) {
-  const plans = site.plans!;
-  const rates = siteComputeRates(site);
-  if (rates.length === 0) return null;
-  const trial = plans.free;
-  const EXAMPLE: Record<string, string> = { pod: 'Shell, files, Git, scripting, Kubernetes API work', vm: 'systemd, storage, SELinux, boot and recovery', heavy: 'kubeadm clusters, multi-node estates, network topologies' };
-  return (
-    <section className="page-section" aria-labelledby="compute">
-      <div className="section-header">
-        <div>
-          <h2 id="compute" className="row" style={{ gap: 8 }}>
-            <Cpu size={18} aria-hidden /> Pay for the compute you use
-          </h2>
-          <p className="muted small">Every lab session is metered from start to stop, per started minute, and billed monthly on top of any plan. A monthly spend cap stops new paid labs when you reach it; a running lab is never cut off.</p>
-        </div>
-        {plans.compute?.placeholder && <Badge tone="warn">Placeholder rates</Badge>}
-      </div>
-      <div className="split split-8-4" style={{ alignItems: 'start' }}>
-        <Card className="card-flush site-compare-wrap">
-          <table className="table site-compare">
-            <thead>
-              <tr>
-                <th scope="col">Environment</th>
-                <th scope="col">Typical labs</th>
-                <th scope="col">Per hour</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rates.map((r) => (
-                <tr key={r.tier}>
-                  <th scope="row">{r.label}</th>
-                  <td className="small muted">{EXAMPLE[r.tier]}</td>
-                  <td className="tnum">{formatMinor(r.pricePerHour, plans.currency)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Card>
-        {trial && trial.trialLabs.length > 0 && (
-          <Card className="stack" style={{ gap: 8 }}>
-            <h3 className="row" style={{ gap: 8 }}>
-              <Gift size={15} aria-hidden /> Try it free
-            </h3>
-            <p className="small muted">
-              A free account runs {trial.trialLabs.length === 1 ? 'one guided lab' : `${trial.trialLabs.length} guided labs`} at no charge, no card needed (up to {trial.maxSessions ?? 3} sessions or {trial.maxMinutes ?? 60} minutes). Add a payment method to run any standard lab.
-            </p>
-          </Card>
-        )}
-      </div>
-    </section>
   );
 }

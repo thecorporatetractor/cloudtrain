@@ -34,15 +34,20 @@ let failed = false;
 
 const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, learner_impersonated: { userId: 'u-lena', orgId: 'org-quillmoor', impersonated: true }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' }, platform_admin: { userId: 'u-elin', orgId: 'org-acme' } };
 
-async function session(theme, persona, width = 1440, height = 900) {
-  const ctx = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 1, ...(storage ? { storageState: storage } : {}) });
+/** The website's launch mode for a view (src/site/launch.ts): `coming-soon*` views show the pre-launch page, the rest the live site. */
+const launchOf = (name) => (name.startsWith('coming-soon') ? 'coming-soon' : 'live');
+
+async function session(theme, persona, width = 1440, height = 900, launch = 'live') {
+  // Reduced motion: the website's hero sequence is captured in its finished state.
+  const ctx = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 1, reducedMotion: 'reduce', ...(storage ? { storageState: storage } : {}) });
   await ctx.addInitScript(
-    ({ t, s }) => {
+    ({ t, s, l }) => {
       localStorage.setItem('ct.theme', t);
       if (s !== null) localStorage.setItem('ct.mock.session', s);
       localStorage.setItem('ct.nav.collapsed', '0');
+      localStorage.setItem('ct.site.launch', l);
     },
-    { t: theme, s: storage ? null : persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
+    { t: theme, s: storage ? null : persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]), l: launch },
   );
   const page = await ctx.newPage();
   page.on('pageerror', (e) => {
@@ -89,6 +94,17 @@ async function ctfSteps(page, hint = true) {
   }
 }
 
+/** A section of the website at the top of the viewport (optionally the heading with `text` in it). */
+const toSection = (id, text) => async (p) => {
+  await p.evaluate(
+    ([i, t]) => {
+      const el = t ? [...document.querySelectorAll(`#${i} h3`)].find((h) => h.textContent?.includes(t)) : document.getElementById(i);
+      el?.scrollIntoView({ block: 'start' });
+    },
+    [id, text],
+  );
+  await p.waitForTimeout(300);
+};
 /** The landing page's waitlist section at the top of the viewport. */
 const toWaitlist = async (p) => {
   await p.evaluate(() => document.getElementById('waitlist')?.scrollIntoView({ block: 'start' }));
@@ -114,8 +130,17 @@ const submitWaitlist = (email, done) => async (p) => {
 const PHONE = { width: 390, height: 844 };
 const TABLET = { width: 768, height: 1024 };
 const VIEWS = [
-  // The public website (signed out), then the same header once signed in.
+  // The public website before launch (content/site.yaml launch.mode: coming-soon).
+  ['coming-soon', 'none', '/', 'Three ways to run CloudTrain'],
+  ['coming-soon-pricing', 'none', '/', 'Three ways to run CloudTrain', toSection('pricing')],
+  ['coming-soon-plans', 'none', '/', 'Three ways to run CloudTrain', toSection('pricing', 'Hosted plans compared')],
+  ['coming-soon-phone', 'none', '/', 'Three ways to run CloudTrain', undefined, PHONE],
+  ['coming-soon-pricing-phone', 'none', '/', 'Three ways to run CloudTrain', toSection('pricing'), PHONE],
+  // The public website (signed out, launch mode live), then the same header once signed in.
   ['landing', 'none', '/', 'How a lab works'],
+  ['landing-features', 'none', '/', 'How a lab works', toSection('why')],
+  ['landing-catalog', 'none', '/', 'How a lab works', toSection('domains')],
+  ['landing-pricing', 'none', '/', 'How a lab works', toSection('pricing')],
   ['landing-phone', 'none', '/', 'How a lab works', undefined, PHONE],
   ['landing-tablet', 'none', '/', 'How a lab works', undefined, TABLET],
   ['waitlist', 'none', '/', 'Join the early-access waitlist', toWaitlist],
@@ -213,7 +238,7 @@ try {
     if (only?.length && !only.includes(name)) continue;
     // Real mode: no clicks that change state, no labs started, no sign-in pages (already signed in).
     if (storage && !only?.length && (extra || persona === 'none' || /\/work$|\/observe\//.test(url))) continue;
-    const { ctx, page } = await session('dark', persona, viewport?.width, viewport?.height);
+    const { ctx, page } = await session('dark', persona, viewport?.width, viewport?.height, launchOf(name));
     try {
       await open(page, url, waitFor);
       if (extra) await extra(page);
@@ -228,11 +253,13 @@ try {
   }
   if (!storage) {
     for (const theme of ['light', 'cream']) {
-      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'waitlist'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'coming-soon'), VIEWS.find((v) => v[0] === 'coming-soon-pricing'), VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'waitlist'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
         if (only?.length && !only.includes(name)) continue;
-        const { ctx, page } = await session(theme, persona);
+        const { ctx, page } = await session(theme, persona, 1440, 900, launchOf(name));
         try {
           await open(page, url, waitFor);
+          const extra = VIEWS.find((v) => v[0] === name)?.[4];
+          if (extra && name.startsWith('coming-soon')) await extra(page);
           await shot(page, `${name}-${theme}`);
         } catch (e) {
           console.log('FAILED', `${name}-${theme}`, e.message.split('\n')[0]);

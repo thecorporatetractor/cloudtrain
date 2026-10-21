@@ -1,23 +1,29 @@
 import { Link } from '@tanstack/react-router';
-import { ArrowRight, LayoutDashboard } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { ArrowRight, Clock, LayoutDashboard } from 'lucide-react';
+import { useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { useMe } from '@/api/client';
 import { isInternalHref, usePublicCatalog, useSite } from '@/api/public';
-import type { PublicCatalog, SiteConfig, SiteCta } from '@/api/types';
+import type { PublicCatalog, SiteConfig, SiteCta, SiteFeatureBlock, SiteFeatureIcon } from '@/api/types';
 import { DomainIcon } from '@/components/domain';
 import { PageSkeleton } from '@/components/ui';
+import { formatMinutes } from '@/lib/pricingModel';
+import { cn } from '@/lib/utils';
+import { LabPreview } from '@/site/LabPreview';
 import { MockSignIn } from '@/site/MockSignIn';
+import { ComputeTiers, PricingPaths, PricingSteps } from '@/site/PricingModel';
+import { SocialProof } from '@/site/SocialProof';
 import { FeatureIcon, SiteAnchor, SiteShot, useDocumentTitle } from '@/site/util';
 import { WaitlistSection } from '@/site/Waitlist';
 
 /**
- * The landing page for visitors (`/` while signed out). Sections, in order: the
- * hero with a real product preview, the six domains with live counts from the
- * public catalog, how a lab works, the three differentiators (plus the secondary
- * capabilities), the product showcase, who the platform is for, the featured
- * questions and the closing call to action (the early-access waitlist, when
- * enabled, sits between who it is for and the questions). Every word comes from the site
- * configuration (content/site.yaml); every figure from the catalog API.
+ * The landing page for visitors (`/` while signed out, launch mode `live`).
+ * Sections, in order: the hero with a live-looking lab, what makes the platform
+ * different (a bento of the differentiators and capabilities), how a lab works,
+ * catalog highlights with live figures, a product tour of real screens, how
+ * pricing works, who it is for, social proof, the waitlist, the featured
+ * questions and the closing call to action. Every word comes from the site
+ * configuration (content/site.yaml); every figure from the catalog API and the
+ * plans.
  */
 export function Landing() {
   const site = useSite();
@@ -44,11 +50,13 @@ export function Landing() {
   return (
     <>
       <Hero site={s} cat={cat} />
-      {s.flags.showCatalog && cat && <Domains site={s} cat={cat} />}
+      {(s.differentiators?.length || s.features.length) > 0 && <Bento site={s} />}
       <HowItWorks site={s} />
-      {(s.differentiators?.length || s.features.length) > 0 && <Differentiators site={s} />}
-      {s.showcase && s.showcase.length > 0 && <Showcase site={s} />}
+      {s.flags.showCatalog && cat && <CatalogHighlights site={s} cat={cat} />}
+      {s.showcase && s.showcase.length > 0 && <Tour site={s} />}
+      {s.pricing?.model && <PricingTeaser site={s} />}
       {s.audiences && s.audiences.length > 0 && <Audiences site={s} />}
+      <SocialProof site={s} />
       <WaitlistSection site={s} />
       {featured.length > 0 && <Trust items={featured} />}
       <ClosingCta site={s} />
@@ -82,11 +90,16 @@ export function Cta({ cta, variant = 'primary', size = 'lg' }: { cta: SiteCta; v
   );
 }
 
-function SectionHead({ id, eyebrow, title, lead, action }: { id: string; eyebrow?: string; title: string; lead?: ReactNode; action?: ReactNode }) {
+function SectionHead({ id, eyebrow, title, lead, action, n }: { id: string; eyebrow?: string; title: string; lead?: ReactNode; action?: ReactNode; n?: number }) {
   return (
     <div className="site-section-head">
       <div className="site-section-head-copy">
-        {eyebrow && <p className="site-eyebrow">{eyebrow}</p>}
+        {eyebrow && (
+          <p className="site-eyebrow">
+            {n !== undefined && <span className="site-eyebrow-n tnum">{String(n).padStart(2, '0')}</span>}
+            {eyebrow}
+          </p>
+        )}
         <h2 id={id} className="site-h2">
           {title}
         </h2>
@@ -112,10 +125,11 @@ function Hero({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
   const proof = h.proof ?? [];
   return (
     <section className="site-hero" aria-labelledby="hero-title">
+      <div className="site-hero-bg" aria-hidden />
       <div className="site-container site-hero-inner">
         <div className="site-hero-copy">
-          {h.eyebrow && <p className="site-eyebrow">{h.eyebrow}</p>}
-          <h1 id="hero-title" className="site-h1">
+          {h.eyebrow && <p className="site-eyebrow site-eyebrow-chip">{h.eyebrow}</p>}
+          <h1 id="hero-title" className="site-h1 site-display">
             {h.title}
           </h1>
           <p className="site-lead">{h.subtitle}</p>
@@ -139,59 +153,120 @@ function Hero({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
           )}
           <MockSignIn />
         </div>
-        {h.preview && (
-          <div className="site-hero-preview">
-            <SiteShot figure={h.preview} priority sizes="(max-width: 1023px) 100vw, 640px" />
-          </div>
-        )}
+        <div className="site-hero-visual">
+          <LabPreview />
+        </div>
       </div>
     </section>
   );
 }
 
-/* -------------------------------------------------------------- domains */
+/* ---------------------------------------------------------------- bento */
 
-function Domains({ site, cat }: { site: SiteConfig; cat: PublicCatalog }) {
-  const domains = site.highlightDomains.map((id) => cat.domains.find((d) => d.id === id)).filter((d): d is NonNullable<typeof d> => !!d && d.labCount > 0);
-  if (domains.length === 0) return null;
-  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+/** A small drawing for a capability, picked by its icon; decorative. */
+function Vignette({ icon }: { icon: SiteFeatureIcon }) {
+  if (icon === 'graduation' || icon === 'timer')
+    return (
+      <div className="vg vg-exam" aria-hidden>
+        <svg viewBox="0 0 44 44" className="vg-ring">
+          <circle cx="22" cy="22" r="18" />
+          <circle cx="22" cy="22" r="18" className="vg-ring-on" pathLength="100" strokeDasharray="68 100" />
+        </svg>
+        <div className="vg-bars">
+          {[82, 64, 91, 47].map((w, i) => (
+            <span key={i}>
+              <i style={{ width: `${w}%` }} />
+            </span>
+          ))}
+        </div>
+        <span className="vg-time tnum">1:47:12</span>
+      </div>
+    );
+  if (icon === 'flag')
+    return (
+      <ol className="vg vg-board" aria-hidden>
+        {[
+          ['blue-team', 1450],
+          ['night-shift', 1210],
+          ['you', 980],
+        ].map(([n, p], i) => (
+          <li key={n} className={i === 2 ? 'is-you' : undefined}>
+            <span className="tnum">{i + 1}</span>
+            {n}
+            <span className="tnum">{p}</span>
+          </li>
+        ))}
+      </ol>
+    );
+  if (icon === 'sparkles' || icon === 'chart')
+    return (
+      <div className="vg vg-heat" aria-hidden>
+        {[3, 4, 2, 1, 4, 3, 2, 4, 1, 3, 4, 2, 2, 3, 4, 1, 3, 2, 4, 3, 1, 2, 3, 4].map((v, i) => (
+          <i key={i} style={{ opacity: 0.15 + v * 0.2 }} />
+        ))}
+      </div>
+    );
+  if (icon === 'users' || icon === 'building' || icon === 'lock')
+    return (
+      <div className="vg vg-sso" aria-hidden>
+        <span className="vg-chip">Entra ID</span>
+        <span className="vg-chip">Okta</span>
+        <span className="vg-chip">Keycloak</span>
+        <span className="vg-arrow">OIDC →</span>
+        <span className="vg-chip vg-chip-on">learner</span>
+        <span className="vg-chip vg-chip-on">manager</span>
+        <span className="vg-chip vg-chip-on">admin</span>
+      </div>
+    );
+  return null;
+}
+
+function Bento({ site }: { site: SiteConfig }) {
+  const diffs = site.differentiators ?? [];
+  const feats: SiteFeatureBlock[] = site.features;
+  // Six columns: the first differentiator spans four, every other card two. The last row is
+  // filled by widening its cards (two of two become two of three, one becomes the whole row).
+  const units = (diffs.length > 0 ? 4 + (diffs.length - 1) * 2 : 0) + feats.length * 2;
+  const rest = units % 6;
+  const widen = (i: number) => (rest === 4 && i >= feats.length - 2 ? 'bento-span-3' : rest === 2 && i === feats.length - 1 ? 'bento-span-6' : undefined);
   return (
-    <section className="site-section" id="domains" aria-labelledby="domains-title">
+    <section className="site-section" id="why" aria-labelledby="why-title">
       <div className="site-container">
         <SectionHead
-          id="domains-title"
-          eyebrow="Catalog"
-          title={`Explore the ${domains.length === 6 ? 'six ' : ''}domains`}
-          lead="Every domain runs on the substrate it needs: pods, virtual machines, kubeadm or virtual clusters, or network devices on real wires."
-          action={
-            <Link to="/catalog" search={{}} className="btn btn-secondary btn-lg site-section-action">
-              Browse the catalog <ArrowRight size={14} aria-hidden />
-            </Link>
-          }
+          id="why-title"
+          n={1}
+          eyebrow="Why it works"
+          title="Real systems. Real grading. Real progress."
+          lead="No simulated shells and no multiple choice: every lab is a live environment, every grade is read from the system you leave behind."
         />
-        <ul className="site-domain-grid" aria-label="Domains">
-          {domains.map((d) => (
-            <li key={d.id}>
-              <Link to="/catalog" search={{ domain: d.id }} className="site-domain-card">
-                <span className="site-icon-tile" aria-hidden>
-                  <DomainIcon domain={d.id} size={20} />
-                </span>
-                <span className="site-domain-card-body">
-                  <span className="site-domain-card-title">
-                    <h3>{d.name}</h3>
-                    <ArrowRight size={16} className="site-domain-card-arrow" aria-hidden />
+        <div className="bento">
+          {diffs.map((d, i) => (
+            <article key={d.title} className={cn('bento-card bento-diff', i === 0 && 'bento-wide')}>
+              <div className="bento-copy">
+                {d.icon && (
+                  <span className="site-icon-tile site-icon-tile-sm" aria-hidden>
+                    <FeatureIcon icon={d.icon} size={16} />
                   </span>
-                  <span className="site-domain-card-text">{d.tagline}</span>
-                  <span className="site-meta">
-                    {plural(d.labCount, 'lab', 'labs')}
-                    {d.pathCount > 0 && ` · ${plural(d.pathCount, 'path', 'paths')}`}
-                    {d.examCount > 0 && ` · ${plural(d.examCount, 'exam simulation', 'exam simulations')}`}
-                  </span>
-                </span>
-              </Link>
-            </li>
+                )}
+                <h3>{d.title}</h3>
+                <p>{d.body}</p>
+              </div>
+              {d.figure && <SiteShot figure={d.figure} className="bento-shot" sizes={i === 0 ? '(max-width: 1023px) 100vw, 760px' : '(max-width: 1023px) 100vw, 380px'} />}
+            </article>
           ))}
-        </ul>
+          {feats.map((f, i) => (
+            <article key={f.title} className={cn('bento-card bento-feat', widen(i))}>
+              <Vignette icon={f.icon} />
+              <div className="bento-copy">
+                <span className="site-icon-tile site-icon-tile-sm" aria-hidden>
+                  <FeatureIcon icon={f.icon} size={16} />
+                </span>
+                <h3>{f.title}</h3>
+                <p>{f.body}</p>
+              </div>
+            </article>
+          ))}
+        </div>
       </div>
     </section>
   );
@@ -203,7 +278,7 @@ function HowItWorks({ site }: { site: SiteConfig }) {
   return (
     <section className="site-section site-section-alt" id="how-it-works" aria-labelledby="how-title">
       <div className="site-container">
-        <SectionHead id="how-title" eyebrow="The loop" title="How a lab works" lead="Choose a problem, operate a real system, prove the outcome. Provisioning, access and reset depend on the lab type; the grading never does." />
+        <SectionHead id="how-title" n={2} eyebrow="The loop" title="How a lab works" lead="Choose a problem, operate a real system, prove the outcome. Provisioning, access and reset depend on the lab type; the grading never does." />
         <ol className="site-steps">
           {site.howItWorks.map((step, i) => (
             <li key={step.title} className="site-step">
@@ -225,45 +300,89 @@ function HowItWorks({ site }: { site: SiteConfig }) {
   );
 }
 
-/* ------------------------------------------------------ differentiators */
+/* --------------------------------------------------- catalog highlights */
 
-function Differentiators({ site }: { site: SiteConfig }) {
-  const diffs = site.differentiators ?? [];
+const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en')} ${n === 1 ? one : many}`;
+
+function CatalogHighlights({ site, cat }: { site: SiteConfig; cat: PublicCatalog }) {
+  const domains = site.highlightDomains.map((id) => cat.domains.find((d) => d.id === id)).filter((d): d is NonNullable<typeof d> => !!d && d.labCount > 0);
+  if (domains.length === 0) return null;
+  const maxLabs = Math.max(...domains.map((d) => d.labCount));
+  const paths = cat.paths.filter((p) => p.kind === 'path').slice(0, 4);
+  const stats: [number, string][] = (
+    [
+      [cat.labs.length, 'hands-on labs'],
+      [cat.paths.length, 'paths and courses'],
+      [cat.exams.length, 'exam simulations'],
+      [domains.length, 'domains'],
+    ] as [number, string][]
+  ).filter(([n]) => n > 0);
   return (
-    <section className="site-section" id="why" aria-labelledby="why-title">
+    <section className="site-section" id="domains" aria-labelledby="domains-title">
       <div className="site-container">
-        <SectionHead id="why-title" eyebrow="Why it works" title="What makes CloudTrain different" />
-        {diffs.length > 0 && (
-          <div className="site-diff-grid">
-            {diffs.map((d) => (
-              <article key={d.title} className="site-diff">
-                {d.figure && <SiteShot figure={d.figure} className="site-diff-figure" sizes="(max-width: 767px) 100vw, (max-width: 1023px) 50vw, 380px" />}
-                <div className="site-diff-body">
-                  {d.icon && (
-                    <span className="site-icon-tile site-icon-tile-sm" aria-hidden>
-                      <FeatureIcon icon={d.icon} size={16} />
+        <SectionHead
+          id="domains-title"
+          n={3}
+          eyebrow="Catalog"
+          title="Everything you can practise"
+          lead="Every domain runs on the substrate it needs: pods, virtual machines, kubeadm or virtual clusters, or network devices on real wires."
+          action={
+            <Link to="/catalog" search={{}} className="btn btn-secondary btn-lg site-section-action">
+              Browse the catalog <ArrowRight size={14} aria-hidden />
+            </Link>
+          }
+        />
+        <dl className="site-stats" aria-label="The catalog in numbers">
+          {stats.map(([n, label]) => (
+            <div key={label} className="site-stat">
+              <dt>{label}</dt>
+              <dd className="tnum">{n.toLocaleString('en')}</dd>
+            </div>
+          ))}
+        </dl>
+        <ul className="site-domain-grid" aria-label="Domains">
+          {domains.map((d) => (
+            <li key={d.id}>
+              <Link to="/catalog" search={{ domain: d.id }} className="site-domain-card">
+                <span className="site-icon-tile" aria-hidden>
+                  <DomainIcon domain={d.id} size={20} />
+                </span>
+                <span className="site-domain-card-body">
+                  <span className="site-domain-card-title">
+                    <h3>{d.name}</h3>
+                    <ArrowRight size={16} className="site-domain-card-arrow" aria-hidden />
+                  </span>
+                  <span className="site-domain-card-text">{d.tagline}</span>
+                  <span className="site-domain-bar" aria-hidden>
+                    <i
+                      style={{
+                        width: `${Math.max(8, Math.round((d.labCount / maxLabs) * 100))}%`,
+                      }}
+                    />
+                  </span>
+                  <span className="site-meta">
+                    {plural(d.labCount, 'lab', 'labs')}
+                    {d.pathCount > 0 && ` · ${plural(d.pathCount, 'path', 'paths')}`}
+                    {d.examCount > 0 && ` · ${plural(d.examCount, 'exam simulation', 'exam simulations')}`}
+                  </span>
+                </span>
+              </Link>
+            </li>
+          ))}
+        </ul>
+        {paths.length > 0 && (
+          <div className="site-paths-strip">
+            <h3 className="site-paths-title">Learning paths</h3>
+            <ul>
+              {paths.map((p) => (
+                <li key={p.id}>
+                  <Link to="/catalog/paths/$pathId" params={{ pathId: p.id }} className="site-path-pill">
+                    <DomainIcon domain={p.domain} size={14} aria-hidden />
+                    <span className="site-path-pill-title">{p.title}</span>
+                    <span className="site-meta">
+                      {plural(p.labCount, 'lab', 'labs')} · <Clock size={11} aria-hidden /> {formatMinutes(p.estimatedMinutes)}
                     </span>
-                  )}
-                  <h3>{d.title}</h3>
-                  <p>{d.body}</p>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-        {site.features.length > 0 && (
-          <div className="site-also">
-            <h3 className="site-also-title">Also on the platform</h3>
-            <ul className="site-feature-list">
-              {site.features.map((f) => (
-                <li key={f.title} className="site-feature">
-                  <span className="site-feature-icon" aria-hidden>
-                    <FeatureIcon icon={f.icon} size={16} />
-                  </span>
-                  <span className="site-feature-text">
-                    <strong>{f.title}</strong>
-                    <span>{f.body}</span>
-                  </span>
+                  </Link>
                 </li>
               ))}
             </ul>
@@ -274,25 +393,83 @@ function Differentiators({ site }: { site: SiteConfig }) {
   );
 }
 
-/* ------------------------------------------------------------- showcase */
+/* ------------------------------------------------------------ the tour */
 
-function Showcase({ site }: { site: SiteConfig }) {
+function Tour({ site }: { site: SiteConfig }) {
+  const items = site.showcase!;
+  const [active, setActive] = useState(0);
+  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
+  const onKey = (e: KeyboardEvent) => {
+    const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+    if (!d) return;
+    e.preventDefault();
+    const next = (active + d + items.length) % items.length;
+    setActive(next);
+    tabs.current[next]?.focus();
+  };
+  const item = items[active]!;
   return (
     <section className="site-section site-section-alt" id="showcase" aria-labelledby="showcase-title">
       <div className="site-container">
-        <SectionHead id="showcase-title" eyebrow="A look inside" title="The platform as learners and managers see it" lead="Real screens from the product, in the theme you are reading this in." />
-        <div className="site-showcase">
-          {site.showcase!.map((item, i) => (
-            <article key={item.title} className="site-showcase-item" aria-labelledby={`showcase-${i}`}>
-              <div className="site-showcase-copy">
-                <h3 id={`showcase-${i}`}>{item.title}</h3>
-                <p>{item.body}</p>
-                {item.why && <p className="site-showcase-why">{item.why}</p>}
-              </div>
-              <SiteShot figure={item.figure} className="site-showcase-figure" sizes="(max-width: 1023px) 100vw, 760px" />
-            </article>
-          ))}
+        <SectionHead id="showcase-title" n={4} eyebrow="A look inside" title="The platform as learners and managers see it" lead="Real screens from the product, in the theme you are reading this in." />
+        <div className="tour">
+          <div className="tour-tabs" role="tablist" aria-label="Product tour" onKeyDown={onKey}>
+            {items.map((it, i) => (
+              <button
+                key={it.title}
+                ref={(el) => {
+                  tabs.current[i] = el;
+                }}
+                type="button"
+                role="tab"
+                id={`tour-tab-${i}`}
+                aria-selected={i === active}
+                aria-controls="tour-panel"
+                tabIndex={i === active ? 0 : -1}
+                className={cn('tour-tab', i === active && 'is-active')}
+                onClick={() => setActive(i)}
+              >
+                <span className="tour-tab-n tnum">{String(i + 1).padStart(2, '0')}</span>
+                <span className="tour-tab-copy">
+                  <strong>{it.title}</strong>
+                  <span>{it.body}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="tour-panel" role="tabpanel" id="tour-panel" aria-labelledby={`tour-tab-${active}`}>
+            <SiteShot key={item.figure.image} figure={item.figure} className="tour-shot" sizes="(max-width: 1023px) 100vw, 760px" />
+            {item.why && <p className="tour-why">{item.why}</p>}
+          </div>
         </div>
+      </div>
+    </section>
+  );
+}
+
+/* --------------------------------------------------------- pricing teaser */
+
+function PricingTeaser({ site }: { site: SiteConfig }) {
+  const m = site.pricing!.model!;
+  return (
+    <section className="site-section pm" id="pricing" aria-labelledby="pricing-title">
+      <div className="site-container">
+        <SectionHead
+          id="pricing-title"
+          n={5}
+          eyebrow={m.eyebrow ?? 'Pricing'}
+          title={m.title}
+          lead={m.intro}
+          action={
+            site.flags.showPricing ? (
+              <Link to="/pricing" className="btn btn-secondary btn-lg site-section-action">
+                Plans and estimator <ArrowRight size={14} aria-hidden />
+              </Link>
+            ) : undefined
+          }
+        />
+        {m.paths && m.paths.length > 0 ? <PricingPaths site={site} /> : <PricingSteps model={m} />}
+        <ComputeTiers site={site} />
       </div>
     </section>
   );
@@ -302,9 +479,9 @@ function Showcase({ site }: { site: SiteConfig }) {
 
 function Audiences({ site }: { site: SiteConfig }) {
   return (
-    <section className="site-section" id="who" aria-labelledby="who-title">
+    <section className="site-section site-section-alt" id="who" aria-labelledby="who-title">
       <div className="site-container">
-        <SectionHead id="who-title" eyebrow="Who it is for" title="One platform, three ways in" />
+        <SectionHead id="who-title" n={6} eyebrow="Who it is for" title="One platform, three ways in" />
         <div className="site-audience-grid">
           {site.audiences!.map((a, i) => (
             <article key={a.title} className="site-audience" id={i === site.audiences!.length - 1 ? 'teams' : undefined}>
@@ -337,7 +514,7 @@ function Audiences({ site }: { site: SiteConfig }) {
 
 function Trust({ items }: { items: SiteConfig['faq'] }) {
   return (
-    <section className="site-section site-section-alt" id="questions" aria-labelledby="trust-title">
+    <section className="site-section" id="questions" aria-labelledby="trust-title">
       <div className="site-container">
         <SectionHead
           id="trust-title"
@@ -372,6 +549,7 @@ function ClosingCta({ site }: { site: SiteConfig }) {
     <section className="site-section" aria-labelledby="cta-title">
       <div className="site-container">
         <div className="site-closing">
+          <div className="site-closing-glow" aria-hidden />
           <div className="site-closing-copy">
             <h2 id="cta-title" className="site-h2">
               {c?.title ?? site.brand.tagline}

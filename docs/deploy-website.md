@@ -26,6 +26,8 @@ pnpm --filter web build:site -- --api-base https://api.cloudtrain.example
 | `--api-base <origin>` (`CT_API_BASE`) | The gateway the waitlist form posts to, e.g. `https://api.cloudtrain.example`. Empty: the site's own origin, for a host that proxies `/api` to the gateway |
 | `--app-url <origin>` (`CT_APP_URL`) | Where the platform lives. Set: "Sign in" and `/sign-in` hand over to `<origin>/sign-in`. Empty: no sign-in button, and `/sign-in` explains that the platform is not open to the public |
 | `--pricing` | Keep the pricing page. Off by default: its plan buttons lead into the platform, which a static host does not have |
+| `--launch <mode>` (`CT_LAUNCH_MODE`) | `coming-soon` or `live`; overrides `launch.mode` in the site configuration (which ships as `coming-soon`) |
+| `--site-url <origin>` (`CT_SITE_URL`) | The site's own origin, e.g. `https://cloudtrain.example`. Makes the Open Graph and Twitter image and URL absolute (scrapers need that), adds the canonical link, writes `sitemap.xml` and names it in `robots.txt`. Empty: none of these |
 
 What the build does:
 
@@ -41,14 +43,112 @@ What the build does:
 3. Adds `runtime-config.js` (the API origin; edit it on the host to repoint the form
    without a rebuild) and the host files: `404.html` (the app, for GitHub Pages),
    `_redirects` and `_headers` (Cloudflare Pages, Netlify), `staticwebapp.config.json`
-   (Azure Static Web Apps), `.nojekyll` and `robots.txt`. The CSP allows scripts from the
-   site only and `connect-src` to the API origin only.
+   (Azure Static Web Apps), `.nojekyll`, `robots.txt` and, with `--site-url`, `sitemap.xml`.
+   The CSP allows scripts from the site only and `connect-src` to the API origin only.
+4. Rewrites the head of `index.html` (and `404.html`) for the launch mode: title, description,
+   Open Graph and Twitter card with `/site/og-image.png`
+   (`node apps/web/scripts/og-image.mjs` renders it), the canonical link, and a preload of
+   `data/site.json`. The favicon, apple-touch icon and `manifest.webmanifest` are in the
+   bundle already.
 
 Preview it locally with `pnpm --filter web exec vite preview --outDir dist-site`.
 Content changes (copy, screenshots, catalog) need a rebuild: the data is a snapshot.
 
 The bundle uses root-relative URLs, so it must be served from the root of a host name
 (`https://www.example.com/`), not from a sub-path such as `https://org.github.io/repo/`.
+
+## Coming soon, step by step
+
+The configuration ships with `launch.mode: coming-soon`: one page that says what CloudTrain
+is, explains the pricing model, collects the waitlist and answers questions, with the legal
+pages beside it and no sign-in, checkout or link into the platform. These steps take it to a
+static host. Nothing here creates an account, buys a domain or deploys anything by itself;
+each step that does is yours to run.
+
+**Before you build**
+
+1. Fill in the placeholders in `content/site.yaml` (see "Placeholders to fill in" below) and run
+   `node tools/lab-verify/bin/lab-verify.mjs --strict`.
+2. Decide the two host names: the website (the apex, e.g. `cloudtrain.example`, with `www`
+   redirecting to it, or the other way round) and the gateway that stores waitlist entries
+   (e.g. `api.cloudtrain.example`).
+
+**Build**
+
+```sh
+pnpm install --frozen-lockfile
+CT_API_BASE=https://api.cloudtrain.example \
+CT_SITE_URL=https://cloudtrain.example \
+CT_APP_URL= \
+pnpm --filter web build:site
+# output: apps/web/dist-site/ (deployable as is)
+```
+
+| Variable | Coming soon | Why |
+|---|---|---|
+| `CT_API_BASE` | The gateway's public origin | The waitlist form posts there (`POST /api/public/waitlist`); `runtime-config.js` in the output holds it, so it can be changed on the host without a rebuild |
+| `CT_SITE_URL` | The website's origin | Absolute social-card URLs, canonical link, `sitemap.xml` |
+| `CT_APP_URL` | Empty | There is no platform to sign in to yet; coming soon hides sign-in either way |
+| `CT_LAUNCH_MODE` | Unset (or `coming-soon`) | Only to override the configuration |
+
+Check it locally: `pnpm --filter web exec vite preview --outDir dist-site --port 6990`, then
+open `http://localhost:6990/` (the coming-soon page), `/legal/privacy` (the privacy notice the
+waitlist consent links to), `/robots.txt` and `/sitemap.xml`. Any other path, `/pricing` for
+example, shows the same coming-soon page.
+
+**Gateway for the waitlist**
+
+On the gateway behind `CT_API_BASE`: `CT_CORS_ORIGINS=https://cloudtrain.example,https://www.cloudtrain.example`,
+`CT_TRUST_PROXY` as the proxy in front of it requires, and Postgres with migration
+`0008_waitlist`. Details below in "The waitlist backend". Without a gateway, set
+`waitlist.enabled: false` and rebuild; the page then has no form (`lab-verify` warns).
+
+**Upload, by host** (pick one; host files are already in the output)
+
+- *Cloudflare Pages*: create a project, either direct upload
+  (`npx wrangler pages deploy apps/web/dist-site --project-name cloudtrain-site`) or connected
+  to the repository with build command
+  `pnpm install --frozen-lockfile && pnpm --filter web build:site`, output directory
+  `apps/web/dist-site`, and `CT_API_BASE`, `CT_SITE_URL` as build environment variables.
+  `_headers` (CSP, caching) and `_redirects` (every path to the page, status 200) apply as they are.
+- *Azure Static Web Apps*: create a Free-plan app and deploy the prebuilt folder, e.g. with the
+  `Azure/static-web-apps-deploy` action (`app_location: apps/web/dist-site`,
+  `skip_app_build: true`) or `npx @azure/static-web-apps-cli deploy apps/web/dist-site`.
+  `staticwebapp.config.json` carries the fallback, the CSP and the caching.
+- *GitHub Pages*: a workflow that runs the build and publishes `apps/web/dist-site` with
+  `actions/upload-pages-artifact` and `actions/deploy-pages`, plus a `CNAME` file with the
+  host name in the output. No custom headers (the CSP is not applied) and unknown paths
+  answer 404 with the page (`404.html`); fine for a single coming-soon page, weakest of the three.
+
+**DNS checklist (apex and www)**
+
+| Record | Cloudflare Pages | Azure Static Web Apps | GitHub Pages |
+|---|---|---|---|
+| Apex `cloudtrain.example` | Add the custom domain in the project; with the zone on Cloudflare a flattened `CNAME` to `<project>.pages.dev` is created for you | `ALIAS`/`ANAME` (or flattened `CNAME`) to the app's default host name, validated with the `TXT` record the portal shows | `A` records `185.199.108.153`, `185.199.109.153`, `185.199.110.153`, `185.199.111.153` (and `AAAA` `2606:50c0:8000::153` to `8003::153`) |
+| `www` | `CNAME www` to `<project>.pages.dev`, added as a second custom domain | `CNAME www` to the default host name | `CNAME www` to `<org>.github.io` |
+| Canonical host | Redirect one to the other with a Bulk Redirect or redirect rule | Add both domains and set the default one | The `CNAME` file names the canonical one; GitHub redirects the other |
+| API | `CNAME api` (or `A`) to the gateway's ingress | same | same |
+| TLS | Automatic | Automatic | Automatic, then tick "Enforce HTTPS" |
+| Mail | Keep or add `MX`, SPF, DKIM, DMARC for the contact address; a coming-soon page with an email address and no mail set up loses replies | same | same |
+
+Then: wait for the certificates, open the site on both host names, submit the waitlist once
+(the entry shows in `GET /api/platform/waitlist.csv`), share the URL in a link-preview tool to
+check the social card, and submit `https://cloudtrain.example/sitemap.xml` in Google Search
+Console if you want it indexed early.
+
+**Placeholders to fill in before going public**
+
+| What | Where |
+|---|---|
+| Launch status line and copy | `launch.status`, `launch.title`, `launch.subtitle`, `launch.points` |
+| Prices and compute rates | `plans` (`placeholder: true` and the "Pricing to be announced" labels stay until final) |
+| Contact addresses | `contact.email`, `contact.salesEmail` (`cloudtrain.example` today) |
+| Customer logos and quotes | `socialProof` (placeholders; landing page only, not on the coming-soon page) |
+| Legal texts | `legal.terms`, `legal.privacy` (drafts, `placeholder: true`) |
+| Domain | `--site-url`, the DNS records above, `CT_CORS_ORIGINS` on the gateway |
+
+**Going live later**: set `launch.mode: live` (or build with `--launch live`) and, once the
+platform has a public address, `CT_APP_URL` for sign-in and `--pricing` for the pricing page.
 
 ## The waitlist backend
 
@@ -117,6 +217,7 @@ separate host.
 4. Whether "Sign in" on the marketing site leads to the platform (`--app-url`) or the
    platform stays closed for now.
 5. Whether the pricing page is shown (`--pricing`); its prices are placeholders.
+6. When to switch from coming soon to live (`launch.mode`).
 
 Once these are answered, the remaining work is a workflow file for the chosen host and
 the DNS records.

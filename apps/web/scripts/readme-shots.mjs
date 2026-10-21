@@ -33,14 +33,16 @@ let failed = false;
 // Mock-mode accounts (see src/mocks/fixtures/platform.ts): one per role.
 const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' } };
 
-async function session(theme, persona = 'manager') {
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, ...(storage ? { storageState: storage } : {}) });
+async function session(theme, persona = 'manager', launch = 'live') {
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, reducedMotion: 'reduce', ...(storage ? { storageState: storage } : {}) });
   await ctx.addInitScript(
-    ({ t, s }) => {
+    ({ t, s, l }) => {
       localStorage.setItem('ct.theme', t);
       if (s !== null) localStorage.setItem('ct.mock.session', s);
+      // The website's launch mode (src/site/launch.ts); the README shows the live site and the coming-soon page.
+      localStorage.setItem('ct.site.launch', l);
     },
-    { t: theme, s: storage ? null : persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
+    { t: theme, s: storage ? null : persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]), l: launch },
   );
   const page = await ctx.newPage();
   page.on('pageerror', (e) => {
@@ -183,9 +185,10 @@ try {
     ['none', '/catalog/paths/cks-readiness', 'Network policy and least privilege', 'catalog-path-public'],
     ['none', '/pricing', 'Compare plans', 'pricing'],
     ['learner', '/account/billing', 'Plans for you', 'billing'],
+    ['none', '/', 'Three ways to run CloudTrain', 'coming-soon'],
   ];
   for (const [persona, url, waitFor, name] of views) {
-    const s = await session('dark', persona);
+    const s = await session('dark', persona, name === 'coming-soon' ? 'coming-soon' : 'live');
     await open(s.page, url, waitFor);
     await shot(s.page, name);
     await s.ctx.close();

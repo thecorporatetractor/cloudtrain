@@ -323,12 +323,63 @@ export interface SiteConfig {
     contactCta?: SiteCta;
     /** FAQ group listed under the plans. */
     faqGroup?: string;
+    /** How pricing works; the rates come from `plans.compute`. */
+    model?: SitePricingModel;
   };
   plans?: SitePlans;
   /** The closing call to action; the buttons default to the hero's. */
   closing?: { title: string; body?: string; primaryCta?: SiteCta; secondaryCta?: SiteCta };
   /** The early-access waitlist section on the landing page. */
   waitlist?: SiteWaitlist;
+  /** Pre-launch (`coming-soon`) or the full website (`live`, the default). */
+  launch?: SiteLaunch;
+  /** Customer logos and quotes; labelled as placeholders while `placeholder` is set. */
+  socialProof?: SiteSocialProof;
+}
+
+export type SiteLaunchMode = 'coming-soon' | 'live';
+
+export interface SitePoint {
+  icon?: SiteFeatureIcon;
+  title: string;
+  body: string;
+}
+
+export interface SiteLaunch {
+  mode: SiteLaunchMode;
+  eyebrow?: string;
+  title?: string;
+  subtitle?: string;
+  status?: string;
+  ctaLabel?: string;
+  points?: SitePoint[];
+  /** FAQ groups on the coming-soon page; absent: the featured questions and the pricing group. */
+  faqGroups?: string[];
+}
+
+/** Compute tiers a lab is billed at, from its topology. */
+export type ComputeTierId = 'pod' | 'vm' | 'heavy';
+
+export interface SitePricingModel {
+  eyebrow?: string;
+  title: string;
+  intro?: string;
+  /** The ways to run CloudTrain (self-host, hosted, enterprise); `hosted` shows the compute rates. */
+  paths?: { id: string; icon?: SiteFeatureIcon; eyebrow?: string; title: string; price?: string; body: string; points?: string[]; cta?: SiteCta }[];
+  steps: SitePoint[];
+  tiers?: Partial<Record<ComputeTierId, { name: string; body: string; examples?: string[] }>>;
+  examples?: { title: string; body?: string; tier: ComputeTierId; minutes: number; sessions?: number }[];
+  estimator?: { title?: string; note?: string; defaultTier?: ComputeTierId; defaultMinutes?: number; defaultSessions?: number };
+  pendingNote?: string;
+}
+
+export interface SiteSocialProof {
+  placeholder?: boolean;
+  eyebrow?: string;
+  title?: string;
+  note?: string;
+  logos?: { name: string; image?: string; imageDark?: string }[];
+  quotes?: { quote: string; name: string; role?: string }[];
 }
 
 /* ================================================================ public catalog */

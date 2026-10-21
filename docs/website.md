@@ -97,7 +97,13 @@ mock-mode captures (dark and light, WebP) that `apps/web/scripts/site-shots.mjs`
 | `flags.showContactForm` | | Contact form (needs a backend; off shows the details only) |
 | `flags.checkoutEnabled` | | Self-service checkout for paid plans (needs the gateway's billing integration); off turns `checkout` calls to action into contact |
 | `pricing.headline`, `pricing.intro`, `pricing.placeholderNote`, `pricing.contactCta`, `pricing.faqGroup` | | Pricing page copy; `placeholderNote` is shown while any price is a placeholder; `faqGroup` names the FAQ group listed under the plans |
+| `pricing.model` | | How pricing works, on the pricing page, the coming-soon page and (steps and tiers) the landing page: `eyebrow`, `title`, `intro`, `steps[]` (`{ icon?, title, body }`), `tiers.{pod,vm,heavy}` (`{ name, body, examples[] }`, copy only), `paths[]` (`{ id, icon?, eyebrow?, title, price?, body, points[], cta? }`: the ways to run CloudTrain, self-host free, hosted pay-for-compute and enterprise features; the `hosted` path shows the lowest compute rate), `examples[]` (`{ title, body?, tier, minutes, sessions? }`, priced from the rates), `estimator` (`title`, `note`, `defaultTier`, `defaultMinutes`, `defaultSessions`) and `pendingNote` (shown where an amount would be while no rates are configured). Every amount comes from `plans`: the compute rates from `plans.compute`, read defensively by `apps/web/src/lib/pricingModel.ts`, so the page says "to be announced" rather than invent one. The plan comparison reads `plans.earlyAccess[]` (labs a tier opens early; public labs are never locked) and `plans.items[].features` (enterprise feature ids or `{ id, label }`) when they exist and leaves those rows out otherwise |
 | `plans` | | See below |
+| `launch.mode` | when `launch` is present | `coming-soon` or `live` (default without the block). See [Launch mode](#launch-mode) |
+| `launch.eyebrow`, `status`, `title`, `subtitle`, `ctaLabel` | | Coming-soon copy: the status pill, the headline and lead (default to the hero's) and the waitlist button |
+| `launch.points[]` | | 2 to 6 `{ icon?, title, body }` blocks: what CloudTrain is |
+| `launch.faqGroups[]` | | FAQ groups on the coming-soon page (default: the featured questions and `pricing.faqGroup`); `lab-verify` fails on a group no question has |
+| `socialProof` | | `{ placeholder, eyebrow, title, note, logos[]: { name, image?, imageDark? }, quotes[]: { quote, name, role? } }` on the landing page. While `placeholder` is not `false` every slot is labelled a placeholder (and logos show their names, not images); `lab-verify` fails when quotes containing "placeholder" are published as real |
 | `closing.title`, `closing.body`, `closing.primaryCta`, `closing.secondaryCta` | | The closing call to action on the landing page; the buttons default to the hero's |
 | `waitlist.enabled` | when `waitlist` is present | Shows the waitlist section on the landing page (`#waitlist`) and lets the gateway accept submissions; off removes both |
 | `waitlist.eyebrow`, `title`, `body`, `note`, `submitLabel`, `emailLabel` | | Section copy and button/field labels (defaults in `apps/web/src/site/Waitlist.tsx`) |
@@ -137,6 +143,31 @@ Internal links (`to` starting with `/`) must be website routes; `lab-verify --st
 (`hero.preview`, `differentiators[].figure`, `showcase[].figure`) and the alignment notice,
 and fails CI otherwise. Validate locally with
 `node tools/lab-verify/bin/lab-verify.mjs --strict`.
+
+## Launch mode
+
+`launch.mode: coming-soon` (the default file's setting until launch) turns the website into
+one standalone page (`apps/web/src/site/ComingSoon.tsx`) in its own chrome: the brand, links
+to its sections, the theme menu and "Join the waitlist" in the header; the hero with a live-looking
+lab, what CloudTrain is (`launch.points`, the catalog figures), how pricing works
+(`pricing.model`, the compute tiers, the estimator, worked examples and the plans compared), the
+waitlist, the questions, and a footer with the legal pages, the contact address and the source.
+Every website path except `/legal/*` shows that page; nothing on it leads into the platform (no
+sign-in, no checkout, no catalog). Signed-in users of a combined deployment still get the app at
+`/`, and `/sign-in` still works for those who know it.
+
+`launch.mode: live` is the full website. Overrides, for viewing and building one mode without
+editing the file (`apps/web/src/site/launch.ts`):
+
+| Where | How |
+|---|---|
+| Static build | `pnpm --filter web build:site -- --launch live` (or `CT_LAUNCH_MODE`) |
+| Dev server | `VITE_LAUNCH_MODE=live pnpm --filter web dev` |
+| Mock mode in the browser | `localStorage.setItem('ct.site.launch', 'live')` (or `'coming-soon'`), then reload; ignored in real API mode |
+
+The hero's lab (`apps/web/src/site/LabPreview.tsx`) is drawn in HTML and SVG from the theme
+tokens and plays its sequence once; with `prefers-reduced-motion: reduce` it shows the end state
+and nothing moves (the same holds for every animation on the website).
 
 ## Early-access waitlist
 
@@ -179,13 +210,16 @@ footer repeats `legal.alignmentNotice` on every page.
 
 ## Screenshots
 
-`apps/web/scripts/platform-shots.mjs` captures `landing` (+ `-phone`, `-tablet`, light and
-cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cream),
+`apps/web/scripts/platform-shots.mjs` captures `coming-soon` (+ `-pricing`, `-plans`, `-phone`,
+`-pricing-phone`; light and cream for the first two), `landing` (+ `-phone`, `-tablet`,
+`-features`, `-catalog`, `-pricing`, light and cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cream),
 `catalog-path-public`, `catalog-exam-public`, `pricing` (+ `-yearly`, `-phone`, light and
 cream), `waitlist` (+ `-filled`, `-errors`, `-success`, `-duplicate`, `-phone`, light and cream),
 `about`, `faq`, `contact`, `legal-terms`, `legal-privacy` and `site-signed-in`; `readme-shots.mjs`
-adds `docs/images/landing.png`, `catalog-public.png`, `catalog-path-public.png` and
-`pricing.png`. `apps/web/scripts/site-shots.mjs` captures the screenshots the website itself
+adds `docs/images/landing.png`, `coming-soon.png`, `catalog-public.png`,
+`catalog-path-public.png` and `pricing.png`. The scripts set the launch mode per view and
+capture with reduced motion. `apps/web/scripts/og-image.mjs` renders the social card
+(`apps/web/public/site/og-image.png`, 1200x630). `apps/web/scripts/site-shots.mjs` captures the screenshots the website itself
 shows (`apps/web/public/site/*.webp`: the workspace after a validation run, the topology and
 checks crops, skills, an exam report and the team dashboard, each in dark and light) and
 prints their sizes for `width`/`height`.

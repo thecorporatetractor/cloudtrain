@@ -105,3 +105,21 @@ test("an enabled waitlist needs a privacy notice that describes it, and required
   await checkSite(file, { domainsWithLabs: domains, repoRoot }, findings);
   assert.deepEqual(findings.filter((f) => f.level === "error"), []);
 });
+
+test("launch and social proof: FAQ groups must exist, placeholder quotes cannot be published as real", async () => {
+  const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
+  assert.equal(doc.launch.mode, "coming-soon");
+  doc.launch.faqGroups = ["Labs", "Nonexistent"];
+  doc.socialProof.placeholder = false;
+  doc.waitlist.enabled = false;
+  const dir = await mkdtemp(path.join(tmpdir(), "site-"));
+  const file = path.join(dir, "site.yaml");
+  await writeFile(file, YAML.stringify(doc));
+  const findings = [];
+  await checkSite(file, { domainsWithLabs: domains, repoRoot }, findings);
+  const errors = findings.filter((f) => f.level === "error").map((f) => f.message);
+  const warnings = findings.filter((f) => f.level !== "error").map((f) => f.message);
+  assert.ok(errors.some((m) => m.includes("no FAQ entry has group 'Nonexistent'")), errors.join("\n"));
+  assert.ok(errors.some((m) => m.includes("placeholder quotes are published as real")), errors.join("\n"));
+  assert.ok(warnings.some((m) => m.includes("coming soon without the waitlist")), warnings.join("\n"));
+});

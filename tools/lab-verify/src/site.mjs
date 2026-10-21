@@ -118,6 +118,18 @@ export async function checkSite(file, ctx, findings) {
     if (f.organisation?.required && f.organisation.enabled === false) err("/waitlist/fields/organisation", "a required field cannot be disabled");
     if (f.role?.required && f.role.enabled === false) err("/waitlist/fields/role", "a required field cannot be disabled");
   }
+  // Launch: the coming-soon page is built around the waitlist and the pricing explanation.
+  if (doc.launch?.mode === "coming-soon") {
+    if (!doc.waitlist?.enabled) warn("/launch/mode", "coming soon without the waitlist: the page has no call to action");
+    if (!doc.pricing?.model) warn("/launch/mode", "coming soon without pricing.model: the page cannot explain pricing");
+  }
+  const groups = new Set(doc.faq.map((f) => f.group).filter(Boolean));
+  for (const [i, g] of (doc.launch?.faqGroups ?? []).entries()) if (!groups.has(g)) err(`/launch/faqGroups/${i}`, `no FAQ entry has group '${g}'`);
+  if (doc.pricing?.faqGroup && !groups.has(doc.pricing.faqGroup)) warn("/pricing/faqGroup", `no FAQ entry has group '${doc.pricing.faqGroup}'`);
+  // Social proof: invented quotes must never pass for real ones.
+  if (doc.socialProof && doc.socialProof.placeholder === false && (doc.socialProof.quotes ?? []).some((q) => /placeholder/i.test(`${q.name} ${q.quote}`))) {
+    err("/socialProof/placeholder", "placeholder quotes are published as real (set placeholder: true or replace them)");
+  }
   if (!/not affiliated/i.test(doc.legal.alignmentNotice)) err("/legal/alignmentNotice", "the alignment notice must say the platform is not affiliated with the certifying bodies");
   for (const [k, legal] of Object.entries({ terms: doc.legal.terms, privacy: doc.legal.privacy })) {
     if (legal.placeholder && !legal.sections.some((s) => /placeholder|draft/i.test(s.title) || s.paragraphs.some((p) => /placeholder|draft/i.test(p)))) {
