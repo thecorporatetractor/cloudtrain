@@ -117,7 +117,7 @@ if [[ -z ${POD_POLICY_SCOPE:-} ]]; then
   POD_POLICY_SCOPE=namespaces
   [[ -n ${SESSION_SELECTOR:-} || -n $others ]] && POD_POLICY_SCOPE=own
 elif [[ $POD_POLICY_SCOPE == namespaces && -n $others ]]; then
-  die "POD_POLICY_SCOPE=namespaces would reject the wired pods of the other lab-orchestrator instances ($(echo $others)); use own"
+  die "POD_POLICY_SCOPE=namespaces would reject the wired pods of the other lab-orchestrator instances ($(tr "\n" " " <<<"$others")); use own"
 fi
 case $POD_POLICY_SCOPE in own|namespaces) ;; *) die "POD_POLICY_SCOPE must be own or namespaces";; esac
 VAP_API=1
