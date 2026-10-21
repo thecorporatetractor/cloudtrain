@@ -133,7 +133,7 @@ spec:
       class Handler(http.server.BaseHTTPRequestHandler):
           def do_GET(self):
               # warm-up: the application answers 503 for the first seconds after a start
-              warm = time.time() - START >= 8
+              warm = time.time() - START >= 20
               body = ("claims-web %s\n" % RELEASE).encode() if warm else b"warming up\n"
               self.send_response(200 if warm else 503)
               self.send_header("Content-Length", str(len(body)))
@@ -174,14 +174,18 @@ spec:
       EOF
           chmod 0755 /usr/local/sbin/ov-claims-app /usr/local/sbin/ov-claims-ctl
           /usr/local/sbin/ov-claims-ctl stop
-          /usr/local/sbin/ov-claims-ctl start ;;
+          /usr/local/sbin/ov-claims-ctl start
+          # past the warm-up before the balancer starts, so no client request meets a warming node
+          i=0
+          while [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8080/health)" != 200 ]; do
+            i=$((i+1)); [ $i -lt 120 ] || { echo "claims app did not warm up" >&2; exit 1; }; sleep 0.5
+          done ;;
         ov-lb1) mkdir -p /run/haproxy ;;
       esac
   - 'on': ov-lb1
-    timeoutSec: 600
     run: |
-      set -eu
-      dnf -y install haproxy >/var/tmp/dnf-haproxy.log 2>&1 || { echo "haproxy does not install from the mirror: $(tail -4 /var/tmp/dnf-haproxy.log | tr '\n' ' ')" >&2; exit 1; }
+      # haproxy is baked into el-lab:10: ov-lb1 is wired (session VPC), which has no route to the package mirror
+      command -v haproxy >/dev/null || { echo "haproxy is missing from the el-lab:10 image (rebuild it)" >&2; exit 1; }
   - 'on': ov-claims-web1
     run: *ov-node
   - 'on': ov-claims-web2
@@ -231,7 +235,8 @@ spec:
       EOF
       haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null
       haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
-      i=0; while [ $i -lt 60 ]; do n=$(echo 'show stat' | nc -U /run/haproxy/admin.sock | awk -F, '$1=="claims_web" && $2 ~ /^ov-claims-web/ && $18 ~ /^UP/ {n++} END {print n+0}'); [ "$n" = 4 ] && break; sleep 1; i=$((i+1)); done
+      # HAProxy starts servers as UP before their first check: wait until all four passed a check (check_status L7OK)
+      i=0; while [ $i -lt 60 ]; do n=$(echo 'show stat' | nc -U /run/haproxy/admin.sock | awk -F, 'NR == 1 {for (c = 1; c <= NF; c++) if ($c == "check_status") k = c; next} $1=="claims_web" && $2 ~ /^ov-claims-web/ && $18 ~ /^UP/ && k && $k == "L7OK" {n++} END {print n+0}'); [ "$n" = 4 ] && break; sleep 1; i=$((i+1)); done
       [ "$n" = 4 ] || { echo 'backends did not become healthy' >&2; exit 1; }
   - 'on': ov-ctl
     run: |
@@ -352,7 +357,11 @@ spec:
     command: |
       # The judged window (since the last ov-lb-reset) must contain the whole rollout: every one of the four nodes answered
       # with r1 first and with r{{rel}} later. A window that was reset after the nodes had switched cannot be judged.
-      sw=$(awk '$2 == 200 && $4 != "-" { if ($3 == "r1") old[$4] = 1; if ($3 == "r{{rel}}" && old[$4]) sw[$4] = 1 } END { n = 0; for (k in sw) n++; print n }' /var/lib/ov-lb/requests.log)
+      # (The last node may not have answered a sampled request yet when the play has just ended: allow a few seconds.)
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        sw=$(awk '$2 == 200 && $4 != "-" { if ($3 == "r1") old[$4] = 1; if ($3 == "r{{rel}}" && old[$4]) sw[$4] = 1 } END { n = 0; for (k in sw) n++; print n }' /var/lib/ov-lb/requests.log)
+        [ "$sw" = 4 ] && break; sleep 1
+      done
       [ "$sw" = 4 ] || { echo "window-misses-rollout=$sw/4"; exit 0; }
       awk '{ if (NR == 1 || $2 < min) min = $2; if ($2 == 3) three++; n++ } END { if (n < 20) print "sampler-short"; else if (min < 3) print "min=" min; else if (!three) print "no-drain-seen"; else print "ok" }' /var/lib/ov-lb/healthy.log
     expect:
@@ -368,7 +377,11 @@ spec:
     command: |
       # The judged window (since the last ov-lb-reset) must contain the whole rollout: every one of the four nodes answered
       # with r1 first and with r{{rel}} later. A window that was reset after the nodes had switched cannot be judged.
-      sw=$(awk '$2 == 200 && $4 != "-" { if ($3 == "r1") old[$4] = 1; if ($3 == "r{{rel}}" && old[$4]) sw[$4] = 1 } END { n = 0; for (k in sw) n++; print n }' /var/lib/ov-lb/requests.log)
+      # (The last node may not have answered a sampled request yet when the play has just ended: allow a few seconds.)
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        sw=$(awk '$2 == 200 && $4 != "-" { if ($3 == "r1") old[$4] = 1; if ($3 == "r{{rel}}" && old[$4]) sw[$4] = 1 } END { n = 0; for (k in sw) n++; print n }' /var/lib/ov-lb/requests.log)
+        [ "$sw" = 4 ] && break; sleep 1
+      done
       [ "$sw" = 4 ] || { echo "window-misses-rollout=$sw/4"; exit 0; }
       n=$(wc -l < /var/lib/ov-lb/requests.log)
       bad=$(awk '$2 != 200' /var/lib/ov-lb/requests.log | wc -l)

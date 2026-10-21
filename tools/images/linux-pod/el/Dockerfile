@@ -8,7 +8,8 @@ ARG TINI_VERSION
 ARG TINI_STATIC_SHA256
 ARG MIRROR_URL
 # Packages from the AlmaLinux point release (ALMA_REPO); documentation is kept (tsflags=nodocs off); coreutils and curl replace
-# the container base's coreutils-single and curl-minimal (which ship no man pages).
+# the container base's coreutils-single and curl-minimal (which ship no man pages). haproxy is baked in because wired pods
+# (topology links) sit in the session VPC with no route to the package mirror, so a lab balancer cannot `dnf install` it.
 RUN set -eux; rm -f /etc/yum.repos.d/*.repo; \
     for r in BaseOS AppStream CRB; do \
       printf '[%s]\nname=AlmaLinux %s (point release)\nbaseurl=%s/%s/x86_64/os/\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10\n' \
@@ -20,7 +21,7 @@ RUN set -eux; rm -f /etc/yum.repos.d/*.repo; \
       procps-ng psmisc lsof strace iproute iputils bind-utils traceroute nmap-ncat curl wget \
       openssh-clients openssh-server rsync git tmux tar gzip bzip2 xz zip unzip zstd acl attr \
       diffutils patch bc words jq python3 python3-pip gcc make cronie at sudo shadow-utils \
-      openssl hostname util-linux cpio sqlite logrotate glibc-langpack-en; \
+      openssl hostname util-linux cpio sqlite logrotate glibc-langpack-en haproxy; \
     dnf -y reinstall $(rpm -qa --qf '%{NAME}\n' | grep -vE '^(gpg-pubkey|filesystem|setup)$') >/dev/null 2>&1 || true; \
     mandb -q || true; \
     dnf clean all; rm -rf /var/cache/dnf /var/log/dnf*
