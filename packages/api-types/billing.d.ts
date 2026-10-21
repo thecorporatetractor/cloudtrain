@@ -7,7 +7,8 @@
  * can show entitlements, and checkout/portal return 409.
  *
  * Pricing model: learners pay for the compute their lab sessions use (metered
- * per session, reported to a Stripe Billing Meter); plans unlock premium labs;
+ * per session, reported to a Stripe Billing Meter); plans unlock premium features
+ * (docs/licensing-keys.md) and early-access labs;
  * a free account gets the trial lab only. Lab starts are enforced when
  * CT_BILLING_ENFORCE is on (default: on with billing).
  */
@@ -64,7 +65,7 @@ export interface BillingSummary {
   enforced: boolean;
   /** A payment method is on file for this scope (setup checkout or a subscription). */
   paymentMethod: boolean;
-  /** Effective premium level (plan level, or the organisation's for a seated member). */
+  /** Effective plan level for early-access labs (plan level, or the organisation's for a seated member). */
   level: number;
   /** User scope: who pays this person's compute; `org` for a seated member. */
   payer: BillingScope;
@@ -218,8 +219,10 @@ export interface LabAccess {
   unitsPerMinute: number;
   /** Minor units per hour of compute (placeholder rates). */
   pricePerHour: number;
-  /** The plan that unlocks this premium lab. */
+  /** The plan that unlocks this early-access lab (hosted edition). */
   requiredPlan?: { id: string; name: string; level: number };
+  /** Early access: content not yet public, unlocked by `requiredPlan` or higher. */
+  earlyAccess?: boolean;
   /** A free-trial lab. */
   trial?: boolean;
   /** Not billed when started now (trial allowance left, or billing off). */

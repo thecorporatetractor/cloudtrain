@@ -47,12 +47,18 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
 
   const loginError = (reply: FastifyReply, reason: string, message: string) => reply.redirect(`${web}/login?error=${encodeURIComponent(reason)}&message=${encodeURIComponent(message)}`, 302);
 
+  /** SSO is a premium feature; a platform IdP (the operator's) always routes, so the operator can fix the license. */
+  const ssoAllowed = (orgId: string) => ps.entitlements.has('sso', { orgId });
+  const ssoRoutes = async (orgId: string, alias: string | null) => !!alias && (ps.config.platformIdps.includes(alias) || (await ssoAllowed(orgId)));
+
   async function discovery(emailRaw: string): Promise<AuthDiscovery> {
     const email = emailRaw.trim().toLowerCase();
     const loginUrl = `${ps.config.publicUrl}/api/auth/login?email=${encodeURIComponent(email)}`;
     const domain = email.split('@')[1];
-    const org = domain ? await orgForDomain(ps.db, domain) : null;
-    if (!org || !org.verified) return { email, method: org ? 'local' : 'unknown', loginUrl, ...(org ? { org: { id: org.org_id, slug: org.slug, name: org.name } } : {}) };
+    const found = domain ? await orgForDomain(ps.db, domain) : null;
+    if (!found || !found.verified) return { email, method: found ? 'local' : 'unknown', loginUrl, ...(found ? { org: { id: found.org_id, slug: found.slug, name: found.name } } : {}) };
+    // Without the feature the org's IdP is not offered: local login.
+    const org = (await ssoRoutes(found.org_id, found.idp_alias)) ? found : { ...found, idp_alias: null, idp_name: null };
     return {
       email,
       method: org.idp_alias ? 'sso' : 'local',
@@ -75,6 +81,7 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
     if (q.idp) {
       const o = await orgForIdp(ps.db, q.idp);
       if (!o) throw badRequest('Unknown identity provider', { idp: 'unknown' });
+      if (!(await ssoRoutes(o.org_id, q.idp))) return loginError(reply, 'sso_unlicensed', 'Single sign-on is not available for this organization: it needs a CloudTrain license or plan that includes SSO. Sign in with a local account, or ask your administrator.');
       idpHint = q.idp;
       orgId = o.org_id;
     } else if (q.email?.includes('@')) {
@@ -113,7 +120,7 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
     }
     const claims = claimsOf(idt);
     if (!claims.email) return loginError(reply, 'no_email', 'Your identity provider did not send an email address.');
-    const result = await provision(ps.db, claims, { platformIdps: ps.config.platformIdps, preferredOrgId: st.org_id, ip: req.ip });
+    const result = await provision(ps.db, claims, { platformIdps: ps.config.platformIdps, preferredOrgId: st.org_id, ip: req.ip, ssoAllowed });
     if (!result.ok) {
       if (result.orgId) {
         await withTenant(ps.db, { orgId: result.orgId }, (tx) => audit(tx, { orgId: result.orgId!, actorId: null, actorName: claims.email, ip: req.ip }, 'auth.login_denied', 'user', claims.sub, { reason: result.reason, idp: claims.identityProvider ?? 'local' }, claims.email)).catch(() => undefined);

@@ -7,6 +7,9 @@ import { RequireAccess } from '@/app/access';
 import { roleLabel } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
 import { When } from '@/components/platform';
+import { FeatureLock } from '@/components/license';
+import { useMe } from '@/api/client';
+import { hasFeature } from '@/lib/entitlements';
 import { Badge, Button, Card, Checkbox, ChipSelect, ConfirmDialog, Dialog, Drawer, EmptyState, ErrorState, Field, Input, PageSkeleton, Segmented, Switch, Textarea, Tooltip } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import { adminSsoRoute } from '@/router';
@@ -30,6 +33,8 @@ function Screen() {
   const q = useSso();
   const test = useTestSso();
   const { toast } = useShell();
+  // SSO is premium (docs/licensing-keys.md): without it connections stay visible but cannot be added, changed or tested.
+  const licensed = hasFeature(useMe().data, 'sso');
 
   if (q.isPending) return <PageSkeleton />;
   if (q.isError) return <ErrorState error={q.error} onRetry={() => void q.refetch()} />;
@@ -39,18 +44,19 @@ function Screen() {
 
   return (
     <div className="stack" style={{ gap: 20 }}>
+      <FeatureLock feature="sso">Existing connections stay as they are, but members of these organisations cannot sign in through them; local accounts keep working.</FeatureLock>
       <div className="split split-7-5" style={{ alignItems: 'start' }}>
         <Card className="card-flush">
           <div className="card-head">
             <h2 className="row" style={{ gap: 8 }}>
               <KeyRound size={14} className="subtle" /> Identity providers
             </h2>
-            <Button variant="primary" size="sm" icon={<Plus size={13} />} onClick={() => set({ add: true })}>
+            <Button variant="primary" size="sm" icon={<Plus size={13} />} disabled={!licensed} onClick={() => set({ add: true })}>
               Add connection
             </Button>
           </div>
           {connections.length === 0 ? (
-            <EmptyState compact icon={<KeyRound size={18} />} title="No identity provider yet" description="Members sign in with CloudTrain passwords. Connect Entra ID, Okta, Google Workspace or any OIDC / SAML 2.0 provider, verify your domain, then enforce it." action={<Button variant="secondary" size="sm" onClick={() => set({ add: true })}>Add connection</Button>} />
+            <EmptyState compact icon={<KeyRound size={18} />} title="No identity provider yet" description="Members sign in with CloudTrain passwords. Connect Entra ID, Okta, Google Workspace or any OIDC / SAML 2.0 provider, verify your domain, then enforce it." action={licensed ? <Button variant="secondary" size="sm" onClick={() => set({ add: true })}>Add connection</Button> : undefined} />
           ) : (
             <ul className="due-list">
               {connections.map((c) => (
@@ -75,6 +81,7 @@ function Screen() {
                   <Button
                     variant="secondary"
                     size="sm"
+                    disabled={!licensed}
                     loading={test.isPending && test.variables === c.id}
                     onClick={() =>
                       test.mutate(c.id, {
@@ -96,16 +103,23 @@ function Screen() {
 
       <Card className="card-body" style={{ padding: 16 }}>
         <div className="row" style={{ gap: 14, alignItems: 'flex-start' }}>
-          {enforced ? <ShieldCheck size={18} className="text-ok" style={{ marginTop: 2 }} /> : <AlertTriangle size={18} className="subtle" style={{ marginTop: 2 }} />}
+          {enforced && licensed ? <ShieldCheck size={18} className="text-ok" style={{ marginTop: 2 }} /> : <AlertTriangle size={18} className="subtle" style={{ marginTop: 2 }} />}
+          {!licensed ? (
+            <div className="stack" style={{ gap: 2 }}>
+              <strong className="small">Single sign-on is off</strong>
+              <span className="small muted">{enforced ? 'Enforcement is saved but does not apply while single sign-on is unavailable: members sign in with CloudTrain passwords.' : 'Members sign in with CloudTrain passwords.'}</span>
+            </div>
+          ) : (
           <div className="stack" style={{ gap: 2 }}>
             <strong className="small">{enforced ? 'Single sign-on is enforced' : 'Single sign-on is not enforced'}</strong>
             <span className="small muted">{enforced ? `Local passwords are disabled for ${verified} verified domain${verified === 1 ? '' : 's'}. Deactivating someone in the IdP blocks them at the next sign-in; deactivating here is immediate.` : `${verified ? 'Members can still sign in with CloudTrain passwords. Test the connection and switch on “Enforce” to require the IdP.' : 'Verify at least one domain (DNS TXT record) and test the connection before enforcing.'}`}</span>
           </div>
+          )}
         </div>
       </Card>
 
       <ConnectionDrawer id={search.connection} connections={connections} domains={domains} onClose={() => set({ connection: undefined })} />
-      <AddConnectionWizard open={!!search.add} onOpenChange={(o) => set({ add: o ? true : undefined })} onCreated={(c) => set({ add: undefined, connection: c.id })} />
+      <AddConnectionWizard open={!!search.add && licensed} onOpenChange={(o) => set({ add: o ? true : undefined })} onCreated={(c) => set({ add: undefined, connection: c.id })} />
     </div>
   );
 }
@@ -218,8 +232,9 @@ function ConnectionDrawer({ id, connections, domains, onClose }: { id: string | 
   const [enforceConfirm, setEnforceConfirm] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   useEffect(() => setMappings(c?.groupMappings ?? []), [c]);
+  const licensed = hasFeature(useMe().data, 'sso');
   const dirty = !!c && JSON.stringify(mappings) !== JSON.stringify(c.groupMappings);
-  const canEnforce = !!c && c.status === 'active' && domains.some((d) => d.verified);
+  const canEnforce = licensed && !!c && c.status === 'active' && domains.some((d) => d.verified);
 
   const saveMappings = () => c && update.mutate({ id: c.id, groupMappings: mappings }, { onSuccess: () => toast({ title: 'Group mappings saved', description: 'Applied at every sign-in.', tone: 'ok' }), onError: (e) => toast({ title: 'Could not save', description: e.message, tone: 'err' }) });
   const setEnforced = (v: boolean) => c && update.mutate({ id: c.id, enforced: v }, { onSuccess: () => (setEnforceConfirm(false), toast({ title: v ? 'SSO enforced' : 'SSO no longer enforced', description: v ? 'Local passwords are disabled for the verified domains.' : 'Members can use passwords again.', tone: v ? 'ok' : 'warn' })), onError: (e) => toast({ title: 'Could not change enforcement', description: e.message, tone: 'err' }) });
@@ -238,10 +253,10 @@ function ConnectionDrawer({ id, connections, domains, onClose }: { id: string | 
               Delete
             </Button>
             <span className="grow" />
-            <Button variant="secondary" size="sm" loading={test.isPending} onClick={() => test.mutate(c.id, { onSuccess: (r) => toast({ title: r.ok ? 'All checks passed' : 'Test failed', description: r.ok ? undefined : r.steps.find((s) => !s.ok)?.detail, tone: r.ok ? 'ok' : 'err' }) })}>
+            <Button variant="secondary" size="sm" disabled={!licensed} loading={test.isPending} onClick={() => test.mutate(c.id, { onSuccess: (r) => toast({ title: r.ok ? 'All checks passed' : 'Test failed', description: r.ok ? undefined : r.steps.find((s) => !s.ok)?.detail, tone: r.ok ? 'ok' : 'err' }) })}>
               Test connection
             </Button>
-            <Button variant="primary" size="sm" disabled={!dirty} loading={update.isPending} onClick={saveMappings}>
+            <Button variant="primary" size="sm" disabled={!dirty || !licensed} loading={update.isPending} onClick={saveMappings}>
               Save mappings
             </Button>
           </>

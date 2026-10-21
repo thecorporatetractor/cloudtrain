@@ -44,18 +44,21 @@ one place so the code and the docs can be updated together. A feature added here
 applies from the version that adds it; it does not change versions already
 published.
 
-| Feature | What it covers | Entitlement (in the license key) |
-| --- | --- | --- |
-| SSO with external identity providers | Signing in through your own OpenID Connect or SAML identity provider (Entra ID, Okta, Google Workspace, Keycloak and others), group-to-role mapping from that provider | `sso` |
-| SCIM provisioning | Creating, updating and deactivating users and groups from your identity provider over SCIM | `scim` |
-| Audit log export | Exporting or streaming the audit log to an external system (SIEM, object storage) | `audit_export` |
-| Advanced manager analytics | Team and cohort analytics beyond the standard progress views: readiness trends and skill-gap reports across teams and cohorts | `advanced_analytics` |
-| Exam-simulation certificates | Issuing certificates of completion for exam simulations | `exam_certificates` |
-| Custom branding | Your own logo, colours, domain and email templates | `custom_branding` |
-| Multiple organisations per installation | More than one organisation (tenant) on a single installation | `multi_org` |
+| Feature | What it covers | Entitlement (in the license key) | Hosted plans | Status in this version |
+| --- | --- | --- | --- | --- |
+| SSO with external identity providers | Signing in through your own OpenID Connect or SAML identity provider (Entra ID, Okta, Google Workspace, Keycloak and others), group-to-role mapping from that provider | `sso` | Team | Gated: adding, changing and testing connections, signing in through an organisation IdP, enforcement. Local accounts always work |
+| SCIM provisioning | Creating, updating and deactivating users and groups from your identity provider over SCIM | `scim` | none yet | Reserved: not built yet |
+| Audit log export | Exporting or streaming the audit log to an external system (SIEM, object storage) | `audit_export` | Team | Gated: the CSV export. Browsing the log in the admin area is free |
+| Advanced manager analytics | Team and cohort analytics beyond the standard progress views: readiness trends and skill-gap reports across teams and cohorts | `advanced_analytics` | Team | Gated: framework readiness per team and member, the eight-week practice trend, team exam readiness. The heatmap, totals, at-risk list, assignments and progress CSV are free |
+| Exam-simulation certificates | Issuing certificates of completion for exam simulations | `exam_certificates` | Pro, Premium, Team | Reserved: not built yet. Exam simulations and their reports are free |
+| Custom branding | Your own logo, colours, domain and email templates | `custom_branding` | Team | Gated: the organisation logo and accent colour (saved values are kept when it lapses) |
+| Multiple organisations per installation | More than one organisation (tenant) on a single installation | `multi_org` | operator only | Gated: creating a second organisation on a self-hosted installation; existing ones keep working |
 
-The entitlement names are provisional until the license-key system ships; the
-code is the source of truth for them.
+The entitlement names are the ones the license-key system uses
+(`services/gateway/src/entitlements/features.ts`). How keys are issued, installed and
+renewed, what happens at expiry (30-day warning, 14-day grace, then the features switch
+off without deleting anything) and the exact routes each feature gates are in
+[licensing-keys.md](licensing-keys.md) and [billing.md](billing.md) ("Premium features").
 
 Without a valid key these features stay off. You may still read, build, modify and
 test their code in non-production use. You may not remove, disable or work around

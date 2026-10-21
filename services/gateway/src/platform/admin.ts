@@ -36,7 +36,7 @@ import { LABEL_LEARNER, LABEL_MANAGED_BY, LABEL_ORG, MANAGED_BY } from '../kube/
 import { labelValue } from '../sessions/service.js';
 import { endAttempt } from '../learner/learning.js';
 import { actorOf, audit } from './audit.js';
-import { normalizeRoles, orgForDomain } from './identity.js';
+import { membershipsOf, normalizeRoles, orgForDomain } from './identity.js';
 import { csvLine, teamsWithStats } from './manager.js';
 import { DEFAULT_SETTINGS, decodeCursor, encodeCursor, pageLimit, userRef, UNKNOWN_USER, type PlatformService } from './service.js';
 
@@ -191,6 +191,9 @@ export async function inviteUser(ps: PlatformService, p: Principal, req: InviteU
   const viaSso = !!(domainOrg?.idp_alias && domainOrg.org_id === p.orgId);
 
   const existing = (await sql<{ id: string }>`SELECT id FROM auth_user_by_email(${email})`.execute(ps.db)).rows[0];
+  // Soft license seat limit (docs/licensing-keys.md): someone already active elsewhere takes no new seat.
+  const alreadyActive = !!existing && (await membershipsOf(ps.db, existing.id)).some((m) => m.status === 'active' && m.org_status === 'active');
+  if (!alreadyActive) await ps.entitlements.assertSeatAvailable(1);
   let userId = existing?.id;
   let kcCreated = false;
   if (!userId) {
@@ -291,6 +294,11 @@ export async function updateUser(ps: PlatformService, p: Principal, id: string, 
   const roles = req.roles ? checkRoles(req.roles) : undefined;
   if (id === p.sub && (req.status === 'deactivated' || (roles && !roles.includes('org_admin') && p.roles.includes('org_admin')))) {
     throw conflict('You cannot deactivate yourself or remove your own org_admin role.');
+  }
+  if (req.status === 'active') {
+    // Reactivating takes a license seat again (soft limit, docs/licensing-keys.md).
+    const was = await ps.tx(p, (tx) => tx.selectFrom('memberships').select('status').where('user_id', '=', id).executeTakeFirst());
+    if (was?.status === 'deactivated') await ps.entitlements.assertSeatAvailable(1);
   }
   const change = await ps.tx(p, async (tx) => {
     const m = await tx.selectFrom('memberships').selectAll().where('user_id', '=', id).executeTakeFirst();
@@ -602,6 +610,8 @@ export async function auditPage(ps: PlatformService, p: Principal, q: AuditQuery
 
 export async function auditCsv(ps: PlatformService, p: Principal, q: AuditQuery, ip?: string): Promise<string> {
   authorize(p, 'audit.read', { kind: 'org' });
+  // Exporting is premium (`audit_export`); browsing and filtering the log are not.
+  await ps.entitlements.assert('audit_export', p);
   return ps.tx(p, async (tx) => {
     const rows = await auditQuery(tx, q).limit(50_000).execute();
     const events = await toAuditEvents(tx, rows);
@@ -633,6 +643,11 @@ export async function updateSettings(ps: PlatformService, p: Principal, req: Upd
     }
   }
   if (req?.name !== undefined && !req.name.trim()) throw badRequest('name cannot be empty', { name: 'required' });
+  // Logo and accent colour are premium (`custom_branding`): setting a new value needs it;
+  // clearing, keeping or saving other settings never does. Saved values are kept when it lapses.
+  const prev = await ps.tx(p, (tx) => tx.selectFrom('orgs').select('settings').where('id', '=', p.orgId).executeTakeFirstOrThrow());
+  const changes = (k: 'logoUrl' | 'accentColor') => s[k] !== undefined && s[k] !== '' && s[k] !== prev.settings[k];
+  if (changes('logoUrl') || changes('accentColor')) await ps.entitlements.assert('custom_branding', p);
   return ps.tx(p, async (tx) => {
     const o = await tx.selectFrom('orgs').selectAll().where('id', '=', p.orgId).executeTakeFirstOrThrow();
     const settings = { ...o.settings, ...s };

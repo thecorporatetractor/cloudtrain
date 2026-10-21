@@ -16,6 +16,10 @@ import type { PlatformService } from './service.js';
  * Self-service SSO: org admins manage IdP connections; the gateway mirrors
  * them into Keycloak (identity provider + claim mappers + organization link).
  * Client secrets go to Keycloak only and are never stored in Postgres.
+ *
+ * SSO is a premium feature (`sso`, docs/licensing-keys.md): creating, changing
+ * and testing a connection need it (402 feature_required); viewing, deleting and
+ * the domains do not, so nothing is stranded when it lapses.
  */
 
 const DOMAIN = /^(?=.{3,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
@@ -141,6 +145,7 @@ export async function linkToOrganization(kc: KeycloakAdmin, kcOrgId: string | nu
 
 export async function createConnection(ps: PlatformService, p: Principal, req: CreateSsoConnectionRequest, ip?: string): Promise<SsoConnection> {
   authorize(p, 'sso.manage', { kind: 'org' });
+  await ps.entitlements.assert('sso', p);
   const kc = kcOf(ps);
   if (!req || !['oidc', 'saml'].includes(req.type)) throw badRequest('type must be oidc or saml', { type: 'invalid' });
   if (!req.displayName?.trim()) throw badRequest('displayName is required', { displayName: 'required' });
@@ -198,6 +203,9 @@ async function connRow(tx: Tx, id: string): Promise<SsoConnectionRow> {
 
 export async function updateConnection(ps: PlatformService, p: Principal, id: string, req: UpdateSsoConnectionRequest, ip?: string): Promise<SsoConnection> {
   authorize(p, 'sso.manage', { kind: 'org' });
+  // Switching a connection off (disable, stop enforcing) never needs the feature.
+  const switchingOff = Object.entries(req ?? {}).every(([k, v]) => (k === 'status' && v === 'disabled') || (k === 'enforced' && v === false));
+  if (!switchingOff) await ps.entitlements.assert('sso', p);
   const kc = kcOf(ps);
   const { row, mappings, doms } = await ps.tx(p, async (tx) => ({ row: await connRow(tx, id), mappings: req.groupMappings ? await checkMappings(tx, req.groupMappings) : undefined, doms: await domains(tx, p.orgId) }));
   if (req.enforced) {
@@ -262,6 +270,7 @@ export async function deleteConnection(ps: PlatformService, p: Principal, id: st
 
 export async function testConnection(ps: PlatformService, p: Principal, id: string, ip?: string): Promise<SsoTestResult> {
   authorize(p, 'sso.manage', { kind: 'org' });
+  await ps.entitlements.assert('sso', p);
   const kc = kcOf(ps);
   const { row, org, doms } = await ps.tx(p, async (tx) => ({ row: await connRow(tx, id), org: await tx.selectFrom('orgs').select('kc_org_id').where('id', '=', p.orgId).executeTakeFirstOrThrow(), doms: await domains(tx, p.orgId) }));
   const steps: SsoTestResult['steps'] = [];

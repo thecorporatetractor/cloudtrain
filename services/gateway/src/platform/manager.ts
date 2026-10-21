@@ -90,8 +90,19 @@ function statusCounts(rows: { status: AssignmentState }[]) {
   };
 }
 
+/**
+ * Basic vs advanced analytics (`advanced_analytics`, docs/licensing-keys.md). Basic,
+ * always: members x competencies mastery, totals, assignments, the at-risk list,
+ * member drill-down (skills, attempts, assignments), the progress CSV. Advanced:
+ * framework readiness (team averages and per member), the eight-week practice
+ * trend and team exam readiness. Without it those fields come back empty and
+ * `analytics` says `basic`.
+ */
+const advancedOf = (ps: PlatformService, p: Principal) => ps.entitlements.has('advanced_analytics', { orgId: p.orgId, userId: p.sub });
+
 export async function dashboard(ps: PlatformService, p: Principal, teamId: string): Promise<TeamDashboard> {
   authorize(p, 'progress.read.team', { kind: 'team', teamId });
+  const advanced = await advancedOf(ps, p);
   return ps.tx(p, async (tx) => {
     const [team] = await teamsWithStats(tx, [teamId]);
     if (!team) throw notFound('Team');
@@ -131,7 +142,7 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
         user: userRef(m),
         role: m.role,
         mastery: competencyMastery(ps.content, mu),
-        readiness: Object.fromEntries(frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>,
+        readiness: advanced ? (Object.fromEntries(frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>) : {},
         minutesThisMonth: minutesSince(mine, monthStart),
         minutesThisWeek: minutesSince(mine, weekAgo),
         attemptsThisMonth: mine.filter((a) => a.started_at >= monthStart).length,
@@ -158,11 +169,14 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
       teams,
       competencies: ps.content.competencies.map((c) => ({ id: c.id, name: c.name, domain: c.domain })),
       members: dm,
-      frameworks: frameworks.map((f) => {
-        const vals = dm.map((m) => m.readiness[f.id] ?? 0);
-        return { frameworkId: f.id, name: f.name, readiness: vals.length ? Math.round((vals.reduce((a, v) => a + v, 0) / vals.length) * 100) / 100 : 0, ready: vals.filter((v) => v >= 0.8).length, members: vals.length };
-      }),
-      minutesByWeek,
+      frameworks: advanced
+        ? frameworks.map((f) => {
+            const vals = dm.map((m) => m.readiness[f.id] ?? 0);
+            return { frameworkId: f.id, name: f.name, readiness: vals.length ? Math.round((vals.reduce((a, v) => a + v, 0) / vals.length) * 100) / 100 : 0, ready: vals.filter((v) => v >= 0.8).length, members: vals.length };
+          })
+        : [],
+      minutesByWeek: advanced ? minutesByWeek : [],
+      analytics: advanced ? 'advanced' : 'basic',
       totals: {
         members: members.length,
         activeThisWeek: new Set(attempts.filter((a) => a.started_at >= weekAgo && practised(a)).map((a) => a.user_id)).size,
@@ -179,6 +193,7 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
 
 export async function memberDetail(ps: PlatformService, p: Principal, teamId: string, userId: string): Promise<MemberDetail> {
   authorize(p, 'progress.read.team', { kind: 'team', teamId });
+  const advanced = await advancedOf(ps, p);
   return ps.tx(p, async (tx) => {
     const team = await tx.selectFrom('teams').select(['id', 'name']).where('id', '=', teamId).executeTakeFirst();
     if (!team) throw notFound('Team');
@@ -195,7 +210,8 @@ export async function memberDetail(ps: PlatformService, p: Principal, teamId: st
       role: m.role,
       skills: skillStates(ps.content, rows, now),
       mastery: competencyMastery(ps.content, mu),
-      readiness: Object.fromEntries(ps.content.frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>,
+      readiness: advanced ? (Object.fromEntries(ps.content.frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>) : {},
+      analytics: advanced ? 'advanced' : 'basic',
       attempts: attempts.items,
       assignments: await ps.myAssignmentsTx(tx, userId),
       minutesThisMonth: minutesSince(lite, new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))),

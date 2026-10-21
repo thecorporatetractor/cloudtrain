@@ -69,6 +69,13 @@ per person and exam" is also a unique index, so it holds under concurrent starts
 
 ## SSO and authentication
 
+Organisation SSO is a premium feature (`sso`: a hosted Team plan or a self-hosted license
+key, `docs/licensing-keys.md`). Without it, local accounts keep working, connections can be
+viewed and deleted but not added, changed or tested, a login through an organisation IdP is
+refused (`error=sso_unlicensed`) and enforcement is not applied. Platform operators can
+always sign in through a platform IdP (`CT_PLATFORM_IDPS`). Audit export, advanced manager
+analytics, custom branding and several organisations per installation are premium too.
+
 - **Keycloak 26** is the identity broker: one realm `cloudtrain`, the
   **Organizations** feature (each CloudTrain org = a Keycloak organization with its
   verified email domains and its identity providers).

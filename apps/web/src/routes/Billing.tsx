@@ -155,21 +155,21 @@ function CurrentPlan({ b, scope }: { b: BillingSummary; scope: BillingScope }) {
       ) : (
         <p className="small muted">This site configures no plans.</p>
       )}
-      <PremiumLevel b={b} scope={scope} />
+      <EarlyAccessLevel b={b} scope={scope} />
       <p className="xs subtle row" style={{ gap: 6 }}>
-        <Info size={11} aria-hidden /> {b.enforced ? 'Lab starts are checked against the premium level, the free trial, the payment method and the spend cap. The numbers above are shown, not enforced.' : 'Billing checks are off on this deployment: nothing is refused.'}
+        <Info size={11} aria-hidden /> {b.enforced ? 'Lab starts are checked against early access, the free trial, the payment method and the spend cap. The numbers above are shown, not enforced.' : 'Billing checks are off on this deployment: nothing is refused.'}
       </p>
     </Card>
   );
 }
 
-function PremiumLevel({ b, scope }: { b: BillingSummary; scope: BillingScope }) {
+function EarlyAccessLevel({ b, scope }: { b: BillingSummary; scope: BillingScope }) {
   const site = useSite();
   const unlocked = (site.data?.plans?.items ?? []).filter((p) => p.kind === 'individual' && (p.level ?? 1) > 0 && (p.level ?? 1) <= b.level).map((p) => p.name);
   return (
     <div className="billing-level small row" style={{ gap: 8 }}>
-      <Badge tone={b.level > 0 ? 'accent' : 'outline'}>Premium labs</Badge>
-      <span className="muted">{unlocked.length ? `${unlocked.join(' and ')} labs included` : 'Standard labs only'}</span>
+      <Badge tone={b.level > 0 ? 'accent' : 'outline'}>Early access</Badge>
+      <span className="muted">{unlocked.length ? `${unlocked.join(' and ')} early-access labs included` : 'Every public lab; no early access'}</span>
       {scope === 'user' && b.seat && <span className="xs subtle">· through your organisation's {b.seat.planName} seat</span>}
     </div>
   );
@@ -363,7 +363,7 @@ function SeatsCard({ b }: { b: BillingSummary }) {
           {seats.assigned.length} of {seats.purchased} assigned
         </span>
       </div>
-      <p className="xs subtle">Seated members get the organisation plan's premium labs, and their compute is billed to the organisation.</p>
+      <p className="xs subtle">Seated members get the organisation plan's early access, and their compute is billed to the organisation.</p>
       {seats.purchased === 0 ? (
         <p className="small muted">No seats yet: subscribe to an organisation plan below.</p>
       ) : (

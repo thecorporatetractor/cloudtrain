@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react';
+import { useMe } from '@/api/client';
 import { useOrgSettings, useUpdateSettings } from '@/api/platform';
+import { FeatureLock } from '@/components/license';
+import { hasFeature } from '@/lib/entitlements';
 import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
@@ -24,6 +27,8 @@ function Screen() {
   const [tz, setTz] = useState('UTC');
   const [local, setLocal] = useState(true);
   const [logo, setLogo] = useState('');
+  // The logo is custom branding (premium): kept when the feature lapses, but not editable or shown.
+  const branding = hasFeature(useMe().data, 'custom_branding');
   useEffect(() => {
     const o = q.data?.org;
     if (o) {
@@ -53,15 +58,18 @@ function Screen() {
           <h2>Organisation</h2>
           <div className="row" style={{ gap: 16, alignItems: 'flex-start' }}>
             <span className="org-logo" aria-hidden>
-              {logo ? <img src={logo} alt="" /> : initials(name)}
+              {logo && branding ? <img src={logo} alt="" /> : initials(name)}
             </span>
             <div className="stack grow" style={{ gap: 12 }}>
               <Field label="Name" required>
                 {({ id }) => <Input id={id} value={name} onChange={(e) => setName(e.target.value)} />}
               </Field>
               <Field label="Logo URL" hint="Square, at least 128 px. Shown in the sign-in page and the navigation.">
-                {({ id, describedBy }) => <Input id={id} aria-describedby={describedBy} value={logo} onChange={(e) => setLogo(e.target.value)} placeholder="https://…/logo.png" />}
+                {({ id, describedBy }) => <Input id={id} aria-describedby={describedBy} value={logo} disabled={!branding} onChange={(e) => setLogo(e.target.value)} placeholder="https://…/logo.png" />}
               </Field>
+              <FeatureLock feature="custom_branding" compact>
+                {logo ? 'The saved logo is kept and comes back when the feature is on again.' : undefined}
+              </FeatureLock>
             </div>
           </div>
           <dl className="summary-list">

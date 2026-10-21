@@ -1,12 +1,14 @@
 import { useNavigate } from '@tanstack/react-router';
 import { Building2, Pause, Play, Plus } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { ApiError } from '@/api/client';
+import { ApiError, useMe } from '@/api/client';
 import { useCreatePlatformOrg, usePlatformOrgAction, usePlatformOrgs, useUpdatePlatformOrg } from '@/api/platform';
 import type { PlatformOrg, Quotas } from '@/api/types';
 import { RequireAccess } from '@/app/access';
 import { useShell } from '@/app/shell-context';
+import { FeatureLock } from '@/components/license';
 import { When } from '@/components/platform';
+import { hasFeature } from '@/lib/entitlements';
 import { Badge, Button, Card, ConfirmDialog, Dialog, Drawer, EmptyState, ErrorState, Field, Input, Stat, TableSkeleton, TableWrap } from '@/components/ui';
 import { platformOrgsRoute } from '@/router';
 
@@ -23,13 +25,17 @@ function Screen() {
   const navigate = useNavigate({ from: platformOrgsRoute.fullPath });
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
   const q = usePlatformOrgs();
+  // A second organisation on a self-hosted deployment is premium (`multi_org`).
+  const multi = hasFeature(useMe().data, 'multi_org');
 
   if (q.isPending) return <TableSkeleton cols={7} />;
   if (q.isError) return <ErrorState error={q.error} onRetry={() => void q.refetch()} />;
   const orgs = q.data;
+  const canCreate = multi || orgs.length === 0;
 
   return (
     <div className="stack" style={{ gap: 16 }}>
+      {!canCreate && <FeatureLock feature="multi_org">Existing organisations keep working.</FeatureLock>}
       <div className="row-between">
         <div className="stat-row" style={{ marginBottom: 0 }}>
           <Stat label="Organisations" value={orgs.length} hint={`${orgs.filter((o) => o.status === 'suspended').length} suspended`} />
@@ -37,7 +43,7 @@ function Screen() {
           <Stat label="Running sessions" value={orgs.reduce((s, o) => s + o.runningSessions, 0)} />
           <Stat label="Lab hours this month" value={Math.round(orgs.reduce((s, o) => s + o.labHoursThisMonth, 0))} />
         </div>
-        <Button variant="primary" icon={<Plus size={14} />} onClick={() => set({ create: true })}>
+        <Button variant="primary" icon={<Plus size={14} />} disabled={!canCreate} onClick={() => set({ create: true })}>
           New organisation
         </Button>
       </div>

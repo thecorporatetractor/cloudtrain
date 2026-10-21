@@ -19,7 +19,7 @@ import { HeaderAuthenticator, Q, harness, type Harness } from './harness.js';
 import { pgAvailable } from './pg.js';
 
 /*
- * Pay for compute, premium labs, the free trial, seats, dunning and spend caps
+ * Pay for compute, early-access labs, the free trial, seats, dunning and spend caps
  * (migration 0009, docs/billing.md) against a throwaway Postgres, FakeStripe
  * and a controllable clock. Never talks to Stripe.
  */
@@ -31,8 +31,13 @@ const KEY = 'sk_test_51FAKEFAKEFAKEFAKEFAKEFAKE';
 const TRIAL = 'shell-first-steps-timetable'; // pod, easy: the free trial lab
 const STANDARD = 'fix-crlf-script'; // pod, easy
 const STANDARD_VM = 'ctr-build-args-labels'; // one VM, easy
-const HARD = 'ov-build-publish-collection'; // pod, hard: Pro
-const HARD_HEAVY = 'ov-async-patching'; // multi-VM, hard: Premium
+// Public labs are never gated by plan; the suite marks two as early access (Pro, Premium).
+const HARD = 'ov-build-publish-collection'; // pod, hard: early access, Pro
+const HARD_HEAVY = 'ov-async-patching'; // multi-VM, hard: early access, Premium
+const EARLY_ACCESS = [
+  { plan: 'pro', labs: [HARD] },
+  { plan: 'premium', labs: [HARD_HEAVY] },
+];
 
 describe('compute tiers and the pricing model (content/site.yaml)', () => {
   let content: Content;
@@ -52,7 +57,7 @@ describe('compute tiers and the pricing model (content/site.yaml)', () => {
     expect(tier('scale-berth-planner')).toBe('pod'); // virtual cluster
   });
 
-  it('prices minutes per tier, rounds up, and resolves premium rules to the highest plan', () => {
+  it('prices minutes per tier, rounds up, and resolves early-access rules to the highest plan', () => {
     const m = new PricingModel(site);
     expect(m.unitsPerMinute('pod')).toBe(1);
     expect(m.unitsPerMinute('vm')).toBe(4);
@@ -60,16 +65,26 @@ describe('compute tiers and the pricing model (content/site.yaml)', () => {
     expect(m.pricePerHour('pod')).toBe(30); // 60 units x 0.5 cent
     expect(m.billedMinutes(0)).toBe(1);
     expect(m.billedMinutes(61_000)).toBe(2);
-    const facts = (id: string) => {
+    const facts = (id: string, tags?: string[]) => {
       const l = content.labs.get(id)!.lab;
-      return { id, domain: l.metadata.domain, difficulty: l.metadata.difficulty, tier: computeTierOf(l.spec.topology) };
+      return { id, domain: l.metadata.domain, difficulty: l.metadata.difficulty, tier: computeTierOf(l.spec.topology), tags: tags ?? l.metadata.tags ?? [] };
     };
+    // content/site.yaml gates no public lab: hard and multi-VM labs are open to everyone.
     expect(m.requiredPlan(facts(STANDARD))).toBeUndefined();
-    expect(m.requiredPlan(facts(HARD))?.id).toBe('pro');
-    expect(m.requiredPlan(facts(HARD_HEAVY))?.id).toBe('premium');
+    expect(m.requiredPlan(facts(HARD))).toBeUndefined();
+    expect(m.requiredPlan(facts(HARD_HEAVY))).toBeUndefined();
+    // A lab flagged `early-access` in its metadata needs Pro.
+    expect(m.requiredPlan(facts(HARD, ['early-access']))?.id).toBe('pro');
+    const ea = new PricingModel({ ...site, plans: { ...site.plans!, earlyAccess: EARLY_ACCESS } });
+    expect(ea.requiredPlan(facts(HARD))?.id).toBe('pro');
+    expect(ea.requiredPlan(facts(HARD_HEAVY))?.id).toBe('premium');
+    // The retired premium rules are ignored, with a startup warning.
+    const legacy = new PricingModel({ ...site, plans: { ...site.plans!, premium: [{ plan: 'pro', difficulties: ['hard'] }] } });
+    expect(legacy.requiredPlan(facts(HARD))).toBeUndefined();
+    expect(legacy.issues(new Set(content.labs.keys()))).toEqual([expect.stringMatching(/plans.premium is ignored/)]);
     expect(m.level(m.plans.find((p) => p.id === 'team'))).toBe(2);
     expect(m.isTrialLab(TRIAL)).toBe(true);
-    // The configured trial lab exists, is pod tier and every premium rule names a plan.
+    // The configured trial lab exists, is pod tier and every early-access rule names a plan.
     expect(m.issues(new Set(content.labs.keys()))).toEqual([]);
     expect(m.trial.labs.every((id) => facts(id).tier === 'pod')).toBe(true);
   });
@@ -139,6 +154,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     stripe = new FakeStripe();
     site = await loadSiteConfig(path.join(repo, 'content/site.yaml'));
     site.flags.checkoutEnabled = true;
+    site.plans!.earlyAccess = EARLY_ACCESS;
     content = await realContent();
     billing = new BillingService({ db: h.t.db, site, stripe: new StripeApi(KEY, stripe.fetch), webhookSecret: SECRET, webUrl: 'http://web.test', enforce: true, labs: content.labs, mailer, now: () => clock });
     cluster = new FakeCluster();
@@ -166,7 +182,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     expect(lab(TRIAL).access.locked).toBeUndefined();
     expect(lab(STANDARD).access.locked).toMatchObject({ reason: 'payment_method_required', action: 'add_payment_method', href: '/account/billing' });
     expect(lab(STANDARD_VM).access).toMatchObject({ computeTier: 'vm', pricePerHour: 120 });
-    expect(lab(HARD).access).toMatchObject({ requiredPlan: { id: 'pro', name: 'Pro', level: 1 }, locked: { reason: 'plan_required', action: 'upgrade' } });
+    expect(lab(HARD).access).toMatchObject({ requiredPlan: { id: 'pro', name: 'Pro', level: 1 }, earlyAccess: true, locked: { reason: 'plan_required', action: 'upgrade' } });
     expect(lab(HARD_HEAVY).access).toMatchObject({ computeTier: 'heavy', requiredPlan: { id: 'premium' } });
     expect((await as(Q.lucas).get(`/api/labs/${STANDARD}`)).json().access.locked.reason).toBe('payment_method_required');
 
@@ -263,8 +279,10 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     expect(me.usage.sessions.find((s: { id: string }) => s.id === bad.id).report).toBe('failed');
   });
 
-  it('premium labs need the plan level: Pro unlocks hard labs, Premium the hard multi-VM ones', async () => {
-    expect(blocked(await start(Q.mei, HARD)).details).toMatchObject({ reason: 'plan_required', action: 'upgrade', requiredPlan: { id: 'pro', level: 1 } });
+  it('early-access labs need the plan level: Pro unlocks the Pro ones, Premium the Premium ones', async () => {
+    const r = blocked(await start(Q.mei, HARD));
+    expect(r.details).toMatchObject({ reason: 'plan_required', action: 'upgrade', requiredPlan: { id: 'pro', level: 1 } });
+    expect(r.error).toMatch(/early access/);
     const cus = await customerOf(Q.mei);
     const sub = stripe.subscription('sub_mei_pro', cus, 'ct_pro_monthly', { metadata: { ct_org_id: h.orgs.quillmoor, ct_user_id: Q.mei, ct_plan_id: 'pro', ct_interval: 'monthly' } });
     expect((await hook('customer.subscription.created', sub)).status).toBe('processed');
@@ -366,7 +384,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
 
     const lucas = (await as(Q.lucas).get('/api/billing/me')).json();
     expect(lucas).toMatchObject({ payer: 'org', level: 2, seat: { planId: 'team', planName: 'Team', level: 2 } });
-    const id = await runFor(Q.lucas, HARD_HEAVY, 10); // Premium-level lab through the seat
+    const id = await runFor(Q.lucas, HARD_HEAVY, 10); // Premium-level early-access lab through the seat
     expect(await usage(id)).toMatchObject({ payer_key: '', billable: true, units: 100 });
     expect(stripe.meterEvents.at(-1)).toMatchObject({ customer: orgCus, value: 100 });
     const org = (await as(Q.priya).get('/api/billing/org')).json();
@@ -437,5 +455,14 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
       await appLoose.close();
       await appOff.close();
     }
+  });
+
+  it('self-hosted (early access not gated): every lab is open, billing still meters when enabled', async () => {
+    const selfhosted = new BillingService({ db: h.t.db, site, stripe: new StripeApi(KEY, stripe.fetch), webhookSecret: SECRET, webUrl: 'http://web.test', enforce: true, earlyAccess: false, labs: content.labs, now: () => clock });
+    const p = (await import('../src/platform/identity.js')).loadPrincipal;
+    const lucas = (await p(h.t.db, Q.lucas, h.orgs.quillmoor))!;
+    const [heavy] = await selfhosted.annotate(lucas, [{ id: HARD_HEAVY }]);
+    expect(heavy!.access).not.toHaveProperty('requiredPlan');
+    expect(heavy!.access?.locked?.reason).not.toBe('plan_required');
   });
 });

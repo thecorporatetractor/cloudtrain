@@ -314,7 +314,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   /* ---------------------------------- exams ---------------------------------- */
 
-  if (deps.exams) registerExamRoutes(app, deps.exams, cluster);
+  if (deps.exams) registerExamRoutes(app, deps.exams, cluster, ps ? { teamReadiness: (p) => ps.entitlements.assert('advanced_analytics', p) } : {});
 
   return app;
 }

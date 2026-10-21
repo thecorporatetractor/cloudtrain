@@ -606,6 +606,11 @@ export interface TeamDashboard {
   /** `activeThisWeek`: members with graded practice in the last 7 days. */
   totals: { members: number; activeThisWeek: number; minutesThisMonth: number; assignmentsOverdue: number; completionRate: number };
   atRisk: AtRiskItem[];
+  /**
+   * `basic` without the `advanced_analytics` feature (docs/licensing-keys.md): `frameworks`,
+   * `minutesByWeek` and each member's `readiness` are then empty. Absent from older gateways.
+   */
+  analytics?: 'basic' | 'advanced';
   /** `empty` when nobody in the team has any history yet (the UI shows an empty state). */
   source: 'live' | 'empty';
   generatedAt: string;
@@ -619,6 +624,8 @@ export interface MemberDetail {
   skills: SkillState[];
   mastery: Record<string, MasteryCell>;
   readiness: Partial<Record<FrameworkId, number>>;
+  /** `basic`: `readiness` is empty (no `advanced_analytics`). */
+  analytics?: 'basic' | 'advanced';
   attempts: Attempt[];
   assignments: MyAssignment[];
   /** Practice minutes this calendar month (UTC), as on the team dashboard. */

@@ -43,7 +43,7 @@ import type {
 } from '@/api/types';
 import { labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks } from './fixtures/skills';
-import { mockEntitlements } from './license';
+import { featureRequired, mockEntitlements, mockHas } from './license';
 import {
   ORG_ACME,
   ORG_QUILLMOOR,
@@ -369,7 +369,10 @@ export const managerHandlers = [
     if (denied || !m) return denied ?? unauthenticated();
     if (!m.managedTeams.some((t) => t.id === params.id)) return forbidden('progress.read.team');
     const d = teamDashboard(String(params.id), m.id, m.activeOrg!.id);
-    return d ? json(d) : notFound('Team');
+    if (!d) return notFound('Team');
+    // Advanced analytics are premium (like the gateway): readiness and trends left out without them.
+    if (!mockHas('advanced_analytics')) return json({ ...d, analytics: 'basic', frameworks: [], minutesByWeek: [], members: d.members.map((x) => ({ ...x, readiness: {} })) });
+    return json({ ...d, analytics: 'advanced' });
   }),
   http.get('/api/teams/:id/members/:userId', async ({ params }) => {
     await latency();
@@ -378,7 +381,8 @@ export const managerHandlers = [
     if (denied || !m) return denied ?? unauthenticated();
     if (!m.managedTeams.some((t) => t.id === params.id)) return forbidden('progress.read.team');
     const d = memberDetail(String(params.id), String(params.userId));
-    return d ? json(d) : notFound('Member');
+    if (!d) return notFound('Member');
+    return json(mockHas('advanced_analytics') ? { ...d, analytics: 'advanced' } : { ...d, analytics: 'basic', readiness: {} });
   }),
   http.get('/api/assignments', async ({ request }) => {
     await latency();
@@ -813,6 +817,8 @@ export const adminHandlers = [
     const m = me();
     const denied = requirePerm(m, 'sso.manage');
     if (denied || !m) return denied ?? unauthenticated();
+    const lockedSso = featureRequired('sso', m);
+    if (lockedSso) return lockedSso;
     const body = (await request.json()) as CreateSsoConnectionRequest;
     if (!body.displayName?.trim()) return HttpResponse.json({ error: 'Give the connection a display name', code: 'invalid', details: { displayName: 'required' } }, { status: 422 });
     if (body.type === 'oidc' && !body.oidc?.discoveryUrl) return HttpResponse.json({ error: 'OIDC needs a discovery URL', code: 'invalid', details: { discoveryUrl: 'required' } }, { status: 422 });
@@ -841,6 +847,9 @@ export const adminHandlers = [
     const denied = requirePerm(m, 'sso.manage');
     if (denied || !m) return denied ?? unauthenticated();
     const body = (await request.json()) as UpdateSsoConnectionRequest;
+    const switchingOff = Object.entries(body).every(([k, v]) => (k === 'status' && v === 'disabled') || (k === 'enforced' && v === false));
+    const lockedSso = switchingOff ? undefined : featureRequired('sso', m);
+    if (lockedSso) return lockedSso;
     const c = ssoOf(m.activeOrg!.id).find((x) => x.id === params.id);
     if (!c) return notFound('Connection');
     if (body.enforced && (c.status !== 'active' || !domainsOf(m.activeOrg!.id).some((d) => d.verified))) return HttpResponse.json({ error: 'Enforcing needs an active connection and at least one verified domain', code: 'conflict' }, { status: 409 });
@@ -873,6 +882,8 @@ export const adminHandlers = [
     const m = me();
     const denied = requirePerm(m, 'sso.manage');
     if (denied || !m) return denied ?? unauthenticated();
+    const lockedSso = featureRequired('sso', m);
+    if (lockedSso) return lockedSso;
     const c = ssoOf(m.activeOrg!.id).find((x) => x.id === params.id);
     if (!c) return notFound('Connection');
     c.lastTest = runSsoTest(c);
@@ -1019,6 +1030,8 @@ export const adminHandlers = [
     const m = me();
     const denied = requirePerm(m, 'audit.read');
     if (denied || !m) return denied ?? unauthenticated();
+    const locked = featureRequired('audit_export', m);
+    if (locked) return locked;
     const items = auditLog(m.activeOrg!.id);
     audit(m.activeOrg!.id, m, 'audit.export', 'org', m.activeOrg!.id, m.activeOrg!.name, { rows: items.length });
     return csv([['id', 'at', 'actor', 'action', 'target_type', 'target_id', 'target_label', 'ip', 'details'], ...items.map((e) => [e.id, e.at, e.actor?.email ?? 'system', e.action, e.targetType, e.targetId, e.targetLabel ?? '', e.ip ?? '', JSON.stringify(e.details)])]);
@@ -1038,6 +1051,9 @@ export const adminHandlers = [
     if (denied || !m) return denied ?? unauthenticated();
     const body = (await request.json()) as UpdateOrgSettingsRequest;
     const org = state.settings[m.activeOrg!.id]!;
+    const brand = (k: 'logoUrl' | 'accentColor') => body.settings?.[k] !== undefined && body.settings[k] !== '' && body.settings[k] !== org.settings[k];
+    const lockedBrand = brand('logoUrl') || brand('accentColor') ? featureRequired('custom_branding', m) : undefined;
+    if (lockedBrand) return lockedBrand;
     if (body.name) org.name = body.name.trim();
     if (body.settings) org.settings = { ...org.settings, ...body.settings };
     audit(m.activeOrg!.id, m, 'settings.update', 'org', org.id, org.name, { changed: [...(body.name ? ['name'] : []), ...Object.keys(body.settings ?? {})] });
@@ -1062,6 +1078,8 @@ export const platformHandlers = [
     const m = me();
     const denied = requirePerm(m, 'org.manage');
     if (denied || !m) return denied ?? unauthenticated();
+    const lockedOrg = state.platformOrgs.length ? featureRequired('multi_org', m) : undefined;
+    if (lockedOrg) return lockedOrg;
     const body = (await request.json()) as CreatePlatformOrgRequest;
     if (!/^[a-z0-9-]{3,}$/.test(body.slug ?? '')) return HttpResponse.json({ error: 'Slug: lowercase letters, digits and dashes', code: 'invalid', details: { slug: 'invalid' } }, { status: 422 });
     if (state.platformOrgs.some((o) => o.slug === body.slug)) return HttpResponse.json({ error: `An organisation with slug ${body.slug} exists`, code: 'conflict' }, { status: 409 });

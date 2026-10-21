@@ -49,8 +49,10 @@ import { StripeApi, StripeError, verifyWebhook, WebhookError, type StripeEvent, 
  *   reported to a Stripe Billing Meter as one meter event, identified by the
  *   usage row, so a retry never bills twice. A metered Price on a separate
  *   "compute" subscription per billing customer turns the units into money.
- * - Plans (subscriptions) unlock premium labs (`plans.premium` rules and plan
- *   levels); compute is billed on top of any plan.
+ * - Plans (subscriptions) unlock premium features (src/entitlements,
+ *   `plans.items[].features`) and, on the hosted edition, early-access labs
+ *   (`plans.earlyAccess` rules and plan levels). Public labs are never gated by
+ *   plan. Compute is billed on top of any plan.
  * - Free accounts get the trial labs (`plans.free`), uncharged and capped;
  *   anything else needs a payment method (Checkout in setup mode) or a plan.
  * - Organisations buy seats (subscription quantity, prorated); seated members
@@ -73,8 +75,13 @@ export interface BillingDeps {
   webhookSecret?: string;
   /** Refuse lab starts that billing does not allow (CT_BILLING_ENFORCE). */
   enforce?: boolean;
-  /** Labs by id (compute tier, premium rules, titles). */
+  /** Labs by id (compute tier, early-access rules, titles). */
   labs?: ReadonlyMap<string, ContentLab>;
+  /**
+   * Gate early-access labs by plan level (`plans.earlyAccess`). On for the hosted
+   * edition; off on self-hosted, where every lab present is usable. Default on.
+   */
+  earlyAccess?: boolean;
   /** Payment-failure and restore emails (Mailpit in dev). */
   mailer?: Mailer;
   /** Where the browser returns after Checkout or the portal (CT_WEB_URL). */
@@ -501,7 +508,7 @@ export class BillingService {
   /* --------------------------------------------------------- enforcement */
 
   /**
-   * The billing gate for a lab start: premium plan level, the free-trial
+   * The billing gate for a lab start: early-access plan level, the free-trial
    * allowance, a payment method, dunning and the spend cap, in that order.
    * Refuses with 402 `payment_required` (`details`: BillingBlockDetails) when
    * enforcement is on; returns what it decided so `meterStart` records who pays.
@@ -538,10 +545,10 @@ export class BillingService {
     const block = (reason: BillingBlockReason, message: string, extra: Partial<BillingBlockDetails> = {}, action: BillingBlockDetails['action']) => ({
       block: { reason, message, details: { reason, action: fix(action), href, scope: s.payer, ...extra } as BillingBlockDetails },
     });
-    const required = this.pricing.requiredPlan(lab);
+    const required = this.requiredPlan(lab);
     if (required && s.level < this.pricing.level(required)) {
       const requiredPlan = { id: required.id, name: required.name, level: this.pricing.level(required) };
-      return { block: { reason: 'plan_required', message: `"${lab.title}" is a premium lab: it needs the ${required.name} plan or higher.`, details: { reason: 'plan_required', action: 'upgrade', href: '/account/billing', scope: 'user', requiredPlan } } };
+      return { block: { reason: 'plan_required', message: `"${lab.title}" is in early access: it needs the ${required.name} plan or higher.`, details: { reason: 'plan_required', action: 'upgrade', href: '/account/billing', scope: 'user', requiredPlan } } };
     }
     if (trialUse) {
       const t = this.pricing.trial;
@@ -562,7 +569,12 @@ export class BillingService {
     return {};
   }
 
-  /** Billing view of labs for the catalog and the lab page: tier, rate, premium plan, trial, lock. */
+  /** The plan an early-access lab needs, when early access is gated on this deployment. */
+  private requiredPlan(lab: LabFacts): SitePlan | undefined {
+    return this.d.earlyAccess === false ? undefined : this.pricing.requiredPlan(lab);
+  }
+
+  /** Billing view of labs for the catalog and the lab page: tier, rate, early-access plan, trial, lock. */
   async annotate<T extends { id: string; access?: LabAccess }>(p: Principal, labs: T[]): Promise<T[]> {
     if (!p.orgId || this.facts.size === 0) return labs;
     const ctx = await this.tx(p, async (tx) => {
@@ -575,12 +587,12 @@ export class BillingService {
       if (!f) return l;
       const trialLab = this.pricing.isTrialLab(l.id);
       const v = this.decide(p, f, ctx.state, trialLab ? ctx.trialUse : undefined);
-      const required = this.pricing.requiredPlan(f);
+      const required = this.requiredPlan(f);
       const access: LabAccess = {
         computeTier: f.tier,
         unitsPerMinute: this.pricing.unitsPerMinute(f.tier),
         pricePerHour: this.pricing.pricePerHour(f.tier),
-        ...(required ? { requiredPlan: { id: required.id, name: required.name, level: this.pricing.level(required) } } : {}),
+        ...(required ? { requiredPlan: { id: required.id, name: required.name, level: this.pricing.level(required) }, earlyAccess: true } : {}),
         ...(trialLab ? { trial: true } : {}),
         ...(v.trial || !this.enabled ? { free: true } : {}),
         ...(v.block && this.enforced ? { locked: { reason: v.block.reason, message: v.block.message, action: v.block.details.action, href: v.block.details.href } } : {}),

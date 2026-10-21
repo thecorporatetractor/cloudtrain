@@ -25,9 +25,10 @@ describe('billing helpers', () => {
     expect(formatMinor(30, 'EUR', 'en')).toBe('€0.30');
   });
 
-  it('labels catalog rows: premium, free trial, locked, nothing for standard', () => {
+  it('labels catalog rows: early access, free trial, locked, nothing for public labs', () => {
     const base = { computeTier: 'pod' as const, unitsPerMinute: 1, pricePerHour: 30 };
-    expect(accessChip({ ...base, requiredPlan: { id: 'pro', name: 'Pro', level: 1 }, locked: { reason: 'plan_required', message: 'm', action: 'upgrade', href: '/account/billing' } })?.label).toBe('Pro');
+    expect(accessChip({ ...base, requiredPlan: { id: 'pro', name: 'Pro', level: 1 }, locked: { reason: 'plan_required', message: 'm', action: 'upgrade', href: '/account/billing' } })?.label).toBe('Early access · Pro');
+    expect(accessChip({ ...base, requiredPlan: { id: 'pro', name: 'Pro', level: 1 }, earlyAccess: true })?.label).toBe('Early access');
     expect(accessChip({ ...base, trial: true, free: true })?.label).toBe('Free trial');
     expect(accessChip({ ...base, locked: { reason: 'payment_method_required', message: 'm', action: 'add_payment_method', href: '/account/billing' } })?.label).toBe('Locked');
     expect(accessChip(base)).toBeUndefined();

@@ -1,12 +1,14 @@
 import { useNavigate } from '@tanstack/react-router';
-import { Download, ScrollText, Search, X } from 'lucide-react';
+import { Download, Lock, ScrollText, Search, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { useMe } from '@/api/client';
 import { downloadCsv, useAudit } from '@/api/platform';
+import { hasFeature, unlockHint } from '@/lib/entitlements';
 import type { AuditEvent } from '@/api/types';
 import { RequireAccess } from '@/app/access';
 import { useShell } from '@/app/shell-context';
 import { When } from '@/components/platform';
-import { Badge, Button, Card, Drawer, EmptyState, ErrorState, Input, Pager, Select, TableSkeleton, TableWrap, Toolbar } from '@/components/ui';
+import { Badge, Button, Card, Drawer, EmptyState, ErrorState, Input, Pager, Select, TableSkeleton, TableWrap, Toolbar, Tooltip } from '@/components/ui';
 import { usePageCursor } from '@/lib/paging';
 import { adminAuditRoute } from '@/router';
 
@@ -48,6 +50,9 @@ function Screen() {
   pages.useRemember(q.data?.nextCursor);
   const { toast } = useShell();
   const [exporting, setExporting] = useState(false);
+  // The CSV export is premium (`audit_export`); browsing the log is not.
+  const me = useMe().data;
+  const canExport = hasFeature(me, 'audit_export');
   const hasFilter = !!(search.action || search.actor || search.targetType || search.from || search.to);
 
   const exportCsv = async () => {
@@ -68,9 +73,19 @@ function Screen() {
     <div className="stack" style={{ gap: 16 }}>
       <Toolbar
         end={
-          <Button variant="secondary" icon={<Download size={14} />} loading={exporting} onClick={() => void exportCsv()}>
-            Export CSV
-          </Button>
+          canExport ? (
+            <Button variant="secondary" icon={<Download size={14} />} loading={exporting} onClick={() => void exportCsv()}>
+              Export CSV
+            </Button>
+          ) : (
+            <Tooltip content={unlockHint(me, 'audit_export').text}>
+              <span tabIndex={0}>
+                <Button variant="secondary" icon={<Lock size={14} />} disabled aria-label={`Export CSV: ${unlockHint(me, 'audit_export').text}`}>
+                  Export CSV
+                </Button>
+              </span>
+            </Tooltip>
+          )
         }
       >
         <label className="search-field" style={{ width: 200 }}>

@@ -6,6 +6,7 @@ import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
 import { HeatCell } from '@/components/charts';
 import { FrameworkIcon, FrameworkReadinessList } from '@/components/framework-picker';
+import { FeatureLock } from '@/components/license';
 import { AssignmentStateBadge, DueDate, ItemLink, OutcomeBadge, When, itemKindLabel } from '@/components/platform';
 import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Stat, TableWrap } from '@/components/ui';
 import { formatDuration, formatMinutes, pct } from '@/lib/utils';
@@ -82,7 +83,7 @@ function MemberScreen() {
         <Stat label="This month" value={formatMinutes(d.minutesThisMonth)} hint="practice" />
         <Stat label="Attempts" value={d.attempts.length} hint={`${passed} passed`} />
         <Stat label="Assignments" value={d.assignments.filter((a) => a.status !== 'completed').length} hint={`${d.assignments.filter((a) => a.status === 'overdue').length} overdue`} tone={d.assignments.some((a) => a.status === 'overdue') ? 'warn' : undefined} />
-        {top.slice(0, 2).map((f) => (
+        {(d.analytics === 'basic' ? [] : top.slice(0, 2)).map((f) => (
           <Stat key={f.id} label={`${f.name} ready`} value={pct(d.readiness[f.id] ?? 0)} />
         ))}
       </div>
@@ -110,6 +111,11 @@ function MemberScreen() {
             <div className="card-head">
               <h2>Framework readiness</h2>
             </div>
+            {d.analytics === 'basic' ? (
+              <div style={{ padding: '14px 20px 16px' }}>
+                <FeatureLock feature="advanced_analytics" compact />
+              </div>
+            ) : (
             <FrameworkReadinessList
               rows={frameworks.map((f) => ({
                 id: f.id,
@@ -122,6 +128,7 @@ function MemberScreen() {
                 ),
               }))}
             />
+            )}
           </Card>
         </div>
 

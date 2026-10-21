@@ -240,6 +240,11 @@ const VIEWS = [
   ['platform-license-community', 'platform_admin', '/platform/license', 'Premium features', mockLicense('community', 'Install a license')],
   ['platform-license-expiring', 'platform_admin', '/platform/license', 'Premium features', mockLicense('expiring', 'expires in')],
   ['platform-license-expired', 'platform_admin', '/platform/license', 'Premium features', mockLicense('expired', 'grace period has ended')],
+  // Community edition (no license): premium features locked, everything else working.
+  ['admin-sso-community', 'org_admin', '/admin/sso', 'Identity providers', mockLicense('community', 'premium feature of self-hosted CloudTrain')],
+  ['admin-audit-community', 'org_admin', '/admin/audit', 'Export CSV', mockLicense('community', 'Export CSV')],
+  ['team-dashboard-community', 'manager', '/team', 'Members × competencies', mockLicense('community', 'Readiness and trends')],
+  ['admin-license-expiring', 'org_admin', '/admin', 'Recent activity', mockLicense('expiring', 'expires in')],
   // Below 1024px the sidebar is a drawer behind the menu button.
   ['home-phone', 'learner', '/', 'Assignments due', undefined, PHONE],
   ['nav-drawer-phone', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Open navigation' }).click(), await p.getByRole('dialog', { name: 'Navigation' }).waitFor()), PHONE],

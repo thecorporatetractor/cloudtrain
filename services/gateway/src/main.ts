@@ -71,6 +71,8 @@ async function main() {
     ...(config.billing.enabled ? { stripe: new StripeApi(config.billing.secretKey), webhookSecret: config.billing.webhookSecret } : {}),
     enforce: config.billing.enforce,
     labs: content.labs,
+    // Early-access labs are gated by plan on the hosted edition only; self-hosted, every lab present is usable.
+    earlyAccess: config.edition === 'hosted',
     mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
     webUrl: config.webUrl,
     log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },

@@ -1,5 +1,11 @@
 # Billing (Stripe, test mode)
 
+This is the **hosted edition** (`CT_EDITION=hosted`): self-hosting CloudTrain is free and
+does not bill unless `CT_BILLING_ENABLED=1` is set explicitly; premium features there come from
+a license key (`docs/licensing-keys.md`). On the hosted service people pay for the compute
+they use, and plans add the premium features and early access to labs that are not public yet.
+Public labs are never gated by plan.
+
 Plans are data (`content/site.yaml` `plans`, see `docs/website.md`); Stripe handles money;
 the gateway keeps the mapping from a Stripe customer and subscription to an organisation
 (and, for individual plans, a person), meters lab compute and enforces who may start what.
@@ -17,8 +23,11 @@ off by default.** Every amount in `site.yaml` is a placeholder.
    **Billing Meter** as one meter event, and a **metered Price** on a separate *compute
    subscription* turns them into an invoice line, monthly in arrears. Compute is billed on top
    of any plan.
-2. **Plans unlock premium labs.** Each plan has a `level` (Free 0, Pro 1, Premium 2, Team 2).
-   `plans.premium` rules say which plan a lab needs; a lab matching no rule is *standard*.
+2. **Plans unlock premium features and early access.** Each plan lists the premium features
+   it includes (`plans.items[].features`, see "Premium features" below) and has a `level`
+   (Free 0, Pro 1, Premium 2, Team 2) for **early-access labs**: content that is not public
+   yet, named by `plans.earlyAccess` rules. A lab matching no rule is public and open to every
+   account (with a payment method, or the trial). Self-hosted deployments never gate labs.
 3. **Free accounts get the trial.** Without a payment method or a plan, a person may start
    only the `plans.free.trialLabs`, uncharged, up to `maxSessions` sessions or `maxMinutes`
    minutes (lifetime, per person and organisation). Everything else needs a payment method
@@ -36,19 +45,26 @@ off by default.** Every amount in `site.yaml` is a placeholder.
    `plans.limits`, each account or org admin may change theirs). With `hardStop` new paid
    labs are refused at the cap; without it the page only warns (at 80% and at the cap).
 
-### Why premium is a site.yaml rule list, not a lab-schema field
+### Early access: a site.yaml rule list, flagged by a tag
 
 The lab schema (`packages/lab-schema`) is content: deployment-neutral, shared and licensed
-with the packs. Which labs are premium is a commercial decision of one deployment, changes
-with pricing, and covers hundreds of labs. Rules over existing lab facts (`labs` ids,
-`domains`, `difficulties`, `computeTiers`, `tags`) gate whole groups without touching a lab
-file, and `CT_SITE_CONFIG` can swap them per deployment. A single lab is listed by id.
+with the packs. Which labs are in early access is a decision of the hosted deployment and
+changes as labs go public. Rules over existing lab facts (`labs` ids, `domains`,
+`difficulties`, `computeTiers`, `tags`) select them without a schema change; the shipped
+rule is `{ plan: pro, tags: [early-access] }`, so a lab is flagged in its own metadata with
+the tag `early-access` and goes public by dropping the tag. A single lab can also be listed
+by id, and `CT_SITE_CONFIG` can swap the rules per deployment. The gate applies on the
+hosted edition only (`BillingDeps.earlyAccess`, set from `CT_EDITION`).
+
+The previous `plans.premium` rules (hard and multi-VM labs behind Pro and Premium) are
+retired: public labs are no longer gated by plan. A `premium` list left in a site file is
+ignored with a startup warning (and a `lab-verify` warning).
 
 ### Enforcement order (`BillingService.assertLabStart`)
 
 | Check | Refusal (`402`, `code: payment_required`, `details: BillingBlockDetails`) |
 |---|---|
-| Premium: the lab's required plan level vs the person's (own plan, or the org's when seated) | `plan_required`, `action: upgrade`, `requiredPlan` |
+| Early access (hosted): the lab's required plan level vs the person's (own plan, or the org's when seated) | `plan_required`, `action: upgrade`, `requiredPlan` |
 | Trial lab with allowance left | allowed, uncharged (`trial`) |
 | Trial used up and no payment method | `trial_exhausted`, `action: add_payment_method` |
 | No payment method (and no plan) for the payer | `payment_method_required`, `action: add_payment_method` |
@@ -58,7 +74,7 @@ file, and `CT_SITE_CONFIG` can swap them per deployment. A single lab is listed 
 When the organisation pays and the caller cannot manage billing, `action` is
 `contact_admin`. `details.href` names the page that fixes it. The catalog
 (`GET /api/catalog`) and the lab page (`GET /api/labs/:id`) carry the same decision per lab
-as `access` (`computeTier`, `pricePerHour`, `requiredPlan`, `trial`, `free`, `locked`), so the
+as `access` (`computeTier`, `pricePerHour`, `requiredPlan` and `earlyAccess`, `trial`, `free`, `locked`), so the
 UI shows locked labs and the reason before anyone clicks.
 
 What is metered: lab sessions started through `POST /api/labs/:id/sessions`. Exam simulations
@@ -81,7 +97,8 @@ and CTF event sessions start through their own services and are not metered or g
 
 | Key | Placeholder value | |
 |---|---|---|
-| `items[].level` | free 0, pro 1, premium 2, team 2 | Premium level a plan grants |
+| `items[].level` | free 0, pro 1, premium 2, team 2 | Early-access level a plan grants |
+| `items[].features` | free none; Pro and Premium `exam_certificates`; Team `sso`, `audit_export`, `advanced_analytics`, `exam_certificates`, `custom_branding` | Premium features (hosted edition) |
 | `items[].prices` | Pro 9/90, Premium 19/190, Team 15/150 per seat (EUR per month/year) | `stripe:sync` creates the Prices |
 | `items[team].minSeats` | 3 | Seat count bounds for checkout and changes |
 | `free.trialLabs` | `[shell-first-steps-timetable]` | A 10-minute single-container Linux lab, status verified |
@@ -92,7 +109,7 @@ and CTF event sessions start through their own services and are not metered or g
 | `compute.lookupKey` / `compute.meterEventName` | `ct_compute_unit` / `ct_compute_units` | The metered Price and the Meter |
 | `limits.user` / `limits.org` | 50.00 hard stop / 500.00 warn only | Default monthly compute caps (minor units; 0 = none) |
 | `dunning.graceDays` | 7 | Grace after a failed payment |
-| `premium` | Pro: `difficulties: [hard]`; Premium: `difficulties: [hard]` + `computeTiers: [heavy]` | Rules; the highest matching plan wins |
+| `earlyAccess` | Pro: `tags: [early-access]` | Rules; the highest matching plan wins; hosted only |
 
 The plan id `compute` is reserved (the Compute product). A rule naming an unknown plan, or an
 unknown trial lab, is logged at startup and covered by `test/billing-compute.test.ts`.
@@ -136,7 +153,7 @@ failure is logged and never undoes billing state.
 
 `billing.manage` is held by `org_admin` (every non-platform permission). Code:
 `services/gateway/src/billing/` (`stripe.ts` REST client and signatures, `compute.ts` tiers,
-rates and premium rules, `service.ts`, `routes.ts`, `sync.ts`), migrations
+rates and early-access rules, `service.ts`, `routes.ts`, `sync.ts`), migrations
 `services/gateway/src/db/migrations/0007_billing.ts` and `0009_billing_compute.ts`.
 
 ## Data
@@ -188,8 +205,48 @@ visit, subscription change and webhook.
 `PlanEntitlements`: lab hours per month, concurrent labs, environment tiers, exam
 simulations per month, CTF events. Shown on `/account/billing` (everyone) and
 `/admin/billing` (org admins, with seats and the event history). They are still recorded
-and displayed only; what is enforced is the model above (premium level, trial, payment
-method, dunning, spend cap).
+and displayed only; what is enforced is the model above (early access, trial, payment
+method, dunning, spend cap) and the premium features below.
+
+## Premium features
+
+One service decides them for both editions: `Entitlements`
+(`services/gateway/src/entitlements/`, `docs/licensing-keys.md`). On the hosted edition it
+reads the plans: organisation features (`sso`, `scim`, `audit_export`, `advanced_analytics`,
+`custom_branding`) from the organisation's plan (an active subscription or a manual grant in
+`billing_entitlements`), personal ones (`exam_certificates`) from the person's own plan or,
+for a seated member, the organisation plan. `multi_org` is the operator's and always on.
+
+| Hosted plan | Premium features |
+|---|---|
+| Free | none |
+| Pro | `exam_certificates` (reserved) |
+| Premium | `exam_certificates` (reserved) |
+| Team | `sso`, `audit_export`, `advanced_analytics`, `exam_certificates` (reserved), `custom_branding` |
+| Self-hosted license | what the key lists, for the whole deployment |
+
+`scim` is in no plan yet (reserved, not built); an enterprise agreement can grant it with a
+manual `billing_entitlements` row once it exists.
+
+What is gated, and what stays free (the gateway answers `402 feature_required`, the web
+locks the control and says who can unlock it):
+
+| Feature | Gated | Always free |
+|---|---|---|
+| `sso` | `POST /api/admin/sso`, `PATCH /api/admin/sso/:id` (except disabling or un-enforcing), `POST /api/admin/sso/:id/test`; sign-in through an organisation IdP (`error=sso_unlicensed`); enforced SSO is not applied | Viewing and deleting connections, domains, local accounts, a platform operator signing in through a platform IdP |
+| `audit_export` | `GET /api/admin/audit.csv` | `GET /api/admin/audit` |
+| `advanced_analytics` | Team dashboard `frameworks`, `minutesByWeek` and each member's `readiness`; member `readiness`; `GET /api/exams/team-readiness` (402). The dashboard says `analytics: basic` | Members x competencies heatmap, totals, assignments, the at-risk list, member drill-down (skills, attempts, assignments), `GET /api/reports/progress.csv`, the learner's own readiness on Skills |
+| `custom_branding` | Setting a new `logoUrl` or `accentColor` in `PATCH /api/admin/settings`; the logo in `/api/me` | Other settings, clearing, re-saving the saved value (kept, not shown) |
+| `multi_org` | `POST /api/platform/orgs` once an organisation exists (self-hosted) | Every existing organisation |
+| `exam_certificates`, `scim` | Reserved flags; nothing to gate yet | Exam simulations and their reports |
+
+### Basic and advanced analytics
+
+Basic is what a manager needs to run a team: who is assigned what, what is overdue or at
+risk, each member's competency mastery, practice time, attempts, and the CSV. Advanced is
+the forecasting layer on top: framework readiness (per team and per member), the eight-week
+practice trend and team exam readiness (simulation scores against the pass mark and weakest
+objectives per member).
 
 ## Products and prices
 
@@ -221,15 +278,18 @@ printed. Run it against the test account whenever `plans` change.
    standard labs unlock. Start and end a lab: the usage table shows it `sent`, and the
    meter's event summaries in the dashboard (Billing → Meters) show the units after a few
    minutes; the customer's upcoming invoice has the compute line.
-6. Subscribe to Pro: hard labs unlock (multi-VM hard labs need Premium).
+6. Subscribe to Pro: early-access labs (tag `early-access`) unlock. To try it on the public
+   catalog, add a rule to a local site file, e.g. `earlyAccess: [{ plan: pro, labs: [<id>] }]`,
+   and run with `CT_EDITION=hosted`.
 7. Failed payment: in the dashboard, attach `4000 0000 0000 0341` (attaches, then declines)
    as the default and advance a test clock past the renewal, or replay an
    `invoice.payment_failed` with `stripe trigger invoice.payment_failed`. The banner shows
    the grace period and Mailpit (`http://localhost:8025`) has the mail; with
    `dunning.graceDays: 0` new paid labs are refused at once. Paying the invoice restores.
 8. As an org admin, `/admin/billing`: buy Team seats, assign members (they now run labs on
-   the organisation's bill at the Premium level), change the seat count (Stripe prorates),
-   set the org spend cap.
+   the organisation's bill at the Team level), change the seat count (Stripe prorates),
+   set the org spend cap. With `CT_EDITION=hosted` the Team plan's features (SSO, audit
+   export, advanced analytics, branding) switch on for the organisation.
 
 A scripted version of steps 4 to 8 against the sandbox (no browser: a SetupIntent confirmed
 with `pm_card_visa` stands in for Checkout, events are signed locally) was run for this
@@ -252,7 +312,7 @@ Not done in this version; all of it is required before `STRIPE_MODE=live` exists
   store them in the deployment's secret store only, never in files on shared machines.
 - Decide the plan shapes (individual, organisation per seat, free trial) and final prices:
   plan fees, `compute.unitPrice`, the tier rates, trial caps, default spend caps, grace
-  period and the premium rules; drop `plans.placeholder`, `placeholderPrices` and
+  period, the plan features and the early-access rules; drop `plans.placeholder`, `placeholderPrices` and
   `compute.placeholder`; re-run `stripe:sync` against the live account once live mode is
   implemented (it creates the live meter and metered price too).
 - Decide whether exam simulations and CTF event sessions are metered and gated (today only

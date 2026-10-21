@@ -1,9 +1,9 @@
-import type { ComputeTier, SiteCompute, SitePlan, SitePremiumRule, SiteConfig, SiteSpendLimit } from '@cloudtrain/api-types';
+import type { ComputeTier, SiteCompute, SiteEarlyAccessRule, SitePlan, SiteConfig, SiteSpendLimit } from '@cloudtrain/api-types';
 import type { ContentLab } from '../content/load.js';
 
 /*
  * The pricing model as data (content/site.yaml `plans`): compute tiers and
- * rates, premium-lab rules and plan levels, the free trial, default spend caps
+ * rates, early-access rules and plan levels, the free trial, default spend caps
  * and the dunning grace period. Pure functions; the service does the I/O.
  *
  * Compute tier from the lab's topology, the environment it really runs on:
@@ -88,10 +88,14 @@ export class PricingModel {
     return round2(units * unitPrice);
   }
 
-  /** The plan a premium lab needs (the highest level among matching rules), or undefined for a standard lab. */
+  /**
+   * The plan an early-access lab needs (the highest level among matching
+   * `plans.earlyAccess` rules), or undefined for a public lab. Public labs are
+   * never gated by plan; the legacy `plans.premium` rules are ignored.
+   */
   requiredPlan(lab: LabFacts): SitePlan | undefined {
     let best: SitePlan | undefined;
-    for (const rule of this.site.plans?.premium ?? []) {
+    for (const rule of this.site.plans?.earlyAccess ?? []) {
       if (!ruleMatches(rule, lab)) continue;
       const plan = this.plans.find((p) => p.id === rule.plan);
       if (plan && (!best || this.level(plan) > this.level(best))) best = plan;
@@ -117,16 +121,17 @@ export class PricingModel {
     return this.site.plans?.dunning?.graceDays ?? DEFAULT_GRACE_DAYS;
   }
 
-  /** Configuration problems worth a startup warning (unknown plan ids in rules, unknown trial labs). */
+  /** Configuration problems worth a startup warning (unknown plan ids in rules, unknown trial labs, the retired `premium` rules). */
   issues(labIds: ReadonlySet<string>): string[] {
     const out: string[] = [];
-    for (const r of this.site.plans?.premium ?? []) if (!this.plans.some((p) => p.id === r.plan)) out.push(`plans.premium: unknown plan ${r.plan}`);
+    if (this.site.plans?.premium?.length) out.push('plans.premium is ignored: public labs are no longer gated by plan; list early-access labs in plans.earlyAccess');
+    for (const r of this.site.plans?.earlyAccess ?? []) if (!this.plans.some((p) => p.id === r.plan)) out.push(`plans.earlyAccess: unknown plan ${r.plan}`);
     for (const id of this.trial.labs) if (!labIds.has(id)) out.push(`plans.free.trialLabs: unknown lab ${id}`);
     return out;
   }
 }
 
-function ruleMatches(rule: SitePremiumRule, lab: LabFacts): boolean {
+function ruleMatches(rule: SiteEarlyAccessRule, lab: LabFacts): boolean {
   if (rule.labs?.includes(lab.id)) return true;
   const selectors = [rule.domains, rule.difficulties, rule.computeTiers, rule.tags].filter((s) => s && s.length);
   if (selectors.length === 0) return false;

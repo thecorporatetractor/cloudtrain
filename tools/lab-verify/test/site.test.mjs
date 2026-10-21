@@ -20,9 +20,9 @@ test("content/site.yaml passes the site checks", async () => {
   assert.equal(r.plans, 4);
 });
 
-test("compute cross-checks: premium rules name plans, trial labs exist, the metered key and plan id are free", async () => {
+test("compute cross-checks: early-access rules name plans, trial labs exist, the metered key and plan id are free", async () => {
   const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
-  doc.plans.premium.push({ plan: "platinum", difficulties: ["hard"] });
+  doc.plans.earlyAccess.push({ plan: "platinum", difficulties: ["hard"] });
   doc.plans.compute.lookupKey = "ct_pro_monthly";
   doc.plans.free.trialLabs = ["no-such-lab"];
   const dir = await mkdtemp(path.join(tmpdir(), "site-"));

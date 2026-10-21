@@ -111,7 +111,7 @@ export interface SitePlan {
   id: string;
   name: string;
   kind: PlanKind;
-  /** Tier level for premium labs (free 0; default 1 for paid plans). Seated organisation members get their organisation plan's level. */
+  /** Tier level for early-access labs (free 0; default 1 for paid plans). Seated organisation members get their organisation plan's level. */
   level?: number;
   description: string;
   badge?: string;
@@ -142,7 +142,13 @@ export interface SitePlans {
   /** Default monthly compute spend caps (minor units). */
   limits?: { user?: SiteSpendLimit; org?: SiteSpendLimit };
   dunning?: { graceDays?: number };
-  /** Premium lab rules: which plan unlocks which labs. */
+  /**
+   * Early-access labs (hosted edition): content not yet public, unlocked by a plan
+   * level. Public labs are never gated by plan. A lab can also be flagged in its own
+   * metadata with the tag `early-access` and a rule `{ plan, tags: [early-access] }`.
+   */
+  earlyAccess?: SiteEarlyAccessRule[];
+  /** @deprecated Replaced by `earlyAccess`: public labs are no longer gated by plan. Ignored (a startup warning names it). */
   premium?: SitePremiumRule[];
   items: SitePlan[];
 }
@@ -180,7 +186,10 @@ export interface SiteSpendLimit {
   hardStop?: boolean;
 }
 
-export interface SitePremiumRule {
+/** @deprecated Use `SiteEarlyAccessRule`. */
+export type SitePremiumRule = SiteEarlyAccessRule;
+
+export interface SiteEarlyAccessRule {
   /** Plan id whose level unlocks the matched labs. */
   plan: string;
   labs?: string[];

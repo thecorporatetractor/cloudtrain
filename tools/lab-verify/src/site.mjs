@@ -94,12 +94,15 @@ export async function checkSite(file, ctx, findings) {
   }
   if (plans.filter((pl) => pl.highlight).length > 1) warn("/plans/items", "more than one highlighted plan");
   if (doc.flags.showPricing && plans.length === 0) warn("/flags/showPricing", "pricing is shown but no plans are configured");
-  // Pay for compute (docs/billing.md): premium rules name real plans, the trial labs exist,
+  // Pay for compute (docs/billing.md): early-access rules name real plans, the trial labs exist,
   // and the metered price's lookup key and the reserved plan id stay clear of the plans.
-  for (const [i, rule] of (doc.plans?.premium ?? []).entries()) {
-    if (!planIds.has(rule.plan)) err(`/plans/premium/${i}/plan`, `premium rule names unknown plan '${rule.plan}'`);
-    if (![rule.labs, rule.domains, rule.difficulties, rule.computeTiers, rule.tags].some((x) => x?.length)) warn(`/plans/premium/${i}`, "premium rule matches no lab (no selector)");
+  for (const [i, rule] of (doc.plans?.earlyAccess ?? []).entries()) {
+    if (!planIds.has(rule.plan)) err(`/plans/earlyAccess/${i}/plan`, `early-access rule names unknown plan '${rule.plan}'`);
+    if (![rule.labs, rule.domains, rule.difficulties, rule.computeTiers, rule.tags].some((x) => x?.length)) warn(`/plans/earlyAccess/${i}`, "early-access rule matches no lab (no selector)");
   }
+  if (doc.plans?.premium?.length) warn("/plans/premium", "premium rules are ignored: public labs are no longer gated by plan; list early-access labs in plans.earlyAccess");
+  // multi_org is a deployment feature (docs/licensing-keys.md): a plan cannot grant it.
+  for (const [i, pl] of plans.entries()) if (pl.features?.includes("multi_org")) warn(`/plans/items/${i}/features`, "multi_org is a deployment feature; plans do not grant it");
   if (planIds.has("compute")) err("/plans/items", "plan id 'compute' is reserved for the metered compute product");
   const computeKey = doc.plans?.compute?.lookupKey;
   if (computeKey && lookupKeys.has(computeKey)) err("/plans/compute/lookupKey", `lookup key '${computeKey}' is also used by ${lookupKeys.get(computeKey)}`);

@@ -37,7 +37,7 @@ export function LabOverview() {
   const { metadata, spec } = personalize(lab.data);
   const summary = catalog.data?.labs.find((l) => l.id === metadata.id);
   const resume = summary?.completion === 'in-progress';
-  // Billing: compute tier and rate, premium plan, trial, and a lock with its fix (docs/billing.md).
+  // Billing: compute tier and rate, early-access plan, trial, and a lock with its fix (docs/billing.md).
   const access = lab.data.access ?? summary?.access;
   const hintCost = (spec.hints ?? []).reduce((a, h) => a + (h.cost ?? 1), 0);
   const skillIds = Array.from(new Set(spec.checks.flatMap((c) => c.skills)));

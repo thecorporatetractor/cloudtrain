@@ -1,9 +1,11 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowRight, ChevronLeft, GraduationCap, History, Hourglass, Play, Users } from 'lucide-react';
 import { useMemo, useState } from 'react';
+import { ApiError } from '@/api/client';
 import { useExams, useGrantExamRetake, useMyAttempts, useTeamExamReadiness, useVoidExamAttempt } from '@/api/exams';
 import type { ExamAttemptSummary, ExamSummary, TeamExamMember } from '@/api/types';
 import { can, RequireAccess } from '@/app/access';
+import { FeatureLock } from '@/components/license';
 import { useShell } from '@/app/shell-context';
 import { alignLabel, Disclaimer, ExamDomainIcon, examDomainLabel, fmtPct, PhaseBadge, ResultBadge, RuleChips, ScoreBar } from '@/components/exams/ui';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Segmented, Stat } from '@/components/ui';
@@ -283,6 +285,8 @@ export function TeamExams() {
         </header>
         {data.isPending ? (
           <PageSkeleton />
+        ) : data.isError && data.error instanceof ApiError && data.error.code === 'feature_required' ? (
+          <FeatureLock feature="advanced_analytics">Each member's simulation scores against the pass mark and weakest objectives are advanced analytics. Members still see their own reports.</FeatureLock>
         ) : data.isError ? (
           <ErrorState title="Team readiness unavailable" error={data.error} onRetry={() => void data.refetch()} />
         ) : !exam ? (

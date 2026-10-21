@@ -28,7 +28,7 @@ export function siteComputeRates(site: SiteConfig | undefined): { tier: ComputeT
 }
 
 export const BLOCK_TITLE: Record<BillingBlockReason, string> = {
-  plan_required: 'A premium lab',
+  plan_required: 'An early-access lab',
   trial_exhausted: 'Your free trial is used up',
   payment_method_required: 'Add a payment method to start this lab',
   payment_overdue: 'A payment is overdue',
@@ -60,9 +60,9 @@ export function billingBlockOf(e: unknown): (BillingBlockDetails & { message: st
 /** Short label for a catalog row. */
 export function accessChip(a: LabAccess | undefined): { label: string; tone: 'ok' | 'warn' | 'accent' | 'outline'; title: string } | undefined {
   if (!a) return undefined;
-  if (a.locked?.reason === 'plan_required' && a.requiredPlan) return { label: a.requiredPlan.name, tone: 'accent', title: a.locked.message };
+  if (a.locked?.reason === 'plan_required' && a.requiredPlan) return { label: `Early access · ${a.requiredPlan.name}`, tone: 'accent', title: a.locked.message };
   if (a.trial && a.free) return { label: 'Free trial', tone: 'ok', title: 'Included in the free trial: no charge' };
   if (a.locked) return { label: 'Locked', tone: 'warn', title: a.locked.message };
-  if (a.requiredPlan) return { label: a.requiredPlan.name, tone: 'outline', title: `Premium lab, included in your ${a.requiredPlan.name} plan or higher` };
+  if (a.requiredPlan) return { label: 'Early access', tone: 'outline', title: `Early-access lab, included in your ${a.requiredPlan.name} plan or higher` };
   return undefined;
 }

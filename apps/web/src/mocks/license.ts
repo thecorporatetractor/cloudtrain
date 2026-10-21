@@ -151,3 +151,23 @@ export const licenseHandlers = [
     return HttpResponse.json(status() as unknown as Record<string, unknown>);
   }),
 ];
+
+/** Whether the mock deployment has `f` now (like Entitlements.has on the gateway). */
+export function mockHas(f: Feature): boolean {
+  return active(readState().state) && ALL.includes(f);
+}
+
+/** The gateway's 402 `feature_required` for `f`, or undefined when the mock has it. */
+export function featureRequired(f: Feature, me: Pick<Me, 'platformAdmin'> | undefined) {
+  if (mockHas(f)) return undefined;
+  const info = FEATURE_CATALOG.find((x) => x.id === f)!;
+  const expired = readState().state === 'expired';
+  return HttpResponse.json(
+    {
+      error: expired ? `${info.name} needs a current CloudTrain license; the installed one has expired.` : `${info.name} is a premium feature: it needs a CloudTrain license on a self-hosted deployment.`,
+      code: 'feature_required',
+      details: { feature: f, featureName: info.name, edition: 'selfhosted', reason: expired ? 'license_expired' : 'no_license', action: me?.platformAdmin ? 'license' : 'contact_admin', href: '/platform/license' },
+    },
+    { status: 402 },
+  );
+}

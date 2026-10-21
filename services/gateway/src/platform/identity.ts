@@ -45,11 +45,17 @@ export interface ProvisionOptions {
   /** Org the login started for (identity-first). */
   preferredOrgId?: string | null;
   ip?: string;
+  /**
+   * Whether the org may use SSO (the `sso` premium feature, docs/licensing-keys.md).
+   * Without it a login through the org's IdP is refused, SSO is not enforced on its
+   * domains, and local accounts keep working. Omitted: always allowed.
+   */
+  ssoAllowed?: (orgId: string) => Promise<boolean>;
 }
 
 export type ProvisionResult =
   | { ok: true; userId: string; orgId: string | null; platformAdmin: boolean }
-  | { ok: false; reason: 'no_membership' | 'deactivated' | 'sso_required' | 'org_suspended' | 'email_conflict'; message: string; orgId?: string };
+  | { ok: false; reason: 'no_membership' | 'deactivated' | 'sso_required' | 'sso_unlicensed' | 'org_suspended' | 'email_conflict'; message: string; orgId?: string };
 
 interface OrgForDomain {
   org_id: string;
@@ -123,10 +129,17 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
   const ssoOrg = c.identityProvider ? await orgForIdp(db, c.identityProvider) : null;
   const domainOrg = await orgForDomain(db, domain);
 
-  if (!c.identityProvider && domainOrg?.verified && domainOrg.enforced) {
+  const ssoOn = async (orgId: string) => !opts.ssoAllowed || (await opts.ssoAllowed(orgId));
+  if (!c.identityProvider && domainOrg?.verified && domainOrg.enforced && (await ssoOn(domainOrg.org_id))) {
     return { ok: false, reason: 'sso_required', message: `${domainOrg.name} requires single sign-on for ${domain}.`, orgId: domainOrg.org_id };
   }
   if (ssoOrg && ssoOrg.status === 'suspended') return { ok: false, reason: 'org_suspended', message: 'This organization is suspended.', orgId: ssoOrg.org_id };
+  // SSO without the feature: refused, except a platform operator through a platform IdP
+  // (who must always be able to sign in and install the license); they get no SSO membership.
+  const ssoOff = !!ssoOrg && !(await ssoOn(ssoOrg.org_id));
+  if (ssoOff && !(opts.platformIdps.includes(c.identityProvider!) && c.idpRoles.includes('CloudTrain.PlatformAdmin'))) {
+    return { ok: false, reason: 'sso_unlicensed', message: 'Single sign-on is not available for this organization: it needs a CloudTrain license or plan that includes SSO. Sign in with a local account, or ask your administrator.', orgId: ssoOrg!.org_id };
+  }
 
   // A pre-provisioned identity ('pending-…', from the seed or an invitation) with this email becomes this sub.
   const existing = (await sql<{ id: string; platform_roles: string[] }>`SELECT * FROM auth_user_by_email(${email})`.execute(db)).rows[0];
@@ -163,7 +176,7 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
   });
 
   // SSO: membership + roles + teams from the IdP, every login.
-  if (ssoOrg) {
+  if (ssoOrg && !ssoOff) {
     const denied = await withTenant(db, { orgId: ssoOrg.org_id, userId: c.sub }, async (tx) => {
       const conn = await tx.selectFrom('sso_connections').selectAll().where('kc_alias', '=', c.identityProvider!).executeTakeFirstOrThrow();
       const mapped = mapSsoClaims(c, conn.group_mappings, conn.default_roles);

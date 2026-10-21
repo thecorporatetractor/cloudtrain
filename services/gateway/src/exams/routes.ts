@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import type { FlagTaskRequest, GrantExamRetakeRequest, VoidExamAttemptRequest } from '@cloudtrain/api-types';
 import { HttpError } from '../errors.js';
+import type { Principal } from '../auth.js';
 import type { LabCluster } from '../kube/cluster.js';
 import type { LabSession } from '../kube/types.js';
 import { bridge, clampSize } from '../terminal/bridge.js';
@@ -33,14 +34,22 @@ export function planExamTerminal(ls: LabSession, node: string): TerminalPlan {
  * scope, plus the CSRF header on writes); the service checks the exact scope
  * (own attempts, a managed team, the candidate's teams/cohorts).
  */
-export function registerExamRoutes(app: FastifyInstance, exams: ExamService, labs: LabCluster): void {
+/** Premium gates on exam routes (src/entitlements): team exam readiness is advanced analytics. */
+export interface ExamRouteGates {
+  teamReadiness?: (p: Principal) => Promise<void>;
+}
+
+export function registerExamRoutes(app: FastifyInstance, exams: ExamService, labs: LabCluster, gates: ExamRouteGates = {}): void {
   const run = { config: { permission: 'lab.run' as const } };
   const team = { config: { permission: 'progress.read.team' as const } };
   const control = { config: { permission: 'session.control' as const } };
   const assign = { config: { permission: 'assignment.manage' as const } };
   app.get('/api/exams', run, async (req) => ({ exams: await exams.list(req.principal) }));
   app.get<{ Querystring: { exam?: string } }>('/api/exams/attempts/mine', run, async (req) => exams.mine(req.principal, req.query.exam || undefined));
-  app.get<{ Querystring: { team?: string } }>('/api/exams/team-readiness', team, async (req) => exams.teamReadiness(req.principal, req.query.team || undefined));
+  app.get<{ Querystring: { team?: string } }>('/api/exams/team-readiness', team, async (req) => {
+    await gates.teamReadiness?.(req.principal);
+    return exams.teamReadiness(req.principal, req.query.team || undefined);
+  });
   app.get<{ Params: { attemptId: string } }>('/api/exams/attempts/:attemptId', run, async (req) => exams.attempt(req.principal, req.params.attemptId));
   app.get<{ Params: { attemptId: string } }>('/api/exams/attempts/:attemptId/report', run, async (req) => exams.report(req.principal, req.params.attemptId));
   app.post<{ Params: { attemptId: string } }>('/api/exams/attempts/:attemptId/submit', run, async (req) => exams.submit(req.principal, req.params.attemptId, req.ip));

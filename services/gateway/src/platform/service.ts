@@ -349,6 +349,10 @@ export class PlatformService implements SessionHooks {
       : { attempts: [] as AttemptLite[], user: undefined, cohorts: [] as { id: string; name: string }[], logoUrl: undefined };
     const now = this.now();
     const cohortName = new Map(stats.cohorts.map((c) => [c.id, c.name]));
+    // The org logo is custom branding (premium): kept in the settings, shown only with the feature.
+    const branded = new Map<string, boolean>();
+    for (const id of new Set([p.orgId, ...memberships.map((m) => m.org_id)].filter(Boolean))) branded.set(id, await this.entitlements.has('custom_branding', { orgId: id }));
+    if (!branded.get(p.orgId)) stats.logoUrl = undefined;
     const userRefFull = { id: p.sub, name: p.name, email: p.email, ...(p.title ? { title: p.title } : {}), ...(stats.user?.avatar_url ? { avatarUrl: stats.user.avatar_url } : {}), ...(stats.user?.last_login_at ? { lastLoginAt: stats.user.last_login_at.toISOString() } : {}) };
     return {
       id: p.sub,
@@ -363,7 +367,7 @@ export class PlatformService implements SessionHooks {
       activeOrg: p.orgId ? { id: p.orgId, slug: p.orgSlug, name: p.orgName, ...(stats.logoUrl ? { logoUrl: stats.logoUrl } : {}) } : null,
       memberships: memberships
         .filter((m) => m.status !== 'deactivated' && m.org_status === 'active')
-        .map((m) => ({ org: { id: m.org_id, slug: m.slug, name: m.name, ...(m.logo_url ? { logoUrl: m.logo_url } : {}) }, roles: m.roles as Me['memberships'][number]['roles'], status: m.status as 'invited' | 'active' })),
+        .map((m) => ({ org: { id: m.org_id, slug: m.slug, name: m.name, ...(m.logo_url && branded.get(m.org_id) ? { logoUrl: m.logo_url } : {}) }, roles: m.roles as Me['memberships'][number]['roles'], status: m.status as 'invited' | 'active' })),
       roles: p.roles,
       permissions: permissionsOf(p),
       grants: grantsOf(p),

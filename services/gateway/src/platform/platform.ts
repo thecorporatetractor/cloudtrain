@@ -94,6 +94,9 @@ export async function createOrg(ps: PlatformService, p: Principal, req: CreatePl
   const domains = (req.domains ?? []).map((d) => d.trim().toLowerCase());
   for (const d of domains) if (!DOMAIN.test(d)) throw badRequest(`Invalid domain ${d}`, { domains: 'invalid' });
   const quotas = checkQuotas(req.quotas);
+  // A second organisation on one deployment is premium (`multi_org`); existing ones always keep working.
+  const count = await ps.ptx(p, async (tx) => Number((await tx.selectFrom('orgs').select(sql<number>`count(*)::int`.as('n')).executeTakeFirstOrThrow()).n));
+  if (count >= 1 && !(await ps.entitlements.has('multi_org', {}))) throw ps.entitlements.error('multi_org', p);
   const org = await ps.ptx(p, async (tx) => {
     if (await tx.selectFrom('orgs').select('id').where('slug', '=', slug).executeTakeFirst()) throw conflict(`An organization ${slug} already exists.`);
     for (const d of domains) if (await tx.selectFrom('org_domains').select('domain').where('domain', '=', d).executeTakeFirst()) throw conflict(`${d} is already claimed.`);

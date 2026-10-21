@@ -13,6 +13,7 @@ import type {
 import { drawTasks, fixtureExams, hash, MOCK_AVAILABLE, reportFor, terminalsFor, type MockTask } from './fixtures/exams';
 import type { FixtureExam } from './fixtures/exams.generated';
 import { membersOfTeam } from './fixtures/platform';
+import { featureRequired } from './license';
 import { currentMe } from './platformHandlers';
 
 /*
@@ -318,6 +319,8 @@ export const examHandlers = [
   }),
   http.get('/api/exams/team-readiness', async ({ request }) => {
     await latency();
+    const locked = featureRequired('advanced_analytics', me());
+    if (locked) return locked;
     const r = team(new URL(request.url).searchParams.get('team'));
     return r instanceof Response ? r : HttpResponse.json(r);
   }),

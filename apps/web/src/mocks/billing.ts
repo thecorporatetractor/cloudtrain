@@ -27,7 +27,7 @@ import { currentSession } from './platformHandlers';
 /*
  * Mock billing (services/gateway/src/billing, docs/billing.md): the signed-in
  * persona's plan and the org's, with a pretend Stripe, metered compute, the
- * free trial, premium labs, seats and spend caps. "Checkout" (plans or setup
+ * free trial, early-access labs, seats and spend caps. "Checkout" (plans or setup
  * mode) completes at once (as if the webhook had landed) and sends the browser
  * back. Lab starts are gated like the gateway does (402 payment_required).
  * State lives in localStorage per org and user; personas start with a card on
@@ -105,7 +105,7 @@ function tierOf(t: Topology): ComputeTier {
 function requiredPlan(lab: Lab): SitePlan | undefined {
   let best: SitePlan | undefined;
   const tier = tierOf(lab.spec.topology);
-  for (const r of site.plans?.premium ?? []) {
+  for (const r of site.plans?.earlyAccess ?? []) {
     const m = lab.metadata;
     const sel = [r.domains, r.difficulties, r.computeTiers, r.tags].some((x) => x?.length);
     const hit = r.labs?.includes(m.id) || (sel && (!r.domains?.length || r.domains.includes(m.domain)) && (!r.difficulties?.length || r.difficulties.includes(m.difficulty)) && (!r.computeTiers?.length || r.computeTiers.includes(tier)) && (!r.tags?.length || r.tags.some((t) => m.tags?.includes(t))));
@@ -313,7 +313,7 @@ function decide(s: MockState, orgId: string, userId: string, lab: Lab): Decision
   const block = (reason: BillingBlockReason, message: string, action: BillingBlockDetails['action'], extra: Partial<BillingBlockDetails> = {}): Decision => ({ block: { reason, message, details: { reason, action: fix(action), href, scope: p.payer, ...extra } } });
   const req = requiredPlan(lab);
   if (req && p.level < levelOf(req)) {
-    return { block: { reason: 'plan_required', message: `"${lab.metadata.title}" is a premium lab: it needs the ${req.name} plan or higher.`, details: { reason: 'plan_required', action: 'upgrade', href: '/account/billing', scope: 'user', requiredPlan: { id: req.id, name: req.name, level: levelOf(req) } } } };
+    return { block: { reason: 'plan_required', message: `"${lab.metadata.title}" is in early access: it needs the ${req.name} plan or higher.`, details: { reason: 'plan_required', action: 'upgrade', href: '/account/billing', scope: 'user', requiredPlan: { id: req.id, name: req.name, level: levelOf(req) } } } };
   }
   if (trialLabs().includes(lab.metadata.id)) {
     const t = trialUse(s, orgId, userId);
@@ -335,7 +335,7 @@ function accessOf(s: MockState, orgId: string, userId: string, lab: Lab): LabAcc
     computeTier: tier,
     unitsPerMinute: upm(tier),
     pricePerHour: pricePerHour(tier),
-    ...(req ? { requiredPlan: { id: req.id, name: req.name, level: levelOf(req) } } : {}),
+    ...(req ? { requiredPlan: { id: req.id, name: req.name, level: levelOf(req) }, earlyAccess: true } : {}),
     ...(trial ? { trial: true } : {}),
     ...(d.trial ? { free: true } : {}),
     ...(d.block ? { locked: { reason: d.block.reason, message: d.block.message, action: d.block.details.action, href: d.block.details.href } } : {}),

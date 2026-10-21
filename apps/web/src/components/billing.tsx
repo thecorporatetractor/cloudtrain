@@ -8,7 +8,7 @@ import { formatDate, relativeTime } from '@/lib/utils';
 
 /*
  * Billing pieces outside the billing pages: why a lab cannot start (and the one
- * action that fixes it), the catalog chip for premium, trial and locked labs,
+ * action that fixes it), the catalog chip for early-access, trial and locked labs,
  * and the app-wide payment banner while a payment is overdue.
  */
 
@@ -30,7 +30,7 @@ export function BillingBlocked({ block, compact, title }: { block: Pick<BillingB
         <Icon size={compact ? 15 : 20} />
       </span>
       <div className="stack grow" style={{ gap: 4, minWidth: 0 }}>
-        <strong className={compact ? 'small' : undefined}>{title ?? (block.reason === 'plan_required' && block.requiredPlan ? `A premium lab: ${block.requiredPlan.name} or higher` : BLOCK_TITLE[block.reason])}</strong>
+        <strong className={compact ? 'small' : undefined}>{title ?? (block.reason === 'plan_required' && block.requiredPlan ? `Early access: ${block.requiredPlan.name} or higher` : BLOCK_TITLE[block.reason])}</strong>
         <span className="small muted">{block.message}</span>
       </div>
       <Link to={to} search={block.action === 'upgrade' && block.requiredPlan ? { plan: block.requiredPlan.id } : {}} className={compact ? 'btn btn-secondary btn-sm' : 'btn btn-primary btn-md'}>
@@ -40,7 +40,7 @@ export function BillingBlocked({ block, compact, title }: { block: Pick<BillingB
   );
 }
 
-/** The catalog chip for a lab: its premium plan, the free trial, or locked. */
+/** The catalog chip for a lab: early access (its plan), the free trial, or locked. */
 export function LabAccessChip({ access }: { access?: LabAccess }) {
   const chip = accessChip(access);
   if (!chip) return null;
@@ -92,18 +92,18 @@ export function CatalogBillingPrompt({ labs }: { labs: LabSummary[] }) {
   const locked = labs.filter((l) => l.access?.locked);
   if (locked.length === 0) return null;
   const needsCard = locked.filter((l) => l.access!.locked!.action === 'add_payment_method').length;
-  const premium = locked.filter((l) => l.access!.locked!.reason === 'plan_required');
+  const early = locked.filter((l) => l.access!.locked!.reason === 'plan_required');
   const trial = labs.find((l) => l.access?.trial && l.access.free);
-  const first = (needsCard ? locked.find((l) => l.access!.locked!.action === 'add_payment_method') : premium[0] ?? locked[0])!;
-  const plan = premium.map((l) => l.access!.requiredPlan!).sort((a, b) => a.level - b.level)[0];
+  const first = (needsCard ? locked.find((l) => l.access!.locked!.action === 'add_payment_method') : early[0] ?? locked[0])!;
+  const plan = early.map((l) => l.access!.requiredPlan!).sort((a, b) => a.level - b.level)[0];
   const message = needsCard
     ? `${trial ? `"${trial.title}" is free to try. ` : ''}Add a payment method to unlock ${needsCard} more lab${needsCard === 1 ? '' : 's'}: you pay only for the compute each session uses.`
-    : premium.length
-      ? `${premium.length} premium lab${premium.length === 1 ? ' needs' : 's need'} a plan upgrade${plan ? `, starting with ${plan.name}` : ''}. Compute is billed on top of any plan.`
+    : early.length
+      ? `${early.length} early-access lab${early.length === 1 ? ' is' : 's are'} included from ${plan ? plan.name : 'a paid plan'}: new content before it goes public. Compute is billed on top of any plan.`
       : first.access!.locked!.message;
   return (
     <div style={{ marginBottom: 16 }}>
-      <BillingBlocked compact title={needsCard ? 'Unlock the catalog' : premium.length ? 'Premium labs' : undefined} block={{ reason: first.access!.locked!.reason, action: first.access!.locked!.action, href: first.access!.locked!.href, message, ...(plan && !needsCard ? { requiredPlan: plan } : {}) }} />
+      <BillingBlocked compact title={needsCard ? 'Unlock the catalog' : early.length ? 'Early access' : undefined} block={{ reason: first.access!.locked!.reason, action: first.access!.locked!.action, href: first.access!.locked!.href, message, ...(plan && !needsCard ? { requiredPlan: plan } : {}) }} />
     </div>
   );
 }

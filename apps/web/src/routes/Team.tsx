@@ -10,6 +10,7 @@ import { useShell } from '@/app/shell-context';
 import { Columns, HeatCell } from '@/components/charts';
 import { DomainIcon } from '@/components/domain';
 import { FrameworkReadinessList } from '@/components/framework-picker';
+import { FeatureLock } from '@/components/license';
 import { AssignmentStateBadge, DueDate, ItemLink } from '@/components/platform';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Select, Stat, Tooltip } from '@/components/ui';
 import { cn, formatMinutes, pct } from '@/lib/utils';
@@ -125,6 +126,16 @@ function TeamScreen() {
           <Heatmap d={d} />
 
           <div className="split split-5-7" style={{ marginTop: 20 }}>
+            {d.analytics === 'basic' ? (
+              <Card className="card-flush">
+                <div className="card-head">
+                  <h2>Readiness and trends</h2>
+                </div>
+                <div style={{ padding: '14px 20px 16px' }}>
+                  <FeatureLock feature="advanced_analytics">Framework readiness per team and member, the weekly practice trend and team exam readiness are advanced analytics.</FeatureLock>
+                </div>
+              </Card>
+            ) : (
             <div className="stack" style={{ gap: 20 }}>
               <Card className="card-flush">
                 <div className="card-head">
@@ -160,6 +171,7 @@ function TeamScreen() {
                 </div>
               </Card>
             </div>
+            )}
 
             <Card className="card-flush">
               <div className="card-head">

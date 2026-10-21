@@ -2101,7 +2101,7 @@ export interface Site {
     };
   };
   /**
-   * Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat). Learners pay for the compute their lab sessions use on top of any plan (`compute`); plans unlock premium labs (`premium`); the free plan gives a trial lab (`free`).
+   * Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat). Learners pay for the compute their lab sessions use on top of any plan (`compute`); plans unlock premium features (`items[].features`) and early-access labs (`earlyAccess`); the free plan gives a trial lab (`free`).
    */
   plans?: {
     /**
@@ -2220,7 +2220,21 @@ export interface Site {
       graceDays?: number;
     };
     /**
-     * Premium labs: each rule names the plan that unlocks the labs it matches (all given selectors must match; `labs` matches by id on its own). A lab needs the highest plan level among the rules it matches; a lab matching no rule is standard.
+     * Early-access labs (hosted edition only): content not yet public, unlocked by a plan level. Each rule names the plan that unlocks the labs it matches (all given selectors must match; `labs` matches by id on its own); a lab needs the highest plan level among the rules it matches. Public labs match no rule and are never gated by plan. Flag a lab in its own metadata with the tag `early-access` and a rule `{ plan, tags: [early-access] }`. Self-hosted deployments do not gate labs.
+     */
+    earlyAccess?: {
+      /**
+       * Plan id; its `level` unlocks the labs.
+       */
+      plan: string;
+      labs?: string[];
+      domains?: string[];
+      difficulties?: ("easy" | "medium" | "hard")[];
+      computeTiers?: ("pod" | "vm" | "heavy")[];
+      tags?: string[];
+    }[];
+    /**
+     * Deprecated and ignored: public labs are no longer gated by plan (use `earlyAccess`). The gateway logs a warning when it is set.
      */
     premium?: {
       /**
@@ -3117,7 +3131,7 @@ export interface Plan {
    */
   kind: "free" | "individual" | "organisation";
   /**
-   * Tier level for premium labs (free 0). A subscriber, or a seated member of an organisation on the plan, may start labs whose premium rules need this level or less. Default: 0 for free, 1 otherwise.
+   * Tier level for early-access labs (free 0). A subscriber, or a seated member of an organisation on the plan, may start labs whose early-access rules need this level or less. Default: 0 for free, 1 otherwise.
    */
   level?: number;
   description: string;
@@ -3147,6 +3161,12 @@ export interface Plan {
    */
   placeholderPrices?: boolean;
   entitlements: Entitlements;
+  /**
+   * Premium features the plan includes on the hosted edition (docs/licensing-keys.md). Organisation features (sso, scim, audit_export, advanced_analytics, custom_branding) come from the organisation's plan; exam_certificates also from an individual plan. multi_org is a deployment feature and is ignored here.
+   */
+  features?: (
+    "sso" | "scim" | "audit_export" | "advanced_analytics" | "exam_certificates" | "custom_branding" | "multi_org"
+  )[];
   /**
    * Marketing bullets under the entitlements.
    *
@@ -3191,7 +3211,7 @@ export interface Price {
   lookupKey: string;
 }
 /**
- * What a plan allows. Recorded and displayed; enforcement covers premium labs, the free trial, payment, dunning and spend caps (docs/billing.md).
+ * What a plan allows. Recorded and displayed; enforcement covers early-access labs, the free trial, payment, dunning and spend caps (docs/billing.md).
  *
  * This interface was referenced by `Site`'s JSON-Schema
  * via the `definition` "entitlements".
