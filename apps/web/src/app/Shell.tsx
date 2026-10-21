@@ -6,6 +6,7 @@ import { useMe } from '@/api/client';
 import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
 import type { Me } from '@/api/types';
+import { BillingBanner } from '@/components/billing';
 import { Badge, Button, Dot, Dropdown, Kbd, Tooltip } from '@/components/ui';
 import { useHotkeys, type Hotkey } from '@/lib/hotkeys';
 import { COMPACT_NAV_QUERY, useMediaQuery } from '@/lib/media';
@@ -175,6 +176,7 @@ function ShellInner() {
         </DialogPrimitive.Root>
 
         <main id="main" className="main" tabIndex={-1}>
+          {!inWorkspace && <BillingBanner />}
           <Outlet />
         </main>
 
@@ -194,6 +196,7 @@ function ShellInner() {
       {navMode !== 'hidden' && panel(navMode)}
 
       <main id="main" className="main" tabIndex={-1}>
+        {!inWorkspace && <BillingBanner />}
         <Outlet />
       </main>
 

@@ -10,7 +10,7 @@ const TEST_KEY = 'sk_test_51FAKEFAKEFAKEFAKEFAKEFAKE';
 describe('billing config guard rails', () => {
   const base = { CT_PUBLIC_URL: 'http://localhost:8787' };
   it('is off by default and never accepts a live key', () => {
-    expect(billingConfig({ ...base })).toEqual({ enabled: false, mode: 'test', secretKey: '', webhookSecret: '' });
+    expect(billingConfig({ ...base })).toEqual({ enabled: false, mode: 'test', secretKey: '', webhookSecret: '', enforce: false, sweepMs: 60000 });
     expect(() => billingConfig({ ...base, STRIPE_SECRET_KEY: 'sk_live_FAKEFAKEFAKEFAKEFAKE' })).toThrow(/live key/);
     expect(() => billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: 'rk_live_FAKEFAKEFAKEFAKEFAKE', STRIPE_WEBHOOK_SECRET: SECRET })).toThrow(/live key/);
   });
@@ -21,7 +21,12 @@ describe('billing config guard rails', () => {
   it('needs a test key and a webhook secret when on', () => {
     expect(() => billingConfig({ ...base, CT_BILLING_ENABLED: '1' })).toThrow(/test-mode key/);
     expect(() => billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: TEST_KEY })).toThrow(/STRIPE_WEBHOOK_SECRET/);
-    expect(billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET })).toEqual({ enabled: true, mode: 'test', secretKey: TEST_KEY, webhookSecret: SECRET });
+    expect(billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET })).toEqual({ enabled: true, mode: 'test', secretKey: TEST_KEY, webhookSecret: SECRET, enforce: true, sweepMs: 60000 });
+    // Enforcement follows billing unless CT_BILLING_ENFORCE says otherwise; it never runs without billing.
+    expect(billingConfig({ ...base, CT_BILLING_ENABLED: '1', CT_BILLING_ENFORCE: '0', STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET }).enforce).toBe(false);
+    expect(billingConfig({ ...base, CT_BILLING_ENFORCE: '1' }).enforce).toBe(false);
+    expect(() => billingConfig({ ...base, CT_BILLING_ENFORCE: 'on' })).toThrow(/CT_BILLING_ENFORCE/);
+    expect(() => billingConfig({ ...base, CT_BILLING_SWEEP_MS: '-5' })).toThrow(/CT_BILLING_SWEEP_MS/);
   });
   it('key helpers', () => {
     expect(isLiveKey('sk_live_x')).toBe(true);

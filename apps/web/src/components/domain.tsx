@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import { useSkills } from '@/api/client';
 import type { Difficulty, Domain, LabSummary, NodeDriver, NodeStatus, Recommendation } from '@/api/types';
 import { Badge, Dot, Tooltip } from '@/components/ui';
+import { LabAccessChip } from '@/components/billing';
 import { cn, formatMinutes, titleCase } from '@/lib/utils';
 
 /* --------------------------------- Domain ---------------------------------- */
@@ -108,6 +109,7 @@ export function LabRow({ lab, trailing }: { lab: LabSummary; trailing?: ReactNod
           <SkillTags ids={lab.skillIds} max={3} size="xs" />
         </span>
       </span>
+      <LabAccessChip access={lab.access} />
       {trailing ?? <CompletionBadge completion={lab.completion} score={lab.bestScore} />}
     </Link>
   );

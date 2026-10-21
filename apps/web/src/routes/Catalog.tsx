@@ -3,6 +3,7 @@ import { ArrowRight, Clock, Search, SlidersHorizontal, X } from 'lucide-react';
 import { useMemo } from 'react';
 import { useCatalog, useSkills } from '@/api/client';
 import type { Difficulty, Domain } from '@/api/types';
+import { CatalogBillingPrompt } from '@/components/billing';
 import { Bar } from '@/components/charts';
 import { DomainIcon, LabRow, domainLabel } from '@/components/domain';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Segmented } from '@/components/ui';
@@ -187,6 +188,7 @@ export function Catalog() {
           </Card>
         )}
 
+        <CatalogBillingPrompt labs={catalog.data?.labs ?? []} />
         {filtered.length === 0 ? (
           <EmptyState
             title="No labs match these filters"

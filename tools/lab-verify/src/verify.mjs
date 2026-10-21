@@ -547,7 +547,7 @@ export async function verifyContent(contentDir, opts = {}) {
   const curriculum = await checkCurriculum(path.join(contentDir, "curriculum.yaml"), { skills, frameworkRefs, catalog, packLabs }, findings);
   // The public website configuration, when present.
   const domainsWithLabs = new Set([...packLabs.values()].map((l) => l.domain).filter(Boolean));
-  const site = await checkSite(path.join(contentDir, "site.yaml"), { domainsWithLabs, repoRoot: path.resolve(contentDir, "..") }, findings);
+  const site = await checkSite(path.join(contentDir, "site.yaml"), { domainsWithLabs, labIds: new Set(packLabs.keys()), repoRoot: path.resolve(contentDir, "..") }, findings);
   const denylistHits = await scanDenylist(contentDir);
   return { skills: skills.size, frameworks: frameworkRefs.size, labs, curriculum, site, findings, denylistHits };
 }

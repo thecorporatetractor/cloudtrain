@@ -181,7 +181,7 @@ try {
     ['none', '/', 'How a lab works', 'landing'],
     ['none', '/catalog', 'Everything you can practise', 'catalog-public'],
     ['none', '/catalog/paths/cks-readiness', 'Network policy and least privilege', 'catalog-path-public'],
-    ['none', '/pricing', 'Compare entitlements', 'pricing'],
+    ['none', '/pricing', 'Compare plans', 'pricing'],
     ['learner', '/account/billing', 'Plans for you', 'billing'],
   ];
   for (const [persona, url, waitFor, name] of views) {

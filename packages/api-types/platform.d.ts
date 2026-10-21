@@ -78,6 +78,8 @@ export type ErrorCode =
   | 'invalid'
   | 'csrf'
   | 'quota_exceeded'
+  /** 402: billing refuses a lab start (`details`: `BillingBlockDetails`). */
+  | 'payment_required'
   | 'org_suspended'
   | 'deactivated'
   | 'upstream'
@@ -999,6 +1001,12 @@ export type AuditAction =
   | 'billing.portal'
   | 'billing.subscription'
   | 'billing.webhook'
+  | 'billing.payment_method'
+  | 'billing.seats'
+  | 'billing.seat_assign'
+  | 'billing.seat_unassign'
+  | 'billing.limit'
+  | 'billing.dunning'
   | (string & {});
 
 export interface AuditEvent {

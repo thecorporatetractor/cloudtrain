@@ -17,12 +17,28 @@ test("content/site.yaml passes the site checks", async () => {
   assert.deepEqual(findings.filter((f) => f.level === "error"), []);
   assert.equal(r.brand, "CloudTrain");
   assert.ok(r.features >= 3);
-  assert.equal(r.plans, 3);
+  assert.equal(r.plans, 4);
+});
+
+test("compute cross-checks: premium rules name plans, trial labs exist, the metered key and plan id are free", async () => {
+  const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
+  doc.plans.premium.push({ plan: "platinum", difficulties: ["hard"] });
+  doc.plans.compute.lookupKey = "ct_pro_monthly";
+  doc.plans.free.trialLabs = ["no-such-lab"];
+  const dir = await mkdtemp(path.join(tmpdir(), "site-"));
+  const file = path.join(dir, "site.yaml");
+  await writeFile(file, YAML.stringify(doc));
+  const findings = [];
+  await checkSite(file, { domainsWithLabs: domains, repoRoot, labIds: new Set(["shell-first-steps-timetable"]) }, findings);
+  const messages = findings.filter((f) => f.level === "error").map((f) => f.message);
+  assert.ok(messages.some((m) => m.includes("unknown plan 'platinum'")), messages.join("\n"));
+  assert.ok(messages.some((m) => m.includes("lookup key 'ct_pro_monthly' is also used by pro/monthly")), messages.join("\n"));
+  assert.ok(messages.some((m) => m.includes("trial lab 'no-such-lab'")), messages.join("\n"));
 });
 
 test("plan cross-checks: duplicate lookup keys, priced free plans, per-seat individuals", async () => {
   const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
-  const [free, pro, team] = doc.plans.items;
+  const [free, pro, , team] = doc.plans.items;
   free.prices = { monthly: { amount: 100, lookupKey: "ct_pro_monthly" } };
   pro.perSeat = true;
   team.prices.yearly.lookupKey = "ct_pro_yearly";

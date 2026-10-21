@@ -441,6 +441,11 @@ export interface BillingCustomersTable {
   email: string | null;
   livemode: Generated<boolean>;
   created_at: Generated<Date>;
+  has_payment_method: Generated<boolean>;
+  invoice_failed_at: Date | null;
+  delinquent_since: Date | null;
+  compute_subscription_id: string | null;
+  updated_at: Generated<Date>;
 }
 
 export interface BillingSubscriptionsTable {
@@ -449,6 +454,8 @@ export interface BillingSubscriptionsTable {
   user_id: string | null;
   customer_id: string;
   stripe_subscription_id: string;
+  /** `plan` (a site plan) or `compute` (the metered compute subscription). */
+  kind: Generated<'plan' | 'compute'>;
   plan_id: string;
   price_lookup_key: string | null;
   billing_interval: 'monthly' | 'yearly';
@@ -485,6 +492,63 @@ export interface BillingEventsTable {
   status: Generated<'received' | 'processed' | 'ignored' | 'failed'>;
   error: string | null;
   summary: Generated<unknown>;
+}
+
+/** One metered lab session (0009_billing_compute). */
+export interface BillingUsageTable {
+  id: Generated<string>;
+  org_id: string;
+  user_id: string;
+  lab_id: string;
+  session_name: string;
+  compute_tier: 'pod' | 'vm' | 'heavy';
+  units_per_minute: number;
+  /** numeric: pg returns a string. */
+  unit_price: string | number;
+  /** The paying scope: a user id, or '' for the organisation. */
+  payer_key: string;
+  customer_id: string | null;
+  trial: Generated<boolean>;
+  billable: boolean;
+  started_at: Date;
+  ended_at: Date | null;
+  minutes: number | null;
+  units: number | null;
+  created_at: Generated<Date>;
+}
+
+export interface BillingMeterOutboxTable {
+  id: Generated<string>;
+  org_id: string;
+  usage_id: string;
+  identifier: string;
+  event_name: string;
+  stripe_customer_id: string;
+  value: number;
+  event_at: Date;
+  status: Generated<'pending' | 'sent' | 'failed'>;
+  attempts: Generated<number>;
+  next_attempt_at: Generated<Date>;
+  last_error: string | null;
+  sent_at: Date | null;
+  created_at: Generated<Date>;
+}
+
+export interface BillingSeatsTable {
+  org_id: string;
+  user_id: string;
+  assigned_by: string | null;
+  assigned_at: Generated<Date>;
+}
+
+export interface BillingLimitsTable {
+  org_id: string;
+  user_id: string | null;
+  scope_key: Generated<string>;
+  monthly_cap: number;
+  hard_stop: boolean;
+  updated_by: string | null;
+  updated_at: Generated<Date>;
 }
 
 export interface DB {
@@ -524,6 +588,10 @@ export interface DB {
   billing_subscriptions: BillingSubscriptionsTable;
   billing_entitlements: BillingEntitlementsTable;
   billing_events: BillingEventsTable;
+  billing_usage: BillingUsageTable;
+  billing_meter_outbox: BillingMeterOutboxTable;
+  billing_seats: BillingSeatsTable;
+  billing_limits: BillingLimitsTable;
   waitlist_entries: WaitlistEntriesTable;
 }
 

@@ -220,13 +220,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   /* --------------------------------- catalog --------------------------------- */
 
-  app.get('/api/catalog', run, async (req) => (ps ? ps.catalog(req.principal) : { domains: content.domains, paths: content.paths, labs: content.summaries }));
+  app.get('/api/catalog', run, async (req) => {
+    const catalog = ps ? await ps.catalog(req.principal) : { domains: content.domains, paths: content.paths, labs: content.summaries };
+    return deps.billing ? deps.billing.annotateCatalog(req.principal, catalog) : catalog;
+  });
 
   app.get<{ Params: { id: string } }>('/api/labs/:id', run, async (req) => {
     const lab = labViews.get(req.params.id);
     if (!lab) throw notFound('Lab');
     await ps?.assertLabVisible(req.principal, req.params.id);
-    return lab;
+    return deps.billing ? deps.billing.annotateLab(req.principal, lab) : lab;
   });
 
   app.get<{ Querystring: { member?: string } }>('/api/skills', self, async (req) => {
@@ -241,9 +244,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   /* --------------------------------- sessions -------------------------------- */
 
   app.post<{ Params: { id: string } }>('/api/labs/:id/sessions', run, async (req, reply) => {
-    // Entitlements are recorded, not enforced yet: this gate never refuses (src/billing/service.ts, assertLabStart).
-    await deps.billing?.assertLabStart(req.principal, req.params.id);
+    // Billing gate (premium plan, free trial, payment method, dunning, spend cap; 402 when
+    // CT_BILLING_ENFORCE is on), then the session is metered from its start (src/billing).
+    const decision = await deps.billing?.assertLabStart(req.principal, req.params.id);
     const s = await sessions.start(req.principal, req.params.id);
+    await deps.billing?.meterStart(req.principal, decision, s).catch((e: unknown) => req.log.error({ err: e, session: s.id }, 'billing: could not record usage start'));
     return reply.code(201).send(s);
   });
   app.get<{ Params: { id: string } }>('/api/labs/:id/sessions', run, async (req) => {
@@ -254,6 +259,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.get<{ Params: { id: string } }>('/api/sessions/:id', run, async (req) => sessions.get(req.principal, req.params.id));
   app.delete<{ Params: { id: string } }>('/api/sessions/:id', run, async (req, reply) => {
     await sessions.end(req.principal, req.params.id);
+    if (req.principal.orgId) await deps.billing?.meterEnd(req.principal.orgId, req.params.id).catch((e: unknown) => req.log.error({ err: e, session: req.params.id }, 'billing: could not record usage end'));
     return reply.code(204).send();
   });
   app.post<{ Params: { id: string } }>('/api/sessions/:id/validate', run, async (req) => sessions.validate(req.principal, req.params.id));

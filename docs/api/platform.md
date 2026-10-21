@@ -61,8 +61,11 @@ the database. `ETag` + `Cache-Control: public, max-age=300`; 429 `rate_limited` 
 
 ## Billing (Stripe, test mode, `CT_BILLING_ENABLED`)
 
-Plans come from the site configuration; details and the webhook flow in `docs/billing.md`.
-Entitlements are recorded and shown, not enforced.
+Plans come from the site configuration; the model (pay for compute, premium labs, free trial,
+seats, dunning, spend caps), the webhook flow and the enforcement order are in
+`docs/billing.md`. A refused lab start (`POST /labs/:id/sessions`) answers `402`
+`payment_required` with `BillingBlockDetails`; `GET /catalog` and `GET /labs/:id` carry
+`access` per lab.
 
 | Method + path | Request | Response | Permission | Audit |
 |---|---|---|---|---|
@@ -73,6 +76,12 @@ Entitlements are recorded and shown, not enforced.
 | `GET /billing/org/events` | | `{ events: BillingEventRow[] }` | `billing.manage` | |
 | `POST /billing/org/checkout` | `CheckoutRequest` `{ planId, interval, seats }` | as above | `billing.manage` | `billing.checkout` |
 | `POST /billing/org/portal` | | as above | `billing.manage` | `billing.portal` |
+| `POST /billing/me/payment-method`, `POST /billing/org/payment-method` | | `201 CheckoutResponse` (Checkout in setup mode); `409` billing or checkout off | `progress.read.self` / `billing.manage` | `billing.payment_method` |
+| `PUT /billing/me/limits`, `PUT /billing/org/limits` | `BillingLimitRequest` `{ monthlyCap, hardStop }` | `BillingLimit`; `422` out of range | `progress.read.self` / `billing.manage` | `billing.limit` |
+| `GET /billing/org/seats` | | `BillingSeats` | `billing.manage` | |
+| `PUT /billing/org/seats` | `SeatCountRequest` `{ seats }` | `BillingSeats`; Stripe quantity prorated; `409` no active per-seat plan or below the assigned count; `422` outside min/max | `billing.manage` | `billing.seats` |
+| `POST /billing/org/seats/assign` | `SeatAssignRequest` `{ userId }` | `BillingSeats`; `404` not an active member; `409` all seats taken | `billing.manage` | `billing.seat_assign` |
+| `DELETE /billing/org/seats/:userId` | | `BillingSeats`; `404` no seat | `billing.manage` | `billing.seat_unassign` |
 | `POST /billing/webhook` | raw Stripe event + `Stripe-Signature` | `{ received, eventId, type, status }` (`processed`, `ignored`, `duplicate`, `failed`); `400` bad signature, stale, live-mode | public (signature) | `billing.webhook`, `billing.subscription` |
 
 ## Learner

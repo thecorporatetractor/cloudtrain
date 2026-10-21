@@ -64,14 +64,16 @@ export interface StripePrice {
   active: boolean;
   currency: string;
   unit_amount: number | null;
+  unit_amount_decimal?: string | null;
   lookup_key: string | null;
-  recurring: { interval: 'day' | 'week' | 'month' | 'year'; interval_count: number } | null;
+  recurring: { interval: 'day' | 'week' | 'month' | 'year'; interval_count: number; usage_type?: 'licensed' | 'metered'; meter?: string | null } | null;
   metadata: Record<string, string>;
 }
 export interface StripeCustomer {
   id: string;
   email?: string | null;
   metadata: Record<string, string>;
+  invoice_settings?: { default_payment_method?: string | null };
 }
 export interface StripeSubscription {
   id: string;
@@ -79,8 +81,27 @@ export interface StripeSubscription {
   status: string;
   cancel_at_period_end: boolean;
   current_period_end?: number;
+  default_payment_method?: string | null;
   metadata: Record<string, string>;
   items: StripeList<{ id: string; quantity?: number; price: StripePrice; current_period_end?: number }>;
+}
+export interface StripeSetupIntent {
+  id: string;
+  customer: string | null;
+  payment_method: string | null;
+  status: string;
+}
+export interface StripeMeter {
+  id: string;
+  event_name: string;
+  display_name: string;
+  status: 'active' | 'inactive';
+}
+export interface StripeMeterEvent {
+  identifier: string;
+  event_name: string;
+  timestamp: number;
+  payload: Record<string, string>;
 }
 export interface StripeCheckoutSession {
   id: string;
@@ -131,6 +152,7 @@ export class StripeApi {
   customers = {
     create: (p: { email?: string; name?: string; metadata?: Record<string, string> }, idempotencyKey?: string) => this.request<StripeCustomer>('POST', '/v1/customers', p, { idempotencyKey }),
     retrieve: (id: string) => this.request<StripeCustomer>('GET', `/v1/customers/${encodeURIComponent(id)}`),
+    update: (id: string, p: { invoice_settings?: { default_payment_method?: string }; metadata?: Record<string, string> }) => this.request<StripeCustomer>('POST', `/v1/customers/${encodeURIComponent(id)}`, p),
   };
   products = {
     search: (query: string) => this.request<StripeList<StripeProduct>>('GET', '/v1/products/search', { query, limit: 10 }),
@@ -140,8 +162,10 @@ export class StripeApi {
   };
   prices = {
     list: (p: { lookup_keys?: string[]; product?: string; active?: boolean; limit?: number }) => this.request<StripeList<StripePrice>>('GET', '/v1/prices', p),
-    create: (p: { product: string; currency: string; unit_amount: number; recurring: { interval: 'month' | 'year' }; lookup_key: string; transfer_lookup_key?: boolean; metadata?: Record<string, string>; nickname?: string }, idempotencyKey?: string) =>
-      this.request<StripePrice>('POST', '/v1/prices', p, { idempotencyKey }),
+    create: (
+      p: { product: string; currency: string; unit_amount?: number; unit_amount_decimal?: string; recurring: { interval: 'month' | 'year'; usage_type?: 'metered'; meter?: string }; lookup_key: string; transfer_lookup_key?: boolean; metadata?: Record<string, string>; nickname?: string },
+      idempotencyKey?: string,
+    ) => this.request<StripePrice>('POST', '/v1/prices', p, { idempotencyKey }),
     update: (id: string, p: { active?: boolean; metadata?: Record<string, string> }) => this.request<StripePrice>('POST', `/v1/prices/${encodeURIComponent(id)}`, p),
   };
   checkout = {
@@ -155,6 +179,25 @@ export class StripeApi {
   };
   subscriptions = {
     retrieve: (id: string) => this.request<StripeSubscription>('GET', `/v1/subscriptions/${encodeURIComponent(id)}`),
+    create: (p: { customer: string; items: { price: string; quantity?: number }[]; metadata?: Record<string, string>; default_payment_method?: string }, idempotencyKey?: string) =>
+      this.request<StripeSubscription>('POST', '/v1/subscriptions', p, { idempotencyKey }),
+    /** Seat changes: `items[0][id]` + `quantity`, prorated (`proration_behavior: create_prorations`). */
+    update: (id: string, p: { items?: { id: string; quantity: number }[]; proration_behavior?: 'create_prorations' | 'none' | 'always_invoice'; metadata?: Record<string, string> }, idempotencyKey?: string) =>
+      this.request<StripeSubscription>('POST', `/v1/subscriptions/${encodeURIComponent(id)}`, p, { idempotencyKey }),
+  };
+  setupIntents = {
+    retrieve: (id: string) => this.request<StripeSetupIntent>('GET', `/v1/setup_intents/${encodeURIComponent(id)}`),
+  };
+  /** Billing Meters (usage-based billing): one meter per event name, summing `payload[value]` per customer. */
+  meters = {
+    list: (p: { status?: 'active' | 'inactive'; limit?: number } = {}) => this.request<StripeList<StripeMeter>>('GET', '/v1/billing/meters', { limit: 100, ...p }),
+    create: (p: { display_name: string; event_name: string; default_aggregation: { formula: 'sum' }; customer_mapping: { type: 'by_id'; event_payload_key: string }; value_settings: { event_payload_key: string } }, idempotencyKey?: string) =>
+      this.request<StripeMeter>('POST', '/v1/billing/meters', p, { idempotencyKey }),
+  };
+  /** Meter events: `identifier` makes a report idempotent (Stripe rejects a repeat within its deduplication window). */
+  meterEvents = {
+    create: (p: { event_name: string; identifier: string; timestamp: number; payload: { stripe_customer_id: string; value: string } }, idempotencyKey?: string) =>
+      this.request<StripeMeterEvent>('POST', '/v1/billing/meter_events', p, { idempotencyKey }),
   };
 }
 

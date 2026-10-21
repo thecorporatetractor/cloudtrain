@@ -110,11 +110,14 @@ export interface BillingSearch {
   plan?: string;
   interval?: 'monthly' | 'yearly';
   checkout?: 'success' | 'cancelled';
+  /** Back from Checkout in setup mode (a saved payment method). */
+  setup?: 'success' | 'cancelled';
 }
 const billingSearch = (s: Record<string, unknown>): BillingSearch => ({
   ...(str(s.plan) ? { plan: str(s.plan) } : {}),
   ...(s.interval === 'monthly' || s.interval === 'yearly' ? { interval: s.interval } : {}),
   ...(s.checkout === 'success' || s.checkout === 'cancelled' ? { checkout: s.checkout } : {}),
+  ...(s.setup === 'success' || s.setup === 'cancelled' ? { setup: s.setup } : {}),
 });
 /** The signed-in person's plan, entitlements and subscription (docs/billing.md). */
 export const accountBillingRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/billing', validateSearch: billingSearch, component: AccountBilling });

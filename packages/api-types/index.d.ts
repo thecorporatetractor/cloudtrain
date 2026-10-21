@@ -11,6 +11,7 @@
 
 import type { MyAssignment, SessionNotice } from './platform.js';
 import type { LabQuestion } from './ctf.js';
+import type { LabAccess } from './billing.js';
 
 export * from './platform.js';
 export * from './ctf.js';
@@ -112,6 +113,8 @@ export interface Lab {
   apiVersion: 'cloudtrain.dev/v3';
   kind: 'Lab';
   metadata: LabMetadata;
+  /** Billing (`GET /api/labs/:id`): as on `LabSummary.access`. */
+  access?: LabAccess;
   spec: {
     description: string;
     objectives?: string[];
@@ -132,6 +135,8 @@ export interface LabSummary extends LabMetadata {
   bestScore?: number;
   /** Number of questions when the lab has answer checks (CTF). */
   questionCount?: number;
+  /** Billing: compute tier and rate, premium plan, trial, and whether this person may start it now. */
+  access?: LabAccess;
 }
 
 export interface Path {

@@ -16,6 +16,7 @@ import { OidcClient } from './oidc/client.js';
 import { OidcAuthenticator, Sealer, SessionStore } from './oidc/sessions.js';
 import { PlatformService } from './platform/service.js';
 import { SessionService } from './sessions/service.js';
+import { phaseOf } from './sessions/map.js';
 import { TerminalHub } from './terminal/hub.js';
 import { loadExamCatalog } from './exams/catalog.js';
 import { LabctlExamCompiler } from './exams/compile.js';
@@ -91,10 +92,15 @@ async function main() {
   const answers = new AnswerService(sessions, new PgAnswerStore(platform), { ratePerMinute: config.answerRatePerMinute, resolve: events.resolveScope });
 
   // Billing (Stripe, test mode only, behind CT_BILLING_ENABLED): plans from the site configuration.
+  // Pay for compute: lab sessions are metered and reported to a Stripe Billing Meter; the
+  // lab-start gate is on with billing unless CT_BILLING_ENFORCE=0 (docs/billing.md).
   const billing = new BillingService({
     db,
     site,
     ...(config.billing.enabled ? { stripe: new StripeApi(config.billing.secretKey), webhookSecret: config.billing.webhookSecret } : {}),
+    enforce: config.billing.enforce,
+    labs: content.labs,
+    mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
     webUrl: config.webUrl,
     log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
   });
@@ -127,13 +133,23 @@ async function main() {
   app.log.info({ labs: content.labs.size, skills: content.skills.length, frameworks: content.frameworks.length, context: config.kubeContext, namespace: config.namespace, contentDir: config.contentDir }, 'content loaded');
   if (config.devImpersonate) app.log.warn({ publicUrl: config.publicUrl }, 'DEV ONLY: CT_DEV_IMPERSONATE=1, POST /api/dev/sign-in-as is enabled (loopback callers only)');
   app.log.info({ file: config.siteConfigFile, brand: site.brand.name, flags: site.flags, plans: site.plans?.items.map((p) => p.id) ?? [] }, 'public website config loaded');
-  if (config.billing.enabled) app.log.info({ mode: 'test', key: maskKey(config.billing.secretKey), checkoutEnabled: !!site.flags.checkoutEnabled }, 'billing: Stripe TEST MODE on (CT_BILLING_ENABLED=1)');
+  if (config.billing.enabled) app.log.info({ mode: 'test', key: maskKey(config.billing.secretKey), checkoutEnabled: !!site.flags.checkoutEnabled, enforce: config.billing.enforce }, 'billing: Stripe TEST MODE on (CT_BILLING_ENABLED=1)');
   else app.log.info({}, 'billing: off (CT_BILLING_ENABLED unset); plans are informational');
   app.log.info({ issuer: config.oidc.issuer, publicUrl: config.publicUrl, webUrl: config.webUrl, platformIdps: config.platformIdps, domainVerifyBypass: config.devDomainVerifyBypass }, 'auth: OIDC (BFF)');
 
   const sweep = config.sweepIntervalMs > 0 ? setInterval(() => void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed')), config.sweepIntervalMs) : undefined;
+  // Metered usage: close sessions that ended outside the gateway (expiry, admin), flush the meter outbox.
+  const sessionEnd = async (name: string): Promise<Date | null> => {
+    const ls = await cluster.getSession(name);
+    if (ls && !['expired', 'failed'].includes(phaseOf(ls))) return null;
+    const exp = ls?.status?.expiresAt ? Date.parse(ls.status.expiresAt) : NaN;
+    return new Date(Number.isNaN(exp) ? Date.now() : Math.min(exp, Date.now()));
+  };
+  const billingSweep = config.billing.sweepMs > 0 ? setInterval(() => void billing.sweep(sessionEnd).catch((e: unknown) => app.log.warn({ err: e }, 'billing sweep failed')), config.billing.sweepMs) : undefined;
   const close = async () => {
     if (sweep) clearInterval(sweep);
+    if (billingSweep) clearInterval(billingSweep);
+    await billing.settle();
     await app.close();
     await db.destroy();
     process.exit(0);

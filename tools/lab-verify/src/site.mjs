@@ -15,7 +15,7 @@ export const SITE_ROUTES = ["/", "/catalog", "/pricing", "/about", "/faq", "/con
 
 /**
  * @param {string} file path of content/site.yaml
- * @param {{ domainsWithLabs: Set<string>, repoRoot: string }} ctx
+ * @param {{ domainsWithLabs: Set<string>, repoRoot: string, labIds?: Set<string> }} ctx
  * @param {import("./verify.mjs").Finding[]} findings
  * @returns {Promise<{ brand: string, features: number, faq: number } | undefined>}
  */
@@ -94,6 +94,19 @@ export async function checkSite(file, ctx, findings) {
   }
   if (plans.filter((pl) => pl.highlight).length > 1) warn("/plans/items", "more than one highlighted plan");
   if (doc.flags.showPricing && plans.length === 0) warn("/flags/showPricing", "pricing is shown but no plans are configured");
+  // Pay for compute (docs/billing.md): premium rules name real plans, the trial labs exist,
+  // and the metered price's lookup key and the reserved plan id stay clear of the plans.
+  for (const [i, rule] of (doc.plans?.premium ?? []).entries()) {
+    if (!planIds.has(rule.plan)) err(`/plans/premium/${i}/plan`, `premium rule names unknown plan '${rule.plan}'`);
+    if (![rule.labs, rule.domains, rule.difficulties, rule.computeTiers, rule.tags].some((x) => x?.length)) warn(`/plans/premium/${i}`, "premium rule matches no lab (no selector)");
+  }
+  if (planIds.has("compute")) err("/plans/items", "plan id 'compute' is reserved for the metered compute product");
+  const computeKey = doc.plans?.compute?.lookupKey;
+  if (computeKey && lookupKeys.has(computeKey)) err("/plans/compute/lookupKey", `lookup key '${computeKey}' is also used by ${lookupKeys.get(computeKey)}`);
+  for (const [i, id] of (doc.plans?.free?.trialLabs ?? []).entries()) {
+    if (ctx.labIds && !ctx.labIds.has(id)) err(`/plans/free/trialLabs/${i}`, `trial lab '${id}' is not a published lab`);
+  }
+  if (doc.plans?.compute?.placeholder === undefined && doc.plans?.compute && doc.plans?.placeholder) warn("/plans/compute", "prices are placeholders; mark the compute rates too (compute.placeholder)");
 
   // Waitlist: the consent checkbox links to /legal/privacy, so that notice has to cover the waitlist.
   if (doc.waitlist?.enabled) {
