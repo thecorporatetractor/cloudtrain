@@ -462,8 +462,6 @@ func loadSandboxes(flagValue, legacy, configPath, preflightPath string) (*driver
 	return sb, nil
 }
 
-// kubeVirtServed reports whether the API serves kubevirt.io/v1
-// VirtualMachines (an error counts as served: the VM driver then reports it).
 // admissionPolicyServed reports whether the API server serves
 // ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1, Kubernetes
 // 1.30+). Only a definite "not served" is false: the policy check then fails
@@ -486,6 +484,8 @@ func admissionPolicyServed(cfg *rest.Config) bool {
 	return false
 }
 
+// kubeVirtServed reports whether the API serves kubevirt.io/v1
+// VirtualMachines (an error counts as served: the VM driver then reports it).
 func kubeVirtServed(cfg *rest.Config) bool {
 	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
 	if err != nil {

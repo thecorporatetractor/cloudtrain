@@ -125,13 +125,16 @@ func TestEnvtestPodPolicy(t *testing.T) {
 	const (
 		labNs   = "ctv-pods"
 		plainNs = "plain"
+		// labctl preflight probes: lab-labelled, but not judged.
+		preflightNs = "ct-preflight-x"
 		mgrSA   = "system:serviceaccount:" + managerNS + ":lab-orchestrator"
 		otherSA = "system:serviceaccount:kube-system:replicaset-controller"
 	)
 	pol, binding := podPolicy(t, "['kata-test']")
 	for _, o := range []client.Object{
-		labNS(labNs, true), labNS(plainNs, false),
+		labNS(labNs, true), labNS(plainNs, false), preflightNS(preflightNs),
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: labNs, Name: "default"}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: preflightNs, Name: "default"}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: plainNs, Name: "default"}},
 		&nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "kata-test"}, Handler: "kata"},
 		&nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "runc-test"}, Handler: "runc"},
@@ -200,6 +203,18 @@ func TestEnvtestPodPolicy(t *testing.T) {
 			return fmt.Errorf("privileged pod not denied yet: %v", err)
 		}
 		return nil
+	})
+
+	t.Run("preflight probe namespaces are not judged", func(t *testing.T) {
+		hostPath := func(p *corev1.Pod) {
+			p.Spec.Volumes = []corev1.Volume{{Name: "m", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/lib/modules"}}}}
+		}
+		if err := other.Create(ctx, pod(preflightNs, all(hostPath, addCaps(0, "NET_ADMIN", "NET_RAW")))); err != nil {
+			t.Errorf("preflight probe pod: %v", err)
+		}
+		if err := other.Create(ctx, pod(labNs, hostPath)); !denied(err) {
+			t.Errorf("hostPath in a lab namespace: want denied, got %v", err)
+		}
 	})
 
 	t.Run("privileged only in a sandbox RuntimeClass", func(t *testing.T) {
@@ -388,4 +403,11 @@ func TestEnvtestPodPolicy(t *testing.T) {
 			t.Errorf("manager's privileged pod under scope own: %v", err)
 		}
 	})
+}
+
+// preflightNS is a labctl preflight probe namespace (lab-labelled too).
+func preflightNS(name string) *corev1.Namespace {
+	ns := labNS(name, true)
+	ns.Labels["labs.cloudtrain.dev/preflight"] = "true"
+	return ns
 }

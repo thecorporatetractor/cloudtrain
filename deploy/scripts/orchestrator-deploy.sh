@@ -109,10 +109,20 @@ SUF=""; [[ $NS != cloudtrain-system ]] && SUF="-$NS"
 # Without the ValidatingAdmissionPolicy API (Kubernetes < 1.30) both admission
 # policies are skipped with a warning, and the manager warns at startup.
 POD_POLICY=${POD_POLICY:-1}
-if [[ -z ${POD_POLICY_SCOPE:-} ]]; then POD_POLICY_SCOPE=namespaces; [[ -n ${SESSION_SELECTOR:-} ]] && POD_POLICY_SCOPE=own; fi
+# Scope "namespaces" judges every pod in lab namespaces against THIS manager's ServiceAccount, so
+# another manager on the cluster (dev: cloudtrain-system, ct-exam-system, ...) would have its wired
+# pods rejected: default to "own" when a selector is set or another instance exists.
+others=$(k get deploy -A -l app.kubernetes.io/name=lab-orchestrator -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | grep -vx "${ORCH_NAMESPACE:-cloudtrain-system}" || true)
+if [[ -z ${POD_POLICY_SCOPE:-} ]]; then
+  POD_POLICY_SCOPE=namespaces
+  [[ -n ${SESSION_SELECTOR:-} || -n $others ]] && POD_POLICY_SCOPE=own
+elif [[ $POD_POLICY_SCOPE == namespaces && -n $others ]]; then
+  die "POD_POLICY_SCOPE=namespaces would reject the wired pods of the other lab-orchestrator instances ($(echo $others)); use own"
+fi
 case $POD_POLICY_SCOPE in own|namespaces) ;; *) die "POD_POLICY_SCOPE must be own or namespaces";; esac
 VAP_API=1
-k api-resources --api-group=admissionregistration.k8s.io -o name 2>/dev/null | grep -q '^validatingadmissionpolicies\.' || VAP_API=0
+# (not `kubectl api-resources`: it fails when any aggregated API is unavailable, e.g. during KubeVirt startup)
+k get --raw /apis/admissionregistration.k8s.io/v1 2>/dev/null | jq -e '.resources[] | select(.name == "validatingadmissionpolicies")' >/dev/null || VAP_API=0
 if [[ $VAP_API == 0 ]]; then
   warn "the cluster does not serve ValidatingAdmissionPolicy (Kubernetes < 1.30): no admission policies (lab-orchestrator, lab pods)"
   POD_POLICY=0

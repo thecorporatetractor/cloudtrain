@@ -472,8 +472,18 @@ DaemonSets, Jobs and CronJobs, and rejects:
 | Setting | Default | Effect |
 |---|---|---|
 | `orchestrator.rbac.podPolicy.enabled` (Helm), `POD_POLICY` (orchestrator-deploy.sh) | on | install the policy and pass `--pod-admission-policy=<name>` |
-| `orchestrator.rbac.podPolicy.scope`, `POD_POLICY_SCOPE` | `namespaces` (Helm; the deploy script without `SESSION_SELECTOR`), `own` (the deploy script with `SESSION_SELECTOR`) | `namespaces` judges every pod in lab namespaces, whoever creates it (KubeVirt's virt-launcher, CDI importers and vcluster-synced pods pass with their baseline capabilities). `own` judges only this manager's requests: for several managers on one cluster, whose policies would otherwise judge each other's pods and whose sandbox lists must then agree |
+| `orchestrator.rbac.podPolicy.scope`, `POD_POLICY_SCOPE` | `namespaces` (Helm; the deploy script without `SESSION_SELECTOR` on a cluster with no other instance), `own` (the deploy script with `SESSION_SELECTOR`, or when another `lab-orchestrator` Deployment exists; it refuses `namespaces` then) | `namespaces` judges every pod in lab namespaces, whoever creates it (KubeVirt's virt-launcher, CDI importers and vcluster-synced pods pass with their baseline capabilities). `own` judges only this manager's requests: for several managers on one cluster, whose policies would otherwise judge each other's pods and whose sandbox lists must then agree |
 | `--pod-admission-policy` | empty | at startup the manager reads the policy and its binding: missing, or a binding that does not deny, stops the manager; a configured sandbox RuntimeClass the policy does not list is a warning. Empty is a warning |
+
+Namespaces of `labctl preflight` probes (`labs.cloudtrain.dev/preflight`) are not
+judged: the probes create hostPath, privileged and wired test pods as the operator.
+KubeVirt must run VMs non-root (the default since KubeVirt 1.0; the `Root` feature
+gate off): a root virt-launcher adds SYS_NICE, which scope `namespaces` rejects.
+`POD_POLICY=0` does not delete a policy an earlier deploy installed (`kubectl apply`
+does not prune): delete `lab-orchestrator-pods<suffix>` and its binding by hand. During
+an upgrade, pods of the previous manager version (privileged net-init, no profile label)
+are rejected until the new manager has rolled out; they are recreated on the next
+reconcile.
 
 The policy fails closed (`failurePolicy: Fail`). It needs Kubernetes 1.30+, where
 ValidatingAdmissionPolicy is GA (the chart's minimum). On an older cluster
