@@ -188,8 +188,10 @@ func required() map[string][]op {
 		"leader election": join(crud("coordination.k8s.io", "leases", managerNS), crud("", "events", managerNS, "create", "patch")),
 		"metrics authn/authz": join(crud("authentication.k8s.io", "tokenreviews", "", "create"),
 			crud("authorization.k8s.io", "subjectaccessreviews", "", "create")),
-		"startup (storage preflight, user namespaces, runtime class)": join(crud("storage.k8s.io", "storageclasses", "", "list"),
-			crud("", "nodes", "", "get", "list"), crud("node.k8s.io", "runtimeclasses", "", "get")),
+		"startup (storage preflight, user namespaces, runtime class, pod admission policy)": join(crud("storage.k8s.io", "storageclasses", "", "list"),
+			crud("", "nodes", "", "get", "list"), crud("node.k8s.io", "runtimeclasses", "", "get"),
+			crud("admissionregistration.k8s.io", "validatingadmissionpolicies", "", "get"),
+			crud("admissionregistration.k8s.io", "validatingadmissionpolicybindings", "", "get")),
 		"session access (bind the session ClusterRole)": join(crud("", "namespaces", "", "get"),
 			crud("rbac.authorization.k8s.io", "rolebindings", lab, "get", "create", "update", "delete"),
 			[]op{{verb: "bind", group: "rbac.authorization.k8s.io", resource: "clusterroles", name: DefaultSessionClusterRole}}),
@@ -251,6 +253,11 @@ func TestForbiddenOperationsDenied(t *testing.T) {
 		{verb: "create", group: "kubevirt.io", resource: "virtualmachines", ns: other},
 		{verb: "create", group: "coordination.k8s.io", resource: "leases", ns: "kube-system"},
 		{verb: "update", group: "coordination.k8s.io", resource: "leases", ns: "kube-node-lease"},
+		// The admission policies are read-only to the manager: it cannot
+		// loosen its own limits or the lab pod backstop.
+		{verb: "update", group: "admissionregistration.k8s.io", resource: "validatingadmissionpolicies"},
+		{verb: "delete", group: "admissionregistration.k8s.io", resource: "validatingadmissionpolicybindings"},
+		{verb: "list", group: "admissionregistration.k8s.io", resource: "validatingadmissionpolicies"},
 		// No RBAC escalation.
 		{verb: "escalate", group: "rbac.authorization.k8s.io", resource: "clusterroles"},
 		{verb: "escalate", group: "rbac.authorization.k8s.io", resource: "roles", ns: lab},

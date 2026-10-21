@@ -42,6 +42,15 @@ type Options struct {
 	// MTU of every session segment (Kube-OVN Subnet spec.mtu); 0 leaves it
 	// to Kube-OVN (node MTU minus the tunnel overhead).
 	MTU int
+	// RouterTuning chains the CNI tuning plugin (containernetworking/plugins,
+	// meta/tuning) behind kube-ovn in the NAD of every link that touches a
+	// netdev node, and routers pass RouterSysctls to it as Multus cni-args.
+	// Set it when wired pods run without a user namespace: routers need
+	// IP forwarding and rp_filter changes in their network namespace, and
+	// without a user namespace /proc/sys is read-only in every unprivileged
+	// container. Every node then needs the tuning binary in its CNI bin
+	// directory.
+	RouterTuning bool
 }
 
 // AnnotationDefaultNetwork is the Multus annotation that replaces a pod's
@@ -56,4 +65,13 @@ func ProviderOf(nad, namespace string) string { return nad + "." + namespace + "
 // Kube-OVN for provider.
 func NADConfig(provider string) string {
 	return fmt.Sprintf(`{"cniVersion":"0.3.1","type":"kube-ovn","server_socket":"/run/openvswitch/kube-ovn-daemon.sock","provider":%q}`, provider)
+}
+
+// NADConfigTuning is NADConfig with the CNI tuning plugin chained behind
+// kube-ovn (Options.RouterTuning). Without cni-args tuning changes nothing,
+// so the hosts on such a link are wired as before. The empty sysctl map is
+// required: tuning (v1.9.1) merges args.cni.sysctl into it and panics on a
+// nil map.
+func NADConfigTuning(provider string) string {
+	return fmt.Sprintf(`{"cniVersion":"0.3.1","name":%q,"plugins":[%s,{"type":"tuning","sysctl":{}}]}`, provider, NADConfig(provider))
 }

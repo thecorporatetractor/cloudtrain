@@ -18,8 +18,8 @@ import (
 // sets it only when
 //   - ContainerDriver.UserNamespaces is on (the cluster's runtime supports it,
 //     see DetectUserNamespaces), and
-//   - no container of the pod is privileged (the lab-link init container writes
-//     netns sysctls as privileged; such nodes keep host users).
+//   - no container of the pod is privileged (only nodes in a VM sandbox are:
+//     systemd and privileged catalog images; such nodes keep host users).
 // Otherwise the pod runs with host users, exactly as before.
 
 // AnnotationUserNamespace records the decision on the pod
@@ -41,7 +41,7 @@ func (d *ContainerDriver) applyUserNamespace(ref NodeRef, pod *corev1.Pod) {
 	case !d.UserNamespaces:
 		reason = "cluster runtime does not support user namespaces (or disabled)"
 	case podHasPrivileged(pod):
-		reason = "pod has a privileged container (topology links)"
+		reason = "pod has a privileged container (sandboxed node)"
 	}
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}

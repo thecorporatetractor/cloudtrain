@@ -17,8 +17,10 @@ decisions 6, 7 and 9). Local development stays on kind
 Platform pods run as non-root on a read-only root filesystem, with no privilege
 escalation, all capabilities dropped and RuntimeDefault seccomp. They fit the
 `restricted` Pod Security level, so the release namespace can enforce it. Lab pods run
-in the sessions namespace, which the chart labels `privileged` (wired labs need a
-privileged `net-init`; [any-kubernetes.md](any-kubernetes.md) 1.4).
+in the sessions namespace, which the chart labels `privileged`: wired labs need
+NET_ADMIN and NET_RAW, user namespaces with an unmasked `/proc`, FRR devices SYS_ADMIN
+([any-kubernetes.md](any-kubernetes.md) 1.4). No lab container runs privileged on the
+host kernel; the [lab pod admission policy](#lab-pod-admission-policy) enforces that.
 
 ### Why the web app has its own server
 
@@ -229,6 +231,7 @@ outside lab namespaces, no writes to namespaced objects anywhere else. Sources, 
 | `leader_election_role.yaml` | Role | the manager's namespace | static |
 | `ovn_central_role.yaml` | Role | `kube-system` (Kube-OVN's ovn-central) | static |
 | `admission_policy.yaml` | ValidatingAdmissionPolicy + binding | requests of the manager's ServiceAccount | static |
+| `pod_admission_policy.yaml` | ValidatingAdmissionPolicy + binding | pods in lab namespaces ([Lab pod admission policy](#lab-pod-admission-policy)) | static; sandbox RuntimeClasses and scope rewritten per instance |
 
 ### Lab namespaces
 
@@ -388,6 +391,109 @@ ClusterRoles, ClusterRoleBindings, namespaces, VPCs and subnets cluster-wide.
 and subnets, and creates a probe namespace with pods and a session network. In
 practice it runs as a cluster administrator (the verify VM, CI); a dedicated role
 would need all of the above.
+
+## Lab pod privileges
+
+No lab container runs privileged on the host kernel. Privileged containers exist only
+for systemd and privileged catalog images inside a VM sandbox RuntimeClass
+([Tier sandboxes](#tier-sandboxes-kata)); everything else gets the capabilities below,
+and the [lab pod admission policy](#lab-pod-admission-policy) rejects anything more.
+
+### Wired lab pods
+
+A node with topology links (a "wired" pod) gets an init container `net-init`, which
+applies addresses, MTU and tc netem to its link interfaces before the node starts, and
+a sidecar `net` for packet capture and impairment. Both use the nettools image, drop
+every capability except their own, cannot escalate privileges
+(`allowPrivilegeEscalation: false`), run on a read-only root filesystem and use the
+RuntimeDefault seccomp profile. The manager labels the pod
+`labs.cloudtrain.dev/pod-profile=wired` (`netdev` for network devices).
+
+| Container | Adds | Why | Not needed |
+|---|---|---|---|
+| `net-init` | `NET_ADMIN` | `ip addr flush/replace`, `ip link set mtu/up`, `ip route del`, `tc qdisc replace ... netem`: netlink operations in the pod's own network namespace. With a user namespace, NET_ADMIN over the namespace it owns also opens the pod's network sysctls (`ip_forward`, `rp_filter`, `ignore_routes_with_linkdown`, `arp_ignore`, `ping_group_range`; `procMount: Unmasked`) | `NET_RAW` (no raw or packet sockets), `SYS_ADMIN` (no mounts, no `ip netns`: the pod is the namespace), `SYS_MODULE` (lab kernel modules are loaded on the node, not from a pod) |
+| `net` (sidecar) | `NET_ADMIN`, `NET_RAW` | tcpdump opens packet sockets (NET_RAW) and sets promiscuous mode, tc changes impairments (NET_ADMIN) | everything else |
+| `node` (the lab's container) | `NET_ADMIN`, `NET_RAW` | labs manage addresses, routes, VLANs, bonds, bridges and qdiscs; ping and traceroute | unchanged by this policy; its other capabilities are the runtime's defaults |
+| `node` of an FRR device | `NET_ADMIN`, `NET_RAW`, `NET_BIND_SERVICE`, `SYS_ADMIN`; seccomp RuntimeDefault | zebra programs routes and addresses, ospfd and isisd use raw sockets, bgpd binds 179; every FRR daemon raises the capabilities its privilege model declares (zebra: SYS_ADMIN, for network-namespace VRFs) and exits if one is outside the bounding set | |
+
+Network sysctls are the one thing an unprivileged container cannot change without a
+user namespace: the runtime mounts `/proc/sys` read-only, and `ip_forward` and
+per-interface `rp_filter` are unsafe sysctls Kubernetes only sets with a kubelet
+allow-list, at sandbox creation, when the CNI interfaces may not exist yet.
+
+- **With user namespaces** (`--user-namespaces` and `--link-sysctls`, both on where the
+  cluster supports them; the manager logs `wired lab pods ... userNamespace: true`)
+  the pod runs with `hostUsers: false` and `net-init` and the node container get an
+  unmasked `/proc`: the pod's network namespace is owned by its user namespace, so
+  NET_ADMIN in it is enough to write its sysctls, and host-wide sysctls stay
+  read-only. Every capability above is then relative to the pod's user namespace.
+- **Without** (Kubernetes < 1.33 or a runtime or kernel without idmapped mounts,
+  `--link-sysctls=false`): hosts set the safe sysctl `ping_group_range` on the pod and
+  need nothing else. Routers (netdev nodes) get theirs from the CNI
+  [`tuning`](https://www.cni.dev/plugins/current/meta/tuning/) plugin: the NAD of every
+  link that touches a netdev node chains `tuning` behind `kube-ovn`, and the router's
+  network-selection elements pass the sysctls as Multus `cni-args` (forwarding on,
+  `rp_filter` off and `ignore_routes_with_linkdown` on for all, default, eth0 and the
+  link interface, `arp_ignore` 1). Hosts on those links pass none, so `tuning` changes
+  nothing for them. `tuning` writes only `net.*` keys, inside the pod's network
+  namespace, from Multus' node daemon, which is the CNI's privilege, not the lab
+  pod's. Every node then needs the `tuning` binary in its CNI bin directory (the
+  reference plugins of containernetworking/plugins; kind does not ship it). If it is
+  missing the router pod fails at sandbox creation; if a Multus version drops the
+  `cni-args` of a chained NAD, `net-init` fails with "IP forwarding is off" (verified
+  with Multus v4.3.1 thick). The manager logs
+  `lab network ... routerSysctls`.
+
+### Lab pod admission policy
+
+`services/lab-orchestrator/config/rbac/pod_admission_policy.yaml` is a
+ValidatingAdmissionPolicy and binding on every namespace labelled
+`labs.cloudtrain.dev/lab-namespace=true`. It judges pod creation, added ephemeral
+containers, and the pod templates of Deployments, ReplicaSets, StatefulSets,
+DaemonSets, Jobs and CronJobs, and rejects:
+
+- a privileged container or init container, unless the pod's `runtimeClassName` is a
+  configured sandbox RuntimeClass (the `runtimeClass` values of `orchestrator.sandboxes`,
+  `--sandboxes` or `--tier-runtime-classes`; the same configuration the manager
+  sandboxes with);
+- outside such a sandbox, any added capability beyond the Pod Security baseline set,
+  except the exact sets in the table above, on the containers named there, in pods
+  carrying `labs.cloudtrain.dev/pod-profile` that the manager's own ServiceAccount
+  creates (any other creator, an ephemeral container or a workload template gets the
+  baseline set only). A learner cannot use the label: learners hold no pod permissions in
+  lab namespaces (their pods carry no ServiceAccount token, the gateway only creates
+  LabSessions), labels on an existing pod cannot change its capabilities, and pods a
+  vcluster syncs into its host namespace are created by the syncer, not the manager
+  (that namespace also enforces Pod Security baseline);
+- SYS_ADMIN without the RuntimeDefault or Localhost seccomp profile;
+- host network, PID or IPC namespaces, hostPath volumes, Windows host processes and an
+  unmasked `/proc` without a user namespace, sandbox or not.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `orchestrator.rbac.podPolicy.enabled` (Helm), `POD_POLICY` (orchestrator-deploy.sh) | on | install the policy and pass `--pod-admission-policy=<name>` |
+| `orchestrator.rbac.podPolicy.scope`, `POD_POLICY_SCOPE` | `namespaces` (Helm; the deploy script without `SESSION_SELECTOR` on a cluster with no other instance), `own` (the deploy script with `SESSION_SELECTOR`, or when another `lab-orchestrator` Deployment exists; it refuses `namespaces` then) | `namespaces` judges every pod in lab namespaces, whoever creates it (KubeVirt's virt-launcher, CDI importers and vcluster-synced pods pass with their baseline capabilities). `own` judges only this manager's requests: for several managers on one cluster, whose policies would otherwise judge each other's pods and whose sandbox lists must then agree |
+| `--pod-admission-policy` | empty | at startup the manager reads the policy and its binding: missing, or a binding that does not deny, stops the manager; a configured sandbox RuntimeClass the policy does not list is a warning. Empty is a warning |
+
+Namespaces of `labctl preflight` probes (`labs.cloudtrain.dev/preflight`) are not
+judged: the probes create hostPath, privileged and wired test pods as the operator.
+KubeVirt must run VMs non-root (the default since KubeVirt 1.0; the `Root` feature
+gate off): a root virt-launcher adds SYS_NICE, which scope `namespaces` rejects.
+`POD_POLICY=0` does not delete a policy an earlier deploy installed (`kubectl apply`
+does not prune): delete `lab-orchestrator-pods<suffix>` and its binding by hand. During
+an upgrade, pods of the previous manager version (privileged net-init, no profile label)
+are rejected until the new manager has rolled out; they are recreated on the next
+reconcile.
+
+The policy fails closed (`failurePolicy: Fail`). It needs Kubernetes 1.30+, where
+ValidatingAdmissionPolicy is GA (the chart's minimum). On an older cluster
+orchestrator-deploy.sh skips both admission policies with a warning, and the manager
+logs `WARNING: the API server does not serve ValidatingAdmissionPolicy` and runs with
+only its own sandbox rules: the only case where it fails open. Tests: the envtest
+`TestEnvtestPodPolicy` (`make test-rbac`) creates the pods the manager builds, privileged
+pods with and without a sandbox RuntimeClass, and the denied cases against a real API
+server.
+
 ## Tier sandboxes (Kata)
 
 Off by default. With `orchestrator.sandboxes` set, container nodes whose catalog image

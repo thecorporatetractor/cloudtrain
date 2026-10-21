@@ -703,8 +703,6 @@ review asked for the decision in the pod create path, separate "usable" and "VM-
 states, sticky VM twins, all-or-nothing twins, and a deny-list of host runtimes; the second
 review approved. The cluster was deleted afterwards.
 
-Still open (phase 3): an admission policy in session namespaces that rejects privileged
-pods unless their `runtimeClassName` is a configured sandbox (defence in depth), the
-privileged `net-init` init container of wired pods without a sandbox, ssh keys in
+Still open (phase 3): ssh keys in
 container nodes, the kata-deploy prerequisites chart, per-lab `requiredFeatures`, a
 nightly verify on the kata profile, re-tiering the content, and the managed-cloud probes.

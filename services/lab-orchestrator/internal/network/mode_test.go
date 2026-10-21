@@ -115,10 +115,12 @@ func TestSecondaryPlan(t *testing.T) {
 	}
 }
 
-// Non-router nodes without user namespaces need no privileged net-init:
-// ping_group_range is a safe sysctl set on the pod, ip/tc need NET_ADMIN.
+// No net-init is privileged: hosts without user namespaces set the safe
+// sysctl ping_group_range on the pod and need only NET_ADMIN for ip/tc;
+// routers without user namespaces get their sysctls from the CNI tuning
+// plugin (and also set ping_group_range on the pod).
 func TestNetInitPrivileges(t *testing.T) {
-	p, err := Build(sess, ospfTopology())
+	p, err := BuildWith(sess, ospfTopology(), Options{Mode: ModePrimary, RouterTuning: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +128,7 @@ func TestNetInitPrivileges(t *testing.T) {
 	if err := p.DecoratePod("core-host", host, "node", PodOptions{ToolsImage: "t"}); err != nil {
 		t.Fatal(err)
 	}
-	isc := host.Spec.InitContainers[0].SecurityContext
-	if isc.Privileged != nil || isc.Capabilities == nil || len(isc.Capabilities.Add) != 2 {
-		t.Errorf("host net-init security context = %+v", isc)
-	}
+	checkPlatformContainers(t, host, false)
 	if sc := host.Spec.SecurityContext; sc == nil || len(sc.Sysctls) != 1 || sc.Sysctls[0].Name != "net.ipv4.ping_group_range" || sc.Sysctls[0].Value != "0 65535" {
 		t.Errorf("pod sysctls = %+v", host.Spec.SecurityContext)
 	}
@@ -137,16 +136,15 @@ func TestNetInitPrivileges(t *testing.T) {
 	if err := p.DecoratePod("edge-1", router, "node", PodOptions{ToolsImage: "t", Router: true}); err != nil {
 		t.Fatal(err)
 	}
-	if rsc := router.Spec.InitContainers[0].SecurityContext; rsc.Privileged == nil || !*rsc.Privileged {
-		t.Errorf("router net-init without user namespaces must stay privileged: %+v", rsc)
-	}
-	if router.Spec.SecurityContext != nil {
+	checkPlatformContainers(t, router, false)
+	if sc := router.Spec.SecurityContext; sc == nil || len(sc.Sysctls) != 1 {
 		t.Errorf("router pod sysctls = %+v", router.Spec.SecurityContext)
 	}
 	un := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
 	if err := p.DecoratePod("core-host", un, "node", PodOptions{ToolsImage: "t", UserNamespace: true}); err != nil {
 		t.Fatal(err)
 	}
+	checkPlatformContainers(t, un, true)
 	if un.Spec.SecurityContext != nil {
 		t.Errorf("user-namespaced pod gets pod sysctls: %+v", un.Spec.SecurityContext)
 	}

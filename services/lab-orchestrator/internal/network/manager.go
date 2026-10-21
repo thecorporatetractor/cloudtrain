@@ -89,7 +89,11 @@ func (m *Manager) Objects(p *Plan) []*unstructured.Unstructured {
 	}
 	for i := range p.Links {
 		l := &p.Links[i]
-		out = append(out, m.subnet(p, l.Segment, l.ID, l.Impair), m.nad(p, l.Segment, l.ID))
+		nad := m.nad(p, l.Segment, l.ID)
+		if p.Options.RouterTuning && (l.Ends[0].Driver == labsv1.DriverNetdev || l.Ends[1].Driver == labsv1.DriverNetdev) {
+			nad.Object["spec"] = map[string]any{"config": NADConfigTuning(l.Segment.Provider)}
+		}
+		out = append(out, m.subnet(p, l.Segment, l.ID, l.Impair), nad)
 	}
 	return out
 }

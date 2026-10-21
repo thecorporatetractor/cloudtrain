@@ -169,16 +169,19 @@ the interface name from `node:iface`, NET_ADMIN/NET_RAW on the node
 container, a `net-init` init container (nettools image) and a `net` sidecar
 (nettools; `sleep infinity`). Where user namespaces are available
 (`--user-namespaces`, `--link-sysctls`, both default on) the pod runs with
-`hostUsers: false`, `net-init` has NET_ADMIN/NET_RAW and `procMount: Unmasked`
-instead of privileged mode, and the node container also gets `procMount:
-Unmasked`: root in the node can change the pod's network sysctls (`ip_forward`,
-`rp_filter`, `accept_ra`, `proxy_arp`), while host-wide sysctls stay read-only
-because the user namespace does not own them. Without user namespaces
-`/proc/sys` is read-only in the node, and `net-init` is privileged only on
-router nodes (netdev: `ip_forward` and per-interface `rp_filter` are unsafe
-sysctls); on other wired nodes it has NET_ADMIN/NET_RAW and the pod sets the
-safe sysctl `ping_group_range` itself, so the learner can ping without NET_RAW
-(with user namespaces `net-init` sets it). On router
+`hostUsers: false`, `net-init` has NET_ADMIN and `procMount: Unmasked`, and the
+node container also gets `procMount: Unmasked`: root in the node can change the
+pod's network sysctls (`ip_forward`, `rp_filter`, `accept_ra`, `proxy_arp`), while
+host-wide sysctls stay read-only because the user namespace does not own them.
+Without user namespaces `/proc/sys` is read-only in every container of the pod
+and no container is privileged: on hosts `net-init` has NET_ADMIN and the pod sets
+the safe sysctl `ping_group_range` itself, so the learner can ping without NET_RAW
+(with user namespaces `net-init` sets it); router (netdev) pods get their sysctls
+from the CNI tuning plugin, chained behind kube-ovn in the NADs of their links and
+fed through Multus `cni-args` (every node then needs the `tuning` binary of
+containernetworking/plugins). `net-init` and the sidecar drop every other
+capability and run without privilege escalation, on a read-only root filesystem,
+with RuntimeDefault seccomp (docs/deploy.md, "Wired lab pods"). On router
 (netdev) pods `net-init` enables forwarding, turns `rp_filter` off and sets `ignore_routes_with_linkdown`
 on every interface (and the default for new ones), so a connected route of an interface without
 carrier is not used, and `arp_ignore=1`, so ARP is answered only for addresses of the receiving
