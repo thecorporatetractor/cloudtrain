@@ -117,12 +117,14 @@ placeholder prices: `free`, `pro` (individual, monthly or yearly) and `team`
 | `plans.currency` | yes | ISO 4217 code; every `amount` is in its minor unit (cents) |
 | `plans.placeholder` | | Every price is a placeholder, not an offer (the page shows `pricing.placeholderNote`) |
 | `plans.taxNote`, `plans.billingNote` | | Small print under the cards |
-| `plans.items[].id`, `name`, `kind`, `description` | yes | `kind`: `free` (no price), `individual` (one person), `organisation` (per seat) |
+| `plans.items[].id`, `name`, `kind`, `description` | yes | `kind`: `free` (no price), `individual` (one person), `organisation` (per seat). The id `compute` is reserved |
+| `plans.items[].level` | | Premium level the plan grants (free 0, paid default 1); `plans.premium` rules name the plan a lab needs |
+| `plans.free`, `plans.compute`, `plans.limits`, `plans.dunning`, `plans.premium` | | The free trial, compute metering rates, default spend caps, the dunning grace period and the premium-lab rules: `docs/billing.md` |
 | `plans.items[].badge`, `highlight` | | Card label; at most one highlighted plan |
 | `plans.items[].prices.monthly`, `.yearly` | paid plans | `{ amount, lookupKey }`; the lookup key names the Stripe Price (`stripe:sync` creates or updates it) and must be unique |
 | `plans.items[].perSeat`, `minSeats`, `maxSeats` | | Organisation plans: price per seat and the allowed seat range |
 | `plans.items[].placeholderPrices` | | This plan's prices are placeholders |
-| `plans.items[].entitlements` | yes | `labHoursPerMonth` (integer or `unlimited`), `concurrentLabs`, `envTiers` (subset of `A B C K V N`), `examSimulationsPerMonth` (integer or `unlimited`), `ctfEvents` (boolean). Recorded and shown; not enforced yet |
+| `plans.items[].entitlements` | yes | `labHoursPerMonth` (integer or `unlimited`), `concurrentLabs`, `envTiers` (subset of `A B C K V N`), `examSimulationsPerMonth` (integer or `unlimited`), `ctfEvents` (boolean). Recorded and shown; enforcement covers the model in `docs/billing.md` (premium level, trial, payment method, dunning, spend cap), not these numbers |
 | `plans.items[].includes[]` | yes | Marketing bullets |
 | `plans.items[].cta` | yes | `{ label, action, to? }`; `signin` (sign in, or "Go to dashboard"), `checkout` (subscribe; contact while `flags.checkoutEnabled` is off), `contact` (`to`, default `/contact`) |
 

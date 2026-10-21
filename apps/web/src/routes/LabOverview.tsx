@@ -1,6 +1,8 @@
 import { Link } from '@tanstack/react-router';
 import { ChevronLeft, Clock, Lightbulb, Play, Tag } from 'lucide-react';
+import { useBilling } from '@/api/billing';
 import { useCatalog, useLab, useSkills } from '@/api/client';
+import { BillingBlocked, ComputeRate, LabAccessChip } from '@/components/billing';
 import { DifficultyBadge, DomainIcon, DriverIcon, SkillTags, domainLabel, driverLabel } from '@/components/domain';
 import { Prose } from '@/components/prose';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
@@ -15,6 +17,7 @@ export function LabOverview() {
   const lab = useLab(labId);
   const catalog = useCatalog();
   const skills = useSkills();
+  const billing = useBilling('user');
 
   if (lab.isPending) {
     return (
@@ -34,6 +37,8 @@ export function LabOverview() {
   const { metadata, spec } = personalize(lab.data);
   const summary = catalog.data?.labs.find((l) => l.id === metadata.id);
   const resume = summary?.completion === 'in-progress';
+  // Billing: compute tier and rate, premium plan, trial, and a lock with its fix (docs/billing.md).
+  const access = lab.data.access ?? summary?.access;
   const hintCost = (spec.hints ?? []).reduce((a, h) => a + (h.cost ?? 1), 0);
   const skillIds = Array.from(new Set(spec.checks.flatMap((c) => c.skills)));
 
@@ -71,13 +76,24 @@ export function LabOverview() {
             ))}
           </div>
         </div>
-        <div className="row" style={{ gap: 10 }}>
-          {summary?.completion === 'completed' && <Badge tone="ok">Best {summary.bestScore} / 100</Badge>}
-          <Link to="/labs/$labId/work" params={{ labId: metadata.id }} search={{}} className="btn btn-primary btn-lg">
-            <Play size={14} /> {resume ? 'Resume lab' : 'Start lab'}
-          </Link>
+        <div className="stack" style={{ gap: 6, alignItems: 'flex-end' }}>
+          <div className="row" style={{ gap: 10 }}>
+            {summary?.completion === 'completed' && <Badge tone="ok">Best {summary.bestScore} / 100</Badge>}
+            <LabAccessChip access={access} />
+            {access?.locked ? null : (
+              <Link to="/labs/$labId/work" params={{ labId: metadata.id }} search={{}} className="btn btn-primary btn-lg">
+                <Play size={14} /> {resume ? 'Resume lab' : 'Start lab'}
+              </Link>
+            )}
+          </div>
+          {access && <ComputeRate access={access} currency={billing.data?.currency ?? 'EUR'} />}
         </div>
       </header>
+      {access?.locked && (
+        <div style={{ marginBottom: 20 }}>
+          <BillingBlocked block={{ reason: access.locked.reason, action: access.locked.action, href: access.locked.href, message: access.locked.message, ...(access.requiredPlan ? { requiredPlan: access.requiredPlan } : {}) }} />
+        </div>
+      )}
 
       <div className="split split-8-4">
         <div className="stack" style={{ gap: 20 }}>

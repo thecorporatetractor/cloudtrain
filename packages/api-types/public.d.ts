@@ -90,7 +90,7 @@ export type EnvTier = 'A' | 'B' | 'C' | 'K' | 'V' | 'N';
 export type PlanKind = 'free' | 'individual' | 'organisation';
 export type PlanInterval = 'monthly' | 'yearly';
 
-/** What a plan allows. Recorded and displayed; not enforced yet. */
+/** What a plan allows. Recorded and displayed; enforcement covers premium labs, the free trial, payment, dunning and spend caps (docs/billing.md). */
 export interface PlanEntitlements {
   labHoursPerMonth: number | 'unlimited';
   concurrentLabs: number;
@@ -110,6 +110,8 @@ export interface SitePlan {
   id: string;
   name: string;
   kind: PlanKind;
+  /** Tier level for premium labs (free 0; default 1 for paid plans). Seated organisation members get their organisation plan's level. */
+  level?: number;
   description: string;
   badge?: string;
   highlight?: boolean;
@@ -130,7 +132,59 @@ export interface SitePlans {
   placeholder?: boolean;
   taxNote?: string;
   billingNote?: string;
+  /** The free trial: labs a free account may start uncharged, up to the caps. */
+  free?: SiteFreeTrial;
+  /** Pay for compute: metered per session, on top of any plan. */
+  compute?: SiteCompute;
+  /** Default monthly compute spend caps (minor units). */
+  limits?: { user?: SiteSpendLimit; org?: SiteSpendLimit };
+  dunning?: { graceDays?: number };
+  /** Premium lab rules: which plan unlocks which labs. */
+  premium?: SitePremiumRule[];
   items: SitePlan[];
+}
+
+/** Compute tiers, derived from a lab's topology: pod (containers, virtual clusters), vm (one VM), heavy (several VMs, kubeadm, netdev). */
+export type ComputeTier = 'pod' | 'vm' | 'heavy';
+
+export interface SiteFreeTrial {
+  trialLabs: string[];
+  /** Trial sessions per learner (lifetime, default 3). */
+  maxSessions?: number;
+  /** Trial compute minutes per learner (lifetime, default 60). */
+  maxMinutes?: number;
+}
+
+export interface SiteComputeTier {
+  label: string;
+  unitsPerMinute: number;
+}
+
+export interface SiteCompute {
+  /** Minor units per compute unit, decimal string (Stripe unit_amount_decimal). */
+  unitPrice: string;
+  lookupKey: string;
+  meterEventName: string;
+  minimumMinutes?: number;
+  placeholder?: boolean;
+  tiers: Record<ComputeTier, SiteComputeTier>;
+}
+
+export interface SiteSpendLimit {
+  /** Minor units per calendar month; 0 = no cap. */
+  monthlyCap: number;
+  /** Refuse new paid lab starts at the cap (running sessions continue). */
+  hardStop?: boolean;
+}
+
+export interface SitePremiumRule {
+  /** Plan id whose level unlocks the matched labs. */
+  plan: string;
+  labs?: string[];
+  domains?: string[];
+  difficulties?: ('easy' | 'medium' | 'hard')[];
+  computeTiers?: ComputeTier[];
+  tags?: string[];
 }
 
 /** CSS custom property overrides: `--token` -> value. */

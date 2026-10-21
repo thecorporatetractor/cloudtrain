@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { BillingService } from '../src/billing/service.js';
-import { signWebhook, StripeApi, type FetchLike } from '../src/billing/stripe.js';
+import { signWebhook, StripeApi } from '../src/billing/stripe.js';
 import { syncPlans } from '../src/billing/sync.js';
 import { withTenant } from '../src/db/index.js';
 import * as m0007 from '../src/db/migrations/0007_billing.js';
@@ -14,6 +14,7 @@ import { FakeCluster, FakeCompiler, realContent, repo } from './fakes.js';
 import { pgAvailable } from './pg.js';
 import { SessionService } from '../src/sessions/service.js';
 import { TerminalHub } from '../src/terminal/hub.js';
+import { FakeStripe } from './fake-stripe.js';
 
 /*
  * Billing against a throwaway Postgres and a fake Stripe (an in-memory fetch
@@ -23,97 +24,6 @@ import { TerminalHub } from '../src/terminal/hub.js';
 const available = await pgAvailable();
 const SECRET = 'whsec_test_0123456789abcdef';
 const KEY = 'sk_test_51FAKEFAKEFAKEFAKEFAKEFAKE';
-
-/** The slice of Stripe the service touches: customers, prices by lookup key, checkout and portal sessions, subscriptions. */
-class FakeStripe {
-  customers = new Map<string, Record<string, unknown>>();
-  subscriptions = new Map<string, Record<string, unknown>>();
-  prices = new Map<string, Record<string, unknown>>();
-  products = new Map<string, Record<string, unknown>>();
-  checkouts: Record<string, string>[] = [];
-  portals: Record<string, string>[] = [];
-  idempotency = new Map<string, unknown>();
-  requests: { method: string; url: string; body: Record<string, string> }[] = [];
-  private n = 1;
-
-  constructor() {
-    this.prices.set('price_pro_m', { id: 'price_pro_m', product: 'prod_pro', active: true, currency: 'eur', unit_amount: 2900, lookup_key: 'ct_pro_monthly', recurring: { interval: 'month', interval_count: 1 }, metadata: {} });
-    this.prices.set('price_team_y', { id: 'price_team_y', product: 'prod_team', active: true, currency: 'eur', unit_amount: 19000, lookup_key: 'ct_team_seat_yearly', recurring: { interval: 'year', interval_count: 1 }, metadata: {} });
-  }
-
-  fetch: FetchLike = async (url, init) => {
-    const u = new URL(url);
-    const body = Object.fromEntries(new URLSearchParams(init.body ?? ''));
-    this.requests.push({ method: init.method, url: u.pathname + u.search, body });
-    const idem = init.headers['idempotency-key'];
-    if (idem && this.idempotency.has(idem)) return ok(this.idempotency.get(idem));
-    const remember = (v: unknown) => (idem && this.idempotency.set(idem, v), ok(v));
-    const id = (p: string) => `${p}_${this.n++}`;
-    if (init.method === 'POST' && u.pathname === '/v1/customers') {
-      const c = { id: id('cus'), email: body.email ?? null, metadata: meta(body) };
-      this.customers.set(c.id, c);
-      return remember(c);
-    }
-    if (init.method === 'GET' && u.pathname === '/v1/prices') {
-      const keys = [...u.searchParams.entries()].filter(([k]) => k.startsWith('lookup_keys')).map(([, v]) => v);
-      return ok({ object: 'list', data: [...this.prices.values()].filter((p) => (keys.length ? keys.includes(p.lookup_key as string) : true)), has_more: false });
-    }
-    if (init.method === 'POST' && u.pathname === '/v1/checkout/sessions') {
-      this.checkouts.push(body);
-      const s = { id: id('cs'), url: `https://checkout.stripe.test/${this.n}`, customer: body.customer, subscription: null, client_reference_id: body.client_reference_id, metadata: meta(body), mode: body.mode };
-      return remember(s);
-    }
-    if (init.method === 'POST' && u.pathname === '/v1/billing_portal/sessions') {
-      this.portals.push(body);
-      return ok({ id: id('bps'), url: `https://portal.stripe.test/${this.n}` });
-    }
-    if (init.method === 'GET' && u.pathname.startsWith('/v1/subscriptions/')) {
-      const s = this.subscriptions.get(decodeURIComponent(u.pathname.split('/').pop()!));
-      return s ? ok(s) : err(404, 'No such subscription');
-    }
-    if (init.method === 'GET' && u.pathname === '/v1/products/search') {
-      const q = /ct_plan_id'\]:'([a-z0-9-]+)'/.exec(u.searchParams.get('query') ?? '')?.[1];
-      return ok({ object: 'list', data: [...this.products.values()].filter((p) => (p.metadata as Record<string, string>).ct_plan_id === q), has_more: false });
-    }
-    if (init.method === 'POST' && u.pathname === '/v1/products') {
-      const p = { id: id('prod'), name: body.name, description: body.description ?? null, active: true, metadata: meta(body) };
-      this.products.set(p.id, p);
-      return remember(p);
-    }
-    if (init.method === 'GET' && u.pathname.startsWith('/v1/products/')) {
-      const p = this.products.get(u.pathname.split('/').pop()!);
-      return p ? ok(p) : err(404, 'No such product');
-    }
-    if (init.method === 'POST' && u.pathname.startsWith('/v1/products/')) {
-      const p = this.products.get(u.pathname.split('/').pop()!)!;
-      Object.assign(p, { name: body.name ?? p.name, description: body.description ?? p.description, active: body.active === undefined ? p.active : body.active === 'true' });
-      return ok(p);
-    }
-    if (init.method === 'POST' && u.pathname === '/v1/prices') {
-      if (body.transfer_lookup_key === 'true') for (const p of this.prices.values()) if (p.lookup_key === body.lookup_key) p.lookup_key = null;
-      const p = { id: id('price'), product: body.product, active: true, currency: body.currency, unit_amount: Number(body.unit_amount), lookup_key: body.lookup_key, recurring: { interval: body['recurring[interval]'], interval_count: 1 }, metadata: meta(body) };
-      this.prices.set(p.id, p);
-      return remember(p);
-    }
-    if (init.method === 'POST' && u.pathname.startsWith('/v1/prices/')) {
-      const p = this.prices.get(u.pathname.split('/').pop()!)!;
-      if (body.active !== undefined) p.active = body.active === 'true';
-      return ok(p);
-    }
-    return err(404, `unhandled ${init.method} ${u.pathname}`);
-  };
-
-  /** A subscription object as Stripe would send it in an event. */
-  subscription(id: string, customer: string, lookupKey: string, over: Record<string, unknown> = {}) {
-    const price = [...this.prices.values()].find((p) => p.lookup_key === lookupKey)!;
-    const s = { id, object: 'subscription', customer, status: 'active', cancel_at_period_end: false, current_period_end: 1_900_000_000, metadata: {}, items: { object: 'list', data: [{ id: 'si_1', quantity: 1, price }], has_more: false }, ...over };
-    this.subscriptions.set(id, s);
-    return s;
-  }
-}
-const meta = (body: Record<string, string>) => Object.fromEntries(Object.entries(body).filter(([k]) => k.startsWith('metadata[')).map(([k, v]) => [k.slice(9, -1), v]));
-const ok = (v: unknown) => ({ status: 200, json: async () => v, text: async () => JSON.stringify(v) });
-const err = (status: number, message: string) => ({ status, json: async () => ({ error: { message } }), text: async () => message });
 
 const event = (id: string, type: string, object: Record<string, unknown>) => JSON.stringify({ id, type, livemode: false, created: Math.floor(Date.now() / 1000), data: { object } });
 
@@ -162,7 +72,7 @@ describe.skipIf(!available)('billing (migration 0007, /api/billing/*, Stripe tes
     const me = (await as(Q.mei).get('/api/billing/me')).json();
     expect(me).toMatchObject({ enabled: true, mode: 'test', scope: 'user', portalAvailable: false, checkoutEnabled: true, placeholder: true, currency: 'EUR' });
     expect(me.plan).toMatchObject({ planId: 'free', source: 'default', entitlements: { concurrentLabs: 1 } });
-    expect(me.plans.map((p: { id: string }) => p.id)).toEqual(['pro']);
+    expect(me.plans.map((p: { id: string }) => p.id)).toEqual(['pro', 'premium']);
     expect((await as(Q.mei).get('/api/billing/org')).statusCode).toBe(403);
     const org = (await as(Q.priya).get('/api/billing/org')).json();
     expect(org.scope).toBe('org');
@@ -292,22 +202,32 @@ describe.skipIf(!available)('billing (migration 0007, /api/billing/*, Stripe tes
     const site = await loadSiteConfig(path.join(repo, 'content/site.yaml'));
     const fresh = new FakeStripe();
     fresh.prices.clear();
+    fresh.meters.clear();
     const api = new StripeApi(KEY, fresh.fetch);
     const first = await syncPlans(api, site);
-    expect(first.filter((a) => a.action === 'product.create')).toHaveLength(2);
-    expect(first.filter((a) => a.action === 'price.create')).toHaveLength(4);
+    // Pro, Premium, Team and the Compute product; two prices each plus the metered compute price; one meter.
+    expect(first.filter((a) => a.action === 'product.create')).toHaveLength(4);
+    expect(first.filter((a) => a.action === 'price.create')).toHaveLength(7);
+    expect(first.filter((a) => a.action === 'meter.create')).toHaveLength(1);
     expect(first.some((a) => a.action === 'skip.free' && a.plan === 'free')).toBe(true);
+    const meter = [...fresh.meters.values()][0]!;
+    expect(meter).toMatchObject({ event_name: 'ct_compute_units', default_aggregation: { formula: 'sum' }, customer_mapping: { event_payload_key: 'stripe_customer_id' }, value_settings: { event_payload_key: 'value' } });
+    const metered = [...fresh.prices.values()].find((p) => p.lookup_key === 'ct_compute_unit')!;
+    expect(metered).toMatchObject({ unit_amount_decimal: '0.5', currency: 'eur', recurring: { interval: 'month', usage_type: 'metered', meter: meter.id } });
     const second = await syncPlans(api, site);
-    expect(second.filter((a) => a.action.endsWith('.ok'))).toHaveLength(6);
+    expect(second.filter((a) => a.action.endsWith('.ok'))).toHaveLength(12);
     expect(second.some((a) => a.action.endsWith('.create'))).toBe(false);
     // A changed amount replaces the price and moves the lookup key.
     site.plans!.items.find((p) => p.id === 'pro')!.prices!.monthly!.amount = 3900;
+    site.plans!.compute!.unitPrice = '0.75';
     const third = await syncPlans(api, site);
-    const replaced = third.find((a) => a.action === 'price.replace');
+    const replaced = third.find((a) => a.action === 'price.replace' && a.plan === 'pro');
     expect(replaced).toMatchObject({ plan: 'pro', interval: 'monthly' });
     const active = [...fresh.prices.values()].filter((p) => p.lookup_key === 'ct_pro_monthly' && p.active);
     expect(active).toHaveLength(1);
     expect(active[0]!.unit_amount).toBe(3900);
+    expect(third.find((a) => a.plan === 'compute' && a.action === 'price.replace')).toBeTruthy();
+    expect([...fresh.prices.values()].filter((p) => p.lookup_key === 'ct_compute_unit' && p.active).map((p) => p.unit_amount_decimal)).toEqual(['0.75']);
     const dry = await syncPlans(api, { ...site, plans: { ...site.plans!, items: site.plans!.items.map((p) => (p.id === 'pro' ? { ...p, prices: { ...p.prices!, monthly: { ...p.prices!.monthly!, amount: 4900 } } } : p)) } }, { dryRun: true });
     expect(dry.find((a) => a.action === 'price.replace')?.detail).toMatch(/dry run/);
     expect([...fresh.prices.values()].filter((p) => p.unit_amount === 4900)).toHaveLength(0);

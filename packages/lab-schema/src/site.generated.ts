@@ -1278,7 +1278,7 @@ export interface Site {
     faqGroup?: string;
   };
   /**
-   * Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat).
+   * Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat). Learners pay for the compute their lab sessions use on top of any plan (`compute`); plans unlock premium labs (`premium`); the free plan gives a trial lab (`free`).
    */
   plans?: {
     /**
@@ -1294,6 +1294,122 @@ export interface Site {
      */
     taxNote?: string;
     billingNote?: string;
+    /**
+     * The free trial: labs a free account (no payment method, no subscription) may start, uncharged, up to the caps. Everything else needs a payment method on file or a subscription.
+     */
+    free?: {
+      /**
+       * Lab ids. Short, pod-tier labs that verify reliably.
+       */
+      trialLabs: string[];
+      /**
+       * Trial sessions per learner (lifetime).
+       */
+      maxSessions?: number;
+      /**
+       * Trial compute minutes per learner (lifetime).
+       */
+      maxMinutes?: number;
+    };
+    /**
+     * Pay for compute: every lab session is metered (wall-clock minutes x the tier's units per minute) and reported to a Stripe Billing Meter; a metered Price bills the units.
+     */
+    compute?: {
+      /**
+       * Price of one compute unit in minor units of `currency`, as a decimal string (Stripe unit_amount_decimal), e.g. '0.5' = half a cent.
+       */
+      unitPrice: string;
+      /**
+       * Lookup key of the metered Price stripe:sync creates.
+       */
+      lookupKey: string;
+      /**
+       * Event name of the Stripe Billing Meter (sum of `value`).
+       */
+      meterEventName: string;
+      /**
+       * Billed minutes are rounded up; a session is billed at least this many.
+       */
+      minimumMinutes?: number;
+      /**
+       * The rates are placeholders, not offers.
+       */
+      placeholder?: boolean;
+      /**
+       * Compute tiers, derived from a lab's topology: pod (container nodes and virtual clusters), vm (one VM), heavy (two or more VMs, a kubeadm cluster or a netdev topology).
+       */
+      tiers: {
+        pod: {
+          label: string;
+          /**
+           * Compute units billed per wall-clock minute of a session on this tier.
+           */
+          unitsPerMinute: number;
+        };
+        vm: {
+          label: string;
+          /**
+           * Compute units billed per wall-clock minute of a session on this tier.
+           */
+          unitsPerMinute: number;
+        };
+        heavy: {
+          label: string;
+          /**
+           * Compute units billed per wall-clock minute of a session on this tier.
+           */
+          unitsPerMinute: number;
+        };
+      };
+    };
+    /**
+     * Default spend caps for an individual account and an organisation.
+     */
+    limits?: {
+      user?: {
+        /**
+         * Default monthly compute spend cap in minor units; 0 = no cap. Accounts may change their own.
+         */
+        monthlyCap: number;
+        /**
+         * At the cap, refuse new paid lab starts (running sessions are never stopped). Off: warn only.
+         */
+        hardStop?: boolean;
+      };
+      org?: {
+        /**
+         * Default monthly compute spend cap in minor units; 0 = no cap. Accounts may change their own.
+         */
+        monthlyCap: number;
+        /**
+         * At the cap, refuse new paid lab starts (running sessions are never stopped). Off: warn only.
+         */
+        hardStop?: boolean;
+      };
+    };
+    /**
+     * Failed payments.
+     */
+    dunning?: {
+      /**
+       * Days after a failed payment (or a past_due/unpaid subscription) before new paid lab starts are refused.
+       */
+      graceDays?: number;
+    };
+    /**
+     * Premium labs: each rule names the plan that unlocks the labs it matches (all given selectors must match; `labs` matches by id on its own). A lab needs the highest plan level among the rules it matches; a lab matching no rule is standard.
+     */
+    premium?: {
+      /**
+       * Plan id; its `level` unlocks the labs.
+       */
+      plan: string;
+      labs?: string[];
+      domains?: string[];
+      difficulties?: ("easy" | "medium" | "hard")[];
+      computeTiers?: ("pod" | "vm" | "heavy")[];
+      tags?: string[];
+    }[];
     /**
      * @minItems 1
      * @maxItems 6
@@ -1845,6 +1961,10 @@ export interface Plan {
    * free: no price; individual: one person, monthly or yearly; organisation: per seat, monthly or yearly.
    */
   kind: "free" | "individual" | "organisation";
+  /**
+   * Tier level for premium labs (free 0). A subscriber, or a seated member of an organisation on the plan, may start labs whose premium rules need this level or less. Default: 0 for free, 1 otherwise.
+   */
+  level?: number;
   description: string;
   /**
    * Small label on the card, e.g. 'Most popular'.
@@ -1916,7 +2036,7 @@ export interface Price {
   lookupKey: string;
 }
 /**
- * What a plan allows. Recorded and displayed; enforcement comes later.
+ * What a plan allows. Recorded and displayed; enforcement covers premium labs, the free trial, payment, dunning and spend caps (docs/billing.md).
  *
  * This interface was referenced by `Site`'s JSON-Schema
  * via the `definition` "entitlements".

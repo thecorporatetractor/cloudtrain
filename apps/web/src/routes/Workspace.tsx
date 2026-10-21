@@ -6,6 +6,7 @@ import { ApiError, useEndSession, useLab, useQuestions, useRevealHint, useSessio
 import { isRealApi } from '@/api/mode';
 import type { LabSession, SessionNotice, TopologyLink, ValidateResponse } from '@/api/types';
 import { useScreenShortcuts, useShell } from '@/app/shell-context';
+import { BillingBlocked } from '@/components/billing';
 import { DifficultyBadge, SkillTags, StatusDot } from '@/components/domain';
 import { Badge, Button, ErrorState, Kbd, Skeleton, Tooltip } from '@/components/ui';
 import { PersistedGroup } from '@/components/ui/panels';
@@ -15,6 +16,7 @@ import { Timer } from '@/components/workspace/Timer';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { useHotkeys } from '@/lib/hotkeys';
 import { useMediaQuery } from '@/lib/media';
+import { billingBlockOf } from '@/lib/billing';
 import { personalize } from '@/lib/personalize';
 import { cn } from '@/lib/utils';
 import { workspaceRoute } from '@/router';
@@ -259,6 +261,18 @@ export function Workspace() {
     return (
       <div className="page page-narrow">
         <ErrorState title="Lab unavailable" error={lab.error} onRetry={() => void lab.refetch()} />
+      </div>
+    );
+  }
+  if (start.isError && billingBlockOf(start.error)) {
+    return (
+      <div className="page page-narrow">
+        <BillingBlocked block={billingBlockOf(start.error)!} />
+        <p className="small" style={{ marginTop: 14 }}>
+          <Link to="/labs/$labId" params={{ labId }} className="link-quiet">
+            Back to the lab
+          </Link>
+        </p>
       </div>
     );
   }

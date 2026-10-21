@@ -7,9 +7,10 @@ import { GOAL_TENANT_TABLES } from '../src/db/migrations/0004_learner_goals.js';
 import { ANSWER_TENANT_TABLES } from '../src/db/migrations/0005_ctf_answers.js';
 import { EVENT_TENANT_TABLES } from '../src/db/migrations/0006_ctf_events.js';
 import { BILLING_TENANT_TABLES } from '../src/db/migrations/0007_billing.js';
+import { COMPUTE_TENANT_TABLES } from '../src/db/migrations/0009_billing_compute.js';
 
 /** Every tenant table of every migration. */
-const TENANT_TABLES = [...PLATFORM_TABLES, ...EXAM_TENANT_TABLES, ...GOAL_TENANT_TABLES, ...ANSWER_TENANT_TABLES, ...EVENT_TENANT_TABLES, ...BILLING_TENANT_TABLES];
+const TENANT_TABLES = [...PLATFORM_TABLES, ...EXAM_TENANT_TABLES, ...GOAL_TENANT_TABLES, ...ANSWER_TENANT_TABLES, ...EVENT_TENANT_TABLES, ...BILLING_TENANT_TABLES, ...COMPUTE_TENANT_TABLES];
 import { defaultPeopleFile, readPeople, seed } from '../src/db/seed.js';
 import { createTestDb, pgAvailable, type TestDb } from './pg.js';
 import { realContent, repo } from './fakes.js';

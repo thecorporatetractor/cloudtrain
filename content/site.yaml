@@ -189,10 +189,13 @@ faq:
     a: In a Postgres database with row-level security on every organisation-scoped row, inside the deployment you choose. Self-hosted deployments keep everything on your infrastructure.
   - group: Plans
     q: Is there a free plan?
-    a: Yes. The Free plan gives a few lab hours a month on the unprivileged tiers so you can see how grading and the skill model work. Pro and Team add every tier, exam simulations and events.
+    a: Yes, as a trial. A free account can run one guided lab free of charge, no card needed, to see how the environments, grading and the skill model work. To run anything else, add a payment method and pay only for the compute your lab sessions use; Pro and Premium unlock the premium labs, with compute billed on top.
   - group: Plans
     q: Individual or organisation?
-    a: Pro is for one person and is billed monthly or yearly. Team is per seat for organisations and adds single sign-on, cohorts, manager dashboards and private events. Seats can be reassigned as people change.
+    a: Pro and Premium are for one person and are billed monthly or yearly. Team is per seat for organisations and adds single sign-on, cohorts, manager dashboards and private events; seated members get Premium and their compute is billed to the organisation. Admins assign and reassign seats as people change.
+  - group: Plans
+    q: How is compute billed?
+    a: Every lab session is metered from start to stop in wall-clock minutes. Pod and virtual-cluster labs cost the least, single-VM labs more, and multi-VM, kubeadm and network-topology labs the most. Usage is invoiced monthly; a monthly spend cap stops new paid labs when you reach it, and a running lab is never cut off.
   - group: Plans
     q: Are the prices final?
     a: Not yet. The amounts on the pricing page are placeholders while plans are finalised. Nothing is charged until checkout opens; until then every plan starts with a conversation.
@@ -362,77 +365,136 @@ flags:
 
 pricing:
   headline: Plans for individuals and teams
-  intro: Start free, go Pro for unlimited practice, or bring your whole team with single sign-on and manager dashboards.
+  intro: Try a lab free, then pay only for the compute you use. Pro and Premium unlock the premium labs; Team brings your organisation with seats, single sign-on and one compute bill.
   placeholderNote: Prices are placeholders while plans are being finalised, not offers. Talk to us for a pilot.
   contactCta: { label: Talk to us, to: /contact }
   faqGroup: Plans
 
 # Plans: configurable data, not code. Amounts are in minor units (cents) of `currency`;
 # lookup keys name the Stripe Prices that `pnpm --filter @cloudtrain/gateway stripe:sync`
-# creates from this file. Entitlements are recorded and displayed, not enforced yet.
+# creates from this file (plus the compute meter and its metered price). Model (docs/billing.md):
+# learners pay for the compute their lab sessions use, on top of any plan; plans unlock premium
+# labs; a free account gets the trial lab only. EVERY AMOUNT BELOW IS A PLACEHOLDER.
 plans:
   currency: EUR
   placeholder: true
   taxNote: Prices exclude VAT where applicable.
+  billingNote: Compute is billed monthly in arrears from metered lab minutes, on top of any plan.
+  # Free accounts (no payment method, no subscription) may start these labs, uncharged, up to the caps.
+  free:
+    trialLabs: [shell-first-steps-timetable]
+    maxSessions: 3
+    maxMinutes: 60
+  # Pay for compute: billed minutes (rounded up, at least minimumMinutes) x the tier's units per minute.
+  # unitPrice is minor units per compute unit (0.5 = half a cent): pod 0.30, VM 1.20, heavy 3.00 EUR/hour.
+  compute:
+    placeholder: true
+    unitPrice: '0.5'
+    lookupKey: ct_compute_unit
+    meterEventName: ct_compute_units
+    minimumMinutes: 1
+    tiers:
+      pod: { label: Pod or virtual cluster, unitsPerMinute: 1 }
+      vm: { label: Single virtual machine, unitsPerMinute: 4 }
+      heavy: { label: 'Multi-VM, kubeadm or network topology', unitsPerMinute: 10 }
+  # Default monthly compute spend caps (minor units, 0 = none); accounts and org admins may change theirs.
+  limits:
+    user: { monthlyCap: 5000, hardStop: true }
+    org: { monthlyCap: 50000, hardStop: false }
+  # Days after a failed payment before new paid lab starts are refused (running labs continue).
+  dunning:
+    graceDays: 7
+  # Premium labs: the plan whose level unlocks the labs a rule matches (highest wins).
+  premium:
+    - plan: pro
+      difficulties: [hard]
+    - plan: premium
+      difficulties: [hard]
+      computeTiers: [heavy]
   items:
     - id: free
       name: Free
       kind: free
-      description: Try real labs on the unprivileged tiers, a few hours a month.
+      level: 0
+      description: Try one guided lab free of charge; add a card to run any standard lab and pay only for the compute you use.
       entitlements:
-        labHoursPerMonth: 4
+        labHoursPerMonth: unlimited
         concurrentLabs: 1
-        envTiers: [A, V]
+        envTiers: [A, B, C, K, V, N]
         examSimulationsPerMonth: 0
         ctfEvents: false
       includes:
-        - Learning labs on pod and virtual-cluster tiers
+        - One trial lab free of charge, no card needed
+        - With a card on file, every standard lab, paying per compute minute
         - Skill tracking and the next-best-lab recommendation
         - Community support
       cta: { label: Get started, action: signin }
     - id: pro
       name: Pro
       kind: individual
-      description: Every lab, every tier, timed exam simulations and CTF events, for one person.
+      level: 1
+      description: Unlocks the hard labs, timed exam simulations and CTF events, for one person. Compute billed on top.
       badge: Placeholder price
       highlight: true
       prices:
-        monthly: { amount: 2900, lookupKey: ct_pro_monthly }
-        yearly: { amount: 29000, lookupKey: ct_pro_yearly }
+        monthly: { amount: 900, lookupKey: ct_pro_monthly }
+        yearly: { amount: 9000, lookupKey: ct_pro_yearly }
       placeholderPrices: true
       entitlements:
-        labHoursPerMonth: 60
+        labHoursPerMonth: unlimited
         concurrentLabs: 2
         envTiers: [A, B, C, K, V, N]
         examSimulationsPerMonth: 4
         ctfEvents: true
       includes:
-        - Full-VM, kubeadm and network-device labs
+        - Hard labs on pod and VM tiers
         - Exam simulations with per-objective reports
         - Solo CTF investigations and public events
         - Email support
       cta: { label: Start Pro, action: checkout }
+    - id: premium
+      name: Premium
+      kind: individual
+      level: 2
+      description: Everything in Pro plus the hard multi-VM, kubeadm and network-topology labs. Compute billed on top.
+      badge: Placeholder price
+      prices:
+        monthly: { amount: 1900, lookupKey: ct_premium_monthly }
+        yearly: { amount: 19000, lookupKey: ct_premium_yearly }
+      placeholderPrices: true
+      entitlements:
+        labHoursPerMonth: unlimited
+        concurrentLabs: 3
+        envTiers: [A, B, C, K, V, N]
+        examSimulationsPerMonth: unlimited
+        ctfEvents: true
+      includes:
+        - Every lab, including hard multi-VM, kubeadm and network labs
+        - Unlimited exam simulations
+        - Priority email support
+      cta: { label: Start Premium, action: checkout }
     - id: team
       name: Team
       kind: organisation
-      description: Per seat, for organisations that train together, with SSO, cohorts and dashboards.
+      level: 2
+      description: Per seat, for organisations that train together, with SSO, cohorts and dashboards. Seated members get Premium; compute is billed to the organisation.
       badge: Placeholder price
       prices:
-        monthly: { amount: 1900, lookupKey: ct_team_seat_monthly }
-        yearly: { amount: 19000, lookupKey: ct_team_seat_yearly }
+        monthly: { amount: 1500, lookupKey: ct_team_seat_monthly }
+        yearly: { amount: 15000, lookupKey: ct_team_seat_yearly }
       perSeat: true
-      minSeats: 5
+      minSeats: 3
       placeholderPrices: true
       entitlements:
-        labHoursPerMonth: 40
+        labHoursPerMonth: unlimited
         concurrentLabs: 2
         envTiers: [A, B, C, K, V, N]
-        examSimulationsPerMonth: 2
+        examSimulationsPerMonth: unlimited
         ctfEvents: true
       includes:
+        - Premium labs for every seated member
         - Single sign-on with group-to-role mapping
         - Manager and instructor dashboards, cohorts, assignments
-        - Private CTF events with team scoreboards
-        - Audit log and usage reports
+        - One compute bill for the organisation, with a spend cap
         - Priority support and onboarding
       cta: { label: Talk to sales, action: contact }

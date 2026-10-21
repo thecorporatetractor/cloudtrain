@@ -565,7 +565,7 @@
         "currency",
         "items"
       ],
-      "description": "Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat).",
+      "description": "Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat). Learners pay for the compute their lab sessions use on top of any plan (`compute`); plans unlock premium labs (`premium`); the free plan gives a trial lab (`free`).",
       "properties": {
         "currency": {
           "type": "string",
@@ -584,6 +584,270 @@
         "billingNote": {
           "type": "string",
           "maxLength": 400
+        },
+        "free": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "trialLabs"
+          ],
+          "description": "The free trial: labs a free account (no payment method, no subscription) may start, uncharged, up to the caps. Everything else needs a payment method on file or a subscription.",
+          "properties": {
+            "trialLabs": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+              },
+              "description": "Lab ids. Short, pod-tier labs that verify reliably."
+            },
+            "maxSessions": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 3,
+              "description": "Trial sessions per learner (lifetime)."
+            },
+            "maxMinutes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1440,
+              "default": 60,
+              "description": "Trial compute minutes per learner (lifetime)."
+            }
+          }
+        },
+        "compute": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "unitPrice",
+            "lookupKey",
+            "meterEventName",
+            "tiers"
+          ],
+          "description": "Pay for compute: every lab session is metered (wall-clock minutes x the tier's units per minute) and reported to a Stripe Billing Meter; a metered Price bills the units.",
+          "properties": {
+            "unitPrice": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]{1,6})?$",
+              "description": "Price of one compute unit in minor units of `currency`, as a decimal string (Stripe unit_amount_decimal), e.g. '0.5' = half a cent."
+            },
+            "lookupKey": {
+              "type": "string",
+              "pattern": "^[a-z0-9_]{3,64}$",
+              "description": "Lookup key of the metered Price stripe:sync creates."
+            },
+            "meterEventName": {
+              "type": "string",
+              "pattern": "^[a-z0-9_]{3,100}$",
+              "description": "Event name of the Stripe Billing Meter (sum of `value`)."
+            },
+            "minimumMinutes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 60,
+              "default": 1,
+              "description": "Billed minutes are rounded up; a session is billed at least this many."
+            },
+            "placeholder": {
+              "type": "boolean",
+              "description": "The rates are placeholders, not offers."
+            },
+            "tiers": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "pod",
+                "vm",
+                "heavy"
+              ],
+              "description": "Compute tiers, derived from a lab's topology: pod (container nodes and virtual clusters), vm (one VM), heavy (two or more VMs, a kubeadm cluster or a netdev topology).",
+              "properties": {
+                "pod": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "label",
+                    "unitsPerMinute"
+                  ],
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 60
+                    },
+                    "unitsPerMinute": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1000,
+                      "description": "Compute units billed per wall-clock minute of a session on this tier."
+                    }
+                  }
+                },
+                "vm": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "label",
+                    "unitsPerMinute"
+                  ],
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 60
+                    },
+                    "unitsPerMinute": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1000,
+                      "description": "Compute units billed per wall-clock minute of a session on this tier."
+                    }
+                  }
+                },
+                "heavy": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "label",
+                    "unitsPerMinute"
+                  ],
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 60
+                    },
+                    "unitsPerMinute": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1000,
+                      "description": "Compute units billed per wall-clock minute of a session on this tier."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Default spend caps for an individual account and an organisation.",
+          "properties": {
+            "user": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "monthlyCap"
+              ],
+              "properties": {
+                "monthlyCap": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100000000,
+                  "description": "Default monthly compute spend cap in minor units; 0 = no cap. Accounts may change their own."
+                },
+                "hardStop": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "At the cap, refuse new paid lab starts (running sessions are never stopped). Off: warn only."
+                }
+              }
+            },
+            "org": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "monthlyCap"
+              ],
+              "properties": {
+                "monthlyCap": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100000000,
+                  "description": "Default monthly compute spend cap in minor units; 0 = no cap. Accounts may change their own."
+                },
+                "hardStop": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "At the cap, refuse new paid lab starts (running sessions are never stopped). Off: warn only."
+                }
+              }
+            }
+          }
+        },
+        "dunning": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Failed payments.",
+          "properties": {
+            "graceDays": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 60,
+              "default": 7,
+              "description": "Days after a failed payment (or a past_due/unpaid subscription) before new paid lab starts are refused."
+            }
+          }
+        },
+        "premium": {
+          "type": "array",
+          "description": "Premium labs: each rule names the plan that unlocks the labs it matches (all given selectors must match; `labs` matches by id on its own). A lab needs the highest plan level among the rules it matches; a lab matching no rule is standard.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "plan"
+            ],
+            "properties": {
+              "plan": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{1,30}$",
+                "description": "Plan id; its `level` unlocks the labs."
+              },
+              "labs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "domains": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "difficulties": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "easy",
+                    "medium",
+                    "hard"
+                  ]
+                }
+              },
+              "computeTiers": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "pod",
+                    "vm",
+                    "heavy"
+                  ]
+                }
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
         },
         "items": {
           "type": "array",
@@ -1014,7 +1278,7 @@
         "examSimulationsPerMonth",
         "ctfEvents"
       ],
-      "description": "What a plan allows. Recorded and displayed; enforcement comes later.",
+      "description": "What a plan allows. Recorded and displayed; enforcement covers premium labs, the free trial, payment, dunning and spend caps (docs/billing.md).",
       "properties": {
         "labHoursPerMonth": {
           "oneOf": [
@@ -1101,6 +1365,12 @@
             "organisation"
           ],
           "description": "free: no price; individual: one person, monthly or yearly; organisation: per seat, monthly or yearly."
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9,
+          "description": "Tier level for premium labs (free 0). A subscriber, or a seated member of an organisation on the plan, may start labs whose premium rules need this level or less. Default: 0 for free, 1 otherwise."
         },
         "description": {
           "type": "string",

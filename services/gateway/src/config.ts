@@ -101,11 +101,16 @@ export interface BillingConfig {
   mode: 'test';
   secretKey: string;
   webhookSecret: string;
+  /** CT_BILLING_ENFORCE: refuse lab starts billing does not allow. Default: on when billing is on. */
+  enforce: boolean;
+  /** CT_BILLING_SWEEP_MS: how often usage is closed and the meter outbox flushed (default 60000; 0 = off). */
+  sweepMs: number;
 }
 
 /**
  * CT_BILLING_ENABLED: '1' turns billing on, unset/''/'0' leaves it off, anything else is an
- * error. A live Stripe key (sk_live_, rk_live_) is refused whether billing is on or off, and
+ * error. CT_BILLING_ENFORCE ('1'/'0') turns the lab-start gate on or off; unset, it follows
+ * billing (on with billing, so dev with billing on enforces). Enforcement needs billing. A live Stripe key (sk_live_, rk_live_) is refused whether billing is on or off, and
  * STRIPE_MODE must be `test`: this version never talks to a live account.
  */
 export function billingConfig(env: NodeJS.ProcessEnv): BillingConfig {
@@ -121,7 +126,12 @@ export function billingConfig(env: NodeJS.ProcessEnv): BillingConfig {
     if (!isTestKey(secretKey)) throw new Error('CT_BILLING_ENABLED=1 needs STRIPE_SECRET_KEY set to a test-mode key (sk_test_...); refusing to start');
     if (!webhookSecret.startsWith('whsec_')) throw new Error('CT_BILLING_ENABLED=1 needs STRIPE_WEBHOOK_SECRET (whsec_..., from `stripe listen` or the dashboard); refusing to start');
   }
-  return { enabled, mode: 'test', secretKey: enabled ? secretKey : '', webhookSecret: enabled ? webhookSecret : '' };
+  const e = env.CT_BILLING_ENFORCE;
+  if (e !== undefined && e !== '' && e !== '0' && e !== '1') throw new Error(`CT_BILLING_ENFORCE must be 1 or 0 (got ${JSON.stringify(e)}); refusing to start`);
+  const enforce = enabled && (e === undefined || e === '' ? true : e === '1');
+  const sweepMs = Number(env.CT_BILLING_SWEEP_MS ?? 60_000);
+  if (!Number.isInteger(sweepMs) || sweepMs < 0) throw new Error('CT_BILLING_SWEEP_MS must be a whole number of milliseconds (0 = off)');
+  return { enabled, mode: 'test', secretKey: enabled ? secretKey : '', webhookSecret: enabled ? webhookSecret : '', enforce, sweepMs };
 }
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);

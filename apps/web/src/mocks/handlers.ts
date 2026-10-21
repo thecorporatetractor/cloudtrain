@@ -10,7 +10,7 @@ import { examHandlers } from './examHandlers';
 import { ctfHandlers } from './ctf';
 import { eventHandlers } from './events';
 import { publicHandlers } from './public';
-import { billingHandlers } from './billing';
+import { annotateLab, annotateLabs, billingHandlers, gateLabStart, meterEnd, meterStart } from './billing';
 import { newSession, sessions } from './sessionStore';
 
 /* ------------------------------------------------------------------ */
@@ -167,22 +167,27 @@ const coreHandlers = [
     // The new learner has finished nothing; only the lab they opened shows as started.
     if (currentSession()?.userId === COLD_START_USER) {
       const started = coldHomeData.resume?.labId;
-      return HttpResponse.json({ domains, paths: paths.map((p) => ({ ...p, progress: 0 })), labs: labSummaries.map(({ bestScore: _b, ...l }) => ({ ...l, completion: l.id === started ? 'in-progress' : 'new' })) });
+      return HttpResponse.json({ domains, paths: paths.map((p) => ({ ...p, progress: 0 })), labs: annotateLabs(labSummaries.map(({ bestScore: _b, ...l }) => ({ ...l, completion: l.id === started ? ('in-progress' as const) : ('new' as const) }))) });
     }
-    return HttpResponse.json({ domains, paths, labs: labSummaries });
+    return HttpResponse.json({ domains, paths, labs: annotateLabs(labSummaries) });
   }),
   http.get('/api/labs/:id', async ({ params }) => {
     await latency();
     const lab = labById.get(String(params.id));
     if (!lab) return HttpResponse.json({ error: 'Lab not found' }, { status: 404 });
-    return HttpResponse.json(lab);
+    return HttpResponse.json(annotateLab(lab));
   }),
 
   http.post('/api/labs/:id/sessions', async ({ params }) => {
     await delay(600);
     const lab = labById.get(String(params.id));
     if (!lab) return HttpResponse.json({ error: 'Lab not found' }, { status: 404 });
-    return HttpResponse.json(newSession(lab.metadata.id), { status: 201 });
+    // Billing gate and metering, as the gateway does (docs/billing.md).
+    const refused = gateLabStart(lab);
+    if (refused) return refused;
+    const created = newSession(lab.metadata.id);
+    meterStart(lab, created);
+    return HttpResponse.json(created, { status: 201 });
   }),
   http.get('/api/sessions/:id', async ({ params }) => {
     await delay(120);
@@ -193,6 +198,7 @@ const coreHandlers = [
   http.delete('/api/sessions/:id', async ({ params }) => {
     await delay(150);
     sessions.delete(String(params.id));
+    meterEnd(String(params.id));
     return new HttpResponse(null, { status: 204 });
   }),
   http.post('/api/sessions/:id/validate', async ({ params }) => {

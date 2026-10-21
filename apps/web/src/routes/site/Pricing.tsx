@@ -1,10 +1,11 @@
 import { Link } from '@tanstack/react-router';
-import { ArrowRight, Check, LayoutDashboard, LogIn, Minus, ShieldCheck, Users } from 'lucide-react';
+import { ArrowRight, Check, Cpu, Gift, LayoutDashboard, LogIn, Minus, ShieldCheck, Users } from 'lucide-react';
 import { useState } from 'react';
 import { useMe } from '@/api/client';
 import { useSite } from '@/api/public';
 import type { PlanInterval, SiteConfig, SitePlan } from '@/api/types';
 import { Badge, Card, PageSkeleton, Segmented } from '@/components/ui';
+import { formatMinor, siteComputeRates } from '@/lib/billing';
 import { ENTITLEMENT_ROWS, entitlementSummary, formatAmount, perMonth, priceFor, yearlySaving } from '@/lib/plans';
 import { cn } from '@/lib/utils';
 import { SiteAnchor, useDocumentTitle } from '@/site/util';
@@ -12,9 +13,10 @@ import { Cta } from './Landing';
 
 /**
  * Pricing: the configured plans (free, individual monthly/yearly, organisation
- * per seat) as cards with an interval switch, a comparison of entitlements, the
- * placeholder note while prices are not final, the plan FAQ and the alignment
- * notice. Calls to action lead to sign-in, checkout (when enabled) or contact.
+ * per seat) as cards with an interval switch, the pay-for-compute rates and the
+ * free trial, a comparison of entitlements and premium labs, the placeholder
+ * note while prices are not final, the plan FAQ and the alignment notice. Calls
+ * to action lead to sign-in, checkout (when enabled) or contact.
  */
 export function Pricing() {
   const site = useSite();
@@ -78,11 +80,13 @@ export function Pricing() {
             {anyYearly && interval === 'yearly' ? ' Yearly prices are shown per month and billed once a year.' : ''}
           </p>
 
+          <ComputeSection site={s!} />
+
           <section className="page-section" aria-labelledby="compare">
             <div className="section-header">
               <div>
-                <h2 id="compare">Compare entitlements</h2>
-                <p className="muted small">Lab hours, concurrent labs, environment tiers, exam simulations and events per plan. Limits are recorded and shown in the app; enforcement follows later.</p>
+                <h2 id="compare">Compare plans</h2>
+                <p className="muted small">Premium labs, lab hours, concurrent labs, environment tiers, exam simulations and events per plan. Compute is billed on top of every plan.</p>
               </div>
             </div>
             <Card className="card-flush site-compare-wrap">
@@ -98,6 +102,19 @@ export function Pricing() {
                   </tr>
                 </thead>
                 <tbody>
+                  {(plans.premium?.length ?? 0) > 0 && (
+                    <tr>
+                      <th scope="row">Premium labs</th>
+                      {plans.items.map((pl) => (
+                        <td key={pl.id} className={cn(premiumUnlocked(plans, pl).length === 0 && 'subtle')}>
+                          <span className="row" style={{ gap: 6 }}>
+                            {premiumUnlocked(plans, pl).length ? <Check size={13} className="text-ok" aria-hidden /> : <Minus size={13} aria-hidden />}
+                            {premiumUnlocked(plans, pl).length ? premiumUnlocked(plans, pl).join(' and ') : pl.kind === 'free' && plans.free?.trialLabs.length ? 'Trial lab only, free' : 'Standard labs'}
+                          </span>
+                        </td>
+                      ))}
+                    </tr>
+                  )}
                   {ENTITLEMENT_ROWS.map((row) => (
                     <tr key={row.key}>
                       <th scope="row">{row.label}</th>
@@ -261,5 +278,71 @@ export function PlanCta({ plan, interval, site, size = 'md' }: { plan: SitePlan;
     <SiteAnchor to={plan.cta.to ?? site.pricing?.contactCta?.to ?? '/contact'} className={cls}>
       {plan.cta.action === 'checkout' ? (site.pricing?.contactCta?.label ?? 'Talk to us') : plan.cta.label} <ArrowRight size={13} aria-hidden />
     </SiteAnchor>
+  );
+}
+
+/** Names of the premium tiers a plan unlocks (rule plans whose level is at most this plan's). */
+function premiumUnlocked(plans: NonNullable<SiteConfig['plans']>, plan: SitePlan): string[] {
+  const level = plan.level ?? (plan.kind === 'free' ? 0 : 1);
+  const names = new Set<string>();
+  for (const rule of plans.premium ?? []) {
+    const rp = plans.items.find((p) => p.id === rule.plan);
+    const rl = rp ? (rp.level ?? (rp.kind === 'free' ? 0 : 1)) : Infinity;
+    if (rp && rl <= level) names.add(`${rp.name} labs`);
+  }
+  return [...names];
+}
+
+/** Pay for compute: the rate per environment tier and the free trial. */
+function ComputeSection({ site }: { site: SiteConfig }) {
+  const plans = site.plans!;
+  const rates = siteComputeRates(site);
+  if (rates.length === 0) return null;
+  const trial = plans.free;
+  const EXAMPLE: Record<string, string> = { pod: 'Shell, files, Git, scripting, Kubernetes API work', vm: 'systemd, storage, SELinux, boot and recovery', heavy: 'kubeadm clusters, multi-node estates, network topologies' };
+  return (
+    <section className="page-section" aria-labelledby="compute">
+      <div className="section-header">
+        <div>
+          <h2 id="compute" className="row" style={{ gap: 8 }}>
+            <Cpu size={18} aria-hidden /> Pay for the compute you use
+          </h2>
+          <p className="muted small">Every lab session is metered from start to stop, per started minute, and billed monthly on top of any plan. A monthly spend cap stops new paid labs when you reach it; a running lab is never cut off.</p>
+        </div>
+        {plans.compute?.placeholder && <Badge tone="warn">Placeholder rates</Badge>}
+      </div>
+      <div className="split split-8-4" style={{ alignItems: 'start' }}>
+        <Card className="card-flush site-compare-wrap">
+          <table className="table site-compare">
+            <thead>
+              <tr>
+                <th scope="col">Environment</th>
+                <th scope="col">Typical labs</th>
+                <th scope="col">Per hour</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rates.map((r) => (
+                <tr key={r.tier}>
+                  <th scope="row">{r.label}</th>
+                  <td className="small muted">{EXAMPLE[r.tier]}</td>
+                  <td className="tnum">{formatMinor(r.pricePerHour, plans.currency)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+        {trial && trial.trialLabs.length > 0 && (
+          <Card className="stack" style={{ gap: 8 }}>
+            <h3 className="row" style={{ gap: 8 }}>
+              <Gift size={15} aria-hidden /> Try it free
+            </h3>
+            <p className="small muted">
+              A free account runs {trial.trialLabs.length === 1 ? 'one guided lab' : `${trial.trialLabs.length} guided labs`} at no charge, no card needed (up to {trial.maxSessions ?? 3} sessions or {trial.maxMinutes ?? 60} minutes). Add a payment method to run any standard lab.
+            </p>
+          </Card>
+        )}
+      </div>
+    </section>
   );
 }

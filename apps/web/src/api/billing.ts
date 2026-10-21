@@ -1,11 +1,12 @@
 import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { BillingEventRow, BillingScope, BillingSummary, CheckoutRequest, CheckoutResponse, PortalResponse } from './types';
-import { post, request } from './client';
+import type { BillingEventRow, BillingLimit, BillingLimitRequest, BillingScope, BillingSeats, BillingSummary, CheckoutRequest, CheckoutResponse, PortalResponse } from './types';
+import { del, post, put, request } from './client';
 
 /*
  * Billing API (packages/api-types/billing.d.ts): the signed-in person's plan
  * (`/api/billing/me`) and the organisation's (`/api/billing/org`, billing.manage).
- * Checkout and the customer portal answer with a Stripe URL the browser is sent to.
+ * Checkout (plans, or setup mode for a payment method) and the customer portal
+ * answer with a Stripe URL the browser is sent to. Limits and seats change in place.
  */
 
 const base = (scope: BillingScope) => (scope === 'org' ? '/api/billing/org' : '/api/billing/me');
@@ -29,4 +30,25 @@ export function usePortal(scope: BillingScope) {
 export function useRefreshBilling() {
   const qc = useQueryClient();
   return () => void qc.invalidateQueries({ queryKey: ['billing'] });
+}
+
+/** Checkout in setup mode: saves a card for pay-as-you-go compute. */
+export function usePaymentMethod(scope: BillingScope) {
+  return useMutation({ mutationFn: () => post<CheckoutResponse>(`${base(scope)}/payment-method`) });
+}
+
+export function useSetLimit(scope: BillingScope) {
+  const qc = useQueryClient();
+  return useMutation({ mutationFn: (body: BillingLimitRequest) => put<BillingLimit>(`${base(scope)}/limits`, body), onSuccess: () => void qc.invalidateQueries({ queryKey: ['billing'] }) });
+}
+
+/** Seats (org): the count (prorated in Stripe) and who holds them. Each answers the new `BillingSeats`. */
+export function useSeatActions() {
+  const qc = useQueryClient();
+  const done = () => void qc.invalidateQueries({ queryKey: ['billing'] });
+  return {
+    count: useMutation({ mutationFn: (seats: number) => put<BillingSeats>('/api/billing/org/seats', { seats }), onSuccess: done }),
+    assign: useMutation({ mutationFn: (userId: string) => post<BillingSeats>('/api/billing/org/seats/assign', { userId }), onSuccess: done }),
+    unassign: useMutation({ mutationFn: (userId: string) => del<BillingSeats>(`/api/billing/org/seats/${encodeURIComponent(userId)}`), onSuccess: done }),
+  };
 }
