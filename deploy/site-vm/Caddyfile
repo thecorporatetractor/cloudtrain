@@ -1,0 +1,53 @@
+# CloudTrain public website (deploy/site-vm). SITE_HOST is the apex (cloudtrain.app);
+# www redirects to it. Caddy gets and renews the Let's Encrypt certificates itself
+# (ports 80 and 443 must be reachable from the internet).
+{
+	email {$ACME_EMAIL}
+}
+
+www.{$SITE_HOST} {
+	redir https://{$SITE_HOST}{uri} permanent
+}
+
+{$SITE_HOST} {
+	encode zstd gzip
+
+	# The same headers as the static build's _headers file (apps/web/scripts/site-hosting.mjs,
+	# csp('') for a same-origin API), plus HSTS.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+		-Server
+	}
+
+	# Only the public API reaches the gateway: public data and the waitlist form.
+	# Sign-in, the platform and the admin API are not served from this host.
+	handle /api/public/* {
+		reverse_proxy gateway:8787
+	}
+	handle /api/* {
+		respond 404
+	}
+
+	handle {
+		root * /srv/site
+		@immutable path /assets/*
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		@data path /data/*
+		header @data Cache-Control "public, max-age=300"
+		@nocache path / /index.html /shell.html /runtime-config.js
+		header @nocache Cache-Control no-cache
+		# Deep links get the app shell (index.html carries the prerendered landing page,
+		# which only / serves).
+		try_files {path} /shell.html
+		file_server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
