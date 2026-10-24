@@ -193,7 +193,7 @@ function LegalPage({ doc }: { doc: SiteLegalDocument | undefined }) {
     <SitePage title={doc?.title ?? 'Legal'} eyebrow="Legal" narrow lead={doc ? `Last updated ${doc.updated}` : undefined}>
       {doc?.placeholder && (
         <p className="site-callout small" role="note">
-          <Badge tone="warn">Placeholder</Badge> This document is a draft that has not passed legal review. It will be replaced before paid plans open.
+          <Badge tone="warn">Placeholder</Badge> <span className="site-callout-text">This document is a draft that has not passed legal review. It will be replaced before paid plans open.</span>
         </p>
       )}
       <div className="site-prose">
