@@ -1,0 +1,104 @@
+# CloudTrain public website on one small VM: Caddy (TLS, the static site, /api/public/*
+# proxied to the gateway), the gateway in site-only use (waitlist and public data, no
+# cluster, no sign-in) and Postgres for the waitlist. docs/deploy-site-vm.md explains it.
+#
+#   cp .env.example .env    # fill in, chmod 600
+#   docker compose up -d
+#
+# Sized for 1 GB of memory (plus swap); see the memory limits below.
+# Images are pinned by tag and digest; bump the gateway with GATEWAY_IMAGE in .env.
+name: cloudtrain-site
+
+services:
+  postgres:
+    image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    restart: unless-stopped
+    command: ['postgres', '-c', 'shared_buffers=32MB', '-c', 'max_connections=20', '-c', 'work_mem=2MB', '-c', 'maintenance_work_mem=16MB']
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      CT_OWNER_PASSWORD: ${CT_OWNER_PASSWORD:?set in .env}
+      CT_APP_PASSWORD: ${CT_APP_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+    networks: [site]
+    mem_limit: 192m
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d cloudtrain']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: applies the schema migrations as the owner role, then exits.
+  migrate:
+    image: ${GATEWAY_IMAGE:?set in .env}
+    command: ['dist/db/cli.js', 'migrate']
+    environment:
+      NODE_ENV: production
+      CT_DATABASE_OWNER_URL: postgres://cloudtrain_owner:${CT_OWNER_PASSWORD}@postgres:5432/cloudtrain
+      CT_DATABASE_URL: postgres://cloudtrain_app:${CT_APP_PASSWORD}@postgres:5432/cloudtrain
+    networks: [site]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: 'no'
+
+  gateway:
+    image: ${GATEWAY_IMAGE:?set in .env}
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=192
+      CT_DATABASE_URL: postgres://cloudtrain_app:${CT_APP_PASSWORD}@postgres:5432/cloudtrain
+      CT_PUBLIC_URL: https://${SITE_HOST}
+      CT_WEB_URL: https://${SITE_HOST}
+      CT_SITE_CONFIG: /etc/cloudtrain/site.yaml
+      CT_SESSION_SECRET: ${CT_SESSION_SECRET:?set in .env}
+      # Site-only use: there is no identity provider and no cluster. The gateway still
+      # wants an OIDC client secret and a kubeconfig context at start; neither is ever
+      # used because Caddy forwards /api/public/* only.
+      CT_OIDC_CLIENT_SECRET: site-only-not-used
+      CT_KUBE_CONTEXT: none
+      KUBECONFIG: /etc/cloudtrain/kubeconfig
+      CT_SWEEP_INTERVAL_MS: '0'
+      # Caddy's fixed address below: X-Forwarded-For from it is the visitor's address
+      # (the waitlist rate limit counts per visitor).
+      CT_TRUST_PROXY: 10.250.50.10
+      CT_WAITLIST_RATE_PER_HOUR: ${CT_WAITLIST_RATE_PER_HOUR:-10}
+      CT_LOG_LEVEL: ${CT_LOG_LEVEL:-info}
+    volumes:
+      - ./site.yaml:/etc/cloudtrain/site.yaml:ro
+      - ./kubeconfig-none.yaml:/etc/cloudtrain/kubeconfig:ro
+    networks: [site]
+    mem_limit: 320m
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      SITE_HOST: ${SITE_HOST:?set in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set in .env}
+    ports: ['80:80', '443:443', '443:443/udp']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./site:/srv/site:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      site: { ipv4_address: 10.250.50.10 }
+    mem_limit: 96m
+    depends_on: [gateway]
+
+networks:
+  site:
+    ipam:
+      config: [{ subnet: 10.250.50.0/24 }]
+
+volumes:
+  pgdata:
+  caddy-data:
+  caddy-config:

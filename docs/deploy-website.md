@@ -4,6 +4,9 @@ How to host CloudTrain's public marketing site (landing page, catalog, about, FA
 contact, legal pages and the early-access waitlist) separately from the platform, or
 with it.
 
+For `cloudtrain.app` on one small VM (Caddy, the gateway for the waitlist, Postgres), see
+[deploy-site-vm.md](deploy-site-vm.md). Mail for the domain: [email.md](email.md).
+
 **Status: undecided.** Which host serves the site and under which domain is the
 owner's decision, and it is still pending. Nothing in this repository creates an
 account, buys or points a domain, or turns on a hosting service (GitHub Pages is not
