@@ -38,7 +38,7 @@ export class FakeStripe {
     price('price_team_m', 'prod_team', 1500, 'ct_team_seat_monthly', 'month');
     price('price_team_y', 'prod_team', 15000, 'ct_team_seat_yearly', 'year');
     this.meters.set('mtr_compute', { id: 'mtr_compute', event_name: 'ct_compute_units', display_name: 'compute units', status: 'active' });
-    this.prices.set('price_compute', { id: 'price_compute', product: 'prod_compute', active: true, currency: 'eur', unit_amount: null, unit_amount_decimal: '0.5', lookup_key: 'ct_compute_unit', recurring: { interval: 'month', interval_count: 1, usage_type: 'metered', meter: 'mtr_compute' }, metadata: {} });
+    this.prices.set('price_compute', { id: 'price_compute', product: 'prod_compute', active: true, currency: 'eur', unit_amount: null, unit_amount_decimal: '0.166667', lookup_key: 'ct_compute_unit', recurring: { interval: 'month', interval_count: 1, usage_type: 'metered', meter: 'mtr_compute' }, metadata: {} });
   }
 
   /** Units reported for a customer (what Stripe would bill on the metered price). */

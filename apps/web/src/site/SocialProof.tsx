@@ -30,19 +30,24 @@ export function SocialProof({ site }: { site: SiteConfig }) {
           )}
         </div>
         {sp.logos && sp.logos.length > 0 && (
-          <ul className="sp-logos" aria-label={ph ? 'Customer logos (placeholders)' : 'Customers'}>
-            {sp.logos.map((l) => {
-              const src = theme === 'dark' ? (l.imageDark ?? l.image) : l.image;
-              return (
-                <li key={l.name} className="sp-logo">
-                  {src && !ph ? <img src={src} alt={l.name} loading="lazy" decoding="async" height={28} /> : <span>{l.name}</span>}
-                </li>
-              );
-            })}
-          </ul>
+          // A slow marquee with motion (the second copy only loops it); a grid on the still page.
+          <div className="marquee marquee-slow sp-marquee">
+            {[false, true].map((dup) => (
+              <ul key={String(dup)} className="sp-logos marquee-track" aria-hidden={dup || undefined} aria-label={dup ? undefined : ph ? 'Customer logos (placeholders)' : 'Customers'}>
+                {sp.logos!.map((l) => {
+                  const src = theme === 'dark' ? (l.imageDark ?? l.image) : l.image;
+                  return (
+                    <li key={l.name} className="sp-logo">
+                      {src && !ph ? <img src={src} alt={l.name} loading="lazy" decoding="async" height={28} /> : <span>{l.name}</span>}
+                    </li>
+                  );
+                })}
+              </ul>
+            ))}
+          </div>
         )}
         {sp.quotes && sp.quotes.length > 0 && (
-          <ul className="sp-quotes">
+          <ul className="sp-quotes" data-reveal="children">
             {sp.quotes.map((q, i) => (
               <li key={`${i}-${q.name}`}>
                 <figure className="sp-quote">

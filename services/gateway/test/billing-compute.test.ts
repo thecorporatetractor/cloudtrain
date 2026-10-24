@@ -54,10 +54,10 @@ describe('compute tiers and the pricing model (content/site.yaml)', () => {
 
   it('prices minutes per tier, rounds up, and resolves premium rules to the highest plan', () => {
     const m = new PricingModel(site);
-    expect(m.unitsPerMinute('pod')).toBe(1);
-    expect(m.unitsPerMinute('vm')).toBe(4);
-    expect(m.unitsPerMinute('heavy')).toBe(10);
-    expect(m.pricePerHour('pod')).toBe(30); // 60 units x 0.5 cent
+    expect(m.unitsPerMinute('pod')).toBe(2);
+    expect(m.unitsPerMinute('vm')).toBe(5);
+    expect(m.unitsPerMinute('heavy')).toBe(15);
+    expect(m.pricePerHour('pod')).toBe(20); // 120 units x a sixth of a cent
     expect(m.billedMinutes(0)).toBe(1);
     expect(m.billedMinutes(61_000)).toBe(2);
     const facts = (id: string) => {
@@ -162,10 +162,10 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
   it('free account: the trial lab starts uncharged and capped, everything else asks for a payment method or a plan', async () => {
     const catalog = (await as(Q.lucas).get('/api/catalog')).json();
     const lab = (id: string) => catalog.labs.find((l: { id: string }) => l.id === id);
-    expect(lab(TRIAL).access).toMatchObject({ computeTier: 'pod', trial: true, free: true, unitsPerMinute: 1, pricePerHour: 30 });
+    expect(lab(TRIAL).access).toMatchObject({ computeTier: 'pod', trial: true, free: true, unitsPerMinute: 2, pricePerHour: 20 });
     expect(lab(TRIAL).access.locked).toBeUndefined();
     expect(lab(STANDARD).access.locked).toMatchObject({ reason: 'payment_method_required', action: 'add_payment_method', href: '/account/billing' });
-    expect(lab(STANDARD_VM).access).toMatchObject({ computeTier: 'vm', pricePerHour: 120 });
+    expect(lab(STANDARD_VM).access).toMatchObject({ computeTier: 'vm', pricePerHour: 50 });
     expect(lab(HARD).access).toMatchObject({ requiredPlan: { id: 'pro', name: 'Pro', level: 1 }, locked: { reason: 'plan_required', action: 'upgrade' } });
     expect(lab(HARD_HEAVY).access).toMatchObject({ computeTier: 'heavy', requiredPlan: { id: 'premium' } });
     expect((await as(Q.lucas).get(`/api/labs/${STANDARD}`)).json().access.locked.reason).toBe('payment_method_required');
@@ -176,7 +176,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     expect(blocked(await start(Q.lucas, HARD)).details).toMatchObject({ reason: 'plan_required', requiredPlan: { id: 'pro' } });
 
     const first = await runFor(Q.lucas, TRIAL, 5);
-    expect(await usage(first)).toMatchObject({ trial: true, billable: false, compute_tier: 'pod', minutes: 5, units: 5, payer_key: Q.lucas, customer_id: null });
+    expect(await usage(first)).toMatchObject({ trial: true, billable: false, compute_tier: 'pod', minutes: 5, units: 10, payer_key: Q.lucas, customer_id: null });
     await runFor(Q.lucas, TRIAL, 2);
     await runFor(Q.lucas, TRIAL, 1);
     expect(await h.t.owner.selectFrom('billing_meter_outbox').selectAll().execute()).toHaveLength(0);
@@ -188,9 +188,9 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     expect(me.usage.sessions).toHaveLength(3);
     expect(me.usage.sessions[0]).toMatchObject({ labId: TRIAL, trial: true, report: 'unbilled', amount: 0 });
     expect(me.compute.tiers.map((t: { tier: string; pricePerHour: number }) => [t.tier, t.pricePerHour])).toEqual([
-      ['pod', 30],
-      ['vm', 120],
-      ['heavy', 300],
+      ['pod', 20],
+      ['vm', 50],
+      ['heavy', 150],
     ]);
   });
 
@@ -222,30 +222,30 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     const id = r.json().id as string;
     clock = new Date(clock.getTime() + 12.5 * 60_000);
     const running = (await as(Q.mei).get('/api/billing/me')).json().usage;
-    expect(running).toMatchObject({ running: 1, minutes: 13, units: 13, estimate: 6.5 });
+    expect(running).toMatchObject({ running: 1, minutes: 13, units: 26, estimate: 4.33 });
     expect((await as(Q.mei).del(`/api/sessions/${id}`)).statusCode).toBe(204);
     await billing.settle();
     const u = await usage(id);
-    expect(u).toMatchObject({ billable: true, trial: false, minutes: 13, units: 13, payer_key: Q.mei });
+    expect(u).toMatchObject({ billable: true, trial: false, minutes: 13, units: 26, payer_key: Q.mei });
     const cus = await customerOf(Q.mei);
-    expect(stripe.meterEvents).toEqual([{ identifier: `ctu_${u.id}`, event_name: 'ct_compute_units', timestamp: Math.floor(clock.getTime() / 1000), customer: cus, value: 13 }]);
+    expect(stripe.meterEvents).toEqual([{ identifier: `ctu_${u.id}`, event_name: 'ct_compute_units', timestamp: Math.floor(clock.getTime() / 1000), customer: cus, value: 26 }]);
     expect(await billing.flushOutbox()).toEqual({ sent: 0, failed: 0, retry: 0 });
     // A resend (a crash between Stripe's answer and our commit) is recognised as already reported.
     await h.t.owner.updateTable('billing_meter_outbox').set({ status: 'pending', next_attempt_at: new Date(0) }).where('usage_id', '=', u.id).execute();
     expect(await billing.flushOutbox()).toMatchObject({ sent: 1 });
     expect(stripe.meterEvents).toHaveLength(1);
-    expect(stripe.upcomingComputeAmount(cus)).toBe(6.5);
+    expect(stripe.upcomingComputeAmount(cus)).toBeCloseTo(4.33, 2);
     const me = (await as(Q.mei).get('/api/billing/me')).json();
-    expect(me.usage).toMatchObject({ minutes: 13, units: 13, estimate: 6.5, running: 0, byTier: [{ tier: 'pod', minutes: 13, units: 13, amount: 6.5 }] });
-    expect(me.usage.sessions[0]).toMatchObject({ labId: STANDARD, payer: 'user', report: 'sent', amount: 6.5 });
-    expect(me.limit).toMatchObject({ monthlyCap: 5000, hardStop: true, source: 'default', spent: 6.5, reached: false });
+    expect(me.usage).toMatchObject({ minutes: 13, units: 26, estimate: 4.33, running: 0, byTier: [{ tier: 'pod', minutes: 13, units: 26, amount: 4.33 }] });
+    expect(me.usage.sessions[0]).toMatchObject({ labId: STANDARD, payer: 'user', report: 'sent', amount: 4.33 });
+    expect(me.limit).toMatchObject({ monthlyCap: 5000, hardStop: true, source: 'default', spent: 4.33, reached: false });
   });
 
   it('retries failed meter reports from the outbox with backoff and dead-letters permanent failures', async () => {
     stripe.failMeterEvents = { count: 2, status: 500, message: 'Stripe is having a moment' };
     const id = await runFor(Q.mei, STANDARD_VM, 3);
     const u = await usage(id);
-    expect(u).toMatchObject({ compute_tier: 'vm', units: 12 });
+    expect(u).toMatchObject({ compute_tier: 'vm', units: 15 });
     const row = () => h.t.owner.selectFrom('billing_meter_outbox').selectAll().where('usage_id', '=', u.id).executeTakeFirstOrThrow();
     expect(await row()).toMatchObject({ status: 'pending', attempts: 1, last_error: 'Stripe is having a moment' });
     expect(await billing.flushOutbox()).toEqual({ sent: 0, failed: 0, retry: 0 }); // not due yet
@@ -254,7 +254,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     clock = new Date(clock.getTime() + 5 * 60_000);
     expect(await billing.flushOutbox()).toMatchObject({ sent: 1 });
     expect(await row()).toMatchObject({ status: 'sent', attempts: 3, last_error: null });
-    expect(stripe.meterEvents.at(-1)).toMatchObject({ identifier: `ctu_${u.id}`, value: 12 });
+    expect(stripe.meterEvents.at(-1)).toMatchObject({ identifier: `ctu_${u.id}`, value: 15 });
 
     stripe.failMeterEvents = { count: 1, status: 400, message: 'Timestamp too far in the past' };
     const bad = await usage(await runFor(Q.mei, STANDARD, 1));
@@ -367,11 +367,11 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     const lucas = (await as(Q.lucas).get('/api/billing/me')).json();
     expect(lucas).toMatchObject({ payer: 'org', level: 2, seat: { planId: 'team', planName: 'Team', level: 2 } });
     const id = await runFor(Q.lucas, HARD_HEAVY, 10); // Premium-level lab through the seat
-    expect(await usage(id)).toMatchObject({ payer_key: '', billable: true, units: 100 });
-    expect(stripe.meterEvents.at(-1)).toMatchObject({ customer: orgCus, value: 100 });
+    expect(await usage(id)).toMatchObject({ payer_key: '', billable: true, units: 150 });
+    expect(stripe.meterEvents.at(-1)).toMatchObject({ customer: orgCus, value: 150 });
     const org = (await as(Q.priya).get('/api/billing/org')).json();
-    expect(org.usage).toMatchObject({ units: 100, estimate: 50 });
-    expect(org.usage.byMember).toEqual([expect.objectContaining({ userId: Q.lucas, units: 100, amount: 50 })]);
+    expect(org.usage).toMatchObject({ units: 150, estimate: 25 });
+    expect(org.usage.byMember).toEqual([expect.objectContaining({ userId: Q.lucas, units: 150, amount: 25 })]);
     expect(org.usage.sessions[0]).toMatchObject({ payer: 'org', userId: Q.lucas });
     expect(org.seats.assigned).toHaveLength(3);
     expect(org.limit).toMatchObject({ monthlyCap: 50000, hardStop: false });
@@ -411,7 +411,7 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     clock = new Date(clock.getTime() + 20 * 60_000);
     const res = await billing.sweep(async (name) => ((await cluster.getSession(name)) ? null : clock));
     expect(res.closed).toBe(1);
-    expect(await usage(id)).toMatchObject({ minutes: 20, units: 20 });
+    expect(await usage(id)).toMatchObject({ minutes: 20, units: 40 });
     expect((await h.t.owner.selectFrom('billing_meter_outbox').select('status').where('identifier', '=', `ctu_${(await usage(id)).id}`).executeTakeFirstOrThrow()).status).toBe('sent');
   });
 

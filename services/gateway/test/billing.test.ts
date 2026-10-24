@@ -70,7 +70,7 @@ describe.skipIf(!available)('billing (migration 0007, /api/billing/*, Stripe tes
 
   it('answers the default (free) plan before any subscription, for a user and for the org', async () => {
     const me = (await as(Q.mei).get('/api/billing/me')).json();
-    expect(me).toMatchObject({ enabled: true, mode: 'test', scope: 'user', portalAvailable: false, checkoutEnabled: true, placeholder: true, currency: 'EUR' });
+    expect(me).toMatchObject({ enabled: true, mode: 'test', scope: 'user', portalAvailable: false, checkoutEnabled: true, placeholder: false, currency: 'EUR' });
     expect(me.plan).toMatchObject({ planId: 'free', source: 'default', entitlements: { concurrentLabs: 1 } });
     expect(me.plans.map((p: { id: string }) => p.id)).toEqual(['pro', 'premium']);
     expect((await as(Q.mei).get('/api/billing/org')).statusCode).toBe(403);
@@ -213,7 +213,7 @@ describe.skipIf(!available)('billing (migration 0007, /api/billing/*, Stripe tes
     const meter = [...fresh.meters.values()][0]!;
     expect(meter).toMatchObject({ event_name: 'ct_compute_units', default_aggregation: { formula: 'sum' }, customer_mapping: { event_payload_key: 'stripe_customer_id' }, value_settings: { event_payload_key: 'value' } });
     const metered = [...fresh.prices.values()].find((p) => p.lookup_key === 'ct_compute_unit')!;
-    expect(metered).toMatchObject({ unit_amount_decimal: '0.5', currency: 'eur', recurring: { interval: 'month', usage_type: 'metered', meter: meter.id } });
+    expect(metered).toMatchObject({ unit_amount_decimal: '0.166667', currency: 'eur', recurring: { interval: 'month', usage_type: 'metered', meter: meter.id } });
     const second = await syncPlans(api, site);
     expect(second.filter((a) => a.action.endsWith('.ok'))).toHaveLength(12);
     expect(second.some((a) => a.action.endsWith('.create'))).toBe(false);

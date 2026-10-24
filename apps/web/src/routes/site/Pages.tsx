@@ -24,7 +24,7 @@ function SitePage({ title, eyebrow, lead, children, narrow }: { title: string; e
   }
   return (
     <div className={narrow ? 'site-container site-page site-page-narrow' : 'site-container site-page'}>
-      <header className="site-page-head site-page-head-stack">
+      <header className="site-page-head site-page-head-stack" data-reveal="children">
         {eyebrow && <div className="page-eyebrow">{eyebrow}</div>}
         <h1 className="site-h1">{title}</h1>
         {lead && <p className="muted site-lead-sm">{lead}</p>}
@@ -196,7 +196,7 @@ function LegalPage({ doc }: { doc: SiteLegalDocument | undefined }) {
           <Badge tone="warn">Placeholder</Badge> <span className="site-callout-text">This document is a draft that has not passed legal review. It will be replaced before paid plans open.</span>
         </p>
       )}
-      <div className="site-prose">
+      <div className="site-prose" data-no-stops>
         {doc?.sections.map((s) => (
           <section key={s.title} aria-labelledby={`legal-${slug(s.title)}`}>
             <h2 id={`legal-${slug(s.title)}`} className="site-h3">
