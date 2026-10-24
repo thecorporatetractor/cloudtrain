@@ -1,19 +1,21 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { Link, useRouterState } from '@tanstack/react-router';
-import { ArrowUpRight, LayoutDashboard, LogIn, Menu, Moon, ShieldCheck, Sun, Sunset, X } from 'lucide-react';
+import { LayoutDashboard, LogIn, Menu, X } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useMe } from '@/api/client';
-import { DEFAULT_BRAND, useSite } from '@/api/public';
+import { useSite } from '@/api/public';
 import type { SiteConfig } from '@/api/types';
-import { BrandLockup, BrandMark, BrandName, useBrandName } from '@/components/brand';
+import { BrandLockup, useBrandName } from '@/components/brand';
 import { Dropdown, Tooltip } from '@/components/ui';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { ON_SITE, surfaceConfig } from '@/lib/surface';
 import { cn } from '@/lib/utils';
 import { ComingSoon } from './ComingSoon';
 import { ComingSoonChrome } from './ComingSoonChrome';
+import { SiteBrand, SiteFooter, themeIcon } from './Footer';
 import { isComingSoon, keepsOwnPage, launchKnown } from './launch';
-import { linkKey, SignInLink, SiteAnchor } from './util';
+import { loadMotion, sitePageEnter, siteScrollTo } from './motion';
+import { SignInLink } from './util';
 
 
 
@@ -79,29 +81,30 @@ function NavLink({ entry, className, current }: { entry: NavEntry; className: st
   );
 }
 
-const themeIcon: Record<Theme, ReactNode> = { dark: <Moon size={15} />, light: <Sun size={15} />, cream: <Sunset size={15} /> };
-
 /**
- * The website scrolls inside `.shell-site`, not the window, so the router's
- * scroll restoration does not reach it: a new page starts at the top and a
- * section link scrolls to its target (the header is sticky; sections carry a
- * scroll margin).
+ * The website scrolls on the window (site.css `html:has(.shell-site)`), and the
+ * router's scroll restoration is not used here: a new page starts at the top and
+ * a section link scrolls to its target (the header is sticky; sections carry a
+ * scroll margin), through the smooth scroll of src/site/motion when it runs.
  */
 function useSiteScroll() {
   const location = useRouterState({ select: (s) => s.location });
   const { pathname, hash } = location;
+  const first = useRef(true);
   useEffect(() => {
+    // A new page (not the first): it rises in; the stops of the page are read from its markup as it scrolls.
+    if (first.current) first.current = false;
+    else sitePageEnter(document.getElementById('main'));
     // After the frame in which the drawer closes and returns focus, so the scroll is not cancelled.
     const id = window.setTimeout(() => {
-      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       if (hash) {
         const el = document.getElementById(hash);
         if (el) {
-          el.scrollIntoView({ block: 'start', behavior: reduced ? 'auto' : 'smooth' });
+          siteScrollTo(el);
           return;
         }
       }
-      document.querySelector('.shell-site')?.scrollTo({ top: 0 });
+      siteScrollTo(0, { immediate: true });
     }, 60);
     return () => window.clearTimeout(id);
   }, [pathname, hash]);
@@ -109,6 +112,10 @@ function useSiteScroll() {
 
 export function SiteLayout({ children }: { children: ReactNode }) {
   useSiteScroll();
+  // The motion engine (smooth scroll, reveals, the hero story) loads once the page is up; never with reduced motion.
+  useEffect(() => {
+    void loadMotion();
+  }, []);
   const site = useSite().data;
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   // Until the configuration says which website this is, neither chrome is drawn (no flash of the other one).
@@ -158,21 +165,6 @@ export function SessionButton({ size = 'md', className }: { size?: 'sm' | 'md' |
       <LogIn size={14} aria-hidden /> Sign in
     </SignInLink>
   );
-}
-
-/** The brand in the header and footer: the approved lockup, or a deployment's own logo and name (content/site.yaml `brand`). */
-function SiteBrand({ height = 22 }: { height?: number }) {
-  const site = useSite().data;
-  const brand = useBrandName();
-  if (site?.brand.logo || brand !== DEFAULT_BRAND) {
-    return (
-      <>
-        <BrandMark size={height + 4} />
-        <BrandName height={Math.round(height * 0.6)} />
-      </>
-    );
-  }
-  return <BrandLockup height={height} title={brand} />;
 }
 
 /** The theme switcher of the website header. */
@@ -237,7 +229,7 @@ function SiteHeader() {
             </DialogPrimitive.Trigger>
             <DialogPrimitive.Portal>
               <DialogPrimitive.Overlay className="dialog-overlay" />
-              <DialogPrimitive.Content id="site-drawer" className="site-drawer" aria-describedby={undefined} onCloseAutoFocus={(e) => (e.preventDefault(), menuButton.current?.focus({ preventScroll: true }))}>
+              <DialogPrimitive.Content id="site-drawer" className="site-drawer" data-lenis-prevent aria-describedby={undefined} onCloseAutoFocus={(e) => (e.preventDefault(), menuButton.current?.focus({ preventScroll: true }))}>
                 <div className="site-drawer-head">
                   <DialogPrimitive.Title className="site-drawer-title">
                     <BrandLockup height={20} title={`${brand} menu`} />
@@ -278,67 +270,5 @@ function SiteHeader() {
         </div>
       </div>
     </header>
-  );
-}
-
-/** Links to pages a flag has turned off are dropped rather than leading to an empty page. */
-function visibleLink(to: string, site: SiteConfig): boolean {
-  const route = to.split(/[?#]/)[0] ?? '';
-  if (route === '/pricing') return site.flags.showPricing;
-  if (route.startsWith('/catalog')) return site.flags.showCatalog;
-  return true;
-}
-
-function SiteFooter() {
-  const site = useSite().data;
-  const brand = useBrandName();
-  const year = new Date().getFullYear();
-  return (
-    <footer className="site-footer">
-      <div className="site-container">
-        <div className="site-footer-grid">
-          <div className="site-footer-brand">
-            <Link to="/" className="site-brand" aria-label={`${brand} home`}>
-              <SiteBrand height={24} />
-            </Link>
-            <p className="site-footer-tagline">{site?.brand.tagline}</p>
-            {site?.footer.note && <p className="site-footer-note">{site.footer.note}</p>}
-          </div>
-          {site?.footer.columns.map((c) => (
-            <nav key={c.title} className="site-footer-col" aria-label={c.title}>
-              <h3>{c.title}</h3>
-              <ul>
-                {c.links.filter((l) => visibleLink(l.to, site)).map((l) => (
-                  <li key={linkKey(l)}>
-                    <SiteAnchor to={l.to} external={l.external} className="site-footer-link">
-                      {l.label}
-                      {!l.to.startsWith('/') && <ArrowUpRight size={13} aria-hidden />}
-                    </SiteAnchor>
-                  </li>
-                ))}
-              </ul>
-            </nav>
-          ))}
-        </div>
-        {site?.legal.alignmentNotice && (
-          <p className="site-notice">
-            <ShieldCheck size={14} aria-hidden /> <span>{site.legal.alignmentNotice}</span>
-          </p>
-        )}
-        <div className="site-footer-bottom">
-          <span>
-            © {year} {site?.brand.legalName ?? brand}
-          </span>
-          <span className="site-footer-legal">
-            <SiteAnchor to="/legal/terms" className="site-footer-link">
-              Terms
-            </SiteAnchor>
-            <SiteAnchor to="/legal/privacy" className="site-footer-link">
-              Privacy
-            </SiteAnchor>
-          </span>
-        </div>
-      </div>
-    </footer>
   );
 }

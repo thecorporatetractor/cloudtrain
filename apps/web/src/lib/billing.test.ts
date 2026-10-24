@@ -18,11 +18,11 @@ describe('billing helpers', () => {
 
   it('derives the compute rates per hour from site.yaml', () => {
     expect(siteComputeRates(site).map((r) => [r.tier, r.pricePerHour])).toEqual([
-      ['pod', 30],
-      ['vm', 120],
-      ['heavy', 300],
+      ['pod', 20],
+      ['vm', 50],
+      ['heavy', 150],
     ]);
-    expect(formatMinor(30, 'EUR', 'en')).toBe('€0.30');
+    expect(formatMinor(20, 'EUR', 'en')).toBe('€0.20');
   });
 
   it('labels catalog rows: premium, free trial, locked, nothing for standard', () => {

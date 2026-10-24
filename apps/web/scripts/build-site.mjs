@@ -95,7 +95,8 @@ async function prerender(dir, shell) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const browser = await chromium.launch({ executablePath: exe, args: ['--no-sandbox'] });
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    // The still page: with reduced motion the motion engine never loads, so no entrance state (src/site/motion) ends up in the markup.
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, reducedMotion: 'reduce' });
     // The API is not part of the page; the waitlist only posts on submit.
     await page.route(/^https?:\/\/(?!127\.0\.0\.1)/, (r) => r.abort());
     await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'networkidle' });

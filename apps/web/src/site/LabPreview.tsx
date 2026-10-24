@@ -5,9 +5,14 @@ import { useEffect, useState, type CSSProperties } from 'react';
  * which a learner fixes a node that will not join, and the checks panel of the
  * validation that follows, next to the per-minute compute meter. Drawn in HTML
  * and SVG from the theme tokens (no image to load, sharp at every size, every
- * theme). The sequence plays once; with prefers-reduced-motion it shows its end
- * state and the meter stands still. Decorative: one label describes it to
- * assistive technology.
+ * theme). Decorative: one label describes it to assistive technology.
+ *
+ * Two modes. `auto` (the default) plays the sequence once on its own (CSS
+ * animations); with prefers-reduced-motion it shows its end state and the meter
+ * stands still. `story` leaves every step to the scroll story (src/site/LabStory.tsx):
+ * the markup is the finished state, so a prerendered page and a reader without
+ * motion see the complete lab, and the story's scrubbed timeline drives the
+ * typing, the node status and the checks from the scroll position.
  */
 
 type Line = { k: 'cmd' | 'out' | 'ok' | 'err' | 'dim'; t: string };
@@ -69,13 +74,21 @@ function useClock(running: boolean): string {
 
 const at = (seconds: number) => ({ '--at': `${seconds}s` }) as CSSProperties;
 
-export function LabPreview({ tierLabel = 'VM lab' }: { tierLabel?: string }) {
+/** How many terminal lines the story types before the checks (the last `.lab-preview-line` is the resting prompt). */
+export const STORY_LINE_COUNT = LINES.length;
+export const STORY_PASSED = CHECKS.filter((c) => c.pass).length;
+export const PROMPT = 'lena@workstation:~$ ';
+/** What the terminal shows while the environment comes up (story mode): the lab is provisioned, the nodes join. */
+export const BOOT: readonly string[] = ['provisioning node-will-not-join: kubeadm, 3 nodes, warm pool', 'cp-1 ready · worker-2 ready · worker-1 joined', 'session started · metered per minute'];
+
+export function LabPreview({ tierLabel = 'VM lab', mode = 'auto' }: { tierLabel?: string; mode?: 'auto' | 'story' }) {
   const reduced = useReducedMotion();
   const clock = useClock(!reduced);
   const passed = CHECKS.filter((c) => c.pass).length;
+  const story = mode === 'story';
   return (
     <div
-      className="lab-preview"
+      className={story ? 'lab-preview lab-preview-story' : 'lab-preview'}
       role="img"
       aria-label="A lab session in progress: a terminal in which the learner finds that swap stops the kubelet on worker-1, turns it off and validates. Three of four checks pass; the open one asks for swap to stay off after a reboot. The session is metered per minute."
     >
@@ -122,34 +135,49 @@ export function LabPreview({ tierLabel = 'VM lab' }: { tierLabel?: string }) {
           </g>
           <Node x={8} y={18} w={84} label="workstation" />
           <Node x={196} y={18} w={72} label="cp-1" />
-          <Node x={372} y={2} w={84} label="worker-1" fixAt={FIXED_AT} />
+          <Node x={372} y={2} w={84} label="worker-1" fixAt={story ? undefined : FIXED_AT} />
           <Node x={372} y={34} w={84} label="worker-2" />
         </svg>
       </div>
 
       <div className="lab-preview-term" aria-hidden>
-        {LINES.map((l, i) => (
-          <div key={i} className={`lab-preview-line is-${l.k}`} style={at(lineAt(i))}>
-            {l.k === 'cmd' && <span className="lab-preview-prompt">lena@workstation:~$ </span>}
-            {l.t}
+        <div className="lab-preview-lines">
+          {story &&
+            BOOT.map((t) => (
+              <div key={t} className="lab-preview-line is-dim lab-preview-boot">
+                {t}
+              </div>
+            ))}
+          {story && (
+            // The empty prompt the story starts on, before the first command is typed.
+            <div className="lab-preview-line is-cmd lab-preview-idle">
+              <span className="lab-preview-prompt">{PROMPT}</span>
+              <span className="lab-preview-cursor" />
+            </div>
+          )}
+          {LINES.map((l, i) => (
+            <div key={i} className={`lab-preview-line is-${l.k}`} style={story ? undefined : at(lineAt(i))} data-chars={(l.k === 'cmd' ? PROMPT.length : 0) + l.t.length}>
+              {l.k === 'cmd' && <span className="lab-preview-prompt">{PROMPT}</span>}
+              {l.t}
+            </div>
+          ))}
+          <div className="lab-preview-line is-cmd lab-preview-rest" style={story ? undefined : at(CHECKS_AT + 1.4)}>
+            <span className="lab-preview-prompt">{PROMPT}</span>
+            <span className="lab-preview-cursor" />
           </div>
-        ))}
-        <div className="lab-preview-line is-cmd" style={at(CHECKS_AT + 1.4)}>
-          <span className="lab-preview-prompt">lena@workstation:~$ </span>
-          <span className="lab-preview-cursor" />
         </div>
       </div>
 
-      <div className="lab-preview-checks" aria-hidden style={at(CHECKS_AT)}>
+      <div className="lab-preview-checks" aria-hidden style={story ? undefined : at(CHECKS_AT)}>
         <div className="lab-preview-checks-head">
           <span>Checks</span>
           <span className="tnum">
-            {passed} / {CHECKS.length} passed
+            <span className="lab-preview-passed">{passed}</span> / {CHECKS.length} passed
           </span>
         </div>
         <ul>
           {CHECKS.map((c, i) => (
-            <li key={c.t} className={c.pass ? 'is-pass' : 'is-open'} style={at(CHECKS_AT + 0.15 * (i + 1))}>
+            <li key={c.t} className={c.pass ? 'is-pass' : 'is-open'} style={story ? undefined : at(CHECKS_AT + 0.15 * (i + 1))}>
               <span className="lab-preview-check-icon">{c.pass ? '✓' : '○'}</span>
               {c.t}
             </li>
@@ -163,9 +191,9 @@ export function LabPreview({ tierLabel = 'VM lab' }: { tierLabel?: string }) {
 function Node({ x, y, w, label, fixAt }: { x: number; y: number; w: number; label: string; fixAt?: number }) {
   const broken = label === 'worker-1';
   return (
-    <g className="lab-preview-node" transform={`translate(${x} ${y})`}>
+    <g className="lab-preview-node" data-node={label} transform={`translate(${x} ${y})`}>
       <rect width={w} height={28} rx={7} />
-      <circle cx={13} cy={14} r={3.5} className={broken ? 'lab-preview-status is-fixing' : 'lab-preview-status'} style={fixAt !== undefined ? ({ animationDuration: `${fixAt}s` } as CSSProperties) : undefined} />
+      <circle cx={13} cy={14} r={3.5} className={broken && fixAt !== undefined ? 'lab-preview-status is-fixing' : 'lab-preview-status'} style={fixAt !== undefined ? ({ animationDuration: `${fixAt}s` } as CSSProperties) : undefined} />
       <text x={23} y={18.5}>
         {label}
       </text>

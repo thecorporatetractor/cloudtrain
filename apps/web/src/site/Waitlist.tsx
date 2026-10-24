@@ -70,7 +70,7 @@ export function WaitlistView({ cfg, values, errors, phase, formError, onChange, 
 
   return (
     <div className="site-wl">
-      <div className="site-wl-copy">
+      <div className="site-wl-copy" data-reveal="children">
         <div className="site-eyebrow">{cfg.eyebrow ?? D.eyebrow}</div>
         <h2 id="waitlist-title" className="site-h2">
           {cfg.title ?? D.title}
@@ -92,7 +92,7 @@ export function WaitlistView({ cfg, values, errors, phase, formError, onChange, 
             )}
           </div>
         ) : (
-          <form className="site-wl-form" onSubmit={submit} noValidate aria-labelledby="waitlist-title">
+          <form className="site-wl-form" onSubmit={submit} noValidate aria-labelledby="waitlist-title" data-reveal="children">
             {(formError || phase === 'error') && (
               <p role="alert" className="site-wl-alert">
                 {formError ?? cfg.errorMessage ?? D.errorMessage}

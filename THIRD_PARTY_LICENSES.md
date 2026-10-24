@@ -151,6 +151,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | get-nonce | 1.0.1 | MIT |
 | get-proto | 1.0.1 | MIT |
 | gopd | 1.2.0 | MIT |
+| gsap | 3.15.0 | Standard 'no charge' license: https://gsap.com/standard-license. |
 | has-symbols | 1.1.0 | MIT |
 | has-tostringtag | 1.0.2 | MIT |
 | hasown | 2.0.4 | MIT |
@@ -167,6 +168,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | json-schema-traverse | 1.0.0 | MIT |
 | jsonpath-plus | 10.4.0 | MIT |
 | kysely | 0.29.6 | MIT |
+| lenis | 1.3.27 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
 | lucide-react | 1.57.0 | ISC |
 | math-intrinsics | 1.1.0 | MIT |

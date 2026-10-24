@@ -12,7 +12,8 @@ import { FeatureIcon, SiteAnchor } from './util';
  * words come from content/site.yaml `pricing.model`; every amount from
  * `plans` (compute rates, plan prices), read defensively (src/lib/pricingModel.ts).
  * While billing has no rates configured the page says "to be announced" instead
- * of inventing a figure, and placeholder amounts are labelled as such.
+ * of inventing a figure; `plans.taxNote` is the one line of small print next to
+ * the amounts (currency, VAT, that launch prices may change).
  */
 
 const PENDING = 'Rates to be announced';
@@ -40,7 +41,7 @@ export function PlaceholderTag({ children = 'Placeholder' }: { children?: string
 
 export function PricingSteps({ model }: { model: SitePricingModel }) {
   return (
-    <ol className="pm-steps">
+    <ol className="pm-steps" data-reveal="children">
       {model.steps.map((s, i) => (
         <li key={s.title} className="pm-step">
           <span className="pm-step-n tnum" aria-hidden>
@@ -72,7 +73,7 @@ export function PricingPaths({ site }: { site: SiteConfig }) {
   if (paths.length === 0) return null;
   const from = compute?.rates[0];
   return (
-    <ul className={cn('pm-paths', paths.length === 2 && 'pm-paths-2')} aria-label="Ways to run CloudTrain">
+    <ul className={cn('pm-paths', paths.length === 2 && 'pm-paths-2')} aria-label="Ways to run CloudTrain" data-reveal="children">
       {paths.map((p) => (
         <li key={p.id} className={cn('pm-path', `pm-path-${p.id}`)}>
           <div className="pm-path-head">
@@ -87,7 +88,7 @@ export function PricingPaths({ site }: { site: SiteConfig }) {
           {p.price && <p className="pm-path-price">{p.price}</p>}
           {p.id === 'hosted' && from && compute && (
             <p className="pm-path-rate">
-              from <span className="tnum">{rateLabels(from, compute.currency).hour}</span> an hour {compute.placeholder && <PlaceholderTag />}
+              from <span className="tnum">{rateLabels(from, compute.currency).hour}</span> an hour
             </p>
           )}
           <p className="pm-path-body">{p.body}</p>
@@ -141,7 +142,7 @@ export function ComputeTiers({ site }: { site: SiteConfig }) {
   const rows = tierRows(compute, model);
   const max = Math.max(...rows.map((r) => r.rate?.perMinute ?? 0), 0);
   return (
-    <ul className="pm-tiers" aria-label="Compute tiers">
+    <ul className="pm-tiers" aria-label="Compute tiers" data-reveal="children">
       {rows.map((t) => {
         const share = t.rate && max > 0 ? t.rate.perMinute / max : WEIGHT[t.id] / 3;
         const labels = t.rate && compute ? rateLabels(t.rate, compute.currency) : undefined;
@@ -162,14 +163,6 @@ export function ComputeTiers({ site }: { site: SiteConfig }) {
                   <span className="pm-tier-amount tnum">{labels.hour}</span>
                   <span className="pm-tier-per">
                     an hour, billed per minute ({labels.minute}/min)
-                    {compute?.placeholder && (
-                      <>
-                        {' '}
-                        <span style={{ whiteSpace: 'nowrap' }}>
-                          · <PlaceholderTag />
-                        </span>
-                      </>
-                    )}
                   </span>
                 </>
               ) : (
@@ -252,25 +245,29 @@ export function Estimator({ site }: { site: SiteConfig }) {
           <label htmlFor={`${uid}-min`}>
             Minutes per session <output className="tnum">{formatMinutes(minutes)}</output>
           </label>
-          <input id={`${uid}-min`} type="range" min={5} max={240} step={5} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} />
+          <input id={`${uid}-min`} type="range" min={5} max={240} step={5} value={minutes} data-count-range onChange={(e) => setMinutes(Number(e.target.value))} />
         </div>
         <div className="pm-field">
           <label htmlFor={`${uid}-ses`}>
             Sessions per month <output className="tnum">{sessions}</output>
           </label>
-          <input id={`${uid}-ses`} type="range" min={1} max={40} step={1} value={sessions} onChange={(e) => setSessions(Number(e.target.value))} />
+          <input id={`${uid}-ses`} type="range" min={1} max={40} step={1} value={sessions} data-count-range onChange={(e) => setSessions(Number(e.target.value))} />
         </div>
       </div>
       <div className="pm-estimator-result" aria-live="polite">
         <div className="pm-estimator-figure">
           <span className="pm-estimator-label">About</span>
-          <span className="pm-estimator-amount tnum">{formatMoney(month, compute.currency)}</span>
+          <span className="pm-estimator-amount tnum" data-count>
+            {formatMoney(month, compute.currency)}
+          </span>
           <span className="pm-estimator-label">of compute a month</span>
         </div>
         <dl className="pm-estimator-lines">
           <div>
             <dt>One session</dt>
-            <dd className="tnum">{formatMoney(one, compute.currency)}</dd>
+            <dd className="tnum" data-count>
+              {formatMoney(one, compute.currency)}
+            </dd>
           </div>
           <div>
             <dt>Rate</dt>
@@ -282,12 +279,8 @@ export function Estimator({ site }: { site: SiteConfig }) {
           </div>
         </dl>
         <p className="pm-estimator-note">
-          {compute.placeholder && (
-            <>
-              <PlaceholderTag>Placeholder rates</PlaceholderTag>{' '}
-            </>
-          )}
           {est?.note ?? 'Billed per started minute while a lab runs. A subscription, if you have one, is billed separately.'}
+          {site.plans?.taxNote && ` ${site.plans.taxNote}`}
         </p>
       </div>
     </div>
@@ -302,7 +295,7 @@ export function WorkedExamples({ site }: { site: SiteConfig }) {
   if (examples.length === 0) return null;
   const names = Object.fromEntries(tierRows(compute, model).map((r) => [r.id, r.name]));
   return (
-    <ul className="pm-examples" aria-label="Worked examples">
+    <ul className="pm-examples" aria-label="Worked examples" data-reveal="children">
       {examples.map((e) => {
         const rate = compute?.rates.find((r) => r.id === e.tier);
         const sessions = e.sessions ?? 1;
@@ -321,7 +314,9 @@ export function WorkedExamples({ site }: { site: SiteConfig }) {
             <div className="pm-example-cost">
               {cost !== undefined && compute ? (
                 <>
-                  <span className="tnum">{formatMoney(cost, compute.currency)}</span>
+                  <span className="tnum" data-count>
+                    {formatMoney(cost, compute.currency)}
+                  </span>
                   <span className="pm-example-per">{sessions > 1 ? 'a month' : 'for the session'}</span>
                 </>
               ) : (
@@ -356,15 +351,14 @@ export function PlanComparison({ site }: { site: SiteConfig }) {
   const { compute, trial } = usePricing(site);
   const plans = site.plans;
   if (!plans || plans.items.length === 0) return null;
-  const placeholder = !!(plans.placeholder || plans.items.some((p) => p.placeholderPrices));
-  type Cell = { yes: boolean; text: string; sub?: string; tag?: boolean };
+  type Cell = { yes: boolean; text: string; sub?: string };
   const early = earlyAccessFor(plans);
   const rows: { label: string; cell: (p: SitePlan) => Cell }[] = [
     {
       label: 'Subscription',
       cell: (p) => {
         const pr = planPrice(p, plans.currency);
-        return { yes: true, text: pr.text, ...(pr.sub ? { sub: pr.sub } : {}), tag: !!(p.prices && (p.placeholderPrices || plans.placeholder)) };
+        return { yes: true, text: pr.text, ...(pr.sub ? { sub: pr.sub } : {}) };
       },
     },
     {
@@ -453,12 +447,6 @@ export function PlanComparison({ site }: { site: SiteConfig }) {
                       {c.yes ? <Check size={14} aria-hidden className="pm-yes" /> : <Minus size={14} aria-hidden />}
                       <span>
                         {c.text}
-                        {c.tag && (
-                          <>
-                            {' '}
-                            <PlaceholderTag />
-                          </>
-                        )}
                         {c.sub && <span className="pm-cell-sub">{c.sub}</span>}
                       </span>
                     </span>
@@ -469,11 +457,7 @@ export function PlanComparison({ site }: { site: SiteConfig }) {
           ))}
         </tbody>
       </table>
-      {placeholder && (
-        <p className="pm-compare-note">
-          <PlaceholderTag>Pricing to be announced</PlaceholderTag> {site.pricing?.placeholderNote ?? 'Amounts are placeholders, not offers.'} {plans.taxNote}
-        </p>
-      )}
+      {plans.taxNote && <p className="pm-compare-note">{plans.taxNote}</p>}
     </div>
   );
 }

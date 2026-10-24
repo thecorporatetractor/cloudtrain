@@ -8,8 +8,8 @@ import { DomainIcon } from '@/components/domain';
 import { PageSkeleton } from '@/components/ui';
 import { formatMinutes } from '@/lib/pricingModel';
 import { cn } from '@/lib/utils';
-import { LabPreview } from '@/site/LabPreview';
-import { MockSignIn } from '@/site/MockSignIn';
+import { DomainMarquee } from '@/site/Flourish';
+import { HeroStory } from '@/site/LabStory';
 import { ComputeTiers, PricingPaths, PricingSteps } from '@/site/PricingModel';
 import { SocialProof } from '@/site/SocialProof';
 import { FeatureIcon, SiteAnchor, SiteShot, useDocumentTitle } from '@/site/util';
@@ -17,13 +17,14 @@ import { WaitlistSection } from '@/site/Waitlist';
 
 /**
  * The landing page for visitors (`/` while signed out, launch mode `live`).
- * Sections, in order: the hero with a live-looking lab, what makes the platform
- * different (a bento of the differentiators and capabilities), how a lab works,
- * catalog highlights with live figures, a product tour of real screens, how
- * pricing works, who it is for, social proof, the waitlist, the featured
- * questions and the closing call to action. Every word comes from the site
- * configuration (content/site.yaml); every figure from the catalog API and the
- * plans.
+ * Sections, in order: the hero and the story of a lab (the lab window stays in
+ * view while the four stages of a lab scroll past it, src/site/LabStory.tsx), a
+ * band of the domains, what makes the platform different (a bento of the
+ * differentiators and capabilities), catalog highlights with live figures, a
+ * product tour of real screens, how pricing works, who it is for, social proof,
+ * the waitlist, the featured questions and the closing call to action. Every
+ * word comes from the site configuration (content/site.yaml); every figure from
+ * the catalog API and the plans.
  */
 export function Landing() {
   const site = useSite();
@@ -50,8 +51,8 @@ export function Landing() {
   return (
     <>
       <Hero site={s} cat={cat} />
+      {s.flags.showCatalog && <DomainMarquee site={s} cat={cat} />}
       {(s.differentiators?.length || s.features.length) > 0 && <Bento site={s} />}
-      <HowItWorks site={s} />
       {s.flags.showCatalog && cat && <CatalogHighlights site={s} cat={cat} />}
       {s.showcase && s.showcase.length > 0 && <Tour site={s} />}
       {s.pricing?.model && <PricingTeaser site={s} />}
@@ -93,7 +94,7 @@ export function Cta({ cta, variant = 'primary', size = 'lg' }: { cta: SiteCta; v
 function SectionHead({ id, eyebrow, title, lead, action, n }: { id: string; eyebrow?: string; title: string; lead?: ReactNode; action?: ReactNode; n?: number }) {
   return (
     <div className="site-section-head">
-      <div className="site-section-head-copy">
+      <div className="site-section-head-copy" data-reveal="children">
         {eyebrow && (
           <p className="site-eyebrow">
             {n !== undefined && <span className="site-eyebrow-n tnum">{String(n).padStart(2, '0')}</span>}
@@ -124,40 +125,31 @@ function Hero({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
   const figures = all.filter(([n]) => n > 0);
   const proof = h.proof ?? [];
   return (
-    <section className="site-hero" aria-labelledby="hero-title">
-      <div className="site-hero-bg" aria-hidden />
-      <div className="site-container site-hero-inner">
-        <div className="site-hero-copy">
-          {h.eyebrow && <p className="site-eyebrow site-eyebrow-chip">{h.eyebrow}</p>}
-          <h1 id="hero-title" className="site-h1 site-display">
-            {h.title}
-          </h1>
-          <p className="site-lead">{h.subtitle}</p>
-          <div className="site-hero-actions">
-            {h.primaryCta && <Cta cta={h.primaryCta} size="xl" />}
-            {h.secondaryCta && <Cta cta={h.secondaryCta} variant="secondary" size="xl" />}
-          </div>
-          {h.note && <p className="site-note">{h.note}</p>}
-          {(figures.length > 0 || proof.length > 0) && (
-            <ul className="site-proof" aria-label="At a glance">
-              {proof.map((p) => (
-                <li key={p}>{p}</li>
-              ))}
-              {/* The live figures arrive after the configuration; appended, so the items before them never move. */}
-              {figures.map(([n, label]) => (
-                <li key={label}>
-                  <span className="site-proof-n tnum">{n.toLocaleString('en')}</span> {label}
-                </li>
-              ))}
-            </ul>
-          )}
-          <MockSignIn />
-        </div>
-        <div className="site-hero-visual">
-          <LabPreview />
-        </div>
+    <HeroStory site={site}>
+      {h.eyebrow && <p className="site-eyebrow site-eyebrow-chip">{h.eyebrow}</p>}
+      <h1 id="hero-title" className="site-h1 site-display">
+        {h.title}
+      </h1>
+      <p className="site-lead">{h.subtitle}</p>
+      <div className="site-hero-actions">
+        {h.primaryCta && <Cta cta={h.primaryCta} size="xl" />}
+        {h.secondaryCta && <Cta cta={h.secondaryCta} variant="secondary" size="xl" />}
       </div>
-    </section>
+      {h.note && <p className="site-note">{h.note}</p>}
+      {(figures.length > 0 || proof.length > 0) && (
+        <ul className="site-proof" aria-label="At a glance">
+          {proof.map((p) => (
+            <li key={p}>{p}</li>
+          ))}
+          {/* The live figures arrive after the configuration; appended, so the items before them never move. */}
+          {figures.map(([n, label]) => (
+            <li key={label}>
+              <span className="site-proof-n tnum">{n.toLocaleString('en')}</span> {label}
+            </li>
+          ))}
+        </ul>
+      )}
+    </HeroStory>
   );
 }
 
@@ -239,7 +231,7 @@ function Bento({ site }: { site: SiteConfig }) {
           title="Real systems. Real grading. Real progress."
           lead="No simulated shells and no multiple choice: every lab is a live environment, every grade is read from the system you leave behind."
         />
-        <div className="bento">
+        <div className="bento" data-reveal="children">
           {diffs.map((d, i) => (
             <article key={d.title} className={cn('bento-card bento-diff', i === 0 && 'bento-wide')}>
               <div className="bento-copy">
@@ -272,34 +264,6 @@ function Bento({ site }: { site: SiteConfig }) {
   );
 }
 
-/* --------------------------------------------------------- how it works */
-
-function HowItWorks({ site }: { site: SiteConfig }) {
-  return (
-    <section className="site-section site-section-alt" id="how-it-works" aria-labelledby="how-title">
-      <div className="site-container">
-        <SectionHead id="how-title" n={2} eyebrow="The loop" title="How a lab works" lead="Choose a problem, operate a real system, prove the outcome. Provisioning, access and reset depend on the lab type; the grading never does." />
-        <ol className="site-steps">
-          {site.howItWorks.map((step, i) => (
-            <li key={step.title} className="site-step">
-              <div className="site-step-head">
-                <span className="site-step-n tnum">{String(i + 1).padStart(2, '0')}</span>
-                {step.icon && (
-                  <span className="site-step-icon" aria-hidden>
-                    <FeatureIcon icon={step.icon} size={18} />
-                  </span>
-                )}
-              </div>
-              <h3>{step.title}</h3>
-              <p className="site-step-body">{step.body}</p>
-            </li>
-          ))}
-        </ol>
-      </div>
-    </section>
-  );
-}
-
 /* --------------------------------------------------- catalog highlights */
 
 const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en')} ${n === 1 ? one : many}`;
@@ -322,7 +286,7 @@ function CatalogHighlights({ site, cat }: { site: SiteConfig; cat: PublicCatalog
       <div className="site-container">
         <SectionHead
           id="domains-title"
-          n={3}
+          n={2}
           eyebrow="Catalog"
           title="Everything you can practise"
           lead="Every domain runs on the substrate it needs: pods, virtual machines, kubeadm or virtual clusters, or network devices on real wires."
@@ -332,15 +296,17 @@ function CatalogHighlights({ site, cat }: { site: SiteConfig; cat: PublicCatalog
             </Link>
           }
         />
-        <dl className="site-stats" aria-label="The catalog in numbers">
+        <dl className="site-stats" aria-label="The catalog in numbers" data-reveal="children">
           {stats.map(([n, label]) => (
             <div key={label} className="site-stat">
               <dt>{label}</dt>
-              <dd className="tnum">{n.toLocaleString('en')}</dd>
+              <dd className="tnum" data-count>
+                {n.toLocaleString('en')}
+              </dd>
             </div>
           ))}
         </dl>
-        <ul className="site-domain-grid" aria-label="Domains">
+        <ul className="site-domain-grid" aria-label="Domains" data-reveal="children">
           {domains.map((d) => (
             <li key={d.id}>
               <Link to="/catalog" search={{ domain: d.id }} className="site-domain-card">
@@ -355,6 +321,7 @@ function CatalogHighlights({ site, cat }: { site: SiteConfig; cat: PublicCatalog
                   <span className="site-domain-card-text">{d.tagline}</span>
                   <span className="site-domain-bar" aria-hidden>
                     <i
+                      data-grow
                       style={{
                         width: `${Math.max(8, Math.round((d.labCount / maxLabs) * 100))}%`,
                       }}
@@ -371,7 +338,7 @@ function CatalogHighlights({ site, cat }: { site: SiteConfig; cat: PublicCatalog
           ))}
         </ul>
         {paths.length > 0 && (
-          <div className="site-paths-strip">
+          <div className="site-paths-strip" data-reveal>
             <h3 className="site-paths-title">Learning paths</h3>
             <ul>
               {paths.map((p) => (
@@ -411,8 +378,8 @@ function Tour({ site }: { site: SiteConfig }) {
   return (
     <section className="site-section site-section-alt" id="showcase" aria-labelledby="showcase-title">
       <div className="site-container">
-        <SectionHead id="showcase-title" n={4} eyebrow="A look inside" title="The platform as learners and managers see it" lead="Real screens from the product, in the theme you are reading this in." />
-        <div className="tour">
+        <SectionHead id="showcase-title" n={3} eyebrow="A look inside" title="The platform as learners and managers see it" lead="Real screens from the product, in the theme you are reading this in." />
+        <div className="tour" data-reveal="children">
           <div className="tour-tabs" role="tablist" aria-label="Product tour" onKeyDown={onKey}>
             {items.map((it, i) => (
               <button
@@ -456,7 +423,7 @@ function PricingTeaser({ site }: { site: SiteConfig }) {
       <div className="site-container">
         <SectionHead
           id="pricing-title"
-          n={5}
+          n={4}
           eyebrow={m.eyebrow ?? 'Pricing'}
           title={m.title}
           lead={m.intro}
@@ -481,8 +448,8 @@ function Audiences({ site }: { site: SiteConfig }) {
   return (
     <section className="site-section site-section-alt" id="who" aria-labelledby="who-title">
       <div className="site-container">
-        <SectionHead id="who-title" n={6} eyebrow="Who it is for" title="One platform, three ways in" />
-        <div className="site-audience-grid">
+        <SectionHead id="who-title" n={5} eyebrow="Who it is for" title="One platform, three ways in" />
+        <div className="site-audience-grid" data-reveal="children">
           {site.audiences!.map((a, i) => (
             <article key={a.title} className="site-audience" id={i === site.audiences!.length - 1 ? 'teams' : undefined}>
               {a.icon && (
@@ -526,7 +493,7 @@ function Trust({ items }: { items: SiteConfig['faq'] }) {
             </Link>
           }
         />
-        <dl className="site-qa">
+        <dl className="site-qa" data-reveal="children">
           {items.map((f) => (
             <div key={f.q} className="site-qa-item">
               <dt>{f.q}</dt>
@@ -548,7 +515,7 @@ function ClosingCta({ site }: { site: SiteConfig }) {
   return (
     <section className="site-section" aria-labelledby="cta-title">
       <div className="site-container">
-        <div className="site-closing">
+        <div className="site-closing" data-reveal>
           <div className="site-closing-glow" aria-hidden />
           <div className="site-closing-copy">
             <h2 id="cta-title" className="site-h2">
@@ -556,7 +523,7 @@ function ClosingCta({ site }: { site: SiteConfig }) {
             </h2>
             {c?.body && <p className="site-section-lead">{c.body}</p>}
           </div>
-          <div className="site-hero-actions">
+          <div className="site-hero-actions" data-reveal="children">
             {primary && <Cta cta={primary} size="xl" />}
             {secondary && <Cta cta={secondary} variant="secondary" size="xl" />}
           </div>

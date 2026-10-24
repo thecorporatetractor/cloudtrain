@@ -1,11 +1,10 @@
 import { ArrowRight } from 'lucide-react';
 import { usePublicCatalog, useSite } from '@/api/public';
 import type { PublicCatalog, SiteConfig } from '@/api/types';
-import { DomainIcon } from '@/components/domain';
 import { PageSkeleton } from '@/components/ui';
 import { CsLink as Section } from './ComingSoonChrome';
-import { LabPreview } from './LabPreview';
-import { MockSignIn } from './MockSignIn';
+import { DomainMarquee } from './Flourish';
+import { HeroStory } from './LabStory';
 import { ComputeTiers, Estimator, PlanComparison, PricingPaths, PricingSteps, WorkedExamples } from './PricingModel';
 import { FeatureIcon, useDocumentTitle } from './util';
 import { WaitlistSection } from './Waitlist';
@@ -40,7 +39,8 @@ export function ComingSoon() {
   const s = site.data;
   return (
     <>
-      <Hero site={s} cat={catalog.data} />
+      <Hero site={s} />
+      {s.flags.showCatalog !== false && <DomainMarquee site={s} cat={catalog.data} label="Domains at launch" />}
       <What site={s} cat={catalog.data} />
       <PricingExplained site={s} />
       <WaitlistSection site={s} />
@@ -49,52 +49,32 @@ export function ComingSoon() {
   );
 }
 
-function Hero({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined }) {
+function Hero({ site }: { site: SiteConfig }) {
   const l = site.launch;
-  const domains = cat ? site.highlightDomains.map((id) => cat.domains.find((d) => d.id === id)).filter((d): d is NonNullable<typeof d> => !!d && d.labCount > 0) : [];
   return (
-    <section className="site-hero cs-hero" aria-labelledby="hero-title">
-      <div className="site-hero-bg" aria-hidden />
-      <div className="site-container site-hero-inner">
-        <div className="site-hero-copy">
-          {l?.status && (
-            <p className="cs-status">
-              <span className="cs-status-dot" aria-hidden /> {l.status}
-            </p>
-          )}
-          <h1 id="hero-title" className="site-h1 site-display">
-            {l?.title ?? site.hero.title}
-          </h1>
-          <p className="site-lead">{l?.subtitle ?? site.hero.subtitle}</p>
-          <div className="site-hero-actions">
-            {site.waitlist?.enabled && (
-              <Section id="waitlist" className="btn btn-primary btn-xl">
-                {l?.ctaLabel ?? 'Join the waitlist'} <ArrowRight size={16} aria-hidden />
-              </Section>
-            )}
-            {site.pricing?.model && (
-              <Section id="pricing" className="btn btn-secondary btn-xl">
-                How pricing works
-              </Section>
-            )}
-          </div>
-          {domains.length > 0 && (
-            <ul className="cs-domains" aria-label="Domains at launch">
-              {domains.map((d) => (
-                <li key={d.id}>
-                  <DomainIcon domain={d.id} size={14} />
-                  {d.name}
-                </li>
-              ))}
-            </ul>
-          )}
-          <MockSignIn />
-        </div>
-        <div className="site-hero-visual">
-          <LabPreview />
-        </div>
+    <HeroStory site={site} className="cs-hero">
+      {l?.status && (
+        <p className="cs-status">
+          <span className="cs-status-dot" aria-hidden /> {l.status}
+        </p>
+      )}
+      <h1 id="hero-title" className="site-h1 site-display">
+        {l?.title ?? site.hero.title}
+      </h1>
+      <p className="site-lead">{l?.subtitle ?? site.hero.subtitle}</p>
+      <div className="site-hero-actions">
+        {site.waitlist?.enabled && (
+          <Section id="waitlist" className="btn btn-primary btn-xl">
+            {l?.ctaLabel ?? 'Join the waitlist'} <ArrowRight size={16} aria-hidden />
+          </Section>
+        )}
+        {site.pricing?.model && (
+          <Section id="pricing" className="btn btn-secondary btn-xl">
+            How pricing works
+          </Section>
+        )}
       </div>
-    </section>
+    </HeroStory>
   );
 }
 
@@ -115,7 +95,7 @@ function What({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
     <section className="site-section" id="what" aria-labelledby="what-title">
       <div className="site-container">
         <div className="site-section-head">
-          <div className="site-section-head-copy">
+          <div className="site-section-head-copy" data-reveal="children">
             <p className="site-eyebrow">{site.launch?.eyebrow ?? 'What it is'}</p>
             <h2 id="what-title" className="site-h2">
               {site.brand.tagline}
@@ -124,17 +104,19 @@ function What({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
           </div>
         </div>
         {figures.length > 0 && (
-          <dl className="site-stats" aria-label="Ready at launch">
+          <dl className="site-stats" aria-label="Ready at launch" data-reveal="children">
             {figures.map(([n, label]) => (
               <div key={label} className="site-stat">
                 <dt>{label}</dt>
-                <dd className="tnum">{n.toLocaleString('en')}</dd>
+                <dd className="tnum" data-count>
+                  {n.toLocaleString('en')}
+                </dd>
               </div>
             ))}
           </dl>
         )}
         {points.length > 0 && (
-          <ul className="cs-points">
+          <ul className="cs-points" data-reveal="children">
             {points.map((p) => (
               <li key={p.title} className="cs-point">
                 {p.icon && (
@@ -161,7 +143,7 @@ export function PricingExplained({ site, id = 'pricing', headingLevel = 2 }: { s
     <section className="site-section site-section-alt pm" id={id} aria-labelledby={`${id}-title`}>
       <div className="site-container">
         <div className="site-section-head pm-head">
-          <div className="site-section-head-copy">
+          <div className="site-section-head-copy" data-reveal="children">
             <p className="site-eyebrow">{m.eyebrow ?? 'Pricing'}</p>
             <H id={`${id}-title`} className={headingLevel === 1 ? 'site-h1 site-display' : 'site-h2'}>
               {m.title}
@@ -200,7 +182,7 @@ function Questions({ site }: { site: SiteConfig }) {
   return (
     <section className="site-section" id="faq" aria-labelledby="faq-title">
       <div className="site-container cs-faq">
-        <div className="site-section-head-copy">
+        <div className="site-section-head-copy" data-reveal="children">
           <p className="site-eyebrow">Questions</p>
           <h2 id="faq-title" className="site-h2">
             Straight answers
@@ -211,7 +193,7 @@ function Questions({ site }: { site: SiteConfig }) {
             </p>
           )}
         </div>
-        <div className="site-faq">
+        <div className="site-faq" data-reveal="children">
           {items.map((f) => (
             <details key={f.q} className="site-faq-item">
               <summary>{f.q}</summary>

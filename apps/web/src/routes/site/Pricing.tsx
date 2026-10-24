@@ -15,7 +15,7 @@ import { Cta } from './Landing';
 /**
  * Pricing: the configured plans (free, individual monthly/yearly, organisation
  * per seat) as cards with an interval switch, a comparison of entitlements, the
- * placeholder note while prices are not final, the plan FAQ and the alignment
+ * price note (currency, VAT), the plan FAQ and the alignment
  * notice. Calls to action lead to sign-in, checkout (when enabled) or contact.
  */
 export function Pricing() {
@@ -33,7 +33,6 @@ export function Pricing() {
   const p = s?.pricing;
   const plans = s?.plans;
   const anyYearly = plans?.items.some((pl) => pl.prices?.yearly) ?? false;
-  const placeholder = !!(plans?.placeholder || plans?.items.some((pl) => pl.placeholderPrices));
   const faq = p?.faqGroup ? (s?.faq ?? []).filter((f) => f.group === p.faqGroup) : [];
 
   return (
@@ -89,12 +88,7 @@ export function Pricing() {
                 </div>
               )}
             </div>
-            {placeholder && p?.placeholderNote && (
-              <p className="site-callout small" role="note" style={{ justifyContent: 'center' }}>
-                <Badge tone="warn">Placeholder prices</Badge> <span className="site-callout-text">{p.placeholderNote}</span>
-              </p>
-            )}
-            <div className={cn('site-plans', plans.items.length === 2 && 'site-plans-2', plans.items.length >= 4 && 'site-plans-4')}>
+            <div className={cn('site-plans', plans.items.length === 2 && 'site-plans-2', plans.items.length >= 4 && 'site-plans-4')} data-reveal="children">
               {plans.items.map((pl) => (
                 <PlanCard key={pl.id} plan={pl} currency={plans.currency} interval={interval} site={s!} />
               ))}
