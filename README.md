@@ -279,8 +279,8 @@ free, what needs a license key, and FAQs.
   [CC BY-NC 4.0](content/LICENSE), with an
   [additional permission](content/LICENSE-ADDITIONAL-PERMISSION.md) to train
   your own organisation's personnel on a self-hosted installation, also in a
-  commercial organisation. Credit "CloudTrain by AzarGuard" when you share it.
-- **Hosted service:** AzarGuard's hosted CloudTrain is paid per compute
+  commercial organisation. Credit "CloudTrain" when you share it.
+- **Hosted service:** CloudTrain's hosted service is paid per compute
   consumed, plus subscription tiers for the premium features.
 - **Third-party software:** see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and [NOTICE](NOTICE).
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md); contributors sign the [CLA](CLA.md).

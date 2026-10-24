@@ -15,12 +15,12 @@ CloudTrain is **source-available**, not open source. In short:
    own staff.
 2. **Premium enterprise features need a license key** (a paid subscription),
    whether you self-host or use the hosted service.
-3. **The hosted service** run by AzarGuard is paid per compute used, plus
+3. **The hosted service** run by CloudTrain is paid per compute used, plus
    subscription tiers for the premium features.
 
 ## What is free, what needs a key, what is paid hosting
 
-| | Free (self-hosted) | Needs a license key | Paid hosting (AzarGuard) |
+| | Free (self-hosted) | Needs a license key | Paid hosting (CloudTrain) |
 | --- | --- | --- | --- |
 | Run the platform on your own infrastructure | yes, any purpose except offering it to third parties as a service or reselling it | no | not needed |
 | Train your own employees, contractors and affiliates' staff, including in a commercial company | yes (software and content) | no | optional |
@@ -29,7 +29,7 @@ CloudTrain is **source-available**, not open source. In short:
 | Premium features (see the [table below](#premium-features)) | no | yes, in production | subscription tier |
 | Evaluate, develop, test or modify the code, including premium features | yes (non-production use) | no | not applicable |
 | Lab compute | your own infrastructure, your cost | no | per compute consumed |
-| Offer CloudTrain, its labs or assessments to third parties as a hosted, managed, embedded or commercial service, or resell it | no | a key is not enough: needs a separate commercial license | AzarGuard's own service |
+| Offer CloudTrain, its labs or assessments to third parties as a hosted, managed, embedded or commercial service, or resell it | no | a key is not enough: needs a separate commercial license | CloudTrain's own service |
 
 The Business Source License does not define "production use". As it is commonly
 read, running the platform for real users and real training is production use;
@@ -73,7 +73,7 @@ production use **for any purpose**, as long as you do not:
   as a hosted, managed, embedded or other commercial training, lab-environment or
   assessment offering, or sell, resell, rent or sublicense it; or
 - **(b)** use the premium features above in production without a valid license key
-  from AzarGuard, or move, change, disable or circumvent the license-key
+  from CloudTrain, or move, change, disable or circumvent the license-key
   functionality, or remove or obscure functionality the key protects.
 
 "Your organization" includes your affiliates (entities under common control).
@@ -83,17 +83,17 @@ Anyone outside your organization and its personnel is a third party.
 
 The lab content in `content/` is under [CC BY-NC 4.0](../content/LICENSE),
 unchanged. CC licenses let the licensor grant more than the license does, so
-AzarGuard adds a separate
+CloudTrain adds a separate
 [additional permission](../content/LICENSE-ADDITIONAL-PERMISSION.md): you may use
 and adapt the content on a self-hosted installation to train your own
 organization's personnel, **even in a commercial organization**. Using the
 content to train third parties commercially still needs a commercial license.
-When you share the content or adaptations, credit "CloudTrain by AzarGuard", link
+When you share the content or adaptations, credit "CloudTrain", link
 to the license and indicate changes.
 
 ### Hosted service
 
-AzarGuard's hosted service is paid per compute consumed (lab minutes, by compute
+CloudTrain's hosted service is paid per compute consumed (lab minutes, by compute
 tier), plus subscription tiers that include the premium features. Its terms of
 service govern use of the service; see [billing.md](billing.md) for how metering
 works.
@@ -117,8 +117,8 @@ identity provider or SCIM).
 Not under the free terms. Running paid courses, bootcamps, certification
 preparation or assessments for other people or companies, offering CloudTrain as a
 hosted or managed service, embedding it in a product you sell, or reselling it
-needs a separate commercial license from AzarGuard. A license key for premium
-features does not grant this. Contact AzarGuard.
+needs a separate commercial license from CloudTrain. A license key for premium
+features does not grant this. Contact CloudTrain (hello@cloudtrain.app).
 
 **Can I train a customer's staff on my installation?**
 A customer's staff are third parties, so this is a third-party offering and needs a
@@ -145,9 +145,9 @@ later Change Dates. The Change Date does not affect the lab content (CC BY-NC 4.
 trademarks, or the hosted service, which remains a paid service.
 
 **What does "license key" mean if I self-host?**
-A key issued by AzarGuard with a paid subscription. The platform checks it and
+A key issued by CloudTrain with a paid subscription. The platform checks it and
 turns on the premium features it covers.
 
 **Can I contribute?**
 Yes, see [CONTRIBUTING.md](../CONTRIBUTING.md). Contributors sign the
-[CLA](../CLA.md) (draft), which lets AzarGuard keep offering this model.
+[CLA](../CLA.md) (draft), which lets CloudTrain keep offering this model.
