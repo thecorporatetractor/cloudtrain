@@ -130,6 +130,7 @@ namespace and with them running labs (`helm.sh/resource-policy: keep`).
 | `gateway.trustProxy` | private ranges | proxies whose `X-Forwarded-*` are trusted (client IPs for audit and rate limits) |
 | `gateway.sessionsNamespace` | `cloudtrain-sessions` | lab sessions and lab pods |
 | `web.runtimeConfig.apiBase`, `web.csp.*` | same origin | runtime config and extra CSP sources |
+| `web.runtimeConfig.siteUrl` | empty (website and app on `host`) | the public website's own origin, e.g. the apex with `host: app.<domain>`: website pages redirect there and the gateway allows it in CORS (docs/deploy-website.md, "Website and app on separate origins"; `examples/values-split-site.yaml`) |
 | `orchestrator.catalog.releaseOverlay` | | `catalog-release.yaml` content |
 | `orchestrator.images.mirrors`, `.registry`, `.pullSecrets` | | where lab images are pulled from ([Images and registries](#images-and-registries)) |
 | `orchestrator.storageClass`, `.vmDisks`, `.runtimeClass` | default class, `persistent`, cluster default | lab storage and runtime |

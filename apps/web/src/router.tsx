@@ -6,6 +6,7 @@ import { RouteError } from './app/RouteError';
 import { PageSkeleton } from './components/ui';
 import { CatalogIndex, RootIndex } from './routes/site/Hybrid';
 import { ensureSampleMocks } from './mocks/sample';
+import { surfaceConfig, surfaceRedirect } from './lib/surface';
 
 // Screens that pull in React Flow or xterm are loaded on demand so the other
 // pages do not download them (see vite.config.ts manualChunks). Role-specific
@@ -71,7 +72,21 @@ function Pending() {
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
 
-const rootRoute = createRootRoute({ component: Shell, notFoundComponent: NotFound });
+/**
+ * Website and app on separate origins (src/lib/surface.ts): a path that belongs to the
+ * other origin leaves for it before anything renders, on the first load and on in-app
+ * navigation alike. Preloads (hovering a link) never navigate.
+ */
+function leaveForOtherSurface({ location, preload }: { location: { pathname: string; searchStr: string; hash: string }; preload: boolean }): Promise<never> | void {
+  if (preload) return;
+  const target = surfaceRedirect(surfaceConfig, location.pathname, location.searchStr, location.hash);
+  if (!target) return;
+  window.location.replace(target);
+  // Keep the router pending (nothing renders) while the browser leaves.
+  return new Promise<never>(() => {});
+}
+
+const rootRoute = createRootRoute({ component: Shell, notFoundComponent: NotFound, beforeLoad: leaveForOtherSurface });
 
 export const homeRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: RootIndex });
 

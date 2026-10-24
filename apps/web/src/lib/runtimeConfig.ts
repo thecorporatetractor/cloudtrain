@@ -18,6 +18,18 @@ export interface RuntimeConfig {
   apiBase: string;
   /** Free-form environment label (e.g. `staging`), informational. */
   environment: string;
+  /**
+   * Origin of the public website (e.g. `https://cloudtrain.com`); empty = the website
+   * and the app share one origin. See src/lib/surface.ts and docs/deploy-website.md.
+   */
+  siteUrl: string;
+  /** Origin of the platform app (e.g. `https://app.cloudtrain.com`); empty = same origin as the website. */
+  appUrl: string;
+  /**
+   * What this origin serves: `site`, `app`, or empty (inferred: the origin that matches
+   * siteUrl or appUrl; neither = both on one origin, the default).
+   */
+  surface: '' | 'site' | 'app';
 }
 
 declare global {
@@ -26,22 +38,43 @@ declare global {
   }
 }
 
-/** Validates the raw object: apiBase must be empty or an http(s) origin without a path. */
-export function parseRuntimeConfig(raw: unknown): RuntimeConfig {
-  const r = raw && typeof raw === 'object' ? (raw as Partial<Record<keyof RuntimeConfig, unknown>>) : {};
-  let apiBase = typeof r.apiBase === 'string' ? r.apiBase.trim() : '';
-  if (apiBase) {
-    try {
-      const u = new URL(apiBase);
-      apiBase = u.protocol === 'http:' || u.protocol === 'https:' ? u.origin : '';
-    } catch {
-      apiBase = '';
-    }
+/** An http(s) origin (any path dropped), or '' for anything else. */
+export function originOf(v: unknown): string {
+  const s = typeof v === 'string' ? v.trim() : '';
+  if (!s) return '';
+  try {
+    const u = new URL(s);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.origin : '';
+  } catch {
+    return '';
   }
-  return { apiBase, environment: typeof r.environment === 'string' ? r.environment : '' };
 }
 
-export const runtimeConfig: RuntimeConfig = parseRuntimeConfig(typeof window === 'undefined' ? undefined : window.__CLOUDTRAIN_CONFIG__);
+/**
+ * Validates the raw object: apiBase, siteUrl and appUrl must be empty or http(s) origins
+ * (a path is dropped). An empty value falls back to `defaults` (the build-time VITE_*
+ * values), so a deployment's runtime-config.js always wins over the build.
+ */
+export function parseRuntimeConfig(raw: unknown, defaults: Partial<Record<keyof RuntimeConfig, unknown>> = {}): RuntimeConfig {
+  const r = raw && typeof raw === 'object' ? (raw as Partial<Record<keyof RuntimeConfig, unknown>>) : {};
+  const origin = (k: 'apiBase' | 'siteUrl' | 'appUrl') => originOf(r[k]) || originOf(defaults[k]);
+  const surf = (v: unknown) => (v === 'site' || v === 'app' ? v : '');
+  return {
+    apiBase: origin('apiBase'),
+    environment: typeof r.environment === 'string' ? r.environment : '',
+    siteUrl: origin('siteUrl'),
+    appUrl: origin('appUrl'),
+    surface: surf(r.surface) || surf(defaults.surface),
+  };
+}
+
+/** Build-time defaults (Vite env): what `task dev:site` / `task dev:web` and build-site.mjs set. */
+const buildDefaults = (): Partial<Record<keyof RuntimeConfig, unknown>> => {
+  const env = (import.meta as { env?: Record<string, unknown> }).env ?? {};
+  return { apiBase: env.VITE_API_BASE, siteUrl: env.VITE_SITE_URL, appUrl: env.VITE_APP_URL, surface: env.VITE_SURFACE };
+};
+
+export const runtimeConfig: RuntimeConfig = parseRuntimeConfig(typeof window === 'undefined' ? undefined : window.__CLOUDTRAIN_CONFIG__, buildDefaults());
 
 /** Absolute or same-origin URL of a gateway path (`/api/...`); other URLs pass through. */
 export function apiUrl(path: string, cfg: RuntimeConfig = runtimeConfig): string {

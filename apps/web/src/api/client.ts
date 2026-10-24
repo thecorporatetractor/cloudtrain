@@ -19,7 +19,7 @@ import type {
   ValidateResponse,
 } from './types';
 import { apiCredentials, apiUrl } from '@/lib/runtimeConfig';
-import { STATIC_SITE } from '@/lib/siteMode';
+import { ON_SITE } from '@/lib/surface';
 
 export class ApiError extends Error {
   constructor(
@@ -44,7 +44,8 @@ export const setCsrfToken = (t: string | undefined) => (csrfToken = t);
 export async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
   const mutating = method !== 'GET' && method !== 'HEAD';
-  const res = await fetch(apiUrl(url), { credentials: apiCredentials(), ...init, headers: { 'content-type': 'application/json', ...(mutating && csrfToken ? { 'x-csrf-token': csrfToken } : {}), ...(init?.headers ?? {}) } });
+  // The website origin has no session: its public requests carry no cookie.
+  const res = await fetch(apiUrl(url), { credentials: ON_SITE ? 'omit' : apiCredentials(), ...init, headers: { 'content-type': 'application/json', ...(mutating && csrfToken ? { 'x-csrf-token': csrfToken } : {}), ...(init?.headers ?? {}) } });
   if (!res.ok) {
     let message = res.statusText || 'Request failed';
     let code: ErrorCode | undefined;
@@ -92,8 +93,8 @@ export const queries = {
     queryOptions({
       queryKey: ['me'],
       queryFn: async () => {
-        // The static website build has no session and no API to ask.
-        if (STATIC_SITE) throw new ApiError(401, 'Not signed in', 'unauthenticated');
+        // The website origin (and the static website build) has no session: sign-in lives on the app.
+        if (ON_SITE) throw new ApiError(401, 'Not signed in', 'unauthenticated');
         const me = await request<Me>('/api/me');
         setCsrfToken(me.csrfToken);
         return me;

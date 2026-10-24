@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import { useSite } from '@/api/public';
 import type { SiteConfig, SiteLegalDocument } from '@/api/types';
 import { Badge, Card, PageSkeleton } from '@/components/ui';
-import { linkKey, Paragraphs, SiteAnchor, useDocumentTitle } from '@/site/util';
+import { linkKey, Paragraphs, SignInLink, SiteAnchor, useDocumentTitle } from '@/site/util';
 
 /*
  * The small public pages: about, FAQ, contact, terms and privacy (pricing has
@@ -176,9 +176,9 @@ export function Contact() {
             <p className="small muted" style={{ marginTop: 6 }}>
               Your organisation's administrator manages people, teams and access. Sign in and ask through the help menu.
             </p>
-            <Link to="/sign-in" className="btn btn-secondary btn-sm" style={{ marginTop: 10 }}>
+            <SignInLink className="btn btn-secondary btn-sm" style={{ marginTop: 10 }}>
               Sign in
-            </Link>
+            </SignInLink>
           </Card>
         </div>
       </div>

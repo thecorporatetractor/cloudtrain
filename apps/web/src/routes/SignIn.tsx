@@ -1,6 +1,6 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowLeft, ArrowRight, Building2, KeyRound, LogOut, ShieldCheck, TimerOff } from 'lucide-react';
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { ApiError, useMe } from '@/api/client';
 import { isRealApi } from '@/api/mode';
 import { useSite } from '@/api/public';
@@ -9,7 +9,7 @@ import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Button, Field, Input } from '@/components/ui';
 import { signInRoute } from '@/router';
 import { apiUrl } from '@/lib/runtimeConfig';
-import { APP_URL, STATIC_SITE } from '@/lib/siteMode';
+import { ON_SITE, signInHref, siteHomeHref, surfaceConfig } from '@/lib/surface';
 
 /**
  * Identity-first sign-in. Step 1 asks for the email; the gateway's discovery
@@ -18,14 +18,14 @@ import { APP_URL, STATIC_SITE } from '@/lib/siteMode';
  * starts the OIDC flow at Keycloak; mock mode completes the login in place.
  */
 export function SignIn() {
-  return STATIC_SITE ? <StaticSignIn /> : <PlatformSignIn />;
+  return ON_SITE ? <StaticSignIn /> : <PlatformSignIn />;
 }
 
-/** The static website build has no sign-in of its own: hand over to the platform, or say so. */
+/** The website origin has no sign-in of its own: hand over to the app (src/lib/surface.ts), or say so. */
 function StaticSignIn() {
   const search = signInRoute.useSearch();
   const brand = useBrandName();
-  const target = APP_URL ? `${APP_URL}/sign-in${search.returnTo && search.returnTo.startsWith('/') && !search.returnTo.startsWith('//') ? `?returnTo=${encodeURIComponent(search.returnTo)}` : ''}` : '';
+  const target = surfaceConfig.appUrl ? signInHref(surfaceConfig, search.returnTo) : '';
   useEffect(() => {
     if (target) window.location.replace(target);
   }, [target]);
@@ -50,6 +50,23 @@ function StaticSignIn() {
         </Link>
       </div>
     </div>
+  );
+}
+
+/** The website's home: on its own origin when the website and the app are split (src/lib/surface.ts). */
+function WebsiteLink({ className, children, 'aria-label': label }: { className: string; children: ReactNode; 'aria-label'?: string }) {
+  const href = siteHomeHref(surfaceConfig);
+  if (href !== '/') {
+    return (
+      <a href={href} className={className} aria-label={label}>
+        {children}
+      </a>
+    );
+  }
+  return (
+    <Link to="/" className={className} aria-label={label}>
+      {children}
+    </Link>
   );
 }
 
@@ -114,10 +131,10 @@ function PlatformSignIn() {
   return (
     <div className="signin">
       <div className="signin-panel">
-        <Link to="/" className="signin-brand" aria-label={`${brand} home`}>
+        <WebsiteLink className="signin-brand" aria-label={`${brand} home`}>
           <BrandMark />
           <BrandName height={15} />
-        </Link>
+        </WebsiteLink>
 
         {search.reason === 'expired' && (
           <div className="signin-notice" role="status">
@@ -239,9 +256,7 @@ function PlatformSignIn() {
       </div>
       <p className="signin-foot xs subtle">
         {tagline} ·{' '}
-        <Link to="/" className="link-quiet">
-          Back to the website
-        </Link>
+        <WebsiteLink className="link-quiet">Back to the website</WebsiteLink>
       </p>
     </div>
   );

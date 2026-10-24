@@ -6,7 +6,7 @@ import { alignLabel, Disclaimer, ExamDomainIcon, examDomainLabel, RuleChips } fr
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { publicExamRoute } from '@/router';
 import { formatMinutes } from '@/lib/utils';
-import { useDocumentTitle } from '@/site/util';
+import { SignInLink, useDocumentTitle } from '@/site/util';
 
 /** An exam simulation, read-only: format, rules, objectives and what the report contains. No attempts, no pool. */
 export function PublicExam() {
@@ -69,9 +69,9 @@ export function PublicExam() {
               Open in the app
             </Link>
           ) : (
-            <Link to="/sign-in" search={{ returnTo: `/exams/${e.id}` }} className="btn btn-primary btn-md">
+            <SignInLink returnTo={`/exams/${e.id}`} className="btn btn-primary btn-md">
               <Lock size={12} aria-hidden /> Sign in to attempt
-            </Link>
+            </SignInLink>
           )}
           {soon && e.availabilityNote && (
             <span className="xs subtle" style={{ maxWidth: 260, textAlign: 'right' }}>

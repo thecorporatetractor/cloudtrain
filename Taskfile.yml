@@ -7,6 +7,15 @@ dotenv: ['deploy/versions.env']
 env:
   PATH: '{{.HOME}}/.local/bin:{{.PATH}}'
 
+# Local origins of the app, the website and the gateway (docs/dev-environment.md,
+# "Website and app on two origins"). Override per run: WEB_PORT=5180 SITE_PORT=6980
+# CT_PORT=8791 task dev:site. CT_SPLIT=0 task dev:web serves both on the app's origin.
+vars:
+  WEB_PORT: '{{.WEB_PORT | default "5173"}}'
+  SITE_PORT: '{{.SITE_PORT | default "6969"}}'
+  GATEWAY_PORT: '{{.CT_PORT | default "8787"}}'
+  SPLIT: '{{.CT_SPLIT | default "1"}}'
+
 tasks:
   default:
     cmds: [task --list]
@@ -172,8 +181,9 @@ tasks:
     cmds: [node deploy/dev/keycloak/gen-realms.mjs]
 
   # ---------------------------------------------------------------- web + gateway
-  # Real-mode development: `task dev:orchestrator`, `task dev:gateway` and
-  # `task dev:web` in three terminals. Every kubectl/manager call is pinned to
+  # Real-mode development: `task dev:orchestrator`, `task dev:gateway`, `task dev:web`
+  # (the app, :5173) and `task dev:site` (the public website, :6969) in separate
+  # terminals; docs/dev-environment.md "Website and app on two origins". Every kubectl/manager call is pinned to
   # CT_KUBE_CONTEXT; the kubeconfig's current-context is never changed.
 
   gateway:labctl:
@@ -208,6 +218,10 @@ tasks:
       # Dev only: POST /api/dev/sign-in-as for agents (loopback callers; docs/dev-environment.md,
       # "Signing in as a real user"). Off: CT_DEV_IMPERSONATE=0 task dev:gateway. Never set it in deploy/.
       CT_DEV_IMPERSONATE: '{{.CT_DEV_IMPERSONATE | default "1"}}'
+      # The website (task dev:site) calls /api/public/* cross-origin, like the apex site
+      # in production; after sign-in and Stripe the browser returns to the app (task dev:web).
+      CT_CORS_ORIGINS: '{{.CT_CORS_ORIGINS | default (printf "http://localhost:%s" .SITE_PORT)}}'
+      CT_WEB_URL: '{{.CT_WEB_URL | default (printf "http://localhost:%s" .WEB_PORT)}}'
     cmds:
       - pnpm --filter @cloudtrain/lab-schema build
       - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}
@@ -218,10 +232,25 @@ tasks:
       - pnpm --filter @cloudtrain/gateway dev
 
   dev:web:
-    desc: Run apps/web in real API mode (proxies /api and the terminal WebSocket to the gateway on :8787)
+    desc: 'Run the app (apps/web) in real API mode on http://localhost:5173 (WEB_PORT), proxying /api and the terminal WebSocket to the gateway (:8787, CT_PORT); website pages redirect to task dev:site (SITE_PORT, 6969); CT_SPLIT=0 serves website and app on this one origin'
     env:
       VITE_API_MODE: real
-    cmds: [pnpm --filter web dev]
+      CT_GATEWAY_URL: 'http://127.0.0.1:{{.GATEWAY_PORT}}'
+      VITE_SURFACE: '{{if eq .SPLIT "0"}}{{else}}app{{end}}'
+      VITE_SITE_URL: '{{if eq .SPLIT "0"}}{{else}}http://localhost:{{.SITE_PORT}}{{end}}'
+      VITE_APP_URL: '{{if eq .SPLIT "0"}}{{else}}http://localhost:{{.WEB_PORT}}{{end}}'
+    cmds: ['pnpm --filter web dev --port {{.WEB_PORT}} --strictPort']
+
+  dev:site:
+    desc: 'Run the public website (apps/web, site surface) in real API mode on http://localhost:6969 (SITE_PORT); it calls the gateway (:8787, CT_PORT) cross-origin and hands "Sign in" and every app path to task dev:web (WEB_PORT, 5173)'
+    env:
+      VITE_API_MODE: real
+      CT_GATEWAY_URL: 'http://127.0.0.1:{{.GATEWAY_PORT}}'
+      VITE_SURFACE: site
+      VITE_SITE_URL: 'http://localhost:{{.SITE_PORT}}'
+      VITE_APP_URL: 'http://localhost:{{.WEB_PORT}}'
+      VITE_API_BASE: 'http://localhost:{{.GATEWAY_PORT}}'
+    cmds: ['pnpm --filter web dev --port {{.SITE_PORT}} --strictPort']
 
   dev:web:mock:
     desc: Run apps/web with the in-browser mock API (no cluster needed)

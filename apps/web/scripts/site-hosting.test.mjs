@@ -14,7 +14,10 @@ describe('static site host files', () => {
     const js = runtimeConfigJs('https://api.example.com');
     const win = {};
     new Function('window', js)(win);
-    expect(win.__CLOUDTRAIN_CONFIG__).toEqual({ apiBase: 'https://api.example.com', environment: 'website' });
+    expect(win.__CLOUDTRAIN_CONFIG__).toEqual({ apiBase: 'https://api.example.com', environment: 'website', appUrl: '', surface: 'site' });
+    const withApp = {};
+    new Function('window', runtimeConfigJs('https://app.example.com', 'website', 'https://app.example.com'))(withApp);
+    expect(withApp.__CLOUDTRAIN_CONFIG__).toMatchObject({ appUrl: 'https://app.example.com', surface: 'site' });
     const same = {};
     new Function('window', runtimeConfigJs(''))(same);
     expect(same.__CLOUDTRAIN_CONFIG__.apiBase).toBe('');

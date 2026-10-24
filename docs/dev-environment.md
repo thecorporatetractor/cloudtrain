@@ -491,6 +491,61 @@ gateway only if it listens beyond loopback (`CT_HOST=0.0.0.0`); with the default
 `127.0.0.1` Keycloak's call fails harmlessly and logout still works through
 `POST /api/auth/logout` and the refresh check.
 
+### Website and app on two origins
+
+In production the public website is the apex (`https://cloudtrain.com`) and the platform
+app a subdomain (`https://app.cloudtrain.com`); locally they are two Vite dev servers from
+the same `apps/web`, both in real API mode against the gateway:
+
+```bash
+task dev:gateway   # http://localhost:8787  CT_CORS_ORIGINS=http://localhost:6969, CT_WEB_URL=http://localhost:5173
+task dev:web       # http://localhost:5173  the app (VITE_SURFACE=app), /api proxied to the gateway
+task dev:site      # http://localhost:6969  the website (VITE_SURFACE=site), /api/public/* cross-origin to :8787
+```
+
+| Variable (Taskfile) | Default | Used by |
+|---|---|---|
+| `WEB_PORT` | `5173` | `dev:web` port; `VITE_APP_URL` of both servers; the gateway's `CT_WEB_URL` |
+| `SITE_PORT` | `6969` | `dev:site` port; `VITE_SITE_URL` of both servers; the gateway's `CT_CORS_ORIGINS` |
+| `CT_PORT` | `8787` | the gateway's port; `CT_GATEWAY_URL` (Vite proxy) and the site's `VITE_API_BASE` |
+| `CT_SPLIT` | `1` | `CT_SPLIT=0 task dev:web` serves website and app on :5173 as one origin (no redirects) |
+
+Each port is strict (`--strictPort`): a busy port fails instead of moving, because the
+other server links to it. Another set of ports for a second checkout:
+`WEB_PORT=5180 SITE_PORT=6980 CT_PORT=8791 task dev:gateway` (and the same variables for
+`dev:web` and `dev:site`). The two servers keep separate Vite caches
+(`node_modules/.vite` and `.vite-site`).
+
+What you see (`apps/web/src/lib/surface.ts`, unit tests in `surface.test.ts`):
+
+- **Website (:6969)**: landing page, public catalog (`/`, `/catalog`, `/catalog/paths/*`,
+  `/catalog/exams/*`), `/pricing`, `/about`, `/faq`, `/contact`, `/legal/*`. "Sign in",
+  "Start lab", "Sign in to attempt" and the plan buttons are links to
+  `http://localhost:5173/sign-in` (with `returnTo` when it is an app page such as
+  `/labs/x` or `/account/billing?plan=pro`). Any other path (`/sign-in`, `/labs/x`,
+  `/admin`, an unknown path) redirects to the same path on :5173. The website has no
+  session: it never calls `/api/me` and sends no cookie, so it always says "Sign in".
+- **App (:5173)**: everything else. `/` and `/catalog` are the learner's Home and the
+  full catalog and need a session like any app page (a visitor goes to sign-in). Website
+  paths redirect to :6969 with their query and hash. The sign-in page's logo and "Back
+  to the website" lead to :6969. Inside the app the sidebar logo stays the dashboard.
+- **Sign-in round trip**: "Sign in" on the site, the app's sign-in page, Keycloak, then
+  `/api/auth/callback` on the gateway, which sets the session cookie and redirects to
+  `CT_WEB_URL` (the app) plus `returnTo`. A visitor who is already signed in and clicks
+  "Sign in" on the site lands straight on the app's dashboard.
+
+**Cookies across the two ports.** Cookies are scoped by host, not port: the gateway's
+host-only `ct_session` cookie for `localhost` is sent to :5173, :6969 and :8787 alike.
+The split does not rely on that (the site omits credentials, and the app's calls go
+through its own Vite proxy), so it behaves as in production, where the cookie stays on
+the app host. Use `localhost` throughout: `127.0.0.1` is a different site for the browser
+and does not match the configured origins (the redirects would not apply, and the
+gateway's CORS list names `localhost`).
+
+Mock mode (`task dev:web:mock`) and the screenshot scripts keep the website and the app
+on one origin, as before. Production: docs/deploy-website.md, "Website and app on
+separate origins".
+
 ### Postgres major upgrades
 
 A Postgres major release cannot read the previous major's data directory. Since
@@ -641,8 +696,9 @@ session object as `signInAs()` (`s.me`, `s.cookie`, `s.csrf`, `s.api()`), plus
   first sign-in Keycloak's first-broker-login "review profile" page asks for an email;
   the script fills in the sign-in name, as a person would. Adding the mail attribute (or
   the `email` optional claim) in the tenant removes that page.
-- `task dev:gateway` does not set `CT_WEB_URL`, so after the callback the browser lands on
-  `http://localhost:8787/` (a 404 JSON page); the script treats that as done and opens
+- `task dev:gateway` sets `CT_WEB_URL=http://localhost:5173`, so after the callback the
+  browser lands on the app; a gateway started without it lands on
+  `http://localhost:8787/` (a 404 JSON page). The script treats either as done and opens
   `--web` for the screenshot (the cookie is host-scoped, so it works on both ports).
 - Signing in writes the usual `auth.login` audit row and updates the user's
   `last_login_at`; it changes nothing else.
@@ -756,7 +812,7 @@ Setup (as `ubuntu`):
    was full within minutes of the first image builds. Stop docker and containerd, rsync
    to `/var/lib/docker/ct-containerd`, bind-mount it on `/var/lib/containerd` (fstab) and add a
    containerd drop-in with `RequiresMountsFor=/var/lib/containerd /var/lib/docker`.
-3. `tools/verify-vm/toolchain.sh`: Go 1.27.2 (sha256 from go.dev), Node 22.23.1 (SHASUMS256),
+3. `tools/verify-vm/toolchain.sh`: Go 1.27.3 (sha256 from go.dev), Node 22.23.1 (SHASUMS256),
    pnpm 9.15.9, kubectl v1.37.1 (dl.k8s.io sha256), helm v4.3.0 (sha256 from `versions.env`),
    tmux, rsync, sysstat and **bzip2** (`build.sh kubeadm-full` unpacks the gVisor tarball on
    the host; WSL had it). Then `deploy/scripts/install-tools.sh` (kind, task, vcluster,

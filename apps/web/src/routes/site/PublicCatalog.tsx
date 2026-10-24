@@ -10,7 +10,7 @@ import { alignLabel, Disclaimer, ExamDomainIcon, examDomainLabel } from '@/compo
 import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Segmented } from '@/components/ui';
 import { catalogRoute } from '@/router';
 import { cn, formatMinutes, titleCase } from '@/lib/utils';
-import { useDocumentTitle } from '@/site/util';
+import { SignInLink, useDocumentTitle } from '@/site/util';
 
 const DIFFS: Difficulty[] = ['easy', 'medium', 'hard'];
 const DURATIONS = [20, 30, 45];
@@ -56,7 +56,7 @@ export function PublicCatalog() {
   if (site.data && site.data.flags.showCatalog === false) {
     return (
       <div className="site-container site-section">
-        <EmptyState icon={<Lock size={20} />} title="The catalog is not public on this site" description="Sign in to browse the labs your organisation has enabled." action={<Link to="/sign-in" search={{ returnTo: '/catalog' }} className="btn btn-primary btn-md">Sign in</Link>} />
+        <EmptyState icon={<Lock size={20} />} title="The catalog is not public on this site" description="Sign in to browse the labs your organisation has enabled." action={<SignInLink returnTo="/catalog" className="btn btn-primary btn-md">Sign in</SignInLink>} />
       </div>
     );
   }
@@ -390,9 +390,9 @@ export function StartLab({ labId, size = 'sm' }: { labId: string; size?: 'sm' | 
     );
   }
   return (
-    <Link to="/sign-in" search={{ returnTo: `/labs/${labId}` }} className={`btn btn-secondary btn-${size}`} title="Sign in to start this lab">
+    <SignInLink returnTo={`/labs/${labId}`} className={`btn btn-secondary btn-${size}`} title="Sign in to start this lab">
       <Lock size={11} aria-hidden /> Start lab
-    </Link>
+    </SignInLink>
   );
 }
 

@@ -213,7 +213,8 @@ task dev:up              # kind + KubeVirt + CDI + Kube-OVN + Multus (heals expi
 task dev:deps            # Postgres, Keycloak (realms, orgs, IdPs), Mailpit; migrate + seed
 task dev:orchestrator    # lab orchestrator in the cluster
 task dev:gateway         # gateway on :8787
-task dev:web             # web app in real mode on :5173
+task dev:web             # the app in real mode on :5173
+task dev:site            # the public website on :6969 (sign-in hands over to :5173)
 ```
 
 Prove a lab works:

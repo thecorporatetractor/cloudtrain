@@ -1,9 +1,10 @@
 import { Link } from '@tanstack/react-router';
 import { BarChart3, Boxes, Building2, Check, Cloud, Eye, Flag, GraduationCap, Layers, Lock, Network, Route, Server, Shield, Sparkles, Target, TerminalSquare, Timer, UserRound, Users, type LucideProps } from 'lucide-react';
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, type CSSProperties, type ReactNode } from 'react';
 import { isInternalHref } from '@/api/public';
 import type { SiteFeatureIcon, SiteFigure, SiteLink } from '@/api/types';
 import { useBrandName } from '@/components/brand';
+import { hrefFor, signInHref, surfaceConfig } from '@/lib/surface';
 import { useTheme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 
@@ -19,8 +20,20 @@ export function useDocumentTitle(page?: string) {
   }, [page, brand]);
 }
 
-/** A configured link: an in-app `<Link>` for paths, `<a>` for URLs (new tab for http(s) unless told otherwise). */
+/**
+ * A configured link: an in-app `<Link>` for paths, `<a>` for URLs (new tab for http(s)
+ * unless told otherwise). A path served by the other origin (the app's `/sign-in` on the
+ * website, a website page in the app; src/lib/surface.ts) is a plain link to that origin.
+ */
 export function SiteAnchor({ to, external, className, children, ...rest }: { to: string; external?: boolean; className?: string; children: ReactNode; 'aria-label'?: string; 'aria-current'?: 'page' | 'location'; onClick?: () => void }) {
+  const cross = isInternalHref(to) ? hrefFor(surfaceConfig, to) : to;
+  if (cross !== to) {
+    return (
+      <a href={cross} className={className} {...rest}>
+        {children}
+      </a>
+    );
+  }
   if (isInternalHref(to)) {
     const [path, hash] = to.split('#');
     return (
@@ -29,11 +42,33 @@ export function SiteAnchor({ to, external, className, children, ...rest }: { to:
       </Link>
     );
   }
-  const newTab = external ?? /^https?:/.test(to);
+  // The app's and the website's own origins open in the same tab, like any internal link.
+  const own = [surfaceConfig.appUrl, surfaceConfig.siteUrl].some((o) => o && (to === o || to.startsWith(`${o}/`)));
+  const newTab = external ?? (!own && /^https?:/.test(to));
   return (
     <a href={to} className={className} {...(newTab ? { target: '_blank', rel: 'noopener noreferrer' } : {})} {...rest}>
       {children}
     </a>
+  );
+}
+
+/**
+ * "Sign in" from the website: the app's sign-in page, on the app origin when the two are
+ * split (src/lib/surface.ts), coming back to `returnTo` when it is an app page.
+ */
+export function SignInLink({ returnTo, className, title, style, children }: { returnTo?: string; className?: string; title?: string; style?: CSSProperties; children: ReactNode }) {
+  const href = signInHref(surfaceConfig, returnTo);
+  if (!href.startsWith('/')) {
+    return (
+      <a href={href} className={className} title={title} style={style}>
+        {children}
+      </a>
+    );
+  }
+  return (
+    <Link to="/sign-in" search={returnTo ? { returnTo } : {}} className={className} title={title} style={style}>
+      {children}
+    </Link>
   );
 }
 
