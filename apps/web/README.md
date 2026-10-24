@@ -24,6 +24,12 @@ Reference: `docs/website.md`.
 | mock (default) | `pnpm --filter web dev` or `task dev:web:mock` | Everything runs in the browser (MSW); no backend or cluster. A first visit is signed out and shows the public website; the landing page offers the sample personas, and a **persona switcher** in the navigation footer switches between them (two fictional organisations with people in every role). |
 | real | `VITE_API_MODE=real`, i.e. `task dev:web` | Vite proxies `/api`, including the terminal and observe WebSockets, to `services/gateway` (`CT_GATEWAY_URL`, default `http://127.0.0.1:8787`). Identity, assignments, teams, cohorts, admin and platform calls go to the gateway endpoints in `docs/api/platform.md`; Home and skill states are the gateway's learner model; only Scenario Studio stays in MSW (no backend yet), whose worker registers when a Studio route first loads, so no service worker sits in front of the website. |
 
+The website and the app run on separate origins in real mode, as in production (apex
+and `app.` subdomain): `task dev:site` serves the website on :6969 and `task dev:web` the
+app on :5173; each redirects the other's paths (`src/lib/surface.ts`,
+docs/dev-environment.md "Website and app on two origins"). Mock mode keeps both on one
+origin.
+
 Real mode needs the stack: `task dev:orchestrator`, `task dev:gateway`, `task dev:web`
 (see `services/gateway/README.md`). In the workspace the terminals wait behind an
 environment panel (per-node progress, or the failure reason) until the session is

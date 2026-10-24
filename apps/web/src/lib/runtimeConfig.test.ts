@@ -6,7 +6,7 @@ const split = parseRuntimeConfig({ apiBase: 'https://api.labs.example.com/', env
 
 describe('runtime config', () => {
   it('defaults to the page origin', () => {
-    expect(same).toEqual({ apiBase: '', environment: '' });
+    expect(same).toEqual({ apiBase: '', environment: '', siteUrl: '', appUrl: '', surface: '' });
     expect(apiUrl('/api/me', same)).toBe('/api/me');
     expect(wsUrl('/api/sessions/s1/terminal?x=1', { protocol: 'https:', host: 'labs.example.com' }, same)).toBe('wss://labs.example.com/api/sessions/s1/terminal?x=1');
     expect(wsUrl('/api/t', { protocol: 'http:', host: '127.0.0.1:5173' }, same)).toBe('ws://127.0.0.1:5173/api/t');
@@ -15,7 +15,7 @@ describe('runtime config', () => {
   });
 
   it('prefixes gateway paths with a separate API origin', () => {
-    expect(split).toEqual({ apiBase: 'https://api.labs.example.com', environment: 'staging' });
+    expect(split).toMatchObject({ apiBase: 'https://api.labs.example.com', environment: 'staging' });
     expect(apiUrl('/api/me', split)).toBe('https://api.labs.example.com/api/me');
     expect(apiUrl('/assets/x.js', split)).toBe('/assets/x.js');
     expect(wsUrl('/api/t', { protocol: 'http:', host: 'x' }, split)).toBe('wss://api.labs.example.com/api/t');
@@ -26,9 +26,15 @@ describe('runtime config', () => {
   it('ignores invalid values instead of breaking the page', () => {
     expect(parseRuntimeConfig({ apiBase: 'javascript:alert(1)' }).apiBase).toBe('');
     expect(parseRuntimeConfig({ apiBase: 'not a url' }).apiBase).toBe('');
-    expect(parseRuntimeConfig({ apiBase: 42, environment: {} })).toEqual({ apiBase: '', environment: '' });
-    expect(parseRuntimeConfig('x')).toEqual({ apiBase: '', environment: '' });
+    expect(parseRuntimeConfig({ apiBase: 42, environment: {} })).toMatchObject({ apiBase: '', environment: '' });
+    expect(parseRuntimeConfig('x')).toMatchObject({ apiBase: '', environment: '' });
+    expect(parseRuntimeConfig({ siteUrl: 'ftp://x', appUrl: 'nope', surface: 'admin' })).toMatchObject({ siteUrl: '', appUrl: '', surface: '' });
     // A path is dropped: the gateway always serves /api at the root of its origin.
     expect(parseRuntimeConfig({ apiBase: 'https://h.example.com/prefix' }).apiBase).toBe('https://h.example.com');
+  });
+
+  it('reads the website and app origins, runtime values first, build-time values as fallback', () => {
+    const c = parseRuntimeConfig({ siteUrl: 'https://cloudtrain.com/', appUrl: '', surface: 'site' }, { appUrl: 'https://app.cloudtrain.com', siteUrl: 'https://old.example.com', surface: 'app', apiBase: 'https://api.cloudtrain.com' });
+    expect(c).toEqual({ apiBase: 'https://api.cloudtrain.com', environment: '', siteUrl: 'https://cloudtrain.com', appUrl: 'https://app.cloudtrain.com', surface: 'site' });
   });
 });

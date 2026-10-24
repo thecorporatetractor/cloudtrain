@@ -7,8 +7,9 @@
 //   --api-base  Origin of the gateway the waitlist form posts to (env CT_API_BASE).
 //               Empty: same origin as the site (a reverse proxy routes /api).
 //               The gateway must list the site's origin in CT_CORS_ORIGINS.
-//   --app-url   Origin of the platform for "Sign in" (env CT_APP_URL). Empty: the
-//               site has no sign-in button and /sign-in explains itself.
+//   --app-url   Origin of the platform (env CT_APP_URL), e.g. https://app.example.com:
+//               "Sign in", plan buttons and every app path go there (src/lib/surface.ts).
+//               Empty: the site has no sign-in button and /sign-in explains itself.
 //   --pricing   Keep the pricing page (its plan buttons need the platform).
 //   --launch    Override content/site.yaml `launch.mode` (env CT_LAUNCH_MODE):
 //               coming-soon (one standalone landing, no sign-in) or live.
@@ -138,7 +139,7 @@ try {
   console.log('3/3 adding data and host files');
   await cp(path.join(data, 'data'), path.join(out, 'data'), { recursive: true });
   await rm(path.join(out, 'mockServiceWorker.js'), { force: true });
-  await writeFile(path.join(out, 'runtime-config.js'), runtimeConfigJs(apiBase));
+  await writeFile(path.join(out, 'runtime-config.js'), runtimeConfigJs(apiBase, 'website', appUrl));
 
   // The head of index.html: what link previews and search results show for this deployment.
   const site = JSON.parse(await readFile(path.join(out, 'data', 'site.json'), 'utf8'));

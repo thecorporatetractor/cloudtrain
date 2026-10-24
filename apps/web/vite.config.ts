@@ -6,8 +6,12 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const real = (env.VITE_API_MODE ?? process.env.VITE_API_MODE) === 'real';
   const gateway = env.CT_GATEWAY_URL ?? 'http://127.0.0.1:8787';
+  // `task dev:site` and `task dev:web` run two dev servers from this directory at once:
+  // each keeps its own dependency pre-bundle cache so they never rewrite each other's.
+  const surface = env.VITE_SURFACE ?? process.env.VITE_SURFACE;
   return {
     plugins: [react()],
+    ...(surface === 'site' ? { cacheDir: 'node_modules/.vite-site' } : {}),
     resolve: {
       alias: {
         '@': fileURLToPath(new URL('./src', import.meta.url)),

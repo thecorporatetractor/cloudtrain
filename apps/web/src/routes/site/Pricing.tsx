@@ -9,7 +9,7 @@ import { ENTITLEMENT_ROWS, entitlementSummary, formatAmount, perMonth, priceFor,
 import { earlyAccessFor as earlyAccess } from '@/lib/pricingModel';
 import { cn } from '@/lib/utils';
 import { PricingExplained } from '@/site/ComingSoon';
-import { SiteAnchor, useDocumentTitle } from '@/site/util';
+import { SignInLink, SiteAnchor, useDocumentTitle } from '@/site/util';
 import { Cta } from './Landing';
 
 /**
@@ -286,9 +286,9 @@ export function PlanCta({ plan, interval, site, size = 'md' }: { plan: SitePlan;
       );
     }
     return (
-      <Link to="/sign-in" search={{ returnTo: target }} className={cls}>
+      <SignInLink returnTo={target} className={cls}>
         <LogIn size={13} aria-hidden /> {plan.cta.label}
-      </Link>
+      </SignInLink>
     );
   }
   if (action === 'signin') {
@@ -300,9 +300,9 @@ export function PlanCta({ plan, interval, site, size = 'md' }: { plan: SitePlan;
       );
     }
     return (
-      <Link to="/sign-in" className={cls}>
+      <SignInLink className={cls}>
         <LogIn size={13} aria-hidden /> {plan.cta.label}
-      </Link>
+      </SignInLink>
     );
   }
   return (

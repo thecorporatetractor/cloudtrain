@@ -7,8 +7,10 @@ with it.
 For `cloudtrain.app` on one small VM (Caddy, the gateway for the waitlist, Postgres), see
 [deploy-site-vm.md](deploy-site-vm.md). Mail for the domain: [email.md](email.md).
 
-**Status: undecided.** Which host serves the site and under which domain is the
-owner's decision, and it is still pending. Nothing in this repository creates an
+**Status: decided.** The website goes on the apex domain (`cloudtrain.app`) and the platform
+on `app.cloudtrain.app` (see "Website and app on separate origins" below; locally
+`task dev:site` on :6969 and `task dev:web` on :5173). The coming-soon site runs on one small
+VM ([deploy-site-vm.md](deploy-site-vm.md)); the hosts below remain alternatives. Nothing in this repository creates an
 account, buys or points a domain, or turns on a hosting service (GitHub Pages is not
 enabled). This page describes what is ready, so the decision can be made and carried
 out in an afternoon.
@@ -27,7 +29,7 @@ pnpm --filter web build:site -- --api-base https://api.cloudtrain.example
 |---|---|
 | `--out <dir>` | Output directory (default `dist-site`, relative to where you run it) |
 | `--api-base <origin>` (`CT_API_BASE`) | The gateway the waitlist form posts to, e.g. `https://api.cloudtrain.example`. Empty: the site's own origin, for a host that proxies `/api` to the gateway |
-| `--app-url <origin>` (`CT_APP_URL`) | Where the platform lives. Set: "Sign in" and `/sign-in` hand over to `<origin>/sign-in`. Empty: no sign-in button, and `/sign-in` explains that the platform is not open to the public |
+| `--app-url <origin>` (`CT_APP_URL`) | Where the platform lives, e.g. `https://app.cloudtrain.com`. Set: "Sign in", the plan buttons and every app path (`/sign-in`, `/labs/...`, unknown paths) go to that origin; it is written into `runtime-config.js` (`appUrl`), so it can be changed on the host without a rebuild. Empty: no sign-in button, and `/sign-in` explains that the platform is not open to the public |
 | `--pricing` | Keep the pricing page. Off by default: its plan buttons lead into the platform, which a static host does not have |
 | `--launch <mode>` (`CT_LAUNCH_MODE`) | `coming-soon` or `live`; overrides `launch.mode` in the site configuration (which ships as `coming-soon`) |
 | `--site-url <origin>` (`CT_SITE_URL`) | The site's own origin, e.g. `https://cloudtrain.example`. Makes the Open Graph and Twitter image and URL absolute (scrapers need that), adds the canonical link, writes `sitemap.xml` and names it in `robots.txt`. Empty: none of these |
@@ -211,14 +213,153 @@ marketing site and the platform share one deployment, one release cadence and on
 failure domain. This is the default today, and the right choice until the owner picks a
 separate host.
 
+## Website and app on separate origins
+
+The production shape: the public website on the apex, the platform on a subdomain.
+
+| | Origin | Served by | What it serves |
+|---|---|---|---|
+| Website | `https://cloudtrain.com` | the static build (`build:site`) on a static host, or the `web` image | `/`, `/catalog`, `/catalog/paths/*`, `/catalog/exams/*`, `/pricing`, `/about`, `/faq`, `/contact`, `/legal/*` |
+| App | `https://app.cloudtrain.com` | the Helm chart (`host: app.cloudtrain.com`): `web` pods for pages, the gateway for `/api` | everything else, including `/sign-in` |
+| API | `https://app.cloudtrain.com/api` | the gateway, behind the same Ingress | the app same-origin; the website cross-origin (CORS) |
+
+### How the split works
+
+One bundle serves both. Each origin knows which "surface" it is (`apps/web/src/lib/surface.ts`)
+from its runtime configuration: `siteUrl`, `appUrl` and `surface` in `runtime-config.js`
+(the `web` image renders them from `CT_SITE_URL`, `CT_APP_URL`, `CT_SURFACE`; the static
+build writes `appUrl` and `surface: "site"`), falling back to the build-time
+`VITE_SITE_URL`, `VITE_APP_URL`, `VITE_SURFACE`. No host name is compiled in.
+
+- **On the website**, a path that belongs to the app leaves for the same path on the app
+  origin, query and hash kept, before anything renders (the router's root `beforeLoad`;
+  hovering a link never navigates). Links that lead into the app are plain links to the
+  app origin: "Sign in" (`/sign-in`, with `returnTo` only when it is an app page),
+  "Start lab", "Sign in to attempt", the plan buttons (`/account/billing?plan=...` or
+  `/admin/billing?plan=...` after sign-in) and configured links in `site.yaml`. The
+  website has no session: it never calls `/api/me`, sends no cookie and always shows
+  "Sign in"; a visitor who is already signed in lands on the dashboard straight away,
+  because the app's sign-in page forwards a signed-in browser.
+- **In the app**, website paths leave for the website origin the same way. The sign-in
+  page's logo and "Back to the website" lead to the website. Inside the signed-in app the
+  sidebar logo stays the dashboard (Home is the app's own start page).
+- **The hybrid paths `/` and `/catalog`**: on the website they are always the landing
+  page and the public catalog; in the app they are always the learner's Home and the full
+  catalog, which need a session like every other app page (a visitor at
+  `app.cloudtrain.com/` is sent to sign-in, not to the landing page). Only on a single
+  combined origin (mock mode, screenshots, a deployment that sets no `siteUrl`) are they
+  still hybrid: the website for visitors, the app once signed in.
+- Unknown paths on the website go to the app, which shows its "not found" page.
+- The redirects happen in the browser, after the page loads. A host that can redirect
+  on the server (a `_redirects` rule, an Ingress annotation) may add 301s for the same
+  paths; nothing depends on it.
+
+### DNS and TLS
+
+- `cloudtrain.com` (apex): the static host. The apex cannot be a CNAME, so use the host's
+  apex support (ALIAS/ANAME, CNAME flattening on Cloudflare, or the A/AAAA records it
+  publishes). `www.cloudtrain.com`: a CNAME to the same host, configured there to
+  redirect to the apex (one canonical origin; otherwise list `www` in the CORS origins
+  too).
+- `app.cloudtrain.com`: an A/AAAA or CNAME to the cluster's load balancer (the Ingress or
+  Gateway address).
+- The identity provider's host (e.g. `auth.cloudtrain.com` for Keycloak) as it is today.
+- TLS: the static host issues the apex (and `www`) certificate automatically; the chart
+  serves `app.` with `tls.mode` `certManager`, `secret` or `external` as for any
+  deployment (docs/deploy.md). No wildcard certificate is needed.
+
+### Gateway origin
+
+Recommended: **`/api` on `app.cloudtrain.com`**, which is what the chart does (one Ingress
+host, `/api` to the gateway, the rest to `web`). The app calls the API on its own origin
+(no CORS, the terminal WebSocket on the same host), and the gateway's `CT_PUBLIC_URL` and
+`CT_WEB_URL` are both `https://app.cloudtrain.com`. Build the website with
+`--api-base https://app.cloudtrain.com` so its public catalog data and waitlist form reach
+the gateway.
+
+A separate `api.cloudtrain.com` works too (it is same-site with `app.`, so the
+`SameSite=Lax` session cookie still flows), but costs more configuration: a second host
+routed to the gateway, `web.runtimeConfig.apiBase: https://api.cloudtrain.com`,
+`web.csp.connectSrc: "https://api.cloudtrain.com wss://api.cloudtrain.com"`,
+`CT_PUBLIC_URL=https://api.cloudtrain.com` (the OIDC redirect URI moves with it) and
+`app.cloudtrain.com` in `gateway.corsOrigins`. The chart derives one host, so this needs
+`gateway.extraEnv` and your own route for the API host.
+
+### CORS
+
+The website calls the gateway cross-origin: `GET /api/public/*` (the `web` image variant;
+the static build reads exported JSON instead) and `POST /api/public/waitlist`. The
+gateway must list the website origin in `CT_CORS_ORIGINS`: the chart adds
+`web.runtimeConfig.siteUrl` to it automatically (plus `gateway.corsOrigins`). The website
+sends no credentials, and the public endpoints need neither a cookie nor a CSRF token.
+The static site's CSP already allows `connect-src` to the `--api-base` origin.
+
+### Cookie domain
+
+None. The gateway's session cookie (`ct_session`) is host-only (no `Domain` attribute):
+`Secure`, `HttpOnly`, `SameSite=Lax`, on `app.cloudtrain.com`. Do not widen it to
+`.cloudtrain.com`: the website never needs the session, and a domain cookie would be sent
+to every subdomain, including a third-party static host on the apex.
+
+### OIDC redirect URIs
+
+The gateway is the OIDC client (BFF); only the app origin appears in the IdP:
+
+- **Keycloak** client `cloudtrain-gateway`: valid redirect URI
+  `https://app.cloudtrain.com/api/auth/callback`, valid post-logout redirect URIs
+  `https://app.cloudtrain.com/*`, web origins `+`. The back-channel logout URL is the
+  gateway's `https://app.cloudtrain.com/api/auth/backchannel-logout` (or its in-cluster
+  address). Nothing on the website origin.
+- **Entra ID** (and any other corporate IdP) is brokered by Keycloak: its app
+  registration's redirect URI is Keycloak's broker endpoint,
+  `https://<keycloak host>/realms/cloudtrain/broker/<alias>/endpoint`, which the split does
+  not change. Only if the gateway used Entra directly as its issuer
+  (`gateway.oidc.issuer` an Entra tenant) would the Entra registration need the Web
+  redirect URI `https://app.cloudtrain.com/api/auth/callback` and the front-channel logout
+  URL on the app.
+- The chart's NOTES print the redirect URI after install.
+
+### Stripe
+
+Checkout success and cancel URLs and the billing portal's return URL are built from the
+gateway's `CT_WEB_URL` (`/account/billing` or `/admin/billing`, `?checkout=success` or
+`cancelled`), so they point at the app; the chart sets `CT_WEB_URL` to
+`https://<host>` = `https://app.cloudtrain.com`. The webhook endpoint is
+`https://app.cloudtrain.com/api/billing/webhook` (docs/billing.md). The pricing page on
+the website only links into the app; it never talks to Stripe.
+
+### Putting it together
+
+```sh
+# The app: the chart with host app.cloudtrain.com and the website origin
+# (deploy/charts/cloudtrain/examples/values-split-site.yaml).
+helm upgrade --install cloudtrain deploy/charts/cloudtrain -n cloudtrain \
+  -f deploy/charts/cloudtrain/examples/values-split-site.yaml
+
+# The website: the static build, pointing at the app for sign-in and the API.
+pnpm --filter web build:site -- --app-url https://app.cloudtrain.com \
+  --api-base https://app.cloudtrain.com --pricing
+# then upload apps/web/dist-site/ to the apex host.
+```
+
+With `web.runtimeConfig.siteUrl` set, the chart renders `CT_SITE_URL`, `CT_APP_URL`
+(`https://<host>`) and `CT_SURFACE=app` for the `web` pods and adds the website origin to
+the gateway's `CT_CORS_ORIGINS`. To serve the website from the `web` image instead of a
+static host, run a second `web` Deployment for the apex with `CT_SURFACE=site`,
+`CT_SITE_URL`, `CT_APP_URL` and `CT_API_BASE=https://app.cloudtrain.com` (the chart does
+not create it).
+
+Locally the same shape is `task dev:site` (:6969) and `task dev:web` (:5173), see
+docs/dev-environment.md "Website and app on two origins".
+
 ## Decisions for the owner
 
 1. The host: one of the three above, or keep the site on the platform.
 2. The domain, and who controls its DNS. Not bought, not configured.
 3. The API origin for the waitlist (a gateway host name reachable from the public
    internet) and whether `CT_CORS_ORIGINS` may include the site's origin.
-4. Whether "Sign in" on the marketing site leads to the platform (`--app-url`) or the
-   platform stays closed for now.
+4. Whether "Sign in" on the marketing site leads to the platform (`--app-url
+   https://app.<domain>`, the planned shape) or the platform stays closed for now.
 5. Whether the pricing page is shown (`--pricing`); its prices are placeholders.
 6. When to switch from coming soon to live (`launch.mode`).
 

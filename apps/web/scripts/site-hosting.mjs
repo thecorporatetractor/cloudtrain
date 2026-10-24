@@ -17,9 +17,12 @@ export function originOf(value, name) {
   return u.origin;
 }
 
-/** runtime-config.js: the API origin the waitlist form posts to (src/lib/runtimeConfig.ts). */
-export function runtimeConfigJs(apiBase, environment = 'website') {
-  return `// Rendered by apps/web/scripts/build-site.mjs. Edit apiBase to repoint the waitlist form without rebuilding.\nwindow.__CLOUDTRAIN_CONFIG__ = ${JSON.stringify({ apiBase, environment })};\n`;
+/**
+ * runtime-config.js (src/lib/runtimeConfig.ts): the API origin the waitlist form posts to
+ * and the app's origin, where "Sign in" and every app path go (src/lib/surface.ts).
+ */
+export function runtimeConfigJs(apiBase, environment = 'website', appUrl = '') {
+  return `// Rendered by apps/web/scripts/build-site.mjs. Edit apiBase (the waitlist form) or appUrl (sign-in) without rebuilding.\nwindow.__CLOUDTRAIN_CONFIG__ = ${JSON.stringify({ apiBase, environment, appUrl, surface: 'site' })};\n`;
 }
 
 /** Content-Security-Policy of the static site: the only cross-origin call is the waitlist POST to the API origin. */

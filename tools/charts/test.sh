@@ -42,6 +42,17 @@ check "in-cluster ServiceAccount auth" q 'select(.kind == "Deployment" and .meta
 check "ingress /api -> gateway" q 'select(.kind == "Ingress") | .spec.rules[0].http.paths[] | select(.path == "/api") | .backend.service.name == "ct-cloudtrain-gateway"' "$OUT/values-nginx.yaml"
 check "ingress / -> web" q 'select(.kind == "Ingress") | .spec.rules[0].http.paths[] | select(.path == "/") | .backend.service.name == "ct-cloudtrain-web"' "$OUT/values-nginx.yaml"
 check "ingress TLS secret" q 'select(.kind == "Ingress") | .spec.tls[0].secretName == "cloudtrain-tls"' "$OUT/values-nginx.yaml"
+
+# Website on the apex, app on a subdomain (web.runtimeConfig.siteUrl): the web pods are
+# the app surface, the gateway allows the website origin and returns to the app.
+envv() { printf 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-%s") | .spec.template.spec.containers[0].env[] | select(.name == "%s") | .value == "%s"' "$1" "$2" "$3"; }
+check "split: web surface app" q "$(envv web CT_SURFACE app)" "$OUT/values-split-site.yaml"
+check "split: web site URL" q "$(envv web CT_SITE_URL https://cloudtrain.example)" "$OUT/values-split-site.yaml"
+check "split: web app URL" q "$(envv web CT_APP_URL https://app.cloudtrain.example)" "$OUT/values-split-site.yaml"
+check "split: gateway CORS allows the website" q "$(envv gateway CT_CORS_ORIGINS https://cloudtrain.example)" "$OUT/values-split-site.yaml"
+check "split: gateway returns to the app" q "$(envv gateway CT_WEB_URL https://app.cloudtrain.example)" "$OUT/values-split-site.yaml"
+check "single origin: no surface" q "$(envv web CT_SURFACE '')" "$OUT/values-nginx.yaml"
+check "single origin: no CORS" bash -c "! yq -e 'select(.kind == \"Deployment\") | .spec.template.spec.containers[0].env[] | select(.name == \"CT_CORS_ORIGINS\")' '$OUT/values-nginx.yaml'"
 check "external TLS: no tls block" q 'select(.kind == "Ingress") | .spec.tls == null' "$OUT/values-eks-alb.yaml"
 check "certManager: Certificate for host" q 'select(.kind == "Certificate") | .spec.dnsNames[0] == "labs.example.com"' "$OUT/values-aks-app-routing.yaml"
 check "gatewayAPI: HTTPRoute on shared parent, no Ingress" bash -c "yq -e 'select(.kind == \"HTTPRoute\") | .spec.parentRefs[0].name == \"eg\"' '$OUT/values-envoy-gateway.yaml' && ! grep -q '^kind: Ingress' '$OUT/values-envoy-gateway.yaml'"

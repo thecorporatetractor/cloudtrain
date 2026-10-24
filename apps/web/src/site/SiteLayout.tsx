@@ -8,12 +8,12 @@ import type { SiteConfig } from '@/api/types';
 import { BrandLockup, BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Dropdown, Tooltip } from '@/components/ui';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
-import { APP_URL, STATIC_SITE } from '@/lib/siteMode';
+import { ON_SITE, surfaceConfig } from '@/lib/surface';
 import { cn } from '@/lib/utils';
 import { ComingSoon } from './ComingSoon';
 import { ComingSoonChrome } from './ComingSoonChrome';
 import { isComingSoon, keepsOwnPage, launchKnown } from './launch';
-import { linkKey, SiteAnchor } from './util';
+import { linkKey, SignInLink, SiteAnchor } from './util';
 
 
 
@@ -143,8 +143,8 @@ export function SiteLayout({ children }: { children: ReactNode }) {
 export function SessionButton({ size = 'md', className }: { size?: 'sm' | 'md' | 'lg'; className?: string }) {
   const me = useMe();
   const location = useRouterState({ select: (s) => s.location });
-  // The static website build has no platform behind it unless VITE_APP_URL names one.
-  if (STATIC_SITE && !APP_URL) return null;
+  // The website origin has no platform behind it unless the app's origin is configured.
+  if (ON_SITE && !surfaceConfig.appUrl) return null;
   if (me.isSuccess) {
     return (
       <Link to="/" className={cn('btn btn-primary', `btn-${size}`, className)}>
@@ -154,9 +154,9 @@ export function SessionButton({ size = 'md', className }: { size?: 'sm' | 'md' |
   }
   const here = location.pathname + location.searchStr;
   return (
-    <Link to="/sign-in" search={here !== '/' ? { returnTo: here } : {}} className={cn('btn btn-primary', `btn-${size}`, className)}>
+    <SignInLink returnTo={here !== '/' ? here : undefined} className={cn('btn btn-primary', `btn-${size}`, className)}>
       <LogIn size={14} aria-hidden /> Sign in
-    </Link>
+    </SignInLink>
   );
 }
 
@@ -330,12 +330,12 @@ function SiteFooter() {
             © {year} {site?.brand.legalName ?? brand}
           </span>
           <span className="site-footer-legal">
-            <Link to="/legal/terms" className="site-footer-link">
+            <SiteAnchor to="/legal/terms" className="site-footer-link">
               Terms
-            </Link>
-            <Link to="/legal/privacy" className="site-footer-link">
+            </SiteAnchor>
+            <SiteAnchor to="/legal/privacy" className="site-footer-link">
               Privacy
-            </Link>
+            </SiteAnchor>
           </span>
         </div>
       </div>

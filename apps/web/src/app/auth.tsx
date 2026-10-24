@@ -3,24 +3,22 @@ import { useNavigate, useRouterState } from '@tanstack/react-router';
 import { useEffect, useRef, type ReactNode } from 'react';
 import { ApiError, UNAUTHENTICATED_EVENT, useMe } from '@/api/client';
 import { PageSkeleton } from '@/components/ui';
+import { HYBRID_PATHS, isHybridRoute, isSiteOnlyPath, ON_APP, PUBLIC_PATHS, SITE_PATHS } from '@/lib/surface';
 
-/** Routes that render without a session and without any chrome (the sign-in card). */
-export const PUBLIC_PATHS = ['/sign-in'];
+export { HYBRID_PATHS, PUBLIC_PATHS, SITE_PATHS };
+
+export const isPublicPath = (pathname: string) => PUBLIC_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 /**
  * The public website: rendered in the site layout (header, footer) with or without a
  * session. Signed-in visitors see "Go to dashboard" instead of "Sign in".
  */
-export const SITE_PATHS = ['/catalog/paths', '/catalog/exams', '/pricing', '/about', '/faq', '/contact', '/legal'];
+export const isSitePath = isSiteOnlyPath;
 /**
- * Routes that are the website for visitors and the app for signed-in users: `/` is
- * the landing page or the learner's Home, `/catalog` the public or the full catalog.
+ * `/` and `/catalog`: the website for visitors and the app for signed-in users, on one
+ * combined origin. On the app origin of a split deployment they are plain app pages
+ * that need a session (src/lib/surface.ts).
  */
-export const HYBRID_PATHS = ['/', '/catalog'];
-
-const under = (pathname: string, prefixes: string[]) => prefixes.some((p) => pathname === p || pathname.startsWith(`${p}/`));
-export const isPublicPath = (pathname: string) => under(pathname, PUBLIC_PATHS);
-export const isSitePath = (pathname: string) => under(pathname, SITE_PATHS);
-export const isHybridPath = (pathname: string) => HYBRID_PATHS.includes(pathname);
+export const isHybridPath = (pathname: string) => !ON_APP && isHybridRoute(pathname);
 /** No session needed to render this path (sign-in, website and hybrid pages). */
 export const isOpenPath = (pathname: string) => isPublicPath(pathname) || isSitePath(pathname) || isHybridPath(pathname);
 
