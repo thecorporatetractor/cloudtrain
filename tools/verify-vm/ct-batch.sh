@@ -240,7 +240,7 @@ sync_repo() {
   if [[ $old != "$new" || ! -x $REPO/services/lab-orchestrator/bin/labctl ]]; then
     log "repo ${old:0:9} -> ${new:0:9}"
     (cd "$REPO" && pnpm install --frozen-lockfile && pnpm --filter @cloudtrain/lab-schema build \
-      && GOTOOLCHAIN=go1.27.2 go build -o services/lab-orchestrator/bin/labctl ./services/lab-orchestrator/cmd/labctl) \
+      && GOTOOLCHAIN=go1.27.3 go build -o services/lab-orchestrator/bin/labctl ./services/lab-orchestrator/cmd/labctl) \
       >>"$RES/state/build.log" 2>&1 || { log "labctl build failed (state/build.log)"; return 1; }
     local imgs
     imgs=$(git -C "$REPO" diff --name-only "$old" "$new" -- tools/images tools/mirrors deploy/versions.env deploy/images | head -50)

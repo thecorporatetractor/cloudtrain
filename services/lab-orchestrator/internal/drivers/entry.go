@@ -233,12 +233,16 @@ func buildTar(files []tarFile) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// sshConfig renders an ssh client config for the session's hosts. UpdateHostKeys
+// no: known_hosts pins each host's key, and a VM's sshd lists its ed25519 key
+// twice (graderDropIn), which the hostkeys extension reports on every login
+// as "received duplicated ssh-ed25519 host key".
 func sshConfig(hosts []HostAccess, user, identity, knownHosts string, batch bool) []byte {
 	var b strings.Builder
 	for _, h := range hosts {
 		fmt.Fprintf(&b, "Host %s\n  HostName %s\n", h.Name, h.IP)
 	}
-	fmt.Fprintf(&b, "Host *\n  User %s\n  IdentityFile %s\n  UserKnownHostsFile %s\n  StrictHostKeyChecking yes\n  ConnectTimeout 5\n  LogLevel ERROR\n", user, identity, knownHosts)
+	fmt.Fprintf(&b, "Host *\n  User %s\n  IdentityFile %s\n  UserKnownHostsFile %s\n  StrictHostKeyChecking yes\n  UpdateHostKeys no\n  ConnectTimeout 5\n  LogLevel ERROR\n", user, identity, knownHosts)
 	if batch {
 		b.WriteString("  BatchMode yes\n  ServerAliveInterval 10\n")
 	}

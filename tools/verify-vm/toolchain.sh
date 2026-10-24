@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Toolchain for the CloudTrain verify VM (run as ubuntu, uses sudo for /usr/local).
 set -euo pipefail
-GO_VERSION=1.27.2
+GO_VERSION=1.27.3
 NODE_VERSION=22.23.1
 PNPM_VERSION=9.15.9
 KUBECTL_VERSION=v1.37.1
@@ -48,6 +48,6 @@ sudo apt-get install -y -qq tmux rsync sysstat bzip2 build-essential >/dev/null
 go_bin=/usr/local/go/bin
 grep -q '/usr/local/go/bin' ~/.profile || cat >> ~/.profile <<'EOF'
 export PATH="$HOME/.local/bin:/usr/local/go/bin:$HOME/go/bin:$PATH"
-export GOTOOLCHAIN=go1.27.2
+export GOTOOLCHAIN=go1.27.3
 EOF
 echo "go $($go_bin/go version | awk '{print $3}') node $(node --version) pnpm $(pnpm --version) kubectl $KUBECTL_VERSION helm $(helm version --short)"

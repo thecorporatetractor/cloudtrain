@@ -57,6 +57,25 @@ rc=$?
 rm -f "$t"
 exit $rc`
 
+// kubeApplyScript is `kubectl apply -f -` ("$@" is the kubectl command
+// line) retried while the API server refuses a Pod because its namespace's
+// default ServiceAccount does not exist yet: a manifest that creates a
+// Namespace and a Pod in it races the ServiceAccount controller, which lags
+// on a loaded cluster. apply is idempotent, so the whole manifest is applied
+// again (up to about a minute).
+const kubeApplyScript = `d=$(mktemp -d) || exit 1
+cat > "$d/m"
+i=0
+while :; do
+  "$@" -f "$d/m" > "$d/o" 2> "$d/e"; rc=$?
+  i=$((i+1))
+  if [ $rc -ne 0 ] && [ $i -lt 30 ] && grep -q 'error looking up service account' "$d/e"; then sleep 2; continue; fi
+  break
+done
+cat "$d/o"; cat "$d/e" >&2
+rm -rf "$d"
+exit $rc`
+
 // execOnCluster runs req against a cluster node's API from the entry node:
 // admin with the cluster-admin kubeconfig in the admin sidecar, learner with
 // the learner's kubeconfig (context cluster.context). ExecKubeApply applies
@@ -68,7 +87,7 @@ func execOnCluster(ctx context.Context, c *ContainerDriver, ref NodeRef, req Exe
 	cmd := req.Command
 	switch req.Kind {
 	case ExecKubeApply:
-		cmd = []string{"kubectl", "apply", "-f", "-"}
+		cmd = []string{"/bin/sh", "-c", kubeApplyScript, "sh", "kubectl", "apply"}
 	case ExecShell, "":
 		if len(cmd) == 0 {
 			return ExecResult{}, fmt.Errorf("cluster %s: empty command", ref.Node.Name)
