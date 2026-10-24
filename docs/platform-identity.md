@@ -13,7 +13,7 @@ and web (`apps/web`) build against this document and the types in
   tenant table). A request can only ever see one org.
 - A user belongs to one or more orgs (`memberships`); the active org is chosen at
   login (identity-first by email domain) and switchable in the user menu.
-- **Platform** scope is outside any org (AzarGuard operators): orgs, capacity,
+- **Platform** scope is outside any org (CloudTrain operators): orgs, capacity,
   global content packs. Only `platform_admin` reaches it.
 
 ## Roles and permissions

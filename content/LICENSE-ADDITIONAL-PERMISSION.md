@@ -1,6 +1,6 @@
 # Additional permission for CloudTrain lab content
 
-> Draft for legal review. AzarGuard grants this permission as written for the
+> Draft for legal review. CloudTrain grants this permission as written for the
 > versions of the content that include this file; counsel may refine the
 > wording in later versions. This file is not legal advice.
 
@@ -13,7 +13,7 @@ license.
 Creative Commons licenses are non-exclusive, and a licensor may grant
 permissions beyond the license separately (CC BY-NC 4.0, Section 7(b): such
 arrangements "are separate from and independent of the terms and conditions of
-this Public License"; Creative Commons calls this "CC+"). AzarGuard, as
+this Public License"; Creative Commons calls this "CC+"). CloudTrain, as
 Licensor, grants the following additional permission.
 
 ## 1. Permission: training your own personnel
@@ -34,10 +34,10 @@ under common control with you.
   to anyone outside your organization for a fee or other commercial advantage
   (for example as a training provider, a consultancy, a reseller or a hosted
   service), whether you use CloudTrain or any other platform. That needs a
-  separate commercial license from AzarGuard.
+  separate commercial license from CloudTrain.
 - **Attribution.** When you Share the Licensed Material or Adapted Material
   (in the sense of CC BY-NC 4.0), the attribution conditions of Section 3 of
-  that license still apply: credit "CloudTrain by AzarGuard", link to the
+  that license still apply: credit "CloudTrain", link to the
   license, and indicate changes.
 - **Everything else** CC BY-NC 4.0 permits stays permitted, and everything it
   does not permit, beyond this file, stays reserved.
@@ -47,7 +47,7 @@ under common control with you.
 - This permission applies to the content only. The CloudTrain software is
   licensed separately under the Business Source License 1.1 (see the
   repository's `LICENSE`); its premium features need a license key.
-- Content used on AzarGuard's hosted service is covered by that service's
+- Content used on CloudTrain's hosted service is covered by that service's
   terms.
 - Exam and product names in the framework mappings are trademarks of their
   owners; this permission grants no rights in them.
