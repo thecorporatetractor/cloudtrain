@@ -11,6 +11,7 @@
 
 import type { Difficulty, Domain, FrameworkId } from './index.js';
 import type { ExamDomain, ExamRules, RetakePolicy, ExamAvailability, ExamObjectiveInfo } from './exam.js';
+import type { Feature } from './entitlements.js';
 
 /* ================================================================ site configuration */
 
@@ -122,6 +123,8 @@ export interface SitePlan {
   maxSeats?: number;
   placeholderPrices?: boolean;
   entitlements: PlanEntitlements;
+  /** Premium features the plan includes on the hosted edition (docs/licensing-keys.md). Organisation-scoped features come from the organisation's plan; person-scoped ones also from an individual plan. */
+  features?: Feature[];
   includes: string[];
   cta: { label: string; action: 'signin' | 'checkout' | 'contact'; to?: string };
 }

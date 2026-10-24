@@ -195,5 +195,8 @@ Terminating a live session from the admin Sessions view uses `POST /sessions/:id
 | `POST /platform/orgs/:id/reactivate` | | `PlatformOrg` | `org.manage` | `platform.org_reactivate` |
 | `DELETE /platform/orgs/:id` | | 204 (409 unless suspended) | `org.manage` | `platform.org_delete` |
 | `GET /platform/capacity` | | `Capacity` | `capacity.read` @ platform | |
+| `GET /platform/license` | | `LicenseStatus`: state, claims, seats, features (docs/licensing-keys.md) | `org.manage` @ platform | |
+| `PUT /platform/license` | `InstallLicenseRequest` | `LicenseStatus` (422 invalid, tampered or expired; 409 when the environment sets the license) | `org.manage` @ platform | history in `platform_licenses`, gateway log |
+| `DELETE /platform/license` | | `LicenseStatus` (community edition; nothing deleted) | `org.manage` @ platform | history in `platform_licenses`, gateway log |
 
 Platform audit rows are written into the affected org's audit log.

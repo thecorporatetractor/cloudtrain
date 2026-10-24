@@ -544,6 +544,16 @@ docker rm -f ct-pg17-dump
    `azarguard-entra` is in `CT_PLATFORM_IDPS` (default). The mapping code is the
    one `acme-idp` exercises today.
 
+### Premium features in dev (CT_DEV_LICENSE)
+
+Organisation SSO (Acme Freight via `acme-idp`, AzarGuard via Entra), audit export,
+advanced analytics, branding and several organisations are premium features
+(docs/licensing-keys.md). `task dev:gateway` sets `CT_DEV_LICENSE=1`: the gateway signs a
+development license with every feature using a key pair that exists only in that process,
+so the seeded orgs keep working without a real license. It is refused with
+`NODE_ENV=production` or a non-localhost URL. `CT_DEV_LICENSE=0 task dev:gateway` runs the
+community edition instead; a real `CT_LICENSE_KEY`/`CT_LICENSE_FILE` wins over it.
+
 ### Signing in as a real user (agents)
 
 Scripts can sign in as local Keycloak users with `deploy/scripts/platform-login.mjs`,

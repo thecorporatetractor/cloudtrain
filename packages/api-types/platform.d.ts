@@ -15,6 +15,7 @@
  */
 
 import type { Domain, FrameworkId, Learner, SessionPhase, SkillState } from './index.js';
+import type { EntitlementsView } from './entitlements.js';
 
 /* ================================================================ roles */
 
@@ -80,6 +81,10 @@ export type ErrorCode =
   | 'quota_exceeded'
   /** 402: billing refuses a lab start (`details`: `BillingBlockDetails`). */
   | 'payment_required'
+  /** 402: a premium feature the plan or license does not include (`details`: `FeatureRequiredDetails`). */
+  | 'feature_required'
+  /** 402: the self-hosted license covers fewer active members (`details`: `SeatsExceededDetails`). */
+  | 'seats_exceeded'
   | 'org_suspended'
   | 'deactivated'
   | 'upstream'
@@ -219,6 +224,8 @@ export interface Me extends Learner {
   auth: { method: 'oidc' | 'dev' | 'dev-impersonation'; idp?: string; sessionExpiresAt?: string; impersonated?: boolean };
   /** True while a platform admin acts inside an org through support access. */
   supportAccess?: { orgId: string; expiresAt: string };
+  /** Premium features in the active org (hosted plan or self-hosted license; docs/licensing-keys.md). Absent from older gateways: treat as everything allowed. */
+  entitlements?: EntitlementsView;
 }
 
 /**

@@ -18,6 +18,7 @@ import { createTestDb, type TestDb } from './pg.js';
 import { loadSiteConfig } from '../src/site/config.js';
 import path from 'node:path';
 import { PgWaitlistStore } from '../src/waitlist/store.js';
+import type { Entitlements } from '../src/entitlements/service.js';
 
 /** Test auth: the principal is loaded from the database for the user named in `x-test-user`. */
 export class HeaderAuthenticator implements Authenticator {
@@ -61,7 +62,7 @@ export const Q = {
   rhea: 'a1000000-0000-4000-8000-0000000000aa',
 };
 
-export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean; answerRatePerMinute?: number } = {}): Promise<Harness> {
+export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean; answerRatePerMinute?: number; entitlements?: (t: TestDb) => Entitlements } = {}): Promise<Harness> {
   const t = await createTestDb();
   const content = await realContent();
   await seed(t.owner, content, await readPeople(defaultPeopleFile(repo)));
@@ -75,6 +76,7 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
     cluster,
     mailer,
     store,
+    ...(opts.entitlements ? { entitlements: opts.entitlements(t) } : {}),
     config: { webUrl: 'http://web.test', publicUrl: 'http://gw.test', oidcClientId: 'cloudtrain-gateway', platformIdps: ['azarguard-entra', 'acme-idp'], devDomainVerifyBypass: true, kubeContext: 'test', namespace: 'ns1' },
   });
   const sessions = new SessionService(content, cluster, new FakeCompiler(), { validateTimeoutMs: 300, pollMs: 10, hooks: ps });

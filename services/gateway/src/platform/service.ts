@@ -38,6 +38,7 @@ import type { SessionStore } from '../oidc/sessions.js';
 import { phaseOf, revealedHints } from '../sessions/map.js';
 import { labelValue, type SessionHooks } from '../sessions/service.js';
 import { membershipsOf } from './identity.js';
+import { Entitlements } from '../entitlements/service.js';
 
 export interface PlatformConfig {
   webUrl: string;
@@ -57,6 +58,8 @@ export interface PlatformDeps {
   config: PlatformConfig;
   store?: SessionStore;
   kc?: KeycloakAdmin | null;
+  /** Premium features (src/entitlements). Omitted: every feature on (tests); main.ts always passes it. */
+  entitlements?: Entitlements;
   now?: () => Date;
   log?: { info(o: object, m?: string): void; warn(o: object, m?: string): void };
 }
@@ -105,6 +108,7 @@ export class PlatformService implements SessionHooks {
   readonly config: PlatformConfig;
   readonly store?: SessionStore;
   readonly kc: KeycloakAdmin | null;
+  readonly entitlements: Entitlements;
   readonly now: () => Date;
   readonly log?: PlatformDeps['log'];
 
@@ -116,6 +120,7 @@ export class PlatformService implements SessionHooks {
     this.config = d.config;
     if (d.store) this.store = d.store;
     this.kc = d.kc ?? null;
+    this.entitlements = d.entitlements ?? Entitlements.unrestricted();
     this.now = d.now ?? (() => new Date());
     this.log = d.log;
   }
@@ -374,6 +379,7 @@ export class PlatformService implements SessionHooks {
         ...(p.session?.expiresAt ? { sessionExpiresAt: p.session.expiresAt } : {}),
         ...(p.session?.impersonated ? { impersonated: true } : {}),
       },
+      entitlements: await this.entitlements.view(p),
     };
   }
 

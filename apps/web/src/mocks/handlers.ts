@@ -11,6 +11,7 @@ import { ctfHandlers } from './ctf';
 import { eventHandlers } from './events';
 import { publicHandlers } from './public';
 import { annotateLab, annotateLabs, billingHandlers, gateLabStart, meterEnd, meterStart } from './billing';
+import { licenseHandlers } from './license';
 import { newSession, sessions } from './sessionStore';
 
 /* ------------------------------------------------------------------ */
@@ -288,4 +289,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...publicHandlers, ...billingHandlers, ...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...eventHandlers, ...examHandlers, ...sampleOnlyHandlers];
+export const handlers = [...publicHandlers, ...billingHandlers, ...licenseHandlers, ...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...eventHandlers, ...examHandlers, ...sampleOnlyHandlers];

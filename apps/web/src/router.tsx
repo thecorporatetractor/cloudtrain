@@ -41,6 +41,7 @@ const PlatformLayout = lazyRouteComponent(() => import('./routes/platform/Platfo
 const PlatformOrgs = lazyRouteComponent(() => import('./routes/platform/Orgs'), 'PlatformOrgs');
 const PlatformCapacity = lazyRouteComponent(() => import('./routes/platform/Capacity'), 'PlatformCapacity');
 const PlatformContent = lazyRouteComponent(() => import('./routes/platform/Content'), 'PlatformContent');
+const PlatformLicense = lazyRouteComponent(() => import('./routes/platform/License'), 'PlatformLicense');
 const ExamDetail = lazyRouteComponent(() => import('./routes/exams/ExamDetail'), 'ExamDetail');
 const ExamWorkspace = lazyRouteComponent(() => import('./routes/exams/ExamWorkspace'), 'ExamWorkspace');
 const ExamResults = lazyRouteComponent(() => import('./routes/exams/ExamResults'), 'ExamResults');
@@ -361,6 +362,7 @@ export const platformOrgsRoute = createRoute({
 });
 export const platformCapacityRoute = createRoute({ getParentRoute: () => platformRoute, path: '/capacity', component: PlatformCapacity });
 export const platformContentRoute = createRoute({ getParentRoute: () => platformRoute, path: '/content', component: PlatformContent });
+export const platformLicenseRoute = createRoute({ getParentRoute: () => platformRoute, path: '/license', component: PlatformLicense });
 
 const routeTree = rootRoute.addChildren([
   homeRoute,
@@ -399,7 +401,7 @@ const routeTree = rootRoute.addChildren([
   cohortBoardRoute,
   observeRoute,
   adminRoute.addChildren([adminIndexRoute, adminUsersRoute, adminTeamsRoute, adminSsoRoute, adminContentRoute, adminSessionsRoute, adminUsageRoute, adminAuditRoute, adminSettingsRoute, adminBillingRoute]),
-  platformRoute.addChildren([platformOrgsRoute, platformCapacityRoute, platformContentRoute]),
+  platformRoute.addChildren([platformOrgsRoute, platformCapacityRoute, platformContentRoute, platformLicenseRoute]),
 ]);
 
 export const router = createRouter({

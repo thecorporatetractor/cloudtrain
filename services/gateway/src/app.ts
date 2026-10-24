@@ -20,6 +20,7 @@ import { registerDevImpersonation } from './routes/dev.js';
 import { registerPlatformRoutes } from './routes/platform.js';
 import { registerPublicRoutes } from './routes/public.js';
 import { registerBillingRoutes } from './billing/routes.js';
+import { registerLicenseRoutes } from './license/routes.js';
 import type { BillingService } from './billing/service.js';
 import type { WaitlistStore } from './waitlist/store.js';
 import { registerWaitlistRoutes } from './waitlist/routes.js';
@@ -303,6 +304,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (deps.events) registerEventRoutes(app, deps.events);
 
   if (ps) registerPlatformRoutes(app, ps, sessions, deps.clusterInfo ?? null);
+  if (ps) registerLicenseRoutes(app, ps.entitlements);
 
   /* ---------------------------------- public --------------------------------- */
 

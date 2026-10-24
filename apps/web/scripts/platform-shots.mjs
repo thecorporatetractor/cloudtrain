@@ -77,6 +77,15 @@ async function shot(page, name) {
   console.log('saved', `${name}.png`);
 }
 
+/** Mock license state (src/mocks/license.ts), then reload and wait for `text`. */
+function mockLicense(state, text) {
+  return async (page) => {
+    await page.evaluate((s) => localStorage.setItem('ct.mock.license', JSON.stringify({ state: s })), state);
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.getByText(text, { exact: false }).first().waitFor({ timeout: 15000 });
+  };
+}
+
 /** CTF lab: one wrong and one right answer, a computed number, a revealed hint on question 3 (mock answers). */
 async function ctfSteps(page, hint = true) {
   const answer = async (n, text) => {
@@ -226,6 +235,11 @@ const VIEWS = [
   ['platform-org', 'platform_admin', '/platform?org=org-quillmoor', 'Quotas'],
   ['platform-capacity', 'platform_admin', '/platform/capacity', 'Cluster nodes'],
   ['platform-content', 'platform_admin', '/platform/content', 'Global packs'],
+  // Self-hosted license (mock: a licensed deployment; ct.mock.license switches the state).
+  ['platform-license', 'platform_admin', '/platform/license', 'Premium features'],
+  ['platform-license-community', 'platform_admin', '/platform/license', 'Premium features', mockLicense('community', 'Install a license')],
+  ['platform-license-expiring', 'platform_admin', '/platform/license', 'Premium features', mockLicense('expiring', 'expires in')],
+  ['platform-license-expired', 'platform_admin', '/platform/license', 'Premium features', mockLicense('expired', 'grace period has ended')],
   // Below 1024px the sidebar is a drawer behind the menu button.
   ['home-phone', 'learner', '/', 'Assignments due', undefined, PHONE],
   ['nav-drawer-phone', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Open navigation' }).click(), await p.getByRole('dialog', { name: 'Navigation' }).waitFor()), PHONE],

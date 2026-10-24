@@ -7,6 +7,7 @@ import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
 import type { Me } from '@/api/types';
 import { BillingBanner } from '@/components/billing';
+import { LicenseBanner } from '@/components/license';
 import { Badge, Button, Dot, Dropdown, Kbd, Tooltip } from '@/components/ui';
 import { useHotkeys, type Hotkey } from '@/lib/hotkeys';
 import { COMPACT_NAV_QUERY, useMediaQuery } from '@/lib/media';
@@ -177,6 +178,7 @@ function ShellInner() {
 
         <main id="main" className="main" tabIndex={-1}>
           {!inWorkspace && <BillingBanner />}
+          {!inWorkspace && <LicenseBanner />}
           <Outlet />
         </main>
 
@@ -197,6 +199,7 @@ function ShellInner() {
 
       <main id="main" className="main" tabIndex={-1}>
         {!inWorkspace && <BillingBanner />}
+        {!inWorkspace && <LicenseBanner />}
         <Outlet />
       </main>
 

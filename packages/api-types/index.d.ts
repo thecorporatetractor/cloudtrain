@@ -471,3 +471,7 @@ export * from './public.js';
 // ---- Billing (Stripe, test mode, behind CT_BILLING_ENABLED) ----
 
 export * from './billing.js';
+
+// ---- Entitlements: premium features, plans and self-hosted license keys ----
+
+export * from './entitlements.js';

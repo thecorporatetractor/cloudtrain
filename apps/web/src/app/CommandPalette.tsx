@@ -24,6 +24,7 @@ const EXTRA: { to: string; label: string; keywords: string[] }[] = [
   { to: '/admin/audit', label: 'Admin: audit log', keywords: ['audit', 'export'] },
   { to: '/admin/settings', label: 'Admin: settings', keywords: ['org', 'logo'] },
   { to: '/platform/capacity', label: 'Platform: capacity', keywords: ['nodes', 'warm pools', 'vms'] },
+  { to: '/platform/license', label: 'Platform: license', keywords: ['license key', 'enterprise', 'premium', 'edition'] },
 ];
 
 export function CommandPalette() {

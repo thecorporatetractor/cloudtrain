@@ -39,6 +39,7 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   '/admin/billing': { any: ['billing.manage'], label: 'Plan & billing' },
   '/platform': { any: ['org.manage', 'capacity.read'], label: 'Platform' },
   '/platform/capacity': { any: ['capacity.read'], label: 'Capacity' },
+  '/platform/license': { any: ['org.manage'], label: 'License' },
 };
 
 export const can = (me: Me | undefined, perm: Permission): boolean => !!me?.permissions.includes(perm);
