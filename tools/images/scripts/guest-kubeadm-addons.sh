@@ -18,6 +18,13 @@ grow_root
 # socket is the only way Trivy reads images in buildah's storage (/var/lib/containers)
 base_setup podman
 systemctl enable podman.socket
+# The podman package drops its CNI bridge config (cni-podman0, 10.88.0.0/16) into
+# /etc/cni/net.d, which is also the kubelet's CNI directory. Before calico-node has written
+# 10-calico.conflist on a node, that file makes the node report NetworkReady and containerd
+# start pods on the podman bridge (10.88.x addresses, unreachable from other nodes; seen as
+# a metrics-server the API server cannot reach). Podman reads its networks from
+# /etc/containers/networks here (guest-kubeadm.sh), so the file is not used by podman.
+rm -f /etc/cni/net.d/87-podman-bridge.conflist
 
 # --- add-on manifests + installer ---
 install -d /opt/cloudtrain/addons /opt/cloudtrain/bin
@@ -149,6 +156,10 @@ PODMAN_VERSION=$(podman --version | awk '{print $3}')
 CSI_HOSTPATH_VERSION=${CSI_HOSTPATH_VERSION}
 R
 cat /etc/cloudtrain-release
+# the kubelet's CNI directory must be empty until the cluster's CNI (cni-install) writes to it
+if find /etc/cni/net.d -maxdepth 1 -type f \( -name '*.conf' -o -name '*.conflist' -o -name '*.json' \) | grep .; then
+  echo "unexpected CNI config in /etc/cni/net.d (pods would start on it before Calico)"; exit 1
+fi
 # generalize (the base image was already generalized; redo what this layer touched,
 # including the build-time apt config of base_setup above)
 generalize
