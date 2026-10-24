@@ -91,7 +91,7 @@ export function Pricing() {
             </div>
             {placeholder && p?.placeholderNote && (
               <p className="site-callout small" role="note" style={{ justifyContent: 'center' }}>
-                <Badge tone="warn">Placeholder prices</Badge> {p.placeholderNote}
+                <Badge tone="warn">Placeholder prices</Badge> <span className="site-callout-text">{p.placeholderNote}</span>
               </p>
             )}
             <div className={cn('site-plans', plans.items.length === 2 && 'site-plans-2', plans.items.length >= 4 && 'site-plans-4')}>
@@ -179,7 +179,7 @@ export function Pricing() {
         )}
 
         {faq.length > 0 && (
-          <section className="page-section site-page-narrow" aria-labelledby="plan-faq" style={{ marginLeft: 'auto', marginRight: 'auto' }}>
+          <section className="page-section site-page-narrow site-page-inset" aria-labelledby="plan-faq">
             <div className="section-header">
               <h2 id="plan-faq">Questions about plans</h2>
               <Link to="/faq" className="link-quiet small">

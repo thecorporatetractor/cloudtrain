@@ -78,7 +78,7 @@ export function PublicPath() {
           {p.disclaimer && <Disclaimer text={p.disclaimer} />}
         </div>
         {first && (
-          <div className="stack" style={{ gap: 6, alignItems: 'flex-end' }}>
+          <div className="site-page-head-action">
             <StartLab labId={first.id} size="md" />
             <span className="xs subtle">Starts with "{first.title}"</span>
           </div>

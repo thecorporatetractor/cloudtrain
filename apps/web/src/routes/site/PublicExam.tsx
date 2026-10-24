@@ -63,7 +63,7 @@ export function PublicExam() {
           )}
           <Disclaimer text={e.disclaimer} />
         </div>
-        <div className="stack" style={{ gap: 6, alignItems: 'flex-end' }}>
+        <div className="site-page-head-action">
           {me.isSuccess ? (
             <Link to="/exams/$examId" params={{ examId: e.id }} className="btn btn-primary btn-md">
               Open in the app

@@ -165,7 +165,9 @@ export function ComputeTiers({ site }: { site: SiteConfig }) {
                     {compute?.placeholder && (
                       <>
                         {' '}
-                        · <PlaceholderTag />
+                        <span style={{ whiteSpace: 'nowrap' }}>
+                          · <PlaceholderTag />
+                        </span>
                       </>
                     )}
                   </span>
