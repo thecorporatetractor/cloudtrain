@@ -2,7 +2,7 @@
 # Built by tools/images/build-jumphost.sh; every version and checksum comes from
 # deploy/versions.env. Ubuntu packages come from a fixed snapshot.ubuntu.com point in
 # time; binaries are verified against pinned sha256 sums (kubectl: dl.k8s.io .sha256).
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 ARG UBUNTU_APT_SNAPSHOT
 ARG KUBECTL_VERSION
 ARG HELM_VERSION

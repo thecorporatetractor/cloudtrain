@@ -19,7 +19,7 @@
 # /var/lib/cloudtrain/kql (root only). Licence notices: /usr/share/doc/cloudtrain-kql.
 
 # --- build: KustoLoco + patches, Kusto.Language from source ------------------------------
-FROM mcr.microsoft.com/dotnet/sdk:10.0-noble@sha256:0d99ebf1ccad15037b5c98c9fe8979d6b8dbac23812feae2277a0b277b5c5ffa AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble@sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b AS build
 ARG KUSTOLOCO_COMMIT
 ARG KUSTO_LANGUAGE_COMMIT
 # 1 runs KustoLoco's BasicTests and LokqlEngineTests on the patched tree (a few minutes)
@@ -68,7 +68,7 @@ RUN mkdir -p /out/doc \
       /root/.nuget/packages /out/doc/nuget /src/licences/overrides
 
 # --- data: the Sentinel sample dataset and the demo dataset ----------------------------------
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS data
+FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS data
 ARG UBUNTU_APT_SNAPSHOT
 ARG AZURE_SENTINEL_COMMIT
 ARG AZURE_SENTINEL_LICENSE_SHA256
@@ -99,7 +99,7 @@ RUN python3 -I -m unittest discover -s tests -t . -q \
  && rm -rf /opt/cloudtrain/loggen/tests && find /opt/cloudtrain/loggen -name __pycache__ -prune -exec rm -rf {} +
 
 # --- runtime ---------------------------------------------------------------------------------
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
 ARG UBUNTU_APT_SNAPSHOT
 ARG KUSTOLOCO_VERSION
 ARG KUSTOLOCO_COMMIT
