@@ -1,8 +1,8 @@
 # Additional permission for CloudTrain lab content
 
-> Draft for legal review. CloudTrain grants this permission as written for the
-> versions of the content that include this file; counsel may refine the
-> wording in later versions. This file is not legal advice.
+> CloudTrain grants this permission as written for the versions of the content
+> that include this file; later versions may refine the wording. This file is
+> not legal advice.
 
 The lab content in `content/` (lab packs, the skill graph, framework mappings
 and exam simulations) is licensed under the Creative Commons
