@@ -1,6 +1,6 @@
 # Licensing
 
-> Draft for legal review. This page explains CloudTrain's licensing model in plain
+> This page explains CloudTrain's licensing model in plain
 > language. It is not legal advice and it is not the license: the binding texts are
 > [LICENSE](../LICENSE) (software, Business Source License 1.1),
 > [content/LICENSE](../content/LICENSE) (lab content, CC BY-NC 4.0) and
