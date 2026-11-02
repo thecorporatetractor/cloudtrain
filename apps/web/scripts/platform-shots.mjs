@@ -110,7 +110,7 @@ const toWaitlist = async (p) => {
   await p.evaluate(() => document.getElementById('waitlist')?.scrollIntoView({ block: 'start' }));
   await p.waitForTimeout(300);
 };
-/** Fills the waitlist form (mock API: `already@example.com` is on the list already). */
+/** Fills the waitlist form. */
 const fillWaitlist = (email) => async (p) => {
   await toWaitlist(p);
   await p.getByLabel('Work or personal email').fill(email);
@@ -149,7 +149,6 @@ const VIEWS = [
   ['waitlist-filled', 'none', '/', 'Join the early-access waitlist', fillWaitlist('ada@quillmoor.example')],
   ['waitlist-errors', 'none', '/', 'Join the early-access waitlist', async (p) => (await toWaitlist(p), await p.getByLabel('Work or personal email').fill('ada@'), await p.getByRole('button', { name: 'Join the waitlist' }).click(), await p.getByText('Enter a valid email address').first().waitFor())],
   ['waitlist-success', 'none', '/', 'Join the early-access waitlist', submitWaitlist('ada@quillmoor.example', 'You are on the list')],
-  ['waitlist-duplicate', 'none', '/', 'Join the early-access waitlist', submitWaitlist('already@example.com', 'You are already on the list')],
   ['waitlist-phone', 'none', '/', 'Join the early-access waitlist', toWaitlist, PHONE],
   ['site-menu-phone', 'none', '/', 'How a lab works', async (p) => (await p.getByRole('button', { name: 'Open menu' }).click(), await p.getByRole('dialog').waitFor()), PHONE],
   ['catalog-public', 'none', '/catalog', 'Everything you can practise'],

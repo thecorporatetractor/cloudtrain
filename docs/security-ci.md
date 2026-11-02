@@ -38,6 +38,7 @@ Images built by `images.yml`:
 | Image | Built from |
 |---|---|
 | lab-orchestrator | `services/lab-orchestrator/Dockerfile` |
+| site-proxy | `services/site-proxy/Dockerfile` |
 | jumphost | `tools/images/jumphost/` |
 | frr, nettools, netsvc | `tools/images/netdev/` |
 | oci-registry | `tools/images/oci-registry/` |
@@ -78,6 +79,8 @@ Groups (`changes.sh` is the source of truth):
 | `tools/curriculum/**`, `tools/lab-verify/**` | content, code, js |
 | `apps/web/**` | node, web, code, js |
 | `services/gateway/**` | node, gateway, code, js |
+| `services/site-api/**` | node, code, js |
+| `services/site-proxy/**` | go, code |
 | `packages/**` (`packages/lab-schema/**` also go, content) | node, web, gateway, code, js |
 | `pnpm-lock.yaml`, `package.json`, `pnpm-workspace.yaml` | node, web, gateway, deps, licenses, code, js |
 | `services/lab-orchestrator/**` | go, content (the gateway's content tests run the real labctl), code |
@@ -204,7 +207,7 @@ only what is uploaded to code scanning is filtered. Each image has a `tier` in t
 
 | Tier | Images | Code scanning (SARIF) | Build gate |
 |---|---|---|---|
-| platform | `lab-orchestrator`, `gateway`, `web` | Trivy and Grype, fixable HIGH and CRITICAL only (`--ignore-unfixed`, `--only-fixed`) | fails on a fixable CRITICAL (Trivy and Grype), unchanged |
+| platform | `lab-orchestrator`, `site-proxy`, `gateway`, `web` | Trivy and Grype, fixable HIGH and CRITICAL only (`--ignore-unfixed`, `--only-fixed`) | fails on a fixable CRITICAL (Trivy and Grype), unchanged |
 | lab | `jumphost`, `frr`, `nettools`, `netsvc`, `oci-registry`, `iac-ws-tofu`, `ansible-ctl`, `kql-ws` | Trivy only, fixable CRITICAL only. Grype is not uploaded | fails on a fixable CRITICAL (Trivy and Grype), unchanged |
 
 Why Trivy-only CRITICAL for lab images, rather than none: a fixable CRITICAL in a lab image

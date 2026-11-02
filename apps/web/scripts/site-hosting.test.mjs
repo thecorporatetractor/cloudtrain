@@ -40,9 +40,29 @@ describe('static site host files', () => {
     expect(staticWebAppConfig('')).not.toContain('google');
   });
 
-  it('deploy/site-vm/Caddyfile carries the same CSP as csp(\'\')', () => {
+  it('deploy/site-vm/Caddyfile carries the same CSP as the static build, with no Google host', () => {
     const caddy = readFileSync(new URL('../../../deploy/site-vm/Caddyfile', import.meta.url), 'utf8');
-    expect(caddy).toContain(`Content-Security-Policy "${csp('')}"`);
+    expect(caddy).toContain(`Content-Security-Policy "${csp('', false)}"`);
+    expect(caddy).not.toMatch(/google/i);
+  });
+
+  it('deploy/site-vm requires the client certificate of Authenticated Origin Pulls by default, on both hosts', () => {
+    const caddy = readFileSync(new URL('../../../deploy/site-vm/Caddyfile', import.meta.url), 'utf8');
+    const compose = readFileSync(new URL('../../../deploy/site-vm/compose.yaml', import.meta.url), 'utf8');
+    expect(caddy).toContain('mode {$SITE_CLIENT_AUTH_MODE:require_and_verify}');
+    expect(caddy).toContain('trust_pool file /certs/origin-pull-ca.pem');
+    expect(compose).toContain('SITE_CLIENT_AUTH_MODE: ${SITE_CLIENT_AUTH_MODE:-require_and_verify}');
+    expect(caddy.match(/^\s*import origin_tls$/gm)).toHaveLength(2);
+    expect(caddy.match(/^\s*tls /gm)).toHaveLength(1);
+    // The CA comes from Cloudflare at install time, never from this repository.
+    expect(caddy).not.toContain('BEGIN CERTIFICATE');
+  });
+
+  it('deploy/site-vm/Caddyfile hands the sidecar exactly the three POST routes and nothing else under /api', () => {
+    const caddy = readFileSync(new URL('../../../deploy/site-vm/Caddyfile', import.meta.url), 'utf8');
+    expect(caddy).toMatch(/@api \{\s+method POST\s+path \/api\/public\/waitlist \/api\/public\/privacy\/requests \/api\/public\/privacy\/confirm\s+\}/);
+    expect(caddy).toMatch(/handle \/api\/\* \{[\s\S]*?` 404/);
+    expect(caddy.match(/reverse_proxy/g)).toHaveLength(1);
   });
 
   it('the source index.html has no analytics snippet in it', () => {

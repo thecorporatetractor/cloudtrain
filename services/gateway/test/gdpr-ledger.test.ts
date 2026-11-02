@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AzureTableLedger, canonicalJson, checkChain, createLedger, GENESIS_HASH, hashRecord, MemoryLedger, nextCheckpoint, signCheckpoint, type LedgerRecordInput, type TableClientLike } from '../src/gdpr/ledger.js';
+import { readFileSync } from 'node:fs';
+import { AzureTableLedger, buildEntry, canonicalJson, checkChain, createLedger, GENESIS_HASH, hashRecord, MemoryLedger, nextCheckpoint, signCheckpoint, type LedgerCheckpoint, type LedgerRecordInput, type TableClientLike } from '../src/gdpr/ledger.js';
 import { issueToken, normaliseEmail, subjectKey, tokenHash, userKey, verifyToken } from '../src/gdpr/subject.js';
 import { DEFAULT_RETENTION, monthsBefore, retentionConfig } from '../src/gdpr/retention.js';
 import { loadConfig } from '../src/config.js';
@@ -327,5 +328,38 @@ describe('configuration', () => {
   it('counts months by the calendar, clamped to shorter months', () => {
     expect(monthsBefore(new Date('2026-11-02T03:00:00Z'), 24).toISOString()).toBe('2024-11-02T03:00:00.000Z');
     expect(monthsBefore(new Date('2026-03-31T00:00:00Z'), 13).toISOString()).toBe('2025-02-28T00:00:00.000Z');
+  });
+});
+
+/** The vectors services/site-api/test/ledger.test.ts also checks: one verifier must read both ledgers. */
+describe('the ledger format shared with services/site-api', () => {
+  const golden = JSON.parse(readFileSync(new URL('./ledger-golden.json', import.meta.url), 'utf8')) as {
+    hmacKey: string;
+    email: string;
+    subjectKey: string;
+    token: string;
+    tokenHash: string;
+    records: { input: LedgerRecordInput; hash: string; canonical: string }[];
+    checkpoint: Omit<LedgerCheckpoint, 'signature'> & { signature: string };
+  };
+
+  it('the subject key and the token hash', () => {
+    expect(subjectKey(golden.email, golden.hmacKey)).toBe(golden.subjectKey);
+    expect(tokenHash(golden.token)).toBe(golden.tokenHash);
+  });
+
+  it('every record, byte for byte: erasure, objection, restricted, lifted, requested', () => {
+    let prev = GENESIS_HASH;
+    golden.records.forEach((r, i) => {
+      const e = buildEntry(r.input, i + 1, prev);
+      expect(e.hash).toBe(r.hash);
+      expect(canonicalJson(e)).toBe(r.canonical);
+      prev = e.hash;
+    });
+  });
+
+  it('a checkpoint: the same signature', () => {
+    const { signature, ...cp } = golden.checkpoint;
+    expect(signCheckpoint(cp, golden.hmacKey).signature).toBe(signature);
   });
 });

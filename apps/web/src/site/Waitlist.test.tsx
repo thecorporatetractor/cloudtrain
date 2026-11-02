@@ -6,7 +6,7 @@ import { parse } from 'yaml';
 import type { SiteConfig } from '@/api/types';
 import siteYaml from '../../../../content/site.yaml?raw';
 import { emptyWaitlistForm } from '@/lib/waitlist';
-import { WaitlistSection, WaitlistView, type WaitlistViewProps } from './Waitlist';
+import { WaitlistSection, WaitlistView, withLinks, type WaitlistViewProps } from './Waitlist';
 
 const site = parse(siteYaml) as SiteConfig;
 const cfg = site.waitlist!;
@@ -97,11 +97,35 @@ describe('waitlist form markup', () => {
     expect(html).toContain('Use another address');
   });
 
-  it('shows the duplicate state with its own copy', () => {
-    const html = view({ phase: 'duplicate' });
-    expect(html).toContain(cfg.duplicateTitle!);
-    expect(html).toContain(cfg.duplicateBody!);
-    expect(html).toContain('data-state="duplicate"');
-    expect(html).not.toContain('<form');
+  it('has no state or copy that says an address is already known', () => {
+    const html = view({ phase: 'created' });
+    expect(html).not.toMatch(/already|registered/i);
+    expect(cfg.duplicateTitle).toBeUndefined();
+    expect(cfg.duplicateBody).toBeUndefined();
+  });
+});
+
+describe('links in the copy', () => {
+  const html = (t: string) => renderToStaticMarkup(<p>{withLinks(t)}</p>);
+
+  it('turns [label](/path) into a link that keeps the form open', () => {
+    expect(html('You can [leave](/legal/privacy-request) at any time.')).toBe('<p>You can <a href="/legal/privacy-request" target="_blank" rel="noopener">leave</a> at any time.</p>');
+  });
+
+  it('leaves everything else as text, and only links internal paths', () => {
+    expect(html('Plain text.')).toBe('<p>Plain text.</p>');
+    expect(html('[x](https://evil.example)')).toBe('<p>[x](https://evil.example)</p>');
+    expect(html('[x](javascript:alert(1))')).toBe('<p>[x](javascript:alert(1))</p>');
+    expect(html('<b>[x]</b>')).toBe('<p>&lt;b&gt;[x]&lt;/b&gt;</p>');
+  });
+
+  it('the shipped copy names what is sent and links the privacy request page at the point of consent', () => {
+    const { waitlist } = parse(siteYaml) as { waitlist: { consentLabel: string; note: string; successBody: string } };
+    for (const t of [waitlist.consentLabel, waitlist.note, waitlist.successBody]) {
+      expect(html(t)).toContain('href="/legal/privacy-request"');
+      expect(t).toContain('No marketing');
+    }
+    // True both for a first signup and for a repeat, which gets no second mail.
+    expect(waitlist.successBody).toMatch(/if this address is new to the list/i);
   });
 });

@@ -22,7 +22,7 @@ export type WaitlistErrors = Partial<Record<WaitlistField, string>>;
 
 export const emptyWaitlistForm: WaitlistForm = { email: '', organisation: '', role: '', interest: '', consent: false, website: '' };
 
-const EMAIL = /^[^\s@.][^\s@]{0,63}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+const EMAIL = /^(?!\.)[!#-'*+\-./0-9=?A-Z^-~]{1,64}(?<!\.)@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 export const isEmail = (v: string): boolean => v.length <= 254 && EMAIL.test(v) && !v.includes('..');
 
 /** Whether the optional field is shown (default yes). */

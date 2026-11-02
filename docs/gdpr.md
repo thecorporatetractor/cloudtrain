@@ -16,6 +16,9 @@ the same two public routes and the same ledger format below. What this document 
 the gateway applies to the platform and to self-hosters; the Function app has its own
 storage and its own evidence wiring.
 
+The public privacy notice describes the website only. `docs/gdpr-platform-launch.md` holds the
+wording to add back before sign-in, labs or billing go live; it is a launch gate.
+
 ## Who can ask for what
 
 | Request | Who | Route | What happens |
@@ -316,7 +319,11 @@ or an admin downloaded, a CSV in someone's mailbox, the upstream identity provid
 
 ## Backups
 
-`deploy/site-vm/backup.sh` keeps dumps for 14 days. Deleted data stays in them until then, and a
+This section is about a gateway on Postgres (the platform, self-hosters). The website has no database:
+its worker copies the waitlist to a private container each night and removes each copy after 14 days
+(docs/deploy-site-vm.md).
+
+Keep dumps for 14 days. Deleted data stays in them until then, and a
 restore brings it back. **`gdpr:reapply` handles this. Run it after every restore, before opening traffic.**
 
 ```sh
@@ -330,11 +337,11 @@ created **after** the erasure is left alone: that person came back of their own 
 gets its own record (`actor: admin`, `reason: post-restore-reapply`). It is idempotent.
 
 **The limit you must plan for: the Postgres ledger is in the dump.** A restore rolls it back too, so
-it forgets every erasure since the dump, and those are the ones you need. So `backup.sh` also writes
-the ledger to `gdpr-ledger-*.jsonl` (no addresses, kept 3 years), which `--ledger-file` restores first:
+it forgets every erasure since the dump, and those are the ones you need. So the backup job must also write
+the ledger to a file with `gdpr:ledger-export` (no addresses, kept 3 years), which `--ledger-file` restores first:
 
 1. **If the database is still alive**, before restoring: `gdpr:ledger-export --out ledger.jsonl`.
-2. **Otherwise** use the newest `gdpr-ledger-*.jsonl`. Erasures after that file are **lost to reapply**:
+2. **Otherwise** use the newest ledger file. Erasures after that file are **lost to reapply**:
    up to a day's worth, and everything if the file was only on the same disk. **Copy it off the VM.**
 
 With the Azure ledger the evidence is outside the dump and `--ledger-file` is not needed.

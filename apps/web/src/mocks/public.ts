@@ -2,7 +2,7 @@ import { delay, http, HttpResponse } from 'msw';
 import { publicCatalog, publicExamDetail, publicPathDetail, site } from './fixtures/site';
 
 /** Mock of `/api/public/*` (services/gateway src/routes/public.ts): no session needed. */
-/** Addresses that joined in this mock session (lowercased), so a second submission shows the duplicate state. */
+/** Addresses that joined in this mock session (lowercased), so a second submission answers as the gateway does (the form shows the same outcome). */
 const waitlist = new Set<string>(['already@example.com']);
 
 export const publicHandlers = [

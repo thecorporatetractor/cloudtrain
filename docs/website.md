@@ -110,7 +110,7 @@ mock-mode captures (dark and light, WebP) that `apps/web/scripts/site-shots.mjs`
 | `waitlist.enabled` | when `waitlist` is present | Shows the waitlist section on the landing page (`#waitlist`) and lets the gateway accept submissions; off removes both |
 | `waitlist.eyebrow`, `title`, `body`, `note`, `submitLabel`, `emailLabel` | | Section copy and button/field labels (defaults in `apps/web/src/site/Waitlist.tsx`) |
 | `waitlist.consentLabel`, `privacyLinkLabel` | | Consent checkbox: the text before the link, and the link text; the link always opens `/legal/privacy` in a new tab |
-| `waitlist.successTitle`, `successBody`, `duplicateTitle`, `duplicateBody`, `errorMessage` | | The two outcome states and the failure message |
+| `waitlist.successTitle`, `successBody`, `errorMessage` | | The two outcome states and the failure message |
 | `waitlist.fields.{organisation,role,interest}` | | `{ enabled?, required?, label? }` each (default: shown, optional). `role.options[]` turns the role into a select whose choices the gateway enforces; `organisation.placeholder`, `role.placeholder`; `interest.enterpriseLabel`, `interest.individualLabel` (the stored values are always `enterprise` and `individual`) |
 
 ### Plans
@@ -217,7 +217,7 @@ footer repeats `legal.alignmentNotice` on every page.
 `-pricing-phone`, `-features` (the callout) and `-features-page`; light and cream for the first two and the callout), `landing` (+ `-phone`, `-tablet`,
 `-features`, `-catalog`, `-pricing`, light and cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cream),
 `catalog-path-public`, `catalog-exam-public`, `features` (+ `-phone`, `-lightbox`, light and cream), `pricing` (+ `-yearly`, `-phone`, light and
-cream), `waitlist` (+ `-filled`, `-errors`, `-success`, `-duplicate`, `-phone`, light and cream),
+cream), `waitlist` (+ `-filled`, `-errors`, `-success`, `-phone`, light and cream),
 `about`, `faq`, `contact`, `legal-terms`, `legal-privacy` and `site-signed-in`; `readme-shots.mjs`
 adds `docs/images/landing.png`, `coming-soon.png`, `catalog-public.png`,
 `catalog-path-public.png` and `pricing.png`. The scripts set the launch mode per view and

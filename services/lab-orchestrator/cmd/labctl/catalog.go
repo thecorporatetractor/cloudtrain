@@ -106,7 +106,7 @@ func catalogCheck(args []string, stdout, stderr io.Writer) int {
 	fl.SetOutput(stderr)
 	cat := fl.String("catalog", "", "catalog files, comma separated (each checked on its own)")
 	wf := fl.String("workflow", "", "images workflow (.github/workflows/images.yml)")
-	platform := fl.String("platform", "lab-orchestrator,gateway,web", "published platform images that are not catalog entries")
+	platform := fl.String("platform", "lab-orchestrator,gateway,web,site-proxy", "published platform images that are not catalog entries")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}

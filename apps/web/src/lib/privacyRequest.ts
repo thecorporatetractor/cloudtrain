@@ -34,7 +34,7 @@ export const emptyPrivacyForm: PrivacyForm = { email: '', type: '', website: '' 
 export const PRIVACY_REQUEST_TYPES: { value: PublicPrivacyRequestType; label: string; hint: string }[] = [
   { value: 'erasure', label: 'Erase my waitlist entry', hint: 'We delete your entry on the early-access waitlist.' },
   { value: 'withdrawal', label: 'Withdraw my consent', hint: 'Your consent is the only reason we hold the entry, so withdrawing it removes the entry too.' },
-  { value: 'export', label: 'Get a copy of my data', hint: 'We show you what the waitlist holds under this address.' },
+  { value: 'export', label: 'Get a copy of my data', hint: 'We email you a copy of what the waitlist holds under this address.' },
 ];
 
 export function validatePrivacyForm(form: PrivacyForm): PrivacyErrors {

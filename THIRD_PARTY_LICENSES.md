@@ -18,9 +18,14 @@ vulnerability DB (public advisory data, under each source's terms).
 
 | Package | Version | License |
 |---|---|---|
+| @azure-rest/core-client | 2.9.0 | MIT |
 | @azure/abort-controller | 2.2.0 | MIT |
+| @azure/communication-common | 2.5.0 | MIT |
+| @azure/communication-email | 1.1.0 | MIT |
 | @azure/core-auth | 1.11.0 | MIT |
 | @azure/core-client | 1.11.1 | MIT |
+| @azure/core-http-compat | 2.5.0 | MIT |
+| @azure/core-lro | 2.7.2 | MIT |
 | @azure/core-paging | 1.7.0 | MIT |
 | @azure/core-process | 1.0.0 | MIT |
 | @azure/core-rest-pipeline | 1.25.0 | MIT |
@@ -28,11 +33,16 @@ vulnerability DB (public advisory data, under each source's terms).
 | @azure/core-util | 1.14.0 | MIT |
 | @azure/core-xml | 1.6.0 | MIT |
 | @azure/data-tables | 13.3.2 | MIT |
+| @azure/functions | 4.17.0 | MIT |
+| @azure/functions-extensions-base | 0.3.0 | MIT |
 | @azure/identity | 4.14.1 | MIT |
 | @azure/logger | 1.4.0 | MIT |
 | @azure/msal-browser | 5.27.0 | MIT |
 | @azure/msal-common | 16.15.0 | MIT |
 | @azure/msal-node | 7.1.2 | MIT |
+| @azure/storage-blob | 12.34.0 | MIT |
+| @azure/storage-common | 12.5.0 | MIT |
+| @azure/storage-queue | 12.32.0 | MIT |
 | @fastify/ajv-compiler | 4.0.7 | MIT |
 | @fastify/cookie | 11.1.3 | MIT |
 | @fastify/deepmerge | 3.2.2 | MIT |
@@ -100,7 +110,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | @types/d3-transition | 3.0.9 | MIT |
 | @types/d3-zoom | 3.0.9 | MIT |
 | @types/js-yaml | 4.0.9 | MIT |
-| @types/node | 22.20.5, 26.6.5 | MIT |
+| @types/node | 22.20.5, 25.9.9, 26.6.5 | MIT |
 | @types/react | 19.3.0 | MIT |
 | @types/react-dom | 19.3.0 | MIT |
 | @types/stream-buffers | 3.0.8 | MIT |
@@ -114,6 +124,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | ajv | 8.20.0 | MIT |
 | ajv-formats | 3.0.1 | MIT |
 | anynum | 1.0.1 | MIT |
+| apache-arrow | 21.2.0 | Apache-2.0 |
 | argparse | 2.0.1 | Python-2.0 |
 | aria-hidden | 1.2.6 | MIT |
 | asynckit | 0.4.0 | MIT |
@@ -131,7 +142,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | classcat | 5.0.5 | MIT |
 | cmdk | 1.1.1 | MIT |
 | combined-stream | 1.0.8 | MIT |
-| cookie | 2.0.1 | MIT |
+| cookie | 0.7.2, 2.0.1 | MIT |
 | cookie-es | 3.1.1 | MIT |
 | csstype | 3.2.3 | MIT |
 | d3-color | 3.1.0 | ISC |
@@ -158,6 +169,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | es-errors | 1.3.0 | MIT |
 | es-object-atoms | 1.1.2 | MIT |
 | es-set-tostringtag | 2.1.0 | MIT |
+| events | 3.3.0 | MIT |
 | events-universal | 1.0.1 | Apache-2.0 |
 | fast-decode-uri-component | 1.0.1 | MIT |
 | fast-deep-equal | 3.1.3 | MIT |
@@ -171,6 +183,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | fastify-plugin | 6.0.1 | MIT |
 | fastq | 1.20.3 | ISC |
 | find-my-way | 9.10.0 | MIT |
+| flatbuffers | 25.9.23 | Apache-2.0 |
 | form-data | 4.0.6 | MIT |
 | function-bind | 1.1.2 | MIT |
 | get-intrinsic | 1.3.0 | MIT |
@@ -199,10 +212,12 @@ vulnerability DB (public advisory data, under each source's terms).
 | jsep | 1.6.0 | MIT |
 | json-schema-ref-resolver | 3.0.1 | MIT |
 | json-schema-traverse | 1.0.0 | MIT |
+| json-with-bigint | 3.5.12 | MIT |
 | jsonpath-plus | 10.4.0 | MIT |
 | jsonwebtoken | 9.0.3 | MIT |
 | jwa | 2.0.1 | MIT |
 | jws | 4.0.1 | MIT |
+| jwt-decode | 4.0.0 | MIT |
 | kysely | 0.29.6 | MIT |
 | lenis | 1.3.27 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
@@ -285,7 +300,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | toad-cache | 3.7.4 | MIT |
 | tslib | 2.8.1 | 0BSD |
 | undici | 8.12.3 | MIT |
-| undici-types | 6.21.0, 8.9.0 | MIT |
+| undici-types | 6.21.0, 7.24.6, 8.9.0 | MIT |
 | use-callback-ref | 1.3.3 | MIT |
 | use-sidecar | 1.1.3 | MIT |
 | use-sync-external-store | 1.7.0 | MIT |
