@@ -33,7 +33,7 @@ export function HeroStory({ site, children, className }: { site: SiteConfig; chi
   useScrollScene(root, (m) => heroEntrance(m, root.current!));
 
   return (
-    <section ref={root} className={cn('site-hero story', className)} aria-labelledby="hero-title">
+    <section ref={root} className={cn('site-hero story', className)} aria-labelledby="hero-title" data-stop>
       <div className="site-hero-bg" aria-hidden />
       <div className="site-container site-hero-inner story-grid">
         <div className="site-hero-copy story-hero-copy">{children}</div>
@@ -46,7 +46,7 @@ export function HeroStory({ site, children, className }: { site: SiteConfig; chi
           </h2>
           <ol className="story-stages" id="how-it-works" aria-labelledby="how-title">
             {steps.map((step, i) => (
-              <li key={step.title} className="story-stage">
+              <li key={step.title} className="story-stage" data-stop>
                 <div className="story-stage-in">
                   <p className="site-eyebrow">
                     <span className="site-eyebrow-n tnum">{String(i + 1).padStart(2, '0')}</span>

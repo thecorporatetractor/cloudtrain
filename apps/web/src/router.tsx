@@ -54,6 +54,7 @@ const EventManage = lazyRouteComponent(() => import('./routes/events/EventManage
 const PublicPath = lazyRouteComponent(() => import('./routes/site/PublicPath'), 'PublicPath');
 const PublicExam = lazyRouteComponent(() => import('./routes/site/PublicExam'), 'PublicExam');
 const Pricing = lazyRouteComponent(() => import('./routes/site/Pricing'), 'Pricing');
+const Features = lazyRouteComponent(() => import('./routes/site/Features'), 'Features');
 const About = lazyRouteComponent(() => import('./routes/site/Pages'), 'About');
 const Faq = lazyRouteComponent(() => import('./routes/site/Pages'), 'Faq');
 const Contact = lazyRouteComponent(() => import('./routes/site/Pages'), 'Contact');
@@ -62,6 +63,7 @@ const Privacy = lazyRouteComponent(() => import('./routes/site/Pages'), 'Privacy
 const AccountPrivacy = lazyRouteComponent(() => import('./routes/AccountPrivacy'), 'AccountPrivacy');
 const PlatformPrivacy = lazyRouteComponent(() => import('./routes/AccountPrivacy'), 'PlatformPrivacy');
 const PrivacyRequestPage = lazyRouteComponent(() => import('./site/PrivacyRequest'), 'PrivacyRequestPage');
+const Cookies = lazyRouteComponent(() => import('./routes/site/Pages'), 'Cookies');
 const AccountBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AccountBilling');
 const AdminBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AdminBilling');
 
@@ -98,12 +100,14 @@ export const homeRoute = createRoute({ getParentRoute: () => rootRoute, path: '/
 export const publicPathRoute = createRoute({ getParentRoute: () => rootRoute, path: '/catalog/paths/$pathId', component: PublicPath });
 export const publicExamRoute = createRoute({ getParentRoute: () => rootRoute, path: '/catalog/exams/$examId', component: PublicExam });
 export const pricingRoute = createRoute({ getParentRoute: () => rootRoute, path: '/pricing', component: Pricing });
+export const featuresRoute = createRoute({ getParentRoute: () => rootRoute, path: '/features', component: Features });
 export const aboutRoute = createRoute({ getParentRoute: () => rootRoute, path: '/about', component: About });
 export const faqRoute = createRoute({ getParentRoute: () => rootRoute, path: '/faq', component: Faq });
 export const contactRoute = createRoute({ getParentRoute: () => rootRoute, path: '/contact', component: Contact });
 export const termsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/terms', component: Terms });
 export const privacyRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy', component: Privacy });
 export const privacyRequestRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy-request', component: PrivacyRequestPage });
+export const cookiesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/cookies', component: Cookies });
 
 /* ------------------------------------------------------------------ auth */
 
@@ -389,12 +393,14 @@ const routeTree = rootRoute.addChildren([
   publicPathRoute,
   publicExamRoute,
   pricingRoute,
+  featuresRoute,
   aboutRoute,
   faqRoute,
   contactRoute,
   termsRoute,
   privacyRoute,
   privacyRequestRoute,
+  cookiesRoute,
   catalogRoute,
   accountBillingRoute,
   accountPrivacyRoute,

@@ -4,8 +4,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { DEFAULT_BRAND, useSite } from '@/api/public';
 import type { SiteConfig } from '@/api/types';
 import { BrandLockup, BrandMark, BrandName, useBrandName } from '@/components/brand';
-import { THEMES, useTheme, type Theme } from '@/lib/theme';
-import { cn } from '@/lib/utils';
+import type { Theme } from '@/lib/theme';
 import { isComingSoon } from './launch';
 import { linkKey, SiteAnchor } from './util';
 
@@ -14,15 +13,14 @@ import { linkKey, SiteAnchor } from './util';
  * the coming-soon chrome: the brand lockup with its tagline, the link columns
  * from content/site.yaml `footer.columns` (Product, Company, Resources, Legal)
  * with the contact address under Company, the alignment notice, the copyright
- * line with the licence note, and the theme switch. In coming-soon mode the
- * links into the platform are dropped and /pricing and /faq become links to the
- * sections of the one page.
+ * line with the licence note. In coming-soon mode the links into the platform
+ * are dropped and /pricing and /faq become links to the sections of the one page.
  */
 
 export const themeIcon: Record<Theme, ReactNode> = { dark: <Moon size={15} />, light: <Sun size={15} />, cream: <Sunset size={15} /> };
 
 /** The brand in the header and footer: the approved lockup, or a deployment's own logo and name (content/site.yaml `brand`). */
-export function SiteBrand({ height = 22 }: { height?: number }) {
+export function SiteBrand({ height = 28 }: { height?: number }) {
   const site = useSite().data;
   const brand = useBrandName();
   if (site?.brand.logo || brand !== DEFAULT_BRAND) {
@@ -45,9 +43,10 @@ function retarget(l: FooterLink, site: SiteConfig, soon: boolean): FooterLink | 
   if (soon) {
     if (route === '/pricing') return site.pricing?.model ? { ...l, to: '/#pricing' } : undefined;
     if (route === '/faq') return { ...l, to: '/#faq' };
-    if (route === '/' || route.startsWith('/legal')) return l;
+    if (route === '/' || route.startsWith('/legal') || route === '/features') return l;
     return undefined;
   }
+  if (route === '/features' && !site.featurePage) return undefined;
   if (route === '/pricing' && !site.flags.showPricing) return undefined;
   if (route.startsWith('/catalog') && !site.flags.showCatalog) return undefined;
   return l;
@@ -56,7 +55,6 @@ function retarget(l: FooterLink, site: SiteConfig, soon: boolean): FooterLink | 
 export function SiteFooter() {
   const site = useSite().data;
   const brand = useBrandName();
-  const { theme, setTheme } = useTheme();
   const year = new Date().getFullYear();
   if (!site) return null;
   const soon = isComingSoon(site);
@@ -64,7 +62,7 @@ export function SiteFooter() {
   const columns = site.footer.columns.map((c) => ({ title: c.title, links: c.links.map((l) => retarget(l, site, soon)).filter((l): l is FooterLink => !!l) })).filter((c) => c.links.length > 0);
   const companyAt = columns.findIndex((c) => /company/i.test(c.title));
   return (
-    <footer className="site-footer">
+    <footer className="site-footer" data-stop>
       <div className="site-container">
         <div className="site-footer-grid" style={{ '--footer-cols': columns.length } as CSSProperties} data-reveal="children">
           <div className="site-footer-brand">
@@ -112,13 +110,6 @@ export function SiteFooter() {
               © {year} {site.brand.legalName ?? brand}
             </span>
             {site.footer.note && <span className="site-footer-note">{site.footer.note}</span>}
-          </div>
-          <div className="site-theme-chips" role="group" aria-label="Theme">
-            {THEMES.map((t) => (
-              <button key={t.id} type="button" className={cn('chip', theme === t.id && 'is-on')} aria-pressed={theme === t.id} onClick={() => setTheme(t.id)}>
-                {themeIcon[t.id]} {t.label}
-              </button>
-            ))}
           </div>
         </div>
       </div>

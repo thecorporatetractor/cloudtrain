@@ -97,16 +97,18 @@ export function robotsFor(siteUrl) {
 }
 
 /**
- * The pages a crawler should know. Coming soon: the landing page and the legal pages (every
- * other path shows the same landing). Live: the website pages, plus every public path and
- * exam detail page.
+ * The pages a crawler should know. Coming soon: the landing page, the features page and the
+ * legal pages (every other path shows the same landing). Live: the website pages, plus every
+ * public path and exam detail page.
  */
-export function sitePaths({ mode, pricing, catalog, paths = [], exams = [] }) {
-  const legal = ['/legal/terms', '/legal/privacy'];
-  if (mode === 'coming-soon') return ['/', ...legal];
+export function sitePaths({ mode, pricing, catalog, cookies = false, features = false, paths = [], exams = [] }) {
+  const legal = ['/legal/terms', '/legal/privacy', ...(cookies ? ['/legal/cookies'] : [])];
+  const featurePage = features ? ['/features'] : [];
+  if (mode === 'coming-soon') return ['/', ...featurePage, ...legal];
   return [
     '/',
     ...(catalog ? ['/catalog'] : []),
+    ...featurePage,
     ...(pricing ? ['/pricing'] : []),
     '/about',
     '/faq',

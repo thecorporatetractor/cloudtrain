@@ -14,6 +14,7 @@ on it comes from one configuration file.
 | `/catalog` (+ `?domain=`, `?q=`, `?difficulty=`, `?maxMinutes=`, `?path=`) | Public read-only catalog: domains, paths, courses, labs and exam simulations from `content/` | The full catalog (same search params, so links keep working) |
 | `/catalog/paths/:id` | A path or course: sections, labs, alignment disclaimer, related paths | Same page, site layout, "Start lab" goes straight to the lab |
 | `/catalog/exams/:id` | An exam simulation: format, rules, objectives and weights, report contents, retake policy. Never the pool task ids | Same page, "Open in the app" |
+| `/features` | Features: every feature with a heading, a short description, which plans include it and its screens, grouped (learn, exams, teach and manage, admin), from `featurePage`; the screens follow the theme and enlarge in a lightbox. Scrolls freely, and keeps its own page in coming-soon mode. The landing page's callout (`#features`, three featured screens) leads here | Same |
 | `/pricing` | Pricing: the configured plans as cards with a monthly/yearly switch, an entitlement comparison, the placeholder note, the plan FAQ group and the alignment notice | Same; plan calls to action go to the billing pages |
 | `/about`, `/faq`, `/contact` | Configured copy | Same |
 | `/legal/terms`, `/legal/privacy` | Legal placeholders, marked as such until reviewed. The privacy notice describes the waitlist processing | Same |
@@ -103,6 +104,7 @@ mock-mode captures (dark and light, WebP) that `apps/web/scripts/site-shots.mjs`
 | `launch.eyebrow`, `status`, `title`, `subtitle`, `ctaLabel` | | Coming-soon copy: the status pill, the headline and lead (default to the hero's) and the waitlist button |
 | `launch.points[]` | | 2 to 6 `{ icon?, title, body }` blocks: what CloudTrain is |
 | `launch.faqGroups[]` | | FAQ groups on the coming-soon page (default: the featured questions and `pricing.faqGroup`); `lab-verify` fails on a group no question has |
+| `featurePage` | | The features page and its homepage callout: `eyebrow`, `title`, `intro`, `callout` (`{ eyebrow?, title?, body?, linkLabel? }`), `groups[]` (`{ id, title, lead? }`, in order; an item is shown under the group it names, so deleting a group's line drops it and its items) and `items[]` (`{ group, title, body, access?, featured?, figures[] }`; `access` says which plans include the feature; the first three `featured` items are the callout). Figures take `image2x` and `imageLight2x` beside `image` and `imageLight` (a `srcset` for high-density screens); `apps/web/scripts/feature-shots.mjs` captures them into `apps/web/public/site/features/`. Absent: no page and no callout |
 | `socialProof` | | `{ placeholder, eyebrow, title, note, logos[]: { name, image?, imageDark? }, quotes[]: { quote, name, role? } }` on the landing page. While `placeholder` is not `false` every slot is labelled a placeholder (and logos show their names, not images); `lab-verify` fails when quotes containing "placeholder" are published as real |
 | `closing.title`, `closing.body`, `closing.primaryCta`, `closing.secondaryCta` | | The closing call to action on the landing page; the buttons default to the hero's |
 | `waitlist.enabled` | when `waitlist` is present | Shows the waitlist section on the landing page (`#waitlist`) and lets the gateway accept submissions; off removes both |
@@ -152,8 +154,9 @@ to its sections, the theme menu and "Join the waitlist" in the header; the hero 
 lab, what CloudTrain is (`launch.points`, the catalog figures), how pricing works
 (`pricing.model`, the compute tiers, the estimator, worked examples and the plans compared), the
 waitlist, the questions, and a footer with the legal pages, the contact address and the source.
-Every website path except `/legal/*` shows that page; nothing on it leads into the platform (no
-sign-in, no checkout, no catalog). Signed-in users of a combined deployment still get the app at
+Every website path except `/legal/*` and `/features` shows that page; nothing on it leads into the
+platform (no sign-in, no checkout, no catalog). The features page keeps its own page, linked from
+the callout after "what it is", the header and the footer. Signed-in users of a combined deployment still get the app at
 `/`, and `/sign-in` still works for those who know it.
 
 `launch.mode: live` is the full website. Overrides, for viewing and building one mode without
@@ -211,9 +214,9 @@ footer repeats `legal.alignmentNotice` on every page.
 ## Screenshots
 
 `apps/web/scripts/platform-shots.mjs` captures `coming-soon` (+ `-pricing`, `-plans`, `-phone`,
-`-pricing-phone`; light and cream for the first two), `landing` (+ `-phone`, `-tablet`,
+`-pricing-phone`, `-features` (the callout) and `-features-page`; light and cream for the first two and the callout), `landing` (+ `-phone`, `-tablet`,
 `-features`, `-catalog`, `-pricing`, light and cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cream),
-`catalog-path-public`, `catalog-exam-public`, `pricing` (+ `-yearly`, `-phone`, light and
+`catalog-path-public`, `catalog-exam-public`, `features` (+ `-phone`, `-lightbox`, light and cream), `pricing` (+ `-yearly`, `-phone`, light and
 cream), `waitlist` (+ `-filled`, `-errors`, `-success`, `-duplicate`, `-phone`, light and cream),
 `about`, `faq`, `contact`, `legal-terms`, `legal-privacy` and `site-signed-in`; `readme-shots.mjs`
 adds `docs/images/landing.png`, `coming-soon.png`, `catalog-public.png`,
@@ -222,4 +225,6 @@ capture with reduced motion. `apps/web/scripts/og-image.mjs` renders the social 
 (`apps/web/public/site/og-image.png`, 1200x630). `apps/web/scripts/site-shots.mjs` captures the screenshots the website itself
 shows (`apps/web/public/site/*.webp`: the workspace after a validation run, the topology and
 checks crops, skills, an exam report and the team dashboard, each in dark and light) and
-prints their sizes for `width`/`height`.
+prints their sizes for `width`/`height`; `apps/web/scripts/feature-shots.mjs` does the same for
+the features page (`apps/web/public/site/features/*.webp`, every screen in dark and light at 1x
+and 2x, the mock persona switcher hidden).

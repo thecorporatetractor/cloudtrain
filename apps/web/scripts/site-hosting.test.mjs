@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { csp, deferEntry, headersFile, injectRoot, siteBootJs, originOf, redirectsFile, rewriteHead, robotsFor, runtimeConfigJs, sitemapXml, sitePaths, staticWebAppConfig } from './site-hosting.mjs';
 
@@ -30,6 +31,29 @@ describe('static site host files', () => {
     expect(csp('')).not.toContain('unsafe-eval');
   });
 
+  it('the CSP names no Google host, and no inline script', () => {
+    const p = csp('');
+    expect(p).not.toMatch(/google|googletagmanager/);
+    expect(p.split('; ').find((d) => d.startsWith('script-src'))).not.toContain('unsafe-inline');
+    expect(csp('https://api.example.com')).not.toMatch(/google/);
+    expect(headersFile('')).not.toContain('google');
+    expect(staticWebAppConfig('')).not.toContain('google');
+  });
+
+  it('deploy/site-vm/Caddyfile carries the same CSP as csp(\'\')', () => {
+    const caddy = readFileSync(new URL('../../../deploy/site-vm/Caddyfile', import.meta.url), 'utf8');
+    expect(caddy).toContain(`Content-Security-Policy "${csp('')}"`);
+  });
+
+  it('the source index.html has no analytics snippet in it', () => {
+    expect(readFileSync(new URL('../index.html', import.meta.url), 'utf8')).not.toMatch(/googletagmanager|google-analytics|gtag\(/);
+  });
+
+  it('the cookie notice is in the sitemap only when it exists', () => {
+    expect(sitePaths({ mode: 'live', catalog: false, cookies: true })).toContain('/legal/cookies');
+    expect(sitePaths({ mode: 'live', catalog: false })).not.toContain('/legal/cookies');
+  });
+
   it('headers, redirects and the Azure config cover the single-page fallback and caching', () => {
     expect(headersFile('')).toMatch(/\/assets\/\*\n {2}Cache-Control: public, max-age=31536000, immutable/);
     expect(headersFile('')).toContain('Content-Security-Policy:');
@@ -46,6 +70,10 @@ describe('static site host files', () => {
 
   it('the sitemap lists the landing and legal pages when coming soon, every website page when live', () => {
     expect(sitePaths({ mode: 'coming-soon', pricing: true, catalog: true, paths: ['p'] })).toEqual(['/', '/legal/terms', '/legal/privacy']);
+    // The features page keeps its own page in both modes (src/site/launch.ts), so a crawler may know it.
+    expect(sitePaths({ mode: 'coming-soon', pricing: true, catalog: true, features: true })).toEqual(['/', '/features', '/legal/terms', '/legal/privacy']);
+    expect(sitePaths({ mode: 'live', pricing: true, catalog: true, features: true })).toContain('/features');
+    expect(sitePaths({ mode: 'live', pricing: true, catalog: true })).not.toContain('/features');
     const live = sitePaths({ mode: 'live', pricing: false, catalog: true, paths: ['cks'], exams: ['sim'] });
     expect(live).toContain('/catalog/paths/cks');
     expect(live).toContain('/catalog/exams/sim');

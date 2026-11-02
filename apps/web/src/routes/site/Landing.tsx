@@ -8,9 +8,10 @@ import { DomainIcon } from '@/components/domain';
 import { PageSkeleton } from '@/components/ui';
 import { formatMinutes } from '@/lib/pricingModel';
 import { cn } from '@/lib/utils';
+import { FeatureCallout } from '@/site/Features';
 import { DomainMarquee } from '@/site/Flourish';
 import { HeroStory } from '@/site/LabStory';
-import { ComputeTiers, PricingPaths, PricingSteps } from '@/site/PricingModel';
+import { ComputeTiers, PricingPaths } from '@/site/PricingModel';
 import { SocialProof } from '@/site/SocialProof';
 import { FeatureIcon, SiteAnchor, SiteShot, useDocumentTitle } from '@/site/util';
 import { WaitlistSection } from '@/site/Waitlist';
@@ -20,7 +21,8 @@ import { WaitlistSection } from '@/site/Waitlist';
  * Sections, in order: the hero and the story of a lab (the lab window stays in
  * view while the four stages of a lab scroll past it, src/site/LabStory.tsx), a
  * band of the domains, what makes the platform different (a bento of the
- * differentiators and capabilities), catalog highlights with live figures, a
+ * differentiators and capabilities), the featured screens that lead to the
+ * features page (src/site/Features.tsx), catalog highlights with live figures, a
  * product tour of real screens, how pricing works, who it is for, social proof,
  * the waitlist, the featured questions and the closing call to action. Every
  * word comes from the site configuration (content/site.yaml); every figure from
@@ -53,6 +55,7 @@ export function Landing() {
       <Hero site={s} cat={cat} />
       {s.flags.showCatalog && <DomainMarquee site={s} cat={cat} />}
       {(s.differentiators?.length || s.features.length) > 0 && <Bento site={s} />}
+      <FeatureCallout site={s} />
       {s.flags.showCatalog && cat && <CatalogHighlights site={s} cat={cat} />}
       {s.showcase && s.showcase.length > 0 && <Tour site={s} />}
       {s.pricing?.model && <PricingTeaser site={s} />}
@@ -222,7 +225,7 @@ function Bento({ site }: { site: SiteConfig }) {
   const rest = units % 6;
   const widen = (i: number) => (rest === 4 && i >= feats.length - 2 ? 'bento-span-3' : rest === 2 && i === feats.length - 1 ? 'bento-span-6' : undefined);
   return (
-    <section className="site-section" id="why" aria-labelledby="why-title">
+    <section className="site-section" id="why" aria-labelledby="why-title" data-stop>
       <div className="site-container">
         <SectionHead
           id="why-title"
@@ -282,7 +285,7 @@ function CatalogHighlights({ site, cat }: { site: SiteConfig; cat: PublicCatalog
     ] as [number, string][]
   ).filter(([n]) => n > 0);
   return (
-    <section className="site-section" id="domains" aria-labelledby="domains-title">
+    <section className="site-section" id="domains" aria-labelledby="domains-title" data-stop>
       <div className="site-container">
         <SectionHead
           id="domains-title"
@@ -376,7 +379,7 @@ function Tour({ site }: { site: SiteConfig }) {
   };
   const item = items[active]!;
   return (
-    <section className="site-section site-section-alt" id="showcase" aria-labelledby="showcase-title">
+    <section className="site-section site-section-alt" id="showcase" aria-labelledby="showcase-title" data-stop>
       <div className="site-container">
         <SectionHead id="showcase-title" n={3} eyebrow="A look inside" title="The platform as learners and managers see it" lead="Real screens from the product, in the theme you are reading this in." />
         <div className="tour" data-reveal="children">
@@ -419,7 +422,7 @@ function Tour({ site }: { site: SiteConfig }) {
 function PricingTeaser({ site }: { site: SiteConfig }) {
   const m = site.pricing!.model!;
   return (
-    <section className="site-section pm" id="pricing" aria-labelledby="pricing-title">
+    <section className="site-section pm" id="pricing" aria-labelledby="pricing-title" data-stop>
       <div className="site-container">
         <SectionHead
           id="pricing-title"
@@ -435,7 +438,7 @@ function PricingTeaser({ site }: { site: SiteConfig }) {
             ) : undefined
           }
         />
-        {m.paths && m.paths.length > 0 ? <PricingPaths site={site} /> : <PricingSteps model={m} />}
+        {m.paths && m.paths.length > 0 && <PricingPaths site={site} />}
         <ComputeTiers site={site} />
       </div>
     </section>
@@ -446,7 +449,7 @@ function PricingTeaser({ site }: { site: SiteConfig }) {
 
 function Audiences({ site }: { site: SiteConfig }) {
   return (
-    <section className="site-section site-section-alt" id="who" aria-labelledby="who-title">
+    <section className="site-section site-section-alt" id="who" aria-labelledby="who-title" data-stop>
       <div className="site-container">
         <SectionHead id="who-title" n={5} eyebrow="Who it is for" title="One platform, three ways in" />
         <div className="site-audience-grid" data-reveal="children">
@@ -481,7 +484,7 @@ function Audiences({ site }: { site: SiteConfig }) {
 
 function Trust({ items }: { items: SiteConfig['faq'] }) {
   return (
-    <section className="site-section site-section-tall" id="questions" aria-labelledby="trust-title">
+    <section className="site-section site-section-tall" id="questions" aria-labelledby="trust-title" data-stop>
       <div className="site-container">
         <SectionHead
           id="trust-title"
@@ -513,7 +516,7 @@ function ClosingCta({ site }: { site: SiteConfig }) {
   const primary = c?.primaryCta ?? site.hero.primaryCta;
   const secondary = c?.secondaryCta ?? site.hero.secondaryCta;
   return (
-    <section className="site-section" aria-labelledby="cta-title">
+    <section className="site-section" aria-labelledby="cta-title" data-stop>
       <div className="site-container">
         <div className="site-closing" data-reveal>
           <div className="site-closing-glow" aria-hidden />

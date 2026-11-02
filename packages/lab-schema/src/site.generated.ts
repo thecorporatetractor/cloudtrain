@@ -562,6 +562,195 @@ export interface Site {
         }
       ];
   /**
+   * The features page (/features): every feature with a heading, a short description and its screenshots, grouped (learn, exams, teach and manage, admin); and the homepage callout that leads to it, which shows the `featured` items. Absent: no page and no callout.
+   */
+  featurePage?: {
+    eyebrow?: string;
+    title: string;
+    intro?: string;
+    /**
+     * The homepage section with the featured screens and the link to the page.
+     */
+    callout?: {
+      eyebrow?: string;
+      title?: string;
+      body?: string;
+      linkLabel?: string;
+    };
+    /**
+     * The groups of the page, in order. An item whose group is not listed here is not shown, so a group is dropped by removing its line.
+     *
+     * @minItems 1
+     * @maxItems 6
+     */
+    groups:
+      | [
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          }
+        ]
+      | [
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          }
+        ]
+      | [
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          }
+        ]
+      | [
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          }
+        ]
+      | [
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          }
+        ]
+      | [
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          },
+          {
+            id: string;
+            title: string;
+            lead?: string;
+          }
+        ];
+    /**
+     * @minItems 1
+     * @maxItems 40
+     */
+    items: [
+      {
+        /**
+         * The id of the group the feature belongs to.
+         */
+        group: string;
+        title: string;
+        body: string;
+        /**
+         * Which plans include it, or that it needs a license key when self-hosted; absent when every plan has it.
+         */
+        access?: string;
+        /**
+         * Shown on the homepage callout (the first three featured items, their first figure).
+         */
+        featured?: boolean;
+        /**
+         * @minItems 1
+         * @maxItems 4
+         */
+        figures: [Figure1] | [Figure1, Figure1] | [Figure1, Figure1, Figure1] | [Figure1, Figure1, Figure1, Figure1];
+      },
+      ...{
+        /**
+         * The id of the group the feature belongs to.
+         */
+        group: string;
+        title: string;
+        body: string;
+        /**
+         * Which plans include it, or that it needs a license key when self-hosted; absent when every plan has it.
+         */
+        access?: string;
+        /**
+         * Shown on the homepage callout (the first three featured items, their first figure).
+         */
+        featured?: boolean;
+        /**
+         * @minItems 1
+         * @maxItems 4
+         */
+        figures: [Figure1] | [Figure1, Figure1] | [Figure1, Figure1, Figure1] | [Figure1, Figure1, Figure1, Figure1];
+      }[]
+    ];
+  };
+  /**
    * Who the platform is for, each with its own next step.
    *
    * @minItems 1
@@ -1223,6 +1412,7 @@ export interface Site {
     alignmentNotice: string;
     terms: LegalDocument;
     privacy: LegalDocument;
+    cookies?: LegalDocument;
   };
   theme?: {
     /**
@@ -1440,10 +1630,12 @@ export interface Site {
       title: string;
       intro?: string;
       /**
+       *  Optional; the public pages no longer show the steps.
+       *
        * @minItems 2
        * @maxItems 6
        */
-      steps:
+      steps?:
         | [
             {
               icon?: Icon;
@@ -2098,6 +2290,10 @@ export interface Site {
               cta?: Cta;
             }
           ];
+      /**
+       * One true sentence on what ends a forgotten lab and what the spend cap does (shown under the estimator).
+       */
+      sessionNote?: string;
     };
   };
   /**
@@ -3247,6 +3443,14 @@ export interface Figure {
    * Variant shown in the light and cream themes; defaults to `image`.
    */
   imageLight?: string;
+  /**
+   * The dark image at twice the pixel size, for high-density screens (a `srcset` candidate).
+   */
+  image2x?: string;
+  /**
+   * The light image at twice the pixel size.
+   */
+  imageLight2x?: string;
   alt: string;
   width?: number;
   height?: number;
@@ -3295,6 +3499,14 @@ export interface Figure1 {
    * Variant shown in the light and cream themes; defaults to `image`.
    */
   imageLight?: string;
+  /**
+   * The dark image at twice the pixel size, for high-density screens (a `srcset` candidate).
+   */
+  image2x?: string;
+  /**
+   * The light image at twice the pixel size.
+   */
+  imageLight2x?: string;
   alt: string;
   width?: number;
   height?: number;
@@ -3682,6 +3894,10 @@ export interface Plan {
     monthly?: Price;
     yearly?: Price;
   };
+  /**
+   * Compute credit included every month, in minor units of `currency` (shown in the plan comparison; billing does not grant it yet).
+   */
+  computeCredit?: number;
   /**
    * Organisation plans: the price is per seat and the buyer picks a seat count.
    */

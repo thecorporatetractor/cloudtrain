@@ -1,25 +1,31 @@
 /*
  * The predefined scroll positions of the website ("stops") and the stepping
- * between them. A stop is the hero (the top), each stage of the hero story at
- * its reading line, every section of the page (its top under the header, and
- * its bottom edge when it is taller than the viewport and the stop before it
- * leaves some of its content below the fold: padding alone earns no stop), the
- * sub-headings of the pricing explanation and its compute block (one stop for
- * the tiers, the packs and the estimator; a bottom edge too, on the same
- * terms), and the end of the page.
+ * between them. A stop is an element marked `data-stop` (the hero, each stage of
+ * the hero story at its reading line, the sections of the page under the
+ * header, the footer): nothing else is one. A marked block whose content is
+ * taller than the viewport gets further stops down its content, each revealing
+ * a meaningful amount more, and the last one showing its end; space that is not
+ * content (a block centred in a viewport-tall box, the margin after it) never
+ * makes a stop, and the step across it is one step. `planStops` is the pure
+ * part, tested on its own (stops.test.ts).
  *
  * With a mouse or trackpad (Lenis runs): one wheel gesture moves one stop, with
  * an animated scroll that settles there; keys do the same (PageUp/PageDown,
- * Space, the arrows, Home/End). Between two stops further apart than a viewport
- * the page scrolls freely, and when it rests it settles on a stop it crossed or
- * came close to. On touch the browser scrolls natively (its own physics) and,
- * when the scroll rests, the page settles on a stop it came close to. Under
- * prefers-reduced-motion none of this runs (the engine is never loaded).
+ * Space, the arrows, Home/End). A page without marks scrolls freely. On touch
+ * the browser scrolls natively (its own physics) and, when the scroll rests,
+ * the page settles on a stop it came close to. Under prefers-reduced-motion
+ * none of this runs (the engine is never loaded).
  */
 
 const COMPACT = '(max-width: 1023px)';
-/** Stops closer than this are one stop. */
+/** Marked stops closer than this are one stop. */
 const MERGE = 32;
+/** A further stop inside a tall block must reveal at least this much of the viewport. */
+const REVEAL = 0.2;
+/** Consecutive stops inside a tall block overlap by this much of the viewport, so nothing is skipped. */
+const OVERLAP = 0.1;
+/** Below the end of a block's content, at its last stop. */
+const TAIL = 24;
 /** A gesture: wheel events less than this far apart belong together (trackpad inertia). */
 const GESTURE_GAP = 200;
 /** After the free scroll rests, a stop this close pulls the page to it. */
@@ -59,52 +65,84 @@ export function stopFor(el: Element): number {
   return Math.max(0, Math.min(maxScroll(), Math.round(top - offset)));
 }
 
+const STOP_SELECTOR = '[data-stop]';
+
 /** The element whose stop a link target belongs to: itself, the first stop inside it, or the stop around it. */
 export function stopElementFor(target: Element): Element | undefined {
   if (target.matches(STOP_SELECTOR)) return target;
   return target.querySelector(STOP_SELECTOR) ?? target.closest(STOP_SELECTOR) ?? undefined;
 }
 
-const STOP_SELECTOR = '.site-hero, .story-stage, main .site-section, main .pm-subhead, main .pm-compute, .site-footer';
-/** The stops that get a bottom-edge stop as well when they are taller than the viewport. */
-const TALL_SELECTOR = '.site-section, .pm-compute';
+/** Elements that show something on their own; with elements holding text, where a block's content is. */
+const SHOWS = 'img, svg, video, input, select, textarea, button, table';
 
-/** Every stop of the page, ascending; none on a page that opts out (`[data-no-stops]`, the legal texts) or has no sections. */
-export function collectStops(): number[] {
-  if (document.querySelector('[data-no-stops]')) return [];
-  const vh = window.innerHeight;
-  const header = headerHeight();
-  const max = maxScroll();
-  const ys = [0, max];
-  // A block taller than the viewport: its bottom edge is a stop too, kept below only when the
-  // stop before it leaves some of the block's content (not just its bottom padding) below the fold.
-  const edges: { y: number; content: number }[] = [];
-  const z = siteZoom();
-  for (const el of document.querySelectorAll(STOP_SELECTOR)) {
-    const y = stopFor(el);
-    ys.push(y);
-    if (el.matches(TALL_SELECTOR)) {
-      const r = el.getBoundingClientRect();
-      if (r.height > vh - header) {
-        const pad = (parseFloat(getComputedStyle(el).paddingBottom) || 0) * z;
-        edges.push({ y: Math.min(max, Math.round(r.bottom + window.scrollY - vh)), content: r.bottom + window.scrollY - pad });
-      }
+/**
+ * Where a block's real content ends (page position): the lowest bottom edge among its
+ * descendants that show something, text included. The block's own box does not count, so a
+ * viewport-tall box with its content centred, or padding, never counts as content; nor does
+ * what is not on screen (the answer inside a closed `details`, which keeps its layout).
+ */
+export function contentBottom(el: Element): number {
+  let bottom = -Infinity;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const e = n as Element;
+    const closed = e.closest('details:not([open])');
+    if (closed && closed !== e && !e.matches('summary, summary *')) continue;
+    let shows = e.matches(SHOWS);
+    if (!shows) for (const c of e.childNodes) if (c.nodeType === Node.TEXT_NODE && c.textContent?.trim()) shows = true;
+    if (!shows) continue;
+    const r = e.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) continue;
+    bottom = Math.max(bottom, r.bottom + window.scrollY);
+  }
+  return bottom === -Infinity ? el.getBoundingClientRect().bottom + window.scrollY : bottom;
+}
+
+export interface StopCandidate {
+  /** The stop that shows the marked element (page position). */
+  top: number;
+  /** Where its content ends (page position); -Infinity when the block holds other marked stops. */
+  contentBottom: number;
+}
+
+/**
+ * The stops of a page from its marked candidates: every candidate's top (and the top and the end
+ * of the page), then, for a block whose content runs past the viewport of its top by a meaningful
+ * amount, further stops down the content (a viewport less the overlap apart) and a last one with
+ * the content's end a little above the fold. Tops closer than `merge` are one stop; a further stop
+ * within a meaningful amount of any top is left out, so a short remainder never makes a stop.
+ */
+export function planStops(candidates: StopCandidate[], vh: number, max: number, merge = MERGE): number[] {
+  const clamp = (y: number) => Math.max(0, Math.min(max, Math.round(y)));
+  const reveal = Math.max(merge, vh * REVEAL);
+  const tops: number[] = [];
+  for (const y of [0, max, ...candidates.map((c) => c.top)].map(clamp).sort((a, b) => a - b)) {
+    const last = tops[tops.length - 1];
+    if (last === undefined || y - last > merge) tops.push(y);
+  }
+  const out = [...tops];
+  for (const c of candidates) {
+    const end = c.contentBottom - vh + TAIL; // the stop that shows the content's end
+    if (!Number.isFinite(end)) continue;
+    let y = c.top;
+    while (end - y > reveal) {
+      y = Math.min(y + vh * (1 - OVERLAP), end);
+      const yy = clamp(y);
+      if (!out.some((s) => Math.abs(s - yy) <= reveal)) out.push(yy);
     }
   }
-  if (ys.length <= 2) return []; // nothing but the top and the end: the page scrolls freely
-  ys.sort((a, b) => a - b);
-  for (const e of edges) {
-    const before = ys.filter((y) => y < e.y - MERGE).pop();
-    if (before !== undefined && e.content <= before + vh + MERGE) continue;
-    ys.push(e.y);
-  }
-  ys.sort((a, b) => a - b);
-  const out: number[] = [];
-  for (const y of ys) {
-    const last = out[out.length - 1];
-    if (last === undefined || y - last > MERGE) out.push(y);
-  }
-  return out;
+  out.sort((a, b) => a - b);
+  return out.filter((y, i) => i === 0 || y - out[i - 1]! > merge);
+}
+
+/** Every stop of the page, ascending; none on a page that opts out (`[data-no-stops]`, the legal texts) or has no marks. */
+export function collectStops(): number[] {
+  if (document.querySelector('[data-no-stops]')) return [];
+  const els = Array.from(document.querySelectorAll(STOP_SELECTOR));
+  if (els.length === 0) return [];
+  const candidates: StopCandidate[] = els.map((el) => ({ top: stopFor(el), contentBottom: el.querySelector(STOP_SELECTOR) ? -Infinity : contentBottom(el) }));
+  return planStops(candidates, window.innerHeight, maxScroll());
 }
 
 export interface Stepper {
@@ -121,10 +159,7 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
   let animating = 0;
   let lastWheel = 0;
   let free = false;
-  let from = 0;
-  let restTimer = 0;
 
-  const nearest = (stops: number[], y: number) => stops.reduce((best, s) => (Math.abs(s - y) < Math.abs(best - y) ? s : best), stops[0] ?? 0);
   const at = (stops: number[], y: number) => stops.find((s) => Math.abs(s - y) <= 3);
   const nextOf = (stops: number[], y: number, dir: number) => (dir > 0 ? stops.find((s) => s > y + 3) : [...stops].reverse().find((s) => s < y - 3));
 
@@ -137,22 +172,13 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
     });
   };
 
-  /** One step from the current position: to the next stop, or a viewport's worth inside a long gap. */
+  /** One step from the current position: to the next stop in that direction. */
   const step = (dir: number) => {
     const stops = collectStops();
     if (stops.length === 0) return false;
-    const y = window.scrollY;
-    const next = nextOf(stops, y, dir);
+    const next = nextOf(stops, window.scrollY, dir);
     if (next === undefined) return false;
-    const here = at(stops, y) ?? y;
-    const gap = Math.abs(next - here);
-    const vh = window.innerHeight;
-    if (gap <= vh + 2) {
-      go(next);
-      return true;
-    }
-    const page = Math.round(vh * 0.82);
-    go(dir > 0 ? Math.min(next, y + page) : Math.max(next, y - page));
+    go(next);
     return true;
   };
 
@@ -181,38 +207,11 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
       free = true;
       return;
     }
-    const y = window.scrollY;
-    const here = at(stops, y);
-    const next = nextOf(stops, y, dir);
-    if (here !== undefined && next !== undefined && Math.abs(next - here) <= window.innerHeight + 2) {
-      free = false;
-      swallow();
-      go(next);
-      return;
-    }
-    // Inside a long gap, or past the last stop: the page scrolls freely and settles on rest.
-    free = true;
-    from = y;
-  };
-
-  const onRest = () => {
-    if (animating || !free) return;
-    const stops = collectStops();
-    const y = window.scrollY;
-    if (stops.length === 0 || at(stops, y) !== undefined) return;
-    const lo = Math.min(from, y);
-    const hi = Math.max(from, y);
-    const crossed = stops.filter((s) => s > lo + 3 && s < hi - 3);
-    const target = crossed.length > 0 ? (y > from ? crossed[0]! : crossed[crossed.length - 1]!) : nearest(stops, y);
-    if (Math.abs(target - y) <= window.innerHeight * PULL || crossed.length > 0) {
-      free = false;
-      go(target);
-    }
-  };
-
-  const onScroll = () => {
-    window.clearTimeout(restTimer);
-    restTimer = window.setTimeout(onRest, 180);
+    free = false;
+    const next = nextOf(stops, window.scrollY, dir);
+    swallow();
+    if (next !== undefined) go(next);
+    else if (at(stops, window.scrollY) === undefined) go(dir > 0 ? stops[stops.length - 1]! : stops[0]!);
   };
 
   const typing = (t: EventTarget | null) => t instanceof HTMLElement && (t.isContentEditable || /^(input|textarea|select|button)$/i.test(t.tagName));
@@ -228,14 +227,11 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
 
   window.addEventListener('wheel', onWheel, { passive: false, capture: true });
   window.addEventListener('keydown', onKey, { capture: true });
-  window.addEventListener('scroll', onScroll, { passive: true });
   return {
     go,
     stop() {
       window.removeEventListener('wheel', onWheel, { capture: true });
       window.removeEventListener('keydown', onKey, { capture: true });
-      window.removeEventListener('scroll', onScroll);
-      window.clearTimeout(restTimer);
     },
   };
 }

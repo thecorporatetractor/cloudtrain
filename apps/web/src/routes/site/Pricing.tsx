@@ -68,7 +68,7 @@ export function Pricing() {
 
       {s && <PricingExplained site={s} id="how-pricing-works" />}
 
-      <div className="site-container site-page site-page-after">
+      <div className="site-container site-page site-page-after" data-stop>
         {plans && plans.items.length > 0 ? (
           <>
             <div className="row-between" style={{ marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
@@ -105,11 +105,11 @@ export function Pricing() {
       <div className="site-container site-page site-page-after">
         {plans && plans.items.length > 0 ? (
           <>
-            <section className="page-section" aria-labelledby="compare">
+            <section className="page-section" aria-labelledby="compare" data-stop>
               <div className="section-header">
                 <div>
                   <h2 id="compare">Compare plans</h2>
-                  <p className="muted small">Premium labs, concurrent labs, environment tiers, exam simulations and events per plan. Compute is billed on top of every plan.</p>
+                  <p className="muted small">Premium labs, labs at once, lab types, exam simulations and events per plan. Compute is billed on top of every plan.</p>
                 </div>
               </div>
               <Card className="card-flush site-compare-wrap">
@@ -173,7 +173,7 @@ export function Pricing() {
         )}
 
         {faq.length > 0 && (
-          <section className="page-section site-page-narrow site-page-inset" aria-labelledby="plan-faq">
+          <section className="page-section site-page-narrow site-page-inset" aria-labelledby="plan-faq" data-stop>
             <div className="section-header">
               <h2 id="plan-faq">Questions about plans</h2>
               <Link to="/faq" className="link-quiet small">

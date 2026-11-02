@@ -88,7 +88,7 @@ test("schema errors, unknown routes, missing screenshots and a weak notice are r
 test("an enabled waitlist needs a privacy notice that describes it, and required fields stay enabled", async () => {
   const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
   assert.ok(doc.waitlist.enabled);
-  doc.legal.privacy.sections = doc.legal.privacy.sections.filter((s) => !/waitlist/i.test(s.title));
+  doc.legal.privacy.sections = doc.legal.privacy.sections.filter((s) => !/waitlist|early.access/i.test(`${s.title} ${s.paragraphs.join(" ")}`));
   doc.waitlist.fields.interest = { required: true, enabled: false };
   const dir = await mkdtemp(path.join(tmpdir(), "site-"));
   const file = path.join(dir, "site.yaml");
@@ -122,4 +122,33 @@ test("launch and social proof: FAQ groups must exist, placeholder quotes cannot 
   assert.ok(errors.some((m) => m.includes("no FAQ entry has group 'Nonexistent'")), errors.join("\n"));
   assert.ok(errors.some((m) => m.includes("placeholder quotes are published as real")), errors.join("\n"));
   assert.ok(warnings.some((m) => m.includes("coming soon without the waitlist")), warnings.join("\n"));
+});
+
+test("features page: items in unlisted groups, missing screens and the featured count are reported; removing a group is one line", async () => {
+  const doc = YAML.parse(await (await import("node:fs/promises")).readFile(siteFile, "utf8"));
+  assert.ok(doc.featurePage, "content/site.yaml configures the features page");
+  assert.equal(doc.featurePage.items.filter((it) => it.featured).length, 3);
+  // Drop the admin group (one line): its items are no longer shown, and the check says so.
+  doc.featurePage.groups = doc.featurePage.groups.filter((g) => g.id !== "admin");
+  doc.featurePage.groups.push({ id: "learn", title: "Twice" });
+  doc.featurePage.items[0].figures[0].image2x = "/site/features/does-not-exist@2x.webp";
+  doc.featurePage.items[1].featured = true;
+  const dir = await mkdtemp(path.join(tmpdir(), "site-"));
+  const file = path.join(dir, "site.yaml");
+  await writeFile(file, YAML.stringify(doc));
+  const findings = [];
+  await checkSite(file, { domainsWithLabs: domains, repoRoot }, findings);
+  const errors = findings.filter((f) => f.level === "error").map((f) => f.message);
+  const warnings = findings.filter((f) => f.level !== "error").map((f) => f.message);
+  assert.ok(errors.some((m) => m.includes("does-not-exist@2x.webp")), errors.join("\n"));
+  assert.ok(errors.some((m) => m.includes("duplicate feature group 'learn'")), errors.join("\n"));
+  assert.ok(warnings.some((m) => m.includes("group 'admin', which featurePage.groups does not list")), warnings.join("\n"));
+  assert.ok(warnings.some((m) => m.includes("featured feature(s); the homepage callout shows three")), warnings.join("\n"));
+  // A footer link to /features is a website route; without a features page it is only a warning.
+  delete doc.featurePage;
+  await writeFile(file, YAML.stringify(doc));
+  findings.length = 0;
+  await checkSite(file, { domainsWithLabs: domains, repoRoot }, findings);
+  assert.deepEqual(findings.filter((f) => f.level === "error"), []);
+  assert.ok(findings.some((f) => f.message.includes("links to /features without a featurePage")), findings.map((f) => f.message).join("\n"));
 });

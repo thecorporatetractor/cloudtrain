@@ -31,7 +31,7 @@ describe('resolveSurface', () => {
 
 describe('ownerOf', () => {
   it('splits the routes between the website and the app', () => {
-    for (const p of ['/pricing', '/about', '/faq', '/contact', '/legal/terms', '/legal/privacy', '/catalog/paths/cka', '/catalog/exams/cks-sim']) expect(ownerOf(p), p).toBe('site');
+    for (const p of ['/features', '/pricing', '/about', '/faq', '/contact', '/legal/terms', '/legal/privacy', '/legal/cookies', '/catalog/paths/cka', '/catalog/exams/cks-sim']) expect(ownerOf(p), p).toBe('site');
     for (const p of ['/', '/catalog']) expect(ownerOf(p), p).toBe('both');
     for (const p of ['/sign-in', '/labs/x', '/labs/x/work', '/exams', '/account/billing', '/admin/billing', '/platform', '/nope', '/pricingx', '/catalogue']) expect(ownerOf(p), p).toBe('app');
   });
@@ -41,6 +41,7 @@ describe('surfaceRedirect', () => {
   it('sends website pages from the app to the site, keeping search and hash', () => {
     expect(surfaceRedirect(app, '/pricing', '?interval=yearly', 'plans')).toBe(`${SITE}/pricing?interval=yearly#plans`);
     expect(surfaceRedirect(app, '/legal/terms')).toBe(`${SITE}/legal/terms`);
+    expect(surfaceRedirect(app, '/legal/cookies')).toBe(`${SITE}/legal/cookies`);
     expect(surfaceRedirect(app, '/catalog/paths/cka', '', '#x')).toBe(`${SITE}/catalog/paths/cka#x`);
   });
 
@@ -56,7 +57,7 @@ describe('surfaceRedirect', () => {
   });
 
   it('keeps website pages and the hybrid paths on the site', () => {
-    for (const p of ['/', '/catalog', '/pricing', '/about', '/legal/privacy', '/catalog/exams/e1']) expect(surfaceRedirect(site, p), p).toBeNull();
+    for (const p of ['/', '/catalog', '/features', '/pricing', '/about', '/legal/privacy', '/legal/cookies', '/catalog/exams/e1']) expect(surfaceRedirect(site, p), p).toBeNull();
   });
 
   it('never redirects on a combined origin or without the other origin', () => {

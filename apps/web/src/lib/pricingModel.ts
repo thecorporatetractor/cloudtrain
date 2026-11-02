@@ -206,6 +206,51 @@ export function earlyAccessFor(plans: SitePlans | undefined): ((plan: { id: stri
   return (plan) => planLevel(plan) >= min;
 }
 
+/**
+ * Which hard labs a plan opens, from the `plans.premium` rules that select by difficulty
+ * (`hard`) and, optionally, by lab type: a lab needs the highest-level plan among the rules it
+ * matches, as the gateway decides it. Undefined when no rule selects hard labs, so the row can
+ * be left out. Rules that select by lab id, domain or tag are not summarised here.
+ */
+export function hardLabsFor(plans: SitePlans | undefined): ((plan: { kind: string; level?: number }) => ComputeTierId[]) | undefined {
+  const p = rec(plans);
+  const byDifficultyOrType = (Array.isArray(p?.premium) ? (p!.premium as unknown[]) : []).map(rec).filter((r): r is Rec => !!r && !r.labs && !r.domains && !r.tags && (Array.isArray(r.difficulties) || Array.isArray(r.computeTiers)));
+  if (!byDifficultyOrType.some((r) => Array.isArray(r.difficulties) && (r.difficulties as unknown[]).includes('hard'))) return undefined;
+  // a rule on hard labs, or on a lab type whatever the difficulty (which covers the hard ones too)
+  const rules = byDifficultyOrType.filter((r) => !Array.isArray(r.difficulties) || (r.difficulties as unknown[]).includes('hard'));
+  const items = (plans?.items ?? []) as { id: string; kind: string; level?: number }[];
+  const required = (t: ComputeTierId) =>
+    Math.max(
+      0,
+      ...rules.filter((r) => !Array.isArray(r.computeTiers) || (r.computeTiers as unknown[]).includes(t)).map((r) => planLevel(items.find((i) => i.id === r.plan) ?? { kind: 'free' })),
+    );
+  return (plan) => COMPUTE_TIERS.filter((t) => required(t) > 0 && planLevel(plan) >= required(t));
+}
+
+/**
+ * The plan level a lab type needs, from the `plans.premium` rules that select by lab type
+ * alone (`computeTiers`, no other selector): 0 when no rule restricts the type. The gateway
+ * applies the same rules when a lab starts.
+ */
+export function levelForType(plans: SitePlans | undefined): (t: ComputeTierId) => number {
+  const p = rec(plans);
+  const rules = (Array.isArray(p?.premium) ? (p!.premium as unknown[]) : []).map(rec).filter((r): r is Rec => !!r && Array.isArray(r.computeTiers) && !r.difficulties && !r.labs && !r.domains && !r.tags);
+  const items = (plans?.items ?? []) as { id: string; kind: string; level?: number }[];
+  return (t) => Math.max(0, ...rules.filter((r) => (r.computeTiers as unknown[]).includes(t)).map((r) => planLevel(items.find((i) => i.id === r.plan) ?? { kind: 'free' })));
+}
+
+/** The lab types a plan includes: those whose required level the plan's reaches. */
+export function labTypesFor(plans: SitePlans | undefined): (plan: { kind: string; level?: number }) => ComputeTierId[] {
+  const need = levelForType(plans);
+  return (plan) => COMPUTE_TIERS.filter((t) => planLevel(plan) >= need(t));
+}
+
+/** The lowest plan whose level reaches `level`, among `items` in order, or undefined. */
+export const planForLevel = <P extends { kind: string; level?: number }>(items: P[], level: number): P | undefined => items.find((p) => planLevel(p) >= level);
+
+/** Compute credit a plan includes every month (`plans.items[].computeCredit`, minor units), or 0. */
+export const includedCompute = (plan: unknown): number => num(rec(plan)?.computeCredit) ?? 0;
+
 /** The enterprise features a plan includes (`plans.items[].features`: ids, or `{ id, label|name }`), as labels. */
 export function planFeatures(plan: unknown): string[] | undefined {
   const f = rec(plan)?.features;

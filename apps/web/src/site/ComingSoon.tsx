@@ -3,15 +3,17 @@ import { usePublicCatalog, useSite } from '@/api/public';
 import type { PublicCatalog, SiteConfig } from '@/api/types';
 import { PageSkeleton } from '@/components/ui';
 import { CsLink as Section } from './ComingSoonChrome';
+import { FeatureCallout } from './Features';
 import { DomainMarquee } from './Flourish';
 import { HeroStory } from './LabStory';
-import { ComputePacks, ComputeSplit, ComputeTiers, PlanComparison, PricingPaths, PricingSteps } from './PricingModel';
+import { ComputePacks, ComputeSplit, ComputeTerms, ComputeTiers, PlanComparison, PricingPaths } from './PricingModel';
 import { FeatureIcon, useDocumentTitle } from './util';
 import { WaitlistSection } from './Waitlist';
 
 /*
  * The coming-soon website (content/site.yaml `launch.mode: coming-soon`, see
- * src/site/launch.ts): one standalone page with what the platform is, how
+ * src/site/launch.ts): one standalone page with what the platform is, the featured
+ * screens that lead to the features page (which keeps its own page in this mode), how
  * pricing works, the early-access waitlist and the questions, in its own chrome
  * (brand, section links, theme, "Join the waitlist"). Nothing on it leads into
  * the platform: no sign-in, no checkout, no catalog. The legal pages keep their
@@ -42,6 +44,7 @@ export function ComingSoon() {
       <Hero site={s} />
       {s.flags.showCatalog !== false && <DomainMarquee site={s} cat={catalog.data} label="Domains at launch" />}
       <What site={s} cat={catalog.data} />
+      <FeatureCallout site={s} />
       <PricingExplained site={s} />
       <WaitlistSection site={s} />
       <Questions site={s} />
@@ -92,7 +95,7 @@ function What({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
     : [];
   if (points.length === 0 && figures.length === 0) return null;
   return (
-    <section className="site-section" id="what" aria-labelledby="what-title">
+    <section className="site-section site-section-tall" id="what" aria-labelledby="what-title" data-stop>
       <div className="site-container">
         <div className="site-section-head">
           <div className="site-section-head-copy" data-reveal="children">
@@ -143,7 +146,7 @@ export function PricingExplained({ site, id = 'pricing', headingLevel = 2 }: { s
     <section className="site-section site-section-alt pm" id={id} aria-labelledby={`${id}-title`}>
       <div className="site-container">
         {/* The head and the three ways fill the first viewport of the section; the rest starts below the fold. */}
-        <div className="pm-fold">
+        <div className="pm-fold" data-stop>
           <div className="site-section-head pm-head">
             <div className="site-section-head-copy" data-reveal="children">
               <p className="site-eyebrow">{m.eyebrow ?? 'Pricing'}</p>
@@ -155,23 +158,21 @@ export function PricingExplained({ site, id = 'pricing', headingLevel = 2 }: { s
           </div>
           <PricingPaths site={site} />
         </div>
-        {m.paths && m.paths.length > 0 && <h3 className="pm-subhead">The hosted service, step by step</h3>}
-        <PricingSteps model={m} />
-        {/* One view, one stop (motion/stops.ts): the tiers, the packs and the estimator with its examples. */}
-        <div className="pm-compute">
-          <h3 className="pm-subhead">Compute, by the minute</h3>
-          <ComputeTiers site={site} />
-          <ComputePacks site={site} />
-          <ComputeSplit site={site} />
+        {/* One view, one stop (motion/stops.ts), centred in its viewport: the rates, the packs, the
+            estimator with its examples, the billing terms. The compared plans start on their own stop. */}
+        <div className="pm-compute" data-stop>
+          <div className="pm-compute-in">
+            <h3 className="pm-subhead">Compute, by the minute</h3>
+            <ComputeTiers site={site} />
+            <ComputePacks site={site} />
+            <ComputeSplit site={site} />
+            <ComputeTerms site={site} />
+          </div>
         </div>
         {site.plans && site.plans.items.length > 0 && (
           // A viewport of its own, so the next section is not in view with it (site.css .pm-compare-block)
-          <div className="pm-compare-block">
-            <div className="pm-compare-head">
-              <h3 className="pm-subhead">Hosted plans compared</h3>
-              {site.plans.billingNote && <p className="pm-compare-intro">{site.plans.billingNote}</p>}
-            </div>
-            <PlanComparison site={site} />
+          <div className="pm-compare-block" data-stop>
+            <PlanComparison site={site} title="Hosted plans compared" />
           </div>
         )}
       </div>
@@ -185,7 +186,7 @@ function Questions({ site }: { site: SiteConfig }) {
   const items = groups?.length ? site.faq.filter((f) => f.group && groups.includes(f.group)) : site.faq.filter((f) => f.featured || (pricingGroup && f.group === pricingGroup));
   if (items.length === 0) return null;
   return (
-    <section className="site-section site-section-tall" id="faq" aria-labelledby="faq-title">
+    <section className="site-section site-section-tall" id="faq" aria-labelledby="faq-title" data-stop>
       <div className="site-container cs-faq">
         <div className="site-section-head-copy" data-reveal="children">
           <p className="site-eyebrow">Questions</p>
@@ -198,12 +199,18 @@ function Questions({ site }: { site: SiteConfig }) {
             </p>
           )}
         </div>
-        <div className="site-faq" data-reveal="children">
-          {items.map((f) => (
-            <details key={f.q} className="site-faq-item">
-              <summary>{f.q}</summary>
-              <p>{f.a}</p>
-            </details>
+        {/* Two independent stacks (the first half, the second), so an open answer lengthens its own
+            column only; on a phone they follow each other, in reading order. */}
+        <div className="site-faq site-faq-2" data-reveal="children">
+          {[items.slice(0, Math.ceil(items.length / 2)), items.slice(Math.ceil(items.length / 2))].map((col, i) => (
+            <div key={i} className="site-faq-col">
+              {col.map((f) => (
+                <details key={f.q} className="site-faq-item">
+                  <summary>{f.q}</summary>
+                  <p>{f.a}</p>
+                </details>
+              ))}
+            </div>
           ))}
         </div>
       </div>

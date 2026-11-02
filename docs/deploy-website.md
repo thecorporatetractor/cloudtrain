@@ -219,7 +219,7 @@ The production shape: the public website on the apex, the platform on a subdomai
 
 | | Origin | Served by | What it serves |
 |---|---|---|---|
-| Website | `https://cloudtrain.com` | the static build (`build:site`) on a static host, or the `web` image | `/`, `/catalog`, `/catalog/paths/*`, `/catalog/exams/*`, `/pricing`, `/about`, `/faq`, `/contact`, `/legal/*` |
+| Website | `https://cloudtrain.com` | the static build (`build:site`) on a static host, or the `web` image | `/`, `/catalog`, `/catalog/paths/*`, `/catalog/exams/*`, `/features`, `/pricing`, `/about`, `/faq`, `/contact`, `/legal/*` |
 | App | `https://app.cloudtrain.com` | the Helm chart (`host: app.cloudtrain.com`): `web` pods for pages, the gateway for `/api` | everything else, including `/sign-in` |
 | API | `https://app.cloudtrain.com/api` | the gateway, behind the same Ingress | the app same-origin; the website cross-origin (CORS) |
 
