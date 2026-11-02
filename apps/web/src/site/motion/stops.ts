@@ -146,8 +146,8 @@ export function collectStops(): number[] {
 }
 
 export interface Stepper {
-  /** Scrolls to a stop position with the stepping animation. */
-  go(y: number): void;
+  /** Scrolls to a stop position with the stepping animation; `done` runs when it has settled or was interrupted. */
+  go(y: number, done?: () => void): void;
   stop(): void;
 }
 
@@ -163,12 +163,13 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
   const at = (stops: number[], y: number) => stops.find((s) => Math.abs(s - y) <= 3);
   const nextOf = (stops: number[], y: number, dir: number) => (dir > 0 ? stops.find((s) => s > y + 3) : [...stops].reverse().find((s) => s < y - 3));
 
-  const go = (y: number) => {
+  const go = (y: number, done?: () => void) => {
     window.clearTimeout(animating);
     animating = window.setTimeout(() => (animating = 0), 2000); // a safety net, if the scroll never reports completion
     animate(y, () => {
       window.clearTimeout(animating);
       animating = 0;
+      done?.();
     });
   };
 
@@ -243,12 +244,13 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
 export function startRestSnapping(animate: (y: number, done: () => void) => void): Stepper {
   let animating = 0;
   let restTimer = 0;
-  const go = (y: number) => {
+  const go = (y: number, done?: () => void) => {
     window.clearTimeout(animating);
     animating = window.setTimeout(() => (animating = 0), 2000);
     animate(y, () => {
       window.clearTimeout(animating);
       animating = 0;
+      done?.();
     });
   };
   const onRest = () => {

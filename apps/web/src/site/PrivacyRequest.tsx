@@ -59,7 +59,7 @@ export function PrivacyRequestView({ values, errors, phase, acceptedMessage, for
   }
   return (
     <div className="site-wl-card">
-      <form
+      <form method="post"
         className="site-wl-form"
         noValidate
         aria-label="Privacy request"

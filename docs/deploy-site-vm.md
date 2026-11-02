@@ -229,9 +229,9 @@ Without a valid one the TLS handshake is refused, on the apex and on `www`. It f
 CA file or a mistyped mode stops Caddy from starting. This is what makes the sidecar's trust in
 `CF-Connecting-IP` safe.
 
-**Which certificate.** This setup uses Cloudflare's **Global** mode, whose certificate Cloudflare says
+**Which certificate.** The live site uses **Zone-level** mode with a certificate of our own, uploaded on the Free plan: the CA key is kept off the VM and the leaf expires on 2031-11-01, so renew it before then. Cloudflare's alternative is **Global** mode, whose certificate Cloudflare says
 "is shared across all Cloudflare accounts" and "only proves a request came from the Cloudflare network".
-So another Cloudflare customer pointing a zone at this IP still passes. They cannot reach the VM
+In that mode another Cloudflare customer pointing a zone at this IP still passes. They cannot reach the VM
 directly, but they could get past our zone's WAF rule, including step 1 of the kill switch. The sidecar's
 limits still apply to them.
 

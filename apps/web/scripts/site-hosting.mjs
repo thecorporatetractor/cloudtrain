@@ -197,11 +197,13 @@ export function siteBootJs(entry) {
 }
 
 const ENTRY = /<script type="module" crossorigin src="(\/assets\/[\w.-]+\.js)"><\/script>/;
-const LOADER = '<script defer src="/site-boot.js"></script>';
+// The URL carries the entry's content hash: a cache in front of the site (Cloudflare keeps .js by
+// default) must never hand a new page the old loader, which would load the old app.
+const loaderTag = (entry) => `<script defer src="/site-boot.js?v=${entry.replace(/^.*\/|\.js$/g, '')}"></script>`;
 
 /** The entry module of index.html (for siteBootJs) and the page with that tag (and its modulepreloads) swapped for the loader. */
 export function deferEntry(html) {
   const m = html.match(ENTRY);
   if (!m) throw new Error('index.html has no entry module script');
-  return { entry: m[1], html: html.replace(ENTRY, LOADER).replace(/\s*<link rel="modulepreload"[^>]*>/g, '') };
+  return { entry: m[1], html: html.replace(ENTRY, loaderTag(m[1])).replace(/\s*<link rel="modulepreload"[^>]*>/g, '') };
 }
