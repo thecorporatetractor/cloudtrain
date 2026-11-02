@@ -13,7 +13,7 @@ RUN GOWORK=off go mod download
 COPY services/lab-orchestrator/ ./
 RUN GOWORK=off CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/labctl ./cmd/labctl
 
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
+FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS build
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH CI=true
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 WORKDIR /src
@@ -23,7 +23,7 @@ RUN pnpm install --frozen-lockfile --filter @cloudtrain/gateway... \
  && pnpm --filter @cloudtrain/gateway build \
  && pnpm --filter @cloudtrain/gateway deploy --prod /out/gateway
 
-FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:ec2313763dd43931543bd03830466e0c409ce73a487e8d46f10db72d3b816c1c
+FROM gcr.io/distroless/nodejs22-debian13:nonroot@sha256:8ad9cc935b7843c4024b7e1487b5ef472c354ea847b97c667023e2618552607e
 WORKDIR /opt/cloudtrain/gateway
 COPY --from=build /out/gateway/ ./
 COPY --from=labctl /out/labctl /usr/local/bin/labctl
