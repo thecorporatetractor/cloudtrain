@@ -85,8 +85,12 @@ async function prerender(dir, shell) {
     return;
   }
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.webp': 'image/webp', '.woff2': 'font/woff2', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
+  // Everything the page reads is in /data, exported above. A production VM answers 404 under /api
+  // except for the forms (docs/deploy-site-vm.md), so a page that calls it would break there.
+  const apiCalls = [];
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x');
+    if (url.pathname.startsWith('/api/')) apiCalls.push(`${req.method} ${url.pathname}`);
     let file = path.join(dir, decodeURIComponent(url.pathname));
     if (!file.startsWith(dir) || url.pathname === '/' || !(await stat(file).then((s) => s.isFile()).catch(() => false))) file = path.join(dir, 'shell.html');
     res.writeHead(200, { 'Content-Type': types[path.extname(file)] ?? 'application/octet-stream' });
@@ -101,6 +105,7 @@ async function prerender(dir, shell) {
     await page.route(/^https?:\/\/(?!127\.0\.0\.1)/, (r) => r.abort());
     await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'networkidle' });
     await page.waitForSelector('#main h1', { timeout: 20000 });
+    if (apiCalls.length) throw new Error(`the static site called the API while loading: ${[...new Set(apiCalls)].join(', ')}`);
     const root = await page.evaluate(() => document.getElementById('root').innerHTML);
     // The page is there before any script runs; the app loads once it has painted (site-boot.js).
     // The text face is preloaded so the prerendered text does not reflow when it arrives.

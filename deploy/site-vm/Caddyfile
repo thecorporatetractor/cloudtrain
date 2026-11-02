@@ -1,16 +1,37 @@
-# CloudTrain public website (deploy/site-vm). SITE_HOST is the apex (cloudtrain.app);
-# www redirects to it. Caddy gets and renews the Let's Encrypt certificates itself
-# (ports 80 and 443 must be reachable from the internet).
+# CloudTrain public website (deploy/site-vm): the static site, and three API routes handed to the
+# sidecar. Behind Cloudflare in Full (strict) mode: TLS uses a Cloudflare origin certificate from
+# mounted files, so there is no ACME and no port 80.
+#
+# Authenticated Origin Pulls: a connection without a client certificate from Cloudflare's origin pull
+# CA is refused during the TLS handshake. It is what makes the sidecar's trust in CF-Connecting-IP
+# safe. Fails closed: a missing CA file or an unknown mode stops Caddy from starting.
+# docs/deploy-site-vm.md explains it, and the one rollout step that relaxes it.
 {
-	email {$ACME_EMAIL}
+	auto_https off
+	admin off
+	servers {
+		protocols h1 h2
+	}
 }
 
-www.{$SITE_HOST} {
+(origin_tls) {
+	tls /certs/origin.pem /certs/origin.key {
+		client_auth {
+			mode {$SITE_CLIENT_AUTH_MODE:require_and_verify}
+			trust_pool file /certs/origin-pull-ca.pem
+		}
+	}
+}
+
+www.{$SITE_HOST}:443 {
+	import origin_tls
 	redir https://{$SITE_HOST}{uri} permanent
 }
 
-{$SITE_HOST} {
-	encode zstd gzip
+{$SITE_HOST}:443 {
+	import origin_tls
+	# Cloudflare compresses for the browser too; gzip here keeps the origin's memory low (zstd keeps large windows).
+	encode gzip
 
 	# The same headers as the static build's _headers file (apps/web/scripts/site-hosting.mjs,
 	# csp('') for a same-origin API), plus HSTS.
@@ -23,13 +44,20 @@ www.{$SITE_HOST} {
 		-Server
 	}
 
-	# Only the public API reaches the gateway: public data and the waitlist form.
-	# Sign-in, the platform and the admin API are not served from this host.
-	handle /api/public/* {
-		reverse_proxy gateway:8787
+	# Only these reach the sidecar. Every other /api path, and any other method, is a 404 here.
+	@api {
+		method POST
+		path /api/public/waitlist /api/public/privacy/requests /api/public/privacy/confirm
+	}
+	handle @api {
+		request_body {
+			max_size 16KB
+		}
+		reverse_proxy site-proxy:8080
 	}
 	handle /api/* {
-		respond 404
+		header Content-Type "application/json; charset=utf-8"
+		respond `{"error":"Not found","code":"not_found"}` 404
 	}
 
 	handle {
@@ -46,8 +74,23 @@ www.{$SITE_HOST} {
 		file_server
 	}
 
+	# The sidecar stopped or restarting (also the kill switch): the form shows its own message.
+	handle_errors 502 503 504 {
+		header Content-Type "application/json; charset=utf-8"
+		header Cache-Control no-store
+		respond `{"error":"Not available right now, try again in a few minutes","code":"upstream"}` 503
+	}
+
+	# Without the request headers: CF-Connecting-IP is the visitor's address, and this log must not
+	# hold it. The remote address in the log is Cloudflare's.
 	log {
 		output stdout
-		format console
+		format filter {
+			wrap console
+			fields {
+				request>headers delete
+				resp_headers delete
+			}
+		}
 	}
 }

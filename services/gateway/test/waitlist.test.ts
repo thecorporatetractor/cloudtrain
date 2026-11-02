@@ -92,6 +92,8 @@ describe('POST /api/public/waitlist', () => {
       [{ consent: true }, 'email'],
       [{ email: 'not-an-email', consent: true }, 'email'],
       [{ email: 'a@b', consent: true }, 'email'],
+      [{ email: 'a<b>@example.com', consent: true }, 'email'],
+      [{ email: 'a.@example.com', consent: true }, 'email'],
       [{ email: 'a..b@example.com', consent: true }, 'email'],
       [{ email: 42, consent: true }, 'email'],
       [{ email: `${'a'.repeat(250)}@example.com`, consent: true }, 'email'],

@@ -35,6 +35,9 @@ classify() {
     # TypeScript workspace.
     apps/web/*) hit=(node web code js) ;;
     services/gateway/*) hit=(node gateway code js) ;;
+    services/site-api/*) hit=(node code js) ;;
+    # The website VM's sidecar: its own Go module, with its own job.
+    services/site-proxy/*) hit=(go code) ;;
     packages/lab-schema/*) hit=(node web gateway go content code js) ;; # schema copy drift, lab-verify
     packages/*) hit=(node web gateway code js) ;;
     pnpm-lock.yaml | package.json | pnpm-workspace.yaml) hit=(node web gateway deps licenses code js) ;;

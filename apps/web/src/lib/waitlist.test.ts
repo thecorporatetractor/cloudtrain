@@ -28,6 +28,7 @@ describe('waitlist form validation', () => {
   it('isEmail matches the gateway rules', () => {
     for (const ok of ['a@b.io', 'first.last+tag@sub.example.co.uk']) expect(isEmail(ok)).toBe(true);
     for (const bad of ['', 'a', 'a@b', 'a b@c.io', 'a@b..io', '.a@b.io']) expect(isEmail(bad)).toBe(false);
+    for (const bad of ['a.@b.io', 'a..b@b.io', 'a"b@b.io', 'a(b@b.io', 'a,b@b.io', 'a:b@b.io', 'a;b@b.io', 'a<b@b.io', 'a>b@b.io', 'a[b@b.io', 'a\\b@b.io', 'a]b@b.io', 'á@b.io']) expect(isEmail(bad)).toBe(false);
   });
 });
 

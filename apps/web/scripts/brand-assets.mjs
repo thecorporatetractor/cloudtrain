@@ -10,6 +10,8 @@
 //   favicon.svg (mark, follows prefers-color-scheme), ../favicon.ico (16/32/48),
 //   apple-touch-icon.png (180), icon-192.png, icon-512.png, icon-maskable-192.png, icon-maskable-512.png,
 //   og-image.png (1200x630), github-social-preview.png (1280x640), github-avatar.png (1024).
+// The wordmark the transactional emails load, cloudtrain-email-logo.png, is made separately by
+// packages/email-templates/scripts/logo.mjs (one mid-grey for light and dark mail clients).
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';

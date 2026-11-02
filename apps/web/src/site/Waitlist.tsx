@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query';
 import { ArrowRight, CheckCircle2, Loader2 } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import type { SiteConfig, SiteWaitlist, WaitlistInterest } from '@/api/types';
 import { emptyWaitlistForm, fieldOn, submitWaitlist, validateWaitlistForm, waitlistPayload, WaitlistError, type WaitlistErrors, type WaitlistField, type WaitlistForm } from '@/lib/waitlist';
 
@@ -12,7 +12,23 @@ import { emptyWaitlistForm, fieldOn, submitWaitlist, validateWaitlistForm, waitl
  * page in a new tab so a half-filled form is not lost.
  */
 
-export type WaitlistPhase = 'idle' | 'submitting' | 'created' | 'duplicate' | 'error';
+/**
+ * Copy from site.yaml with `[label](/path)` links, internal paths only. They open in a new tab, as
+ * the consent link does, so a half-filled form is not lost.
+ */
+export function withLinks(text: string): ReactNode[] {
+  return text.split(/(\[[^\]]+\]\(\/[^)\s]*\))/).map((part, i) => {
+    const m = /^\[([^\]]+)\]\((\/[^)\s]*)\)$/.exec(part);
+    if (!m) return part;
+    return (
+      <a key={i} href={m[2]} target="_blank" rel="noopener">
+        {m[1]}
+      </a>
+    );
+  });
+}
+
+export type WaitlistPhase = 'idle' | 'submitting' | 'created' | 'error';
 
 const D = {
   eyebrow: 'Early access',
@@ -24,8 +40,6 @@ const D = {
   privacyLinkLabel: 'privacy notice',
   successTitle: 'You are on the list',
   successBody: 'Thank you. We will be in touch when early access opens for you.',
-  duplicateTitle: 'You are already on the list',
-  duplicateBody: 'This address is already registered, so there is nothing more to do.',
   errorMessage: 'We could not save your details just now. Please try again in a few minutes.',
 };
 
@@ -46,7 +60,7 @@ export function WaitlistView({ cfg, values, errors, phase, formError, onChange, 
   const uid = useId();
   const id = (n: string) => `${uid}-${n}`;
   const statusRef = useRef<HTMLDivElement>(null);
-  const done = phase === 'created' || phase === 'duplicate';
+  const done = phase === 'created';
   useEffect(() => {
     if (done) statusRef.current?.focus();
   }, [done]);
@@ -76,15 +90,15 @@ export function WaitlistView({ cfg, values, errors, phase, formError, onChange, 
           {cfg.title ?? D.title}
         </h2>
         <p className="site-section-lead">{cfg.body ?? D.body}</p>
-        {cfg.note && <p className="site-wl-note">{cfg.note}</p>}
+        {cfg.note && <p className="site-wl-note">{withLinks(cfg.note)}</p>}
       </div>
 
       <div className="site-wl-card">
         {done ? (
           <div ref={statusRef} role="status" tabIndex={-1} className="site-wl-done" data-state={phase}>
             <CheckCircle2 size={22} aria-hidden className="site-wl-done-icon" />
-            <h3 className="site-h3">{phase === 'created' ? (cfg.successTitle ?? D.successTitle) : (cfg.duplicateTitle ?? D.duplicateTitle)}</h3>
-            <p className="muted">{phase === 'created' ? (cfg.successBody ?? D.successBody) : (cfg.duplicateBody ?? D.duplicateBody)}</p>
+            <h3 className="site-h3">{cfg.successTitle ?? D.successTitle}</h3>
+            <p className="muted">{withLinks(cfg.successBody ?? D.successBody)}</p>
             {onReset && (
               <button type="button" className="btn btn-secondary btn-md" onClick={onReset}>
                 Use another address
@@ -168,7 +182,7 @@ export function WaitlistView({ cfg, values, errors, phase, formError, onChange, 
               <label className="site-wl-consent">
                 <input type="checkbox" name="consent" required checked={values.consent} onChange={(e) => onChange({ consent: e.target.checked })} {...aria('consent')} />
                 <span>
-                  {cfg.consentLabel ?? D.consentLabel}{' '}
+                  {withLinks(cfg.consentLabel ?? D.consentLabel)}{' '}
                   <a href="/legal/privacy" target="_blank" rel="noopener">
                     {cfg.privacyLinkLabel ?? D.privacyLinkLabel}
                     <span className="sr-only"> (opens in a new tab)</span>
@@ -210,7 +224,8 @@ export function WaitlistPanel({ cfg }: { cfg: SiteWaitlist }) {
     }
     setPhase('submitting');
     send.mutate(values, {
-      onSuccess: (r) => setPhase(r.status),
+      // One outcome, whatever the backend says: the page never tells that an address is known.
+      onSuccess: () => setPhase('created'),
       onError: (e) => {
         setPhase('idle');
         if (e instanceof WaitlistError && e.kind === 'invalid') {

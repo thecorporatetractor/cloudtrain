@@ -4,7 +4,7 @@ How to host CloudTrain's public marketing site (landing page, catalog, about, FA
 contact, legal pages and the early-access waitlist) separately from the platform, or
 with it.
 
-For `cloudtrain.app` on one small VM (Caddy, the gateway for the waitlist, Postgres), see
+For `cloudtrain.app` on one small VM (Caddy, a sidecar and Azure Functions, no database), see
 [deploy-site-vm.md](deploy-site-vm.md). Mail for the domain: [email.md](email.md).
 
 **Status: decided.** The website goes on the apex domain (`cloudtrain.app`) and the platform
