@@ -5,7 +5,7 @@
 # environment): CT_API_BASE, CT_ENVIRONMENT, CT_CSP_{SCRIPT,CONNECT,IMG,FRAME}_SRC,
 # CT_WEB_PORT, and for a website on its own origin CT_SITE_URL, CT_APP_URL and
 # CT_SURFACE (site|app; apps/web/src/lib/surface.ts). Read-only root filesystem: mount a writable /tmp.
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
+FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS build
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH CI=true
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 WORKDIR /src
