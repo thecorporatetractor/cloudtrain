@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SitePlans } from '@/api/types';
-import { bestPack, billedMinutes, earlyAccessFor, planFeatures, formatMinutes, formatMoney, rateLabels, readCompute, readFreeTrial, readPacks, sessionCost, withPack } from './pricingModel';
+import { bestPack, billedMinutes, earlyAccessFor, hardLabsFor, includedCompute, labTypesFor, levelForType, planFeatures, planForLevel, formatMinutes, formatMoney, rateLabels, readCompute, readFreeTrial, readPacks, sessionCost, withPack } from './pricingModel';
 
 const base = {
   currency: 'EUR',
@@ -137,6 +137,45 @@ describe('costs', () => {
     expect(formatMinutes(45)).toBe('45 min');
     expect(formatMinutes(60)).toBe('1 h');
     expect(formatMinutes(90)).toBe('1 h 30 min');
+  });
+});
+
+describe('hard labs', () => {
+  const items = [
+    { id: 'free', kind: 'free' },
+    { id: 'pro', kind: 'individual', level: 1 },
+    { id: 'premium', kind: 'individual', level: 2 },
+    { id: 'team', kind: 'organisation', level: 2 },
+  ];
+  it('is undefined without a rule on hard labs, and otherwise opens the lab types a plan level unlocks', () => {
+    expect(hardLabsFor(undefined)).toBeUndefined();
+    expect(hardLabsFor({ ...base, premium: [{ plan: 'pro', labs: ['x'] }] } as unknown as SitePlans)).toBeUndefined();
+    const hard = hardLabsFor({ ...base, items, premium: [{ plan: 'pro', difficulties: ['hard'] }, { plan: 'premium', difficulties: ['hard'], computeTiers: ['heavy'] }] } as unknown as SitePlans)!;
+    expect(hard(items[0]!)).toEqual([]);
+    expect(hard(items[1]!)).toEqual(['pod', 'vm']);
+    expect(hard(items[2]!)).toEqual(['pod', 'vm', 'heavy']);
+    expect(hard(items[3]!)).toEqual(['pod', 'vm', 'heavy']);
+  });
+  it('derives the lab types a plan includes from rules that select by lab type alone', () => {
+    const plans = { ...base, items, premium: [{ plan: 'pro', difficulties: ['hard'] }, { plan: 'premium', computeTiers: ['heavy'] }] } as unknown as SitePlans;
+    expect(levelForType(plans)('pod')).toBe(0);
+    expect(levelForType(plans)('heavy')).toBe(2);
+    const types = labTypesFor(plans);
+    expect(types(items[0]!)).toEqual(['pod', 'vm']);
+    expect(types(items[1]!)).toEqual(['pod', 'vm']);
+    expect(types(items[2]!)).toEqual(['pod', 'vm', 'heavy']);
+    expect(types(items[3]!)).toEqual(['pod', 'vm', 'heavy']);
+    expect(labTypesFor(base)(items[0]!)).toEqual(['pod', 'vm', 'heavy']);
+    expect(planForLevel(items, 2)?.id).toBe('premium');
+    expect(planForLevel(items, 3)).toBeUndefined();
+    // the hard-lab rule still layers on top: Pro's hard labs are the Pod and VM ones, Premium's every type
+    const hard = hardLabsFor(plans)!;
+    expect(hard(items[1]!)).toEqual(['pod', 'vm']);
+    expect(hard(items[2]!)).toEqual(['pod', 'vm', 'heavy']);
+  });
+  it('reads included compute credit, 0 when none', () => {
+    expect(includedCompute({ computeCredit: 500 })).toBe(500);
+    expect(includedCompute({})).toBe(0);
   });
 });
 

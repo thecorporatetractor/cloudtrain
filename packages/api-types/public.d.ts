@@ -41,9 +41,41 @@ export interface SiteFeatureBlock {
 export interface SiteFigure {
   image: string;
   imageLight?: string;
+  /** The dark image at twice the pixel size, for high-density screens. */
+  image2x?: string;
+  imageLight2x?: string;
   alt: string;
   width?: number;
   height?: number;
+}
+
+/** A group of the features page (`/features`); an item whose group is not configured is not shown. */
+export interface SiteFeatureGroup {
+  id: string;
+  title: string;
+  lead?: string;
+}
+
+/** A feature on the features page: a heading, a short description and its screenshots. */
+export interface SiteFeatureItem {
+  group: string;
+  title: string;
+  body: string;
+  /** Which plans include it, or that it needs a license key when self-hosted; absent when every plan has it. */
+  access?: string;
+  /** Shown on the homepage callout (the first three featured items). */
+  featured?: boolean;
+  figures: SiteFigure[];
+}
+
+/** The features page and the homepage callout that leads to it. */
+export interface SiteFeaturePage {
+  eyebrow?: string;
+  title: string;
+  intro?: string;
+  callout?: { eyebrow?: string; title?: string; body?: string; linkLabel?: string };
+  groups: SiteFeatureGroup[];
+  items: SiteFeatureItem[];
 }
 
 export interface SiteDifferentiator {
@@ -119,6 +151,8 @@ export interface SitePlan {
   highlight?: boolean;
   /** Absent for free plans. */
   prices?: { monthly?: PlanPrice; yearly?: PlanPrice };
+  /** Compute credit included every month, in minor units (website only until billing grants it). */
+  computeCredit?: number;
   perSeat?: boolean;
   minSeats?: number;
   maxSeats?: number;
@@ -302,6 +336,8 @@ export interface SiteConfig {
   howItWorks: { title: string; body: string; icon?: SiteFeatureIcon }[];
   differentiators?: SiteDifferentiator[];
   showcase?: SiteShowcaseItem[];
+  /** The features page (`/features`) and its homepage callout; absent: neither. */
+  featurePage?: SiteFeaturePage;
   audiences?: SiteAudience[];
   faq: { q: string; a: string; group?: string; featured?: boolean }[];
   about: { title: string; paragraphs: string[]; facts?: { label: string; value: string }[] };
@@ -324,6 +360,8 @@ export interface SiteConfig {
     alignmentNotice: string;
     terms: SiteLegalDocument;
     privacy: SiteLegalDocument;
+    /** Cookie notice at /legal/cookies. */
+    cookies?: SiteLegalDocument;
   };
   theme?: {
     default?: SiteTheme;
@@ -387,10 +425,13 @@ export interface SitePricingModel {
   intro?: string;
   /** The ways to run CloudTrain (self-host, hosted, enterprise); `hosted` shows the compute rates. */
   paths?: { id: string; icon?: SiteFeatureIcon; eyebrow?: string; title: string; price?: string; body: string; points?: string[]; cta?: SiteCta }[];
-  steps: SitePoint[];
+  /** Optional; the public pages no longer show the steps. */
+  steps?: SitePoint[];
   tiers?: Partial<Record<ComputeTierId, { name: string; body: string; examples?: string[] }>>;
   examples?: { title: string; body?: string; tier: ComputeTierId; minutes: number; sessions?: number }[];
   estimator?: { title?: string; note?: string; defaultTier?: ComputeTierId; defaultMinutes?: number; defaultSessions?: number };
+  /** One true sentence on what ends a forgotten lab and what the spend cap does (under the estimator). */
+  sessionNote?: string;
   pendingNote?: string;
 }
 

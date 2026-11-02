@@ -40,7 +40,7 @@ export interface SurfaceConfig {
 /** Routes that render without a session and without any chrome (the sign-in card). */
 export const PUBLIC_PATHS = ['/sign-in'];
 /** The public website: rendered in the site layout (header, footer). */
-export const SITE_PATHS = ['/catalog/paths', '/catalog/exams', '/pricing', '/about', '/faq', '/contact', '/legal'];
+export const SITE_PATHS = ['/catalog/paths', '/catalog/exams', '/features', '/pricing', '/about', '/faq', '/contact', '/legal'];
 /** The website for visitors and the app for signed-in users on a combined origin (see above). */
 export const HYBRID_PATHS = ['/', '/catalog'];
 

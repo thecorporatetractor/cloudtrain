@@ -218,4 +218,9 @@ export function Privacy() {
   return <LegalPage doc={useSite().data?.legal.privacy} />;
 }
 
+/** The cookie notice (legal.cookies); an empty page, not an error, on a deployment that has not written one. */
+export function Cookies() {
+  return <LegalPage doc={useSite().data?.legal.cookies} />;
+}
+
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');

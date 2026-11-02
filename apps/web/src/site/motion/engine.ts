@@ -18,7 +18,7 @@
 import { gsap } from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
 import Lenis from 'lenis';
-import { siteZoom, startRestSnapping, startStepping, stopElementFor, stopFor, type Stepper } from './stops';
+import { collectStops, siteZoom, startRestSnapping, startStepping, stopElementFor, stopFor, type Stepper } from './stops';
 import { DUR, EASE, RISE, SCROLL_LERP, SCROLL_TO_DURATION } from './tokens';
 
 gsap.registerPlugin(ScrollTrigger);
@@ -205,6 +205,8 @@ function watch() {
 
 /** Called once by ./index.ts after the engine is imported. */
 export function start() {
+  // In development the stop list is readable from the console and the screenshot audits (scripts), so they test the real thing.
+  if (import.meta.env.DEV) (window as unknown as { __ctStops?: () => number[] }).__ctStops = collectStops;
   startLenis();
   scanFigures();
   // Touch: the browser scrolls, the page settles on a stop when the scroll rests.

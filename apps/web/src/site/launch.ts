@@ -35,8 +35,8 @@ export function launchMode(site: SiteConfig | undefined): SiteLaunchMode {
 
 export const isComingSoon = (site: SiteConfig | undefined) => launchMode(site) === 'coming-soon';
 
-/** Website paths that keep their own page in coming-soon mode; every other one shows the coming-soon landing. */
-const KEPT = ['/legal'];
+/** Website paths that keep their own page in coming-soon mode (the legal texts, the features page); every other one shows the coming-soon landing. */
+const KEPT = ['/legal', '/features'];
 export const keepsOwnPage = (pathname: string) => KEPT.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 
 /** The mode is known: from an override, or once the configuration has loaded (until then neither chrome is drawn). */

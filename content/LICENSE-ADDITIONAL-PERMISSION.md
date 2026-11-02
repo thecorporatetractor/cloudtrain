@@ -13,8 +13,8 @@ license.
 Creative Commons licenses are non-exclusive, and a licensor may grant
 permissions beyond the license separately (CC BY-NC 4.0, Section 7(b): such
 arrangements "are separate from and independent of the terms and conditions of
-this Public License"; Creative Commons calls this "CC+"). CloudTrain, as
-Licensor, grants the following additional permission.
+this Public License"; Creative Commons calls this "CC+"). Marco Azarmaneche,
+who runs CloudTrain, as Licensor, grants the following additional permission.
 
 ## 1. Permission: training your own personnel
 

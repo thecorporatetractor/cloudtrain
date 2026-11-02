@@ -3,7 +3,7 @@
 > Draft for legal review. Not yet in force.
 
 Thank you for contributing to CloudTrain. This agreement makes clear the terms
-under which CloudTrain ("we") accepts your contributions. It does not transfer
+under which Marco Azarmaneche, who runs CloudTrain ("we"), accepts your contributions. It does not transfer
 ownership: you keep the copyright in your work.
 
 1. **Definitions.** "Contribution" means any original work (code, documentation,

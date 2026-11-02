@@ -11,7 +11,7 @@ import { validateSite } from "@cloudtrain/lab-schema";
 
 /** Website routes an internal link may point at (apps/web/src/router.tsx, public section). */
 /** (Section links such as `/#waitlist` resolve against the route before the hash.) */
-export const SITE_ROUTES = ["/", "/catalog", "/pricing", "/about", "/faq", "/contact", "/legal/terms", "/legal/privacy", "/sign-in"];
+export const SITE_ROUTES = ["/", "/catalog", "/features", "/pricing", "/about", "/faq", "/contact", "/legal/terms", "/legal/privacy", "/legal/cookies", "/legal/privacy-request", "/sign-in"];
 
 /**
  * @param {string} file path of content/site.yaml
@@ -53,6 +53,7 @@ export async function checkSite(file, ctx, findings) {
     const route = to.split(/[?#]/)[0];
     if (!SITE_ROUTES.includes(route) && !route.startsWith("/catalog/")) err(p, `internal link '${to}' is not a website route (${SITE_ROUTES.join(", ")})`);
     if (route === "/pricing" && !doc.flags.showPricing) warn(p, "links to /pricing while flags.showPricing is off");
+    if (route === "/features" && !doc.featurePage) warn(p, "links to /features without a featurePage");
     if (route.startsWith("/catalog") && !doc.flags.showCatalog) warn(p, "links to the catalog while flags.showCatalog is off");
   }
 
@@ -61,12 +62,29 @@ export async function checkSite(file, ctx, findings) {
     ...(doc.hero.preview ? [["/hero/preview", doc.hero.preview]] : []),
     ...(doc.differentiators ?? []).flatMap((d, i) => (d.figure ? [[`/differentiators/${i}/figure`, d.figure]] : [])),
     ...(doc.showcase ?? []).map((s, i) => [`/showcase/${i}/figure`, s.figure]),
+    ...(doc.featurePage?.items ?? []).flatMap((it, i) => it.figures.map((f, j) => [`/featurePage/items/${i}/figures/${j}`, f])),
   ];
   for (const [p, f] of figures) {
-    for (const k of ["image", "imageLight"]) {
+    for (const k of ["image", "imageLight", "image2x", "imageLight2x"]) {
       const img = f[k];
       if (img && img.startsWith("/") && !existsSync(path.join(ctx.repoRoot, "apps/web/public", img))) err(`${p}/${k}`, `screenshot '${img}' is not in apps/web/public`);
     }
+  }
+  // The features page: every item in a configured group (a group is dropped by removing its line,
+  // which silently drops its items, so an unknown group on an item is a mistake), unique group ids,
+  // and three featured items for the homepage callout.
+  if (doc.featurePage) {
+    const groupIds = new Set();
+    for (const [i, g] of doc.featurePage.groups.entries()) {
+      if (groupIds.has(g.id)) err(`/featurePage/groups/${i}/id`, `duplicate feature group '${g.id}'`);
+      groupIds.add(g.id);
+    }
+    for (const [i, it] of doc.featurePage.items.entries()) {
+      if (!groupIds.has(it.group)) warn(`/featurePage/items/${i}/group`, `feature '${it.title}' is in group '${it.group}', which featurePage.groups does not list, so it is not shown`);
+    }
+    const featured = doc.featurePage.items.filter((it) => it.featured && groupIds.has(it.group)).length;
+    if (featured !== 3) warn("/featurePage/items", `${featured} featured feature(s); the homepage callout shows three`);
+    for (const g of groupIds) if (!doc.featurePage.items.some((it) => it.group === g)) warn("/featurePage/groups", `feature group '${g}' has no items`);
   }
   if ((doc.faq ?? []).filter((f) => f.featured).length > 6) warn("/faq", "more than six featured questions; the landing page shows the first six");
   for (const [k, img] of Object.entries({ logo: doc.brand.logo, logoDark: doc.brand.logoDark, favicon: doc.brand.favicon })) {

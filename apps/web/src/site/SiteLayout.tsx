@@ -32,11 +32,12 @@ interface NavEntry {
   label: string;
 }
 
-/** The header navigation: the catalog and its paths, the two landing sections, pricing when enabled. */
+/** The header navigation: the catalog and its paths, the features page when configured, the two landing sections, pricing when enabled. */
 export function siteNav(site: SiteConfig | undefined): NavEntry[] {
   const flags = site?.flags;
   return [
     ...(flags?.showCatalog !== false ? [{ to: '/catalog', label: 'Catalog' }, { to: '/catalog#paths', label: 'Learning paths' }] : []),
+    ...(site?.featurePage ? [{ to: '/features', label: 'Features' }] : []),
     { to: '/#how-it-works', label: 'How it works' },
     { to: '/#teams', label: 'For teams' },
     ...(flags?.showPricing ? [{ to: '/pricing', label: 'Pricing' }] : []),
@@ -81,6 +82,9 @@ function NavLink({ entry, className, current }: { entry: NavEntry; className: st
   );
 }
 
+/** The longest a section link waits for a newly opened page to stop growing. */
+const SETTLE_MAX_MS = 3000;
+
 /**
  * The website scrolls on the window (site.css `html:has(.shell-site)`), and the
  * router's scroll restoration is not used here: a new page starts at the top and
@@ -91,22 +95,42 @@ function useSiteScroll() {
   const location = useRouterState({ select: (s) => s.location });
   const { pathname, hash } = location;
   const first = useRef(true);
+  const lastPath = useRef<string | null>(null);
   useEffect(() => {
     // A new page (not the first): it rises in; the stops of the page are read from its markup as it scrolls.
     if (first.current) first.current = false;
     else sitePageEnter(document.getElementById('main'));
+    const arrived = lastPath.current !== pathname;
+    lastPath.current = pathname;
+    let timer = 0;
     // After the frame in which the drawer closes and returns focus, so the scroll is not cancelled.
-    const id = window.setTimeout(() => {
-      if (hash) {
-        const el = document.getElementById(hash);
-        if (el) {
-          siteScrollTo(el);
-          return;
-        }
+    timer = window.setTimeout(() => {
+      if (!hash) return siteScrollTo(0, { immediate: true });
+      // On arrival the page is still growing (data, the story's pinned length): aim once it holds still.
+      if (arrived) {
+        const start = performance.now();
+        let last = -1;
+        let still = 0;
+        const wait = () => {
+          const el = document.getElementById(hash);
+          const now = el ? el.getBoundingClientRect().top + window.scrollY + document.documentElement.scrollHeight : -1;
+          still = el && now === last ? still + 1 : 0;
+          last = now;
+          if (still >= 4 || performance.now() - start > SETTLE_MAX_MS) {
+            if (el) siteScrollTo(el);
+            else siteScrollTo(0, { immediate: true });
+            return;
+          }
+          timer = window.setTimeout(wait, 100);
+        };
+        wait();
+        return;
       }
-      siteScrollTo(0, { immediate: true });
+      const el = document.getElementById(hash);
+      if (el) siteScrollTo(el);
+      else siteScrollTo(0, { immediate: true });
     }, 60);
-    return () => window.clearTimeout(id);
+    return () => window.clearTimeout(timer);
   }, [pathname, hash]);
 }
 
@@ -209,7 +233,7 @@ function SiteHeader() {
   return (
     <header className="site-header">
       <div className="site-container site-header-inner">
-        <Link to="/" className="site-brand" aria-label={`${brand} home`}>
+        <Link to="/" className="site-brand" aria-label={`${brand} home`} onClick={() => siteScrollTo(0)}>
           <SiteBrand />
         </Link>
         <nav className="site-nav" aria-label="Website">

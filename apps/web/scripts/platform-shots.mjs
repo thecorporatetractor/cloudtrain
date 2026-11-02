@@ -136,6 +136,8 @@ const VIEWS = [
   ['coming-soon-plans', 'none', '/', 'Three ways to run CloudTrain', toSection('pricing', 'Hosted plans compared')],
   ['coming-soon-phone', 'none', '/', 'Three ways to run CloudTrain', undefined, PHONE],
   ['coming-soon-pricing-phone', 'none', '/', 'Three ways to run CloudTrain', toSection('pricing'), PHONE],
+  ['coming-soon-features', 'none', '/', 'Three ways to run CloudTrain', toSection('features')],
+  ['coming-soon-features-page', 'none', '/features', 'The product, screen by screen'],
   // The public website (signed out, launch mode live), then the same header once signed in.
   ['landing', 'none', '/', 'How a lab works'],
   ['landing-features', 'none', '/', 'How a lab works', toSection('why')],
@@ -155,6 +157,9 @@ const VIEWS = [
   ['catalog-public-phone', 'none', '/catalog', 'Everything you can practise', undefined, PHONE],
   ['catalog-path-public', 'none', '/catalog/paths/cks-readiness', 'Network policy and least privilege'],
   ['catalog-exam-public', 'none', '/catalog/exams/sim-k8s-admin', 'Objectives and weights'],
+  ['features', 'none', '/features', 'The product, screen by screen'],
+  ['features-phone', 'none', '/features', 'The product, screen by screen', undefined, PHONE],
+  ['features-lightbox', 'none', '/features', 'The product, screen by screen', async (p) => (await p.getByRole('button', { name: /^Enlarge:/ }).first().click(), await p.getByRole('dialog').waitFor(), await p.waitForTimeout(400))],
   ['pricing', 'none', '/pricing', 'Compare plans'],
   ['pricing-yearly', 'none', '/pricing', 'Compare plans', async (p) => p.getByRole('radio', { name: 'Yearly' }).click()],
   ['pricing-phone', 'none', '/pricing', 'Compare plans', undefined, PHONE],
@@ -258,7 +263,7 @@ try {
   }
   if (!storage) {
     for (const theme of ['light', 'cream']) {
-      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'coming-soon'), VIEWS.find((v) => v[0] === 'coming-soon-pricing'), VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'waitlist'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'coming-soon'), VIEWS.find((v) => v[0] === 'coming-soon-pricing'), VIEWS.find((v) => v[0] === 'coming-soon-features'), VIEWS.find((v) => v[0] === 'features'), VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'waitlist'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
         if (only?.length && !only.includes(name)) continue;
         const { ctx, page } = await session(theme, persona, 1440, 900, launchOf(name));
         try {

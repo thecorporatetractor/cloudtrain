@@ -14,7 +14,7 @@ export function SocialProof({ site }: { site: SiteConfig }) {
   if (!sp || (!sp.logos?.length && !sp.quotes?.length)) return null;
   const ph = sp.placeholder !== false;
   return (
-    <section className="site-section sp" id="customers" aria-labelledby="sp-title" data-placeholder={ph || undefined}>
+    <section className="site-section sp" id="customers" aria-labelledby="sp-title" data-stop data-placeholder={ph || undefined}>
       <div className="site-container">
         <div className="sp-head">
           <div>

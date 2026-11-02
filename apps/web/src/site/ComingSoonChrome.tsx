@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { useSite } from '@/api/public';
 import { BrandLockup, useBrandName } from '@/components/brand';
 import { SiteFooter } from './Footer';
+import { siteScrollTo } from './motion';
 
 /*
  * Chrome of the coming-soon website (src/site/launch.ts): brand, links to the
@@ -31,13 +32,18 @@ export function ComingSoonChrome({ children, themeMenu }: { children: ReactNode;
       </a>
       <header className="site-header">
         <div className="site-container site-header-inner">
-          <Link to="/" className="site-brand" aria-label={`${brand} home`}>
-            <BrandLockup height={22} title={brand} />
+          <Link to="/" className="site-brand" aria-label={`${brand} home`} onClick={() => siteScrollTo(0)}>
+            <BrandLockup height={28} title={brand} />
           </Link>
           <nav className="site-nav cs-nav" aria-label="Sections">
             <CsLink id="what" className="site-nav-link">
               What it is
             </CsLink>
+            {site?.featurePage && (
+              <Link to="/features" className="site-nav-link">
+                Features
+              </Link>
+            )}
             <CsLink id="pricing" className="site-nav-link">
               Pricing
             </CsLink>

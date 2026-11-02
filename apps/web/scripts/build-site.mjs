@@ -165,12 +165,17 @@ try {
   await writeFile(path.join(out, 'robots.txt'), robotsFor(siteUrl));
   if (siteUrl) {
     const ids = async (dir) => (await readdir(path.join(out, 'data', dir)).catch(() => [])).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5));
-    const pages = sitePaths({ mode, pricing: site.flags?.showPricing, catalog: site.flags?.showCatalog, paths: await ids('paths'), exams: await ids('exams') });
+    const pages = sitePaths({ mode, pricing: site.flags?.showPricing, catalog: site.flags?.showCatalog, cookies: !!site.legal?.cookies, features: !!site.featurePage, paths: await ids('paths'), exams: await ids('exams') });
     await writeFile(path.join(out, 'sitemap.xml'), sitemapXml(siteUrl, pages, new Date().toISOString().slice(0, 10)));
   }
 
   if (!index.includes('src="/runtime-config.js"')) throw new Error('index.html does not load runtime-config.js');
   if (prerenderOn) await prerender(out, index);
+  // No third-party analytics anywhere: neither the shell nor the prerendered page may mention Google tags.
+  for (const f of ['index.html', 'shell.html', '404.html']) {
+    const html = await readFile(path.join(out, f), 'utf8');
+    if (/googletagmanager|google-analytics|gtag\(/.test(html)) throw new Error(`${f} must not load analytics`);
+  }
   await stat(path.join(out, 'data', 'site.json'));
   console.log(`\nStatic site ready in ${out}`);
   console.log(`  API base for the waitlist form: ${apiBase || '(same origin as the site)'}`);
