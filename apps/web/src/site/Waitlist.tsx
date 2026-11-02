@@ -106,7 +106,7 @@ export function WaitlistView({ cfg, values, errors, phase, formError, onChange, 
             )}
           </div>
         ) : (
-          <form className="site-wl-form" onSubmit={submit} noValidate aria-labelledby="waitlist-title" data-reveal="children">
+          <form method="post" className="site-wl-form" onSubmit={submit} noValidate aria-labelledby="waitlist-title" data-reveal="children">
             {(formError || phase === 'error') && (
               <p role="alert" className="site-wl-alert">
                 {formError ?? cfg.errorMessage ?? D.errorMessage}

@@ -126,7 +126,7 @@ describe('static site host files', () => {
 
   it('defers the entry module of a prerendered page to a loader that runs after the first paint', () => {
     const html = '<head>\n<script type="module" crossorigin src="/assets/index-A.js"></script>\n    <link rel="modulepreload" crossorigin href="/assets/react-B.js">\n</head>';
-    expect(deferEntry(html)).toEqual({ entry: '/assets/index-A.js', html: '<head>\n<script defer src="/site-boot.js"></script>\n</head>' });
+    expect(deferEntry(html)).toEqual({ entry: '/assets/index-A.js', html: '<head>\n<script defer src="/site-boot.js?v=index-A"></script>\n</head>' });
     expect(() => deferEntry('<head></head>')).toThrow(/entry module/);
     expect(siteBootJs('/assets/index-A.js')).toContain('"/assets/index-A.js"');
     expect(() => new Function(siteBootJs('/assets/index-A.js'))).not.toThrow();

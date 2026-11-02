@@ -57,13 +57,28 @@ function startLenis() {
 /** Where the sticky header ends: anchors scroll to just below it (window pixels, stops.ts). */
 const headerHeight = () => document.querySelector('.site-header')?.getBoundingClientRect().height ?? 0;
 
+/**
+ * Goes to a stop, and again if it moved on the way: the hero's lab window shrinks as the page scrolls
+ * past it, by a few hundred pixels on a phone, and the browser may adjust the scroll as it does. A visitor
+ * who took over the scroll is left alone.
+ */
+function goToStop(stop: Element, s: Stepper, tries = 3) {
+  let takenOver = false;
+  const takeOver = () => (takenOver = true);
+  for (const ev of INTERRUPTS) window.addEventListener(ev, takeOver, { passive: true, once: true });
+  s.go(stopFor(stop), () => {
+    for (const ev of INTERRUPTS) window.removeEventListener(ev, takeOver);
+    if (!takenOver && tries > 0 && Math.abs(stopFor(stop) - window.scrollY) > 4) goToStop(stop, s, tries - 1);
+  });
+}
+
 /** Scrolls to an element (below the header, honouring its scroll-margin-top) or to a position. */
 export function scrollTo(target: Element | number, opts: { immediate?: boolean; duration?: number } = {}) {
   let offset = 0;
   if (typeof target !== 'number') {
     // A link target that is (or holds, or sits in) a stop lands on that stop, like a step would.
     const stop = stopElementFor(target);
-    if (stop && stepper && !opts.immediate) return stepper.go(stopFor(stop));
+    if (stop && stepper && !opts.immediate) return goToStop(stop, stepper);
     const margin = (parseFloat(getComputedStyle(target).scrollMarginTop) || 0) * siteZoom();
     offset = -(margin || headerHeight());
   }
