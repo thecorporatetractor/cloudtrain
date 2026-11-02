@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
@@ -7,6 +8,20 @@ import { as, harness, Q, type Harness } from './harness.js';
 import { pgAvailable } from './pg.js';
 
 const available = await pgAvailable();
+
+/**
+ * A finished two-hour attempt in the current month. The seed places its attempts at least about
+ * five days back, so early in a month it has none in that month, and tests that need usage this
+ * month cannot rely on it.
+ */
+async function usageThisMonth(h: Harness): Promise<void> {
+  const now = new Date();
+  const started = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  await h.t.owner
+    .insertInto('lab_attempts')
+    .values({ org_id: h.orgs.quillmoor, user_id: Q.lucas, lab_id: 'gateway-smoke', session_name: `usage-${randomUUID()}`, started_at: started, ended_at: started, outcome: 'passed', duration_s: 7200 } as never)
+    .execute();
+}
 
 describe.skipIf(!available)('platform API', () => {
   let h: Harness;
@@ -114,6 +129,7 @@ describe.skipIf(!available)('platform API', () => {
     // Another org's sessions do not count against this org.
     expect((await as(h, Q.priya).get('/api/admin/sessions')).json()).toHaveLength(1);
     await priya.put('/api/admin/quotas', { maxConcurrentSessions: 50, monthlyLabHours: 1 });
+    await usageThisMonth(h);
     const hours = await as(h, Q.mei).post('/api/labs/gateway-smoke/sessions');
     expect(hours.statusCode).toBe(429);
     expect(hours.json().details.quota).toBe('monthly_lab_hours');
@@ -277,6 +293,7 @@ describe.skipIf(!available)('platform API', () => {
     const csv = await priya.get('/api/admin/audit.csv?action=team.');
     expect(csv.body.split('\r\n').filter(Boolean).length).toBe(6);
     expect((await as(h, Q.amara).get('/api/admin/audit')).statusCode).toBe(403);
+    await usageThisMonth(h);
     const usage = (await priya.get('/api/admin/usage')).json();
     expect(usage.sessions).toBeGreaterThan(0);
   });
