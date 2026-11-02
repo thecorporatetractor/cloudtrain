@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot-test CloudTrain VM images on the dev cluster, OFFLINE, one VM at a time.
 #
-# Usage: boot-test.sh [kubeadm-node|kubeadm-upgrade|kubeadm-full|etcd-host|el-vm|ubuntu-vm ...]   (default: all)
+# Usage: boot-test.sh [kubeadm-node|kubeadm-upgrade|kubeadm-full|etcd-host|el-vm|ubuntu-vm|docker-vm|docker-vm-upgrade ...]   (default: all)
 #
 # Per image, in a fresh namespace: an isolated Kube-OVN VPC (no route to the platform
 # network or the internet, the same model as lab:demo), the VM booted from the
@@ -69,6 +69,7 @@ image_of() {
     el-vm)           echo "$EL_VM_IMAGE" ;;
     ubuntu-vm)       echo "$UBUNTU_VM_IMAGE" ;;
     docker-vm)       echo "$DOCKER_VM_IMAGE" ;;
+    docker-vm-upgrade) echo "$DOCKER_VM_UPGRADE_IMAGE" ;;
     *) die "unknown image '$1'" ;;
   esac
 }
@@ -76,7 +77,7 @@ image_of() {
 run_test() {
   local variant=$1 img mem ns work
   img=$(image_of "$variant")
-  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; docker-vm) mem=2048Mi ;; kubeadm-full) mem=4Gi ;; *) mem=2560Mi ;; esac
+  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; docker-vm|docker-vm-upgrade) mem=2048Mi ;; kubeadm-full) mem=4Gi ;; *) mem=2560Mi ;; esac
   # Linux VM images: two blank data disks, as the vm driver attaches topology
   # resources.disks (emptyDisk for ephemeral VMs, serial ct-dataN).
   local xdisks="" xvols=""
@@ -583,8 +584,25 @@ echo "virtualization: $(systemd-detect-virt 2>/dev/null || echo unknown)"
 EOS
 }
 
+test_docker-vm-upgrade() {
+  vmrun <<'EOS' || return 1
+set -e
+echo "== engine"; docker version --format '{{.Server.Version}}' | tee /tmp/v; grep -q '^28\.' /tmp/v && echo "ok: Engine 28"
+docker info --format '{{.Driver}} {{json .DriverStatus}}' | grep -q 'io.containerd.snapshotter' && echo "ok: containerd image store"
+apt-mark showhold | grep -qx docker-ce && echo "ok: docker-ce held"
+echo "== offline run"; docker run --rm --entrypoint nginx nginx:1.29-alpine -v && echo "ok: preloaded nginx runs"
+echo "== staged repo"; echo 'deb [trusted=yes] file:/srv/apt/engine-29 ./' > /etc/apt/sources.list.d/bt.list
+apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/bt.list -o Dir::Etc::sourceparts=- 
+apt-cache policy docker-ce | tee /tmp/p; grep -q '5:29\.' /tmp/p && echo "ok: Engine 29 is a candidate"
+apt-mark unhold docker-ce docker-ce-cli containerd.io >/dev/null; apt-get install -y docker-ce docker-ce-cli containerd.io >/dev/null
+for i in $(seq 20); do docker info >/dev/null 2>&1 && break; sleep 2; done
+docker version --format '{{.Server.Version}}' | tee /tmp/v; grep -q '^29\.' /tmp/v && echo "ok: upgraded offline to Engine 29"
+docker run --rm --entrypoint nginx nginx:1.29-alpine -v && echo "ok: images survive the upgrade"
+EOS
+}
+
 targets=("$@"); ((${#targets[@]})) || targets=(kubeadm-node kubeadm-upgrade kubeadm-full etcd-host el-vm ubuntu-vm)
 for t in "${targets[@]}"; do
-  case $t in kubeadm-node|kubeadm-upgrade|kubeadm-full|etcd-host|el-vm|ubuntu-vm|docker-vm) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | el-vm | ubuntu-vm | docker-vm)" ;; esac
+  case $t in kubeadm-node|kubeadm-upgrade|kubeadm-full|etcd-host|el-vm|ubuntu-vm|docker-vm|docker-vm-upgrade) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | el-vm | ubuntu-vm | docker-vm)" ;; esac
 done
 for t in "${targets[@]}"; do run_test "$t"; done

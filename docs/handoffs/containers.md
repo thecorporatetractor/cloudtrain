@@ -385,7 +385,7 @@ lab-verify now also errors when a built or verified lab's curriculum images diff
 | `ctr-scan-triage-vex`, `ctr-scout-policy` | 4 | no trivy/grype/scout, no offline vulnerability DB |
 | `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify` | 4 | no cosign on docker-vm:29 (handoff pins cosign v2) |
 | `ctr-notation-sign-verify`, `ctr-signed-only-gate` | 4 | no notation CLI on docker-vm:29 |
-| `ctr-engine-upgrade` | 5 | needs a docker-vm variant that boots on Engine 28 with Engine 29 packages staged in a local apt repo (`/srv/apt/engine-29`); setup refuses otherwise |
+| `ctr-engine-upgrade` | 5 | runs on `docker-vm:28-upgrade` (Engine 28 held, Engine 29 staged in `/srv/apt/engine-29`) |
 | `ctr-ci-rootless-buildkit` | 5 | needs `moby/buildkit:rootless`, cosign, trivy and an offline trivy DB on docker-vm |
 | `ctr-release-pipeline-capstone` | 5 | needs cosign, `moby/buildkit` (docker-container builder) and the buildkit-syft-scanner image; arm64 side is `FROM scratch` (no binfmt) |
 | `ctr-swarm-init-quorum`, `ctr-swarm-services`, `ctr-swarm-stack` | 5 | not image-blocked; unconfirmed that the Kube-OVN VPC passes 2377/tcp, 7946/tcp+udp, 4789/udp (and ESP/xfrm for the encrypted overlay, not needed by the grader); 3 VMs x 2 GiB each |
@@ -401,7 +401,7 @@ Every containers lab is a `jumphost:1` workstation pod plus one `docker-vm:29` K
 - kubeadm: none.
 - netdev: none.
 - Kata-blocked: none individually. The tier-B Kata `dockerd:29` variants are not built, so every lab runs as tier C (VM) only (`ctr-ci-rootless-buildkit` and `ctr-release-pipeline-capstone` are tier B).
-- image-blocked (verify only after the docker-vm rebuild or tool install): `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`, `xcd-supply-sbom-sign`, `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate`, `ctr-engine-upgrade` (Engine 28 variant), `ctr-ci-rootless-buildkit`, `ctr-release-pipeline-capstone`.
+- image-blocked (verify only after the docker-vm rebuild or tool install): `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`, `xcd-supply-sbom-sign`, `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate`, `ctr-ci-rootless-buildkit`, `ctr-release-pipeline-capstone`.
 - infra-blocked: `ctr-macvlan-encoder` (second NIC).
 - unconfirmed-behaviour, verify last: the remaining wave 1 and 3 items in the table above.
 - Exam reboot pass of `sim-containers-docker` and `sim-containers-podman` is not part of `labctl verify`.
@@ -457,7 +457,7 @@ All 19 are `built` (static checks only; lab-verify --strict, render --check, sch
 | Module (course id) | Labs | Host(s) |
 |---|---|---|
 | `ctr-ops-failures` | `ctr-oom-exit-137`, `ctr-nofile-after-upgrade`, `ctr-link-env-removed`, `ctr-seccomp-legacy-binary`, `ctr-api-version-floor`, `ctr-events-flapping`, `ctr-debug-distroless` | one `docker-vm:29` each (`cl-transcode-03`, `cl-edge-01`, `cl-rights-01`, `cl-caption-01`, `cl-ci-01`, `cl-batch-02`, `cl-catalogue-02`) |
-| `ctr-ops-host` | `ctr-log-rotation`, `ctr-restart-policy`, `ctr-daemon-json-conflict`, `ctr-engine-upgrade` (blocked) | `cl-ingest-01`, `cl-subtitle-01`, `cl-pack-01`, `cl-transcode-06` |
+| `ctr-ops-host` | `ctr-log-rotation`, `ctr-restart-policy`, `ctr-daemon-json-conflict`, `ctr-engine-upgrade` | `cl-ingest-01`, `cl-subtitle-01`, `cl-pack-01`, `cl-transcode-06` |
 | `ctr-ops-delivery` | `ctr-ci-rootless-buildkit` (blocked), `ctr-release-pipeline-capstone` (blocked) | `cl-ci-02`, `cl-release-01` |
 | `ctr-internals-runtime` | `ctr-runtime-stack-trace`, `ctr-runc-bundle`, `ctr-image-layout-on-disk` | `cl-transcode-04`, `cl-oci-01`, `cl-transcode-05` |
 | `ctr-swarm-all` | `ctr-swarm-init-quorum`, `ctr-swarm-services`, `ctr-swarm-stack` | three `docker-vm:29` (`playout-1..3`, 2 GiB each: heavy) |
@@ -477,7 +477,6 @@ All 19 are `built` (static checks only; lab-verify --strict, render --check, sch
 
 | Lab | Blocker |
 |---|---|
-| `ctr-engine-upgrade` | needs a docker-vm variant that boots on Engine 28 with the Engine 29 packages staged as a local apt repo in `/srv/apt/engine-29`; setup refuses otherwise |
 | `ctr-ci-rootless-buildkit` | needs `moby/buildkit:rootless`, `cosign`, `trivy` and an offline trivy database; the BuildKit builder cannot use the engine image store and the host is offline, so setup pushes busybox:1.37 to the lab registry and the Dockerfile builds FROM it (written that way); Gitea is not used (`GITEA_IMAGE` is not on docker-vm), the CI job is a plain script |
 | `ctr-release-pipeline-capstone` | needs `cosign`, `moby/buildkit:v0.23.2` exactly (builder pinned with `--driver-opt image=`; base image served from the lab registry, as in `ctr-buildx-cache-export`) (docker-container builder for the registry cache) and the `buildkit-syft-scanner` image; the arm64 side is `FROM scratch` content (no binfmt) |
 | swarm labs | unconfirmed: the Kube-OVN VPC passes 2377/tcp, 7946/tcp+udp and 4789/udp between lab VMs, and ESP plus kernel `xfrm`/`esp4`/`xt_u32` for the encrypted overlay in `ctr-swarm-stack` (the grader only needs the routing mesh, so the check still passes if encryption is not enforced); 3 VMs x 2 GiB per lab |

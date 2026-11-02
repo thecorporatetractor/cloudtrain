@@ -14,12 +14,12 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kubernetes | 5 | 89 | 103 | 3 | 190 | 2 | 0 | C 1, K 112, V 79 | 25 |
 | Linux administration | 11 | 160 | 119 | 3 | 276 | 3 | 0 | A 82, B 71, C 126 | 48 |
-| Containers with Docker | 11 | 91 | 44 | 2 | 127 | 8 | 0 | B 71, C 64 | 28 |
+| Containers with Docker | 11 | 91 | 44 | 2 | 128 | 7 | 0 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 86 | 2 | 9 | A 41, B 5, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 33 | 1 | 72 | 0 | 6 | N 78 | 15 |
 | Security operations | 3 | 42 | 25 | 1 | 0 | 0 | 67 | A 61, C 4, K 2 | 22 |
-| **Total** | 46 | 542 | 405 | 14 | 850 | 15 | 82 | A 237, B 148, C 240, K 114, V 124, N 84 | 183 |
+| **Total** | 46 | 542 | 405 | 14 | 851 | 14 | 82 | A 237, B 148, C 240, K 114, V 124, N 84 | 183 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 53, do 374, fix 87, hack 19, ctf 9. New skills proposed: 236.
 
@@ -720,7 +720,7 @@ Optional short track. Image building, registries and troubleshooting transfer fr
 | `ctr-debug-distroless` | Debug a shell-less catalogue API returning 500 | fix | medium | 15 | B | verified | ex188-aligned:troubleshoot, docker-practitioner:operations | The distroless catalogue API returns 500 for every request; attach a debug container sharing its process and network namespaces, find the missing config file it expects, and fix the deployment so /titles returns 200. |
 | `ctr-ci-rootless-buildkit` | Replace the privileged CI builder with a rootless image builder | do | hard | 25 | B | verified | docker-practitioner:operations | Copperleaf's CI job builds with a privileged dind sidecar; switch it to a rootless BuildKit builder that builds, scans, signs and pushes the thumbnailer, with the privileged sidecar removed. |
 | `ctr-release-pipeline-capstone` | Ship a catalogue release from commit to running service | do | hard | 45 | B | built | docker-practitioner:supply-chain, docker-practitioner:build | Take catalogue-api 5.0.0 from commit to staging: multi-platform build with registry cache, SBOM and provenance, a signature, a push by digest, a Compose deployment pinned to that digest, and a gate that refuses the unsigned previous build. |
-| `ctr-engine-upgrade` | Upgrade the transcoder host engine with running jobs | do | hard | 30 | C | built | dca-legacy:install-config, docker-practitioner:operations | Upgrade the transcoder host from Engine 28 to 29 from the local package mirror with live-restore enabled, so the long-running transcode container keeps running through the upgrade and the engine reports version 29. |
+| `ctr-engine-upgrade` | Upgrade the transcoder host engine with running jobs | do | hard | 30 | C | verified | dca-legacy:install-config, docker-practitioner:operations | Upgrade the transcoder host from Engine 28 to 29 from the local package mirror with live-restore enabled, so the long-running transcode container keeps running through the upgrade and the engine reports version 29. |
 | `ctr-runtime-stack-trace` | Trace the transcoder container down to its host process | learn | medium | 15 | C | verified |  | Map the running transcoder container from its engine ID to its containerd task in the moby namespace, its shim and its host PID, and write the four identifiers to ~/runtime-chain.txt. |
 | `ctr-runc-bundle` | Run the subtitle service from a hand-made OCI bundle | do | hard | 25 | B | verified |  | Export the subtitle image's filesystem into an OCI bundle, generate and edit config.json for a read-only root and hostname caption-box, and run it with runc so the grader sees it in runc list. |
 | `ctr-image-layout-on-disk` | Find the layer that deleted Copperleaf's signing keys | do | hard | 20 | B | verified |  | Unpack transcoder:7.1 as an OCI image layout, walk index, manifest and config, and record the digest of the layer whose whiteout removes /etc/copperleaf/keys in ~/whiteout-layer.txt. |

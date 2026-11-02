@@ -5,7 +5,7 @@
 #   kubeadm-node | kubeadm-upgrade | etcd-host   containerDisks -> nodes that run VMs
 #   jumphost, linux-pod-el, linux-pod-deb, linux-pod-el-sys, linux-pod-deb-sys, mirror,
 #   iac-ws-terraform, iac-ws-tofu, ansible-ctl, kql-ws, oci-registry -> every node
-#   el-vm | ubuntu-vm | docker-vm                containerDisks -> nodes that run VMs
+#   el-vm | ubuntu-vm | docker-vm | docker-vm-upgrade   containerDisks -> nodes that run VMs
 #   workloads                                    lab workload images (tools/images/lock/
 #                                                workloads.lock) -> every node, for
 #                                                `mode: virtual` labs whose Pods run on
@@ -81,6 +81,8 @@ for t in "${targets[@]}"; do
                      load_docker_image "$UBUNTU_VM_IMAGE" $VM_NODES ;;
     docker-vm)       # shellcheck disable=SC2086
                      load_docker_image "$DOCKER_VM_IMAGE" $VM_NODES ;;
+    docker-vm-upgrade) # shellcheck disable=SC2086
+                     load_docker_image "$DOCKER_VM_UPGRADE_IMAGE" $VM_NODES ;;
     mirror)          # shellcheck disable=SC2086
                      load_docker_image "$MIRROR_CONTENT_IMAGE" $ALL_NODES ;;
     workloads)       # shellcheck disable=SC2086

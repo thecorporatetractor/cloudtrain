@@ -21,6 +21,9 @@
 #   docker-vm        ${DOCKER_VM_IMAGE}                             catalog docker-vm:29
 #                    (Ubuntu cloud image + Docker Engine 29, buildx, compose, rootless extras;
 #                    tools/images/docker-vm/preload-images.txt preloaded, lock/docker-vm.lock;
+#   docker-vm-upgrade ${DOCKER_VM_UPGRADE_IMAGE}                    catalog docker-vm:28-upgrade
+#                    Engine 28 held, Engine 29 staged in /srv/apt/engine-29;
+#                    preload-images-upgrade.txt preloaded, lock/docker-vm-upgrade.lock;
 #                    cosign v2, notation, trivy + offline DB pinned in deploy/versions.env)
 #   el-vm/ubuntu-vm need the mirror content: tools/mirrors/build-content.sh (task mirror:content)
 #
@@ -68,7 +71,9 @@ case $VARIANT in
     TAG="$UBUNTU_VM_IMAGE"; REF=ubuntu-vm:24.04; GUEST=ubuntu-vm; DISK_SIZE=10G ;;
   docker-vm)
     TAG="$DOCKER_VM_IMAGE"; REF=docker-vm:29; GUEST=docker-vm; DISK_SIZE=12G ;;
-  *) die "unknown variant '$VARIANT' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm)" ;;
+  docker-vm-upgrade)
+    TAG="$DOCKER_VM_UPGRADE_IMAGE"; REF=docker-vm:28-upgrade; GUEST=docker-vm-upgrade; DISK_SIZE=8G ;;
+  *) die "unknown variant '$VARIANT' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm | docker-vm-upgrade)" ;;
 esac
 
 # --- 0. catalog contract: the catalog must name exactly what this build produces ---
@@ -311,6 +316,14 @@ if [[ $GUEST == docker-vm ]]; then
   cp "$CACHE/trivy-${TRIVY_VERSION}.tar.gz" "$T/trivy.tar.gz"
   cp "$CACHE/notation_${NOTATION_VERSION#v}_linux_amd64.tar.gz" "$T/notation.tar.gz"
 fi
+if [[ $GUEST == docker-vm-upgrade ]]; then
+  # Images preloaded into the engine: tools/images/docker-vm/preload-images-upgrade.txt, by digest.
+  mapfile -t DIMAGES < <(grep -v '^#' "$HERE/docker-vm/preload-images-upgrade.txt" | grep . | while read -r i; do normalize "$i"; done)
+  ((${#DIMAGES[@]})) || die "docker-vm/preload-images-upgrade.txt lists no image"
+  n0=${#LOCKED[@]}
+  lock_check "$LOCKDIR/docker-vm-upgrade.lock" "${DIMAGES[@]}"
+  printf '%s\n' "${LOCKED[@]:$n0}" > "$WORK/in/docker-images.txt"
+fi
 if [[ $GUEST == el-vm || $GUEST == ubuntu-vm ]]; then
   MIRROR="$CACHE/mirror/$MIRROR_SNAPSHOT"
   repo=$([[ $GUEST == el-vm ]] && echo el10 || echo noble)
@@ -374,6 +387,7 @@ UBUNTU_APT_SNAPSHOT=${UBUNTU_APT_SNAPSHOT}
 DOCKERIO_MIRROR=${DOCKERIO_MIRROR:-}
 DOCKER_APT_KEY_FPR=${DOCKER_APT_KEY_FPR}
 DOCKER_CE_VERSION=${DOCKER_CE_VERSION}
+DOCKER_CE_UPGRADE_VERSION=${DOCKER_CE_UPGRADE_VERSION}
 DOCKER_BUILDX_VERSION=${DOCKER_BUILDX_VERSION}
 DOCKER_COMPOSE_VERSION=${DOCKER_COMPOSE_VERSION}
 NOTATION_VERSION=${NOTATION_VERSION}
