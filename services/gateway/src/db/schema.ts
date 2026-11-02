@@ -42,6 +42,13 @@ export interface UsersTable {
   last_login_at: Timestamp | null;
   last_idp: string | null;
   created_at: CreatedAt;
+  /** Art. 18 (0011_gdpr_lifecycle). */
+  restricted_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
+  closed_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
+  closed_orgs: ColumnType<string[], string[] | undefined, string[]>;
+  inactivity_warned_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
+  privacy_notice_version: ColumnType<string | null, string | null | undefined, string | null>;
+  privacy_notice_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
 }
 
 export interface OrgDomainsTable {
@@ -331,6 +338,8 @@ export interface AuthLoginStatesTable {
 }
 
 export interface AuthSessionsTable {
+  /** The ID token's auth_time: when the person really authenticated. */
+  authenticated_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
   id_hash: string;
   user_id: string;
   org_id: string | null;
@@ -498,7 +507,8 @@ export interface BillingEventsTable {
 export interface BillingUsageTable {
   id: Generated<string>;
   org_id: string;
-  user_id: string;
+  /** Null once the person has been erased: the row stays as the anonymous basis of the bill (0010_gdpr). */
+  user_id: string | null;
   lab_id: string;
   session_name: string;
   compute_tier: 'pod' | 'vm' | 'heavy';
@@ -593,6 +603,9 @@ export interface DB {
   billing_seats: BillingSeatsTable;
   billing_limits: BillingLimitsTable;
   waitlist_entries: WaitlistEntriesTable;
+  gdpr_ledger: GdprLedgerTable;
+  gdpr_ledger_checkpoints: { through_seq: number; record: string };
+  gdpr_requests: GdprRequestsTable;
 }
 
 /** Early-access waitlist (0008_waitlist): not tenant data, no org_id. */
@@ -604,6 +617,53 @@ export interface WaitlistEntriesTable {
   interest: 'enterprise' | 'individual' | null;
   consent_at: Timestamp;
   created_at: CreatedAt;
+}
+
+/** The default evidence ledger (0010_gdpr): append-only, no direct identifiers. `record` is the canonical JSON the hash covers. */
+export interface GdprLedgerTable {
+  seq: number;
+  request_id: string;
+  type: 'erasure' | 'withdrawal' | 'export' | 'restriction' | 'objection';
+  subject_key: string;
+  prev_hash: string;
+  hash: string;
+  record: string;
+}
+
+/** The rights flows' work queue (0010_gdpr): platform code paths only. */
+export interface GdprRequestsTable {
+  id: Generated<string>;
+  type: 'erasure' | 'withdrawal' | 'export' | 'restriction';
+  scope: 'waitlist' | 'account';
+  actor: Generated<'self' | 'admin'>;
+  subject_key: string;
+  user_key: string | null;
+  token_hash: string | null;
+  email_sealed: string | null;
+  user_id: string | null;
+  status: 'awaiting_confirmation' | 'processing' | 'evidence_pending' | 'completed';
+  requested_at: Timestamp;
+  verified_at: Timestamp | null;
+  expires_at: Timestamp | null;
+  completed_at: Timestamp | null;
+  lease_until: Timestamp | null;
+  attempts: Generated<number>;
+  last_error: string | null;
+  state: Json<GdprRequestStateJson>;
+  ledger_seq: number | null;
+}
+
+export interface GdprRequestStateJson {
+  /** Which steps of the erasure are done; each one is idempotent and retried until it is. */
+  steps?: Partial<Record<'cluster' | 'billing' | 'keycloak' | 'data' | 'waitlist', boolean>>;
+  /** Per-system outcomes gathered so far (fixed labels and counts only). */
+  outcomes?: { system: string; category: string; action: string; rows: number; legalBasis?: string }[];
+  categories?: string[];
+  stripeCustomerIds?: string[];
+  /** The result needs a mail when done: the person was not told "completed" in the response. */
+  notify?: boolean;
+  /** A fixed label for the ledger record, e.g. post-restore-reapply. */
+  reason?: string;
 }
 
 export type CtfEventRow = Selectable<CtfEventsTable>;

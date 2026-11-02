@@ -72,6 +72,8 @@ export interface PermissionGrant {
 
 export type ErrorCode =
   | 'unauthenticated'
+  /** 403: the action needs a recent sign-in; send the person through sign-in again. */
+  | 'reauth_required'
   | 'forbidden'
   | 'not_found'
   | 'conflict'
@@ -219,6 +221,8 @@ export interface Me extends Learner {
   auth: { method: 'oidc' | 'dev' | 'dev-impersonation'; idp?: string; sessionExpiresAt?: string; impersonated?: boolean };
   /** True while a platform admin acts inside an org through support access. */
   supportAccess?: { orgId: string; expiresAt: string };
+  /** The information notice at first sign-in (and when it changes): information, not consent. */
+  privacyNotice?: { required: boolean; version: string };
 }
 
 /**
@@ -939,6 +943,7 @@ export interface AdminOverview {
 
 /** Dotted `<area>.<verb>` action names; new values may appear. */
 export type AuditAction =
+  | 'gdpr.erasure'
   | 'auth.login'
   | 'auth.logout'
   | 'auth.login_denied'

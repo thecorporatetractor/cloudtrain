@@ -31,3 +31,14 @@ export const SCROLL_LERP = 0.11;
 export const SCROLL_TO_DURATION = 1.1;
 /** Scrubbed timelines lag the scroll by this many seconds, so wheel steps read as glides. */
 export const SCRUB = 0.5;
+
+/** The hero story (src/site/LabStory.tsx), in story time (one stop = 1). */
+export const STORY = {
+  /** The morph of the cluster view into the compact window runs over this part of the first step. */
+  morphFrom: 0.04,
+  morphTo: 0.96,
+  /** A stage's copy away from its stop: how faint, how far below or above (px), how blurred (px). */
+  copyFloor: 0.14,
+  copyRise: 18,
+  copyBlur: 3,
+} as const;

@@ -241,6 +241,26 @@ export class KeycloakAdmin {
     }
   }
 
+  async getUser(id: string): Promise<KcUser | null> {
+    try {
+      return (await this.request<KcUser>('GET', `/users/${encodeURIComponent(id)}`)).data;
+    } catch (e) {
+      if (e instanceof KeycloakError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  /** Permanently deletes the user (GDPR erasure). False when there was no such user: deleting twice is not an error. */
+  async deleteUser(id: string): Promise<boolean> {
+    try {
+      await this.request('DELETE', `/users/${encodeURIComponent(id)}`);
+      return true;
+    } catch (e) {
+      if (e instanceof KeycloakError && e.status === 404) return false;
+      throw e;
+    }
+  }
+
   /** Keycloak's own "set your password" email (sent through the realm SMTP: Mailpit in dev). */
   async sendActionsEmail(id: string, actions: string[], clientId: string, redirectUri: string, lifespanSeconds = 7 * 86_400): Promise<void> {
     await this.request('PUT', `/users/${id}/execute-actions-email?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&lifespan=${lifespanSeconds}`, actions);

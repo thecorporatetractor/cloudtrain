@@ -18,6 +18,8 @@ import { createTestDb, type TestDb } from './pg.js';
 import { loadSiteConfig } from '../src/site/config.js';
 import path from 'node:path';
 import { PgWaitlistStore } from '../src/waitlist/store.js';
+import { GdprService, type GdprDeps } from '../src/gdpr/service.js';
+import { PostgresLedger, type ChainReport, type ErasureLedger, type LedgerRecordInput, type VerifyOptions } from '../src/gdpr/ledger.js';
 
 /** Test auth: the principal is loaded from the database for the user named in `x-test-user`. */
 export class HeaderAuthenticator implements Authenticator {
@@ -32,7 +34,64 @@ export class HeaderAuthenticator implements Authenticator {
   }
 }
 
+export const TEST_GDPR_KEY = 'test-gdpr-hmac-key-0123456789abcdef0123456789';
+
+/** The Postgres ledger with an off switch: `failNext` appends throw, as an outage would. */
+export class FlakyLedger implements ErasureLedger {
+  failNext = 0;
+  constructor(readonly inner: PostgresLedger) {}
+  async append(input: LedgerRecordInput) {
+    if (this.failNext > 0) {
+      this.failNext -= 1;
+      throw new Error('ledger unavailable');
+    }
+    return this.inner.append(input);
+  }
+  entries() {
+    return this.inner.entries();
+  }
+  verifyChain(opts?: VerifyOptions): Promise<ChainReport> {
+    return this.inner.verifyChain(opts);
+  }
+  checkpoint() {
+    return this.inner.checkpoint();
+  }
+  prune(cutoff: Date, limit: number) {
+    return this.inner.prune(cutoff, limit);
+  }
+}
+
+/** Keycloak's user endpoints the erasure uses. `failNext` makes deleteUser throw. */
+export class FakeKeycloakUsers {
+  deleted: string[] = [];
+  loggedOut: string[] = [];
+  failNext = 0;
+  async getUser(id: string) {
+    return this.deleted.includes(id) ? null : { id, username: 'someone', enabled: true };
+  }
+  enabled = new Map<string, boolean>();
+  async setUserEnabled(id: string, on: boolean) {
+    this.enabled.set(id, on);
+  }
+  async logoutUser(id: string) {
+    this.loggedOut.push(id);
+  }
+  async deleteUser(id: string) {
+    if (this.failNext > 0) {
+      this.failNext -= 1;
+      throw Object.assign(new Error('Keycloak unavailable'), { status: 503 });
+    }
+    if (this.deleted.includes(id)) return false;
+    this.deleted.push(id);
+    return true;
+  }
+}
+
 export interface Harness {
+  gdpr: GdprService;
+  ledger: FlakyLedger;
+  kc: FakeKeycloakUsers;
+  waitlist: PgWaitlistStore;
   t: TestDb;
   app: FastifyInstance;
   ps: PlatformService;
@@ -61,7 +120,7 @@ export const Q = {
   rhea: 'a1000000-0000-4000-8000-0000000000aa',
 };
 
-export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean; answerRatePerMinute?: number } = {}): Promise<Harness> {
+export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean; answerRatePerMinute?: number; gdpr?: Partial<GdprDeps>; privacyPerHour?: number } = {}): Promise<Harness> {
   const t = await createTestDb();
   const content = await realContent();
   await seed(t.owner, content, await readPeople(defaultPeopleFile(repo)));
@@ -90,8 +149,16 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
   const answers = new AnswerService(sessions, new PgAnswerStore(ps), { ratePerMinute: opts.answerRatePerMinute ?? 20, resolve: events.resolveScope });
   // The public website routes are part of the surface (DAST scans them too).
   const site = await loadSiteConfig(path.join(repo, 'content/site.yaml'));
-  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, site: { config: site, waitlist: { store: new PgWaitlistStore(t.db) } }, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
+  const waitlist = new PgWaitlistStore(t.db);
+  const ledger = new FlakyLedger(new PostgresLedger(t.db, TEST_GDPR_KEY));
+  const kc = new FakeKeycloakUsers();
+  const gdpr = new GdprService({ db: t.db, ledger, hmacKey: TEST_GDPR_KEY, sealer: new Sealer('test-session-secret-0123456789'), mailer, webUrl: 'http://web.test', waitlist, cluster, kc, store, contact: 'gdpr@cloudtrain.test', identityAccountUrl: 'http://id.test/account/', ...(opts.gdpr ?? {}) });
+  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, gdpr: { service: gdpr, ...(opts.privacyPerHour ? { perHour: opts.privacyPerHour } : {}) }, site: { config: site, waitlist: { store: waitlist } }, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
   return {
+    gdpr,
+    ledger,
+    kc,
+    waitlist,
     t,
     app,
     ps,

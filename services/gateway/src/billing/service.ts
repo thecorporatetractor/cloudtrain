@@ -87,6 +87,8 @@ const ACTIVE: ReadonlySet<string> = new Set<SubscriptionStatus>(['trialing', 'ac
 const DELINQUENT: ReadonlySet<string> = new Set<SubscriptionStatus>(['past_due', 'unpaid']);
 const STATUSES: ReadonlySet<string> = new Set<SubscriptionStatus>(['trialing', 'active', 'past_due', 'canceled', 'unpaid', 'incomplete', 'incomplete_expired', 'paused']);
 const DAY = 86_400_000;
+/** `userId` of a usage row whose person has been erased (src/gdpr, docs/gdpr.md). */
+const ERASED_MEMBER = 'erased';
 const OUTBOX_BATCH = 50;
 const OUTBOX_MAX_ATTEMPTS = 12;
 const OUTBOX_LEASE_MS = 120_000;
@@ -418,11 +420,13 @@ export class BillingService {
         t.amount = round2(t.amount + amount);
         tiers.set(r.compute_tier, t);
         if (who.payerKey === '') {
-          const m = members.get(r.user_id) ?? { userId: r.user_id, name: r.user_name ?? r.user_id, minutes: 0, units: 0, amount: 0 };
+          // An erased member's usage stays on the org's bill, under no name.
+          const memberId = r.user_id ?? ERASED_MEMBER;
+          const m = members.get(memberId) ?? { userId: memberId, name: r.user_name ?? (r.user_id ? r.user_id : 'Erased user'), minutes: 0, units: 0, amount: 0 };
           m.minutes += mins;
           m.units += units;
           m.amount = round2(m.amount + amount);
-          members.set(r.user_id, m);
+          members.set(memberId, m);
         }
       }
       if (out.sessions.length < 50) {
@@ -432,8 +436,8 @@ export class BillingService {
           sessionName: r.session_name,
           labId: r.lab_id,
           labTitle: this.facts.get(r.lab_id)?.title ?? r.lab_id,
-          userId: r.user_id,
-          ...(r.user_name ? { userName: r.user_name } : {}),
+          userId: r.user_id ?? ERASED_MEMBER,
+          ...(r.user_name ? { userName: r.user_name } : r.user_id ? {} : { userName: 'Erased user' }),
           tier: r.compute_tier,
           startedAt: r.started_at.toISOString(),
           ...(r.ended_at ? { endedAt: r.ended_at.toISOString() } : {}),
@@ -1036,6 +1040,11 @@ export class BillingService {
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
         const sub = obj as unknown as StripeSubscription;
+        // The person was erased (docs/gdpr.md): the closing events of the deleted Stripe customer have nothing left to update.
+        const erasedUser = sub.metadata?.ct_user_id;
+        if (erasedUser && !(await this.customerByStripeId(tx, sub.customer)) && !(await tx.selectFrom('users').select('id').where('id', '=', erasedUser).executeTakeFirst())) {
+          return { status: 'ignored', summary: { reason: 'subject erased', subscription: sub.id } };
+        }
         if (this.isComputeSub(sub)) {
           const r = await this.upsertComputeSubscription(tx, sub);
           const d = await this.recomputeDunning(tx, r.customer);

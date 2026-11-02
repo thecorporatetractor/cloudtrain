@@ -2,8 +2,11 @@
  * The predefined scroll positions of the website ("stops") and the stepping
  * between them. A stop is the hero (the top), each stage of the hero story at
  * its reading line, every section of the page (its top under the header, and
- * its bottom edge when it is taller than the viewport), the sub-headings of
- * the pricing explanation, and the end of the page.
+ * its bottom edge when it is taller than the viewport and the stop before it
+ * leaves some of its content below the fold: padding alone earns no stop), the
+ * sub-headings of the pricing explanation and its compute block (one stop for
+ * the tiers, the packs and the estimator; a bottom edge too, on the same
+ * terms), and the end of the page.
  *
  * With a mouse or trackpad (Lenis runs): one wheel gesture moves one stop, with
  * an animated scroll that settles there; keys do the same (PageUp/PageDown,
@@ -22,8 +25,21 @@ const GESTURE_GAP = 200;
 /** After the free scroll rests, a stop this close pulls the page to it. */
 const PULL = 0.22;
 
-const headerHeight = () => (document.querySelector('.site-header') as HTMLElement | null)?.offsetHeight ?? 0;
+/*
+ * The website is drawn at a zoom (site.css `--site-zoom`, 1.25 on a wide screen), so there are
+ * two kinds of pixel: element rects and scroll positions are in the window's (zoomed) pixels,
+ * offset sizes, computed styles and the values CSS takes are in the site's own. Everything here
+ * is in window pixels; `siteZoom` converts where a value crosses over.
+ */
+const rectHeight = (el: Element | null) => el?.getBoundingClientRect().height ?? 0;
+const headerHeight = () => rectHeight(document.querySelector('.site-header'));
 const maxScroll = () => Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+
+/** The site's zoom: window pixels per site pixel (measured, so it holds whatever the browser's zoom semantics). */
+export function siteZoom(): number {
+  const site = document.querySelector<HTMLElement>('.site');
+  return site && site.offsetWidth ? site.getBoundingClientRect().width / site.offsetWidth : 1;
+}
 
 /** The scroll position that shows `el` as a stop: the hero at 0, a stage at its reading line, anything else under the header. */
 export function stopFor(el: Element): number {
@@ -33,10 +49,10 @@ export function stopFor(el: Element): number {
   if (el.classList.contains('story-stage')) {
     // A stage reads centred in the viewport below the header, where the lab window sits
     // (LabStory.tsx places it there); on a phone it reads just below the window.
-    const h = (el as HTMLElement).offsetHeight;
+    const h = rectHeight(el);
     if (window.matchMedia(COMPACT).matches) {
-      const visual = document.querySelector('.story-visual') as HTMLElement | null;
-      offset = offset + 8 + (visual?.offsetHeight ?? vh * 0.4) + 16;
+      const visual = document.querySelector('.story-visual');
+      offset = offset + 8 + (visual ? rectHeight(visual) : vh * 0.4) + 16;
     } else offset = offset + Math.max(0, (vh - offset - h) / 2);
   }
   if (el.classList.contains('site-hero')) offset = top;
@@ -49,7 +65,9 @@ export function stopElementFor(target: Element): Element | undefined {
   return target.querySelector(STOP_SELECTOR) ?? target.closest(STOP_SELECTOR) ?? undefined;
 }
 
-const STOP_SELECTOR = '.site-hero, .story-stage, main .site-section, main .pm-subhead, .site-footer';
+const STOP_SELECTOR = '.site-hero, .story-stage, main .site-section, main .pm-subhead, main .pm-compute, .site-footer';
+/** The stops that get a bottom-edge stop as well when they are taller than the viewport. */
+const TALL_SELECTOR = '.site-section, .pm-compute';
 
 /** Every stop of the page, ascending; none on a page that opts out (`[data-no-stops]`, the legal texts) or has no sections. */
 export function collectStops(): number[] {
@@ -58,16 +76,28 @@ export function collectStops(): number[] {
   const header = headerHeight();
   const max = maxScroll();
   const ys = [0, max];
+  // A block taller than the viewport: its bottom edge is a stop too, kept below only when the
+  // stop before it leaves some of the block's content (not just its bottom padding) below the fold.
+  const edges: { y: number; content: number }[] = [];
+  const z = siteZoom();
   for (const el of document.querySelectorAll(STOP_SELECTOR)) {
     const y = stopFor(el);
     ys.push(y);
-    // A section taller than the viewport: its bottom edge is a stop too.
-    if (el.matches('.site-section')) {
+    if (el.matches(TALL_SELECTOR)) {
       const r = el.getBoundingClientRect();
-      if (r.height > vh - header) ys.push(Math.min(max, Math.round(r.bottom + window.scrollY - vh)));
+      if (r.height > vh - header) {
+        const pad = (parseFloat(getComputedStyle(el).paddingBottom) || 0) * z;
+        edges.push({ y: Math.min(max, Math.round(r.bottom + window.scrollY - vh)), content: r.bottom + window.scrollY - pad });
+      }
     }
   }
   if (ys.length <= 2) return []; // nothing but the top and the end: the page scrolls freely
+  ys.sort((a, b) => a - b);
+  for (const e of edges) {
+    const before = ys.filter((y) => y < e.y - MERGE).pop();
+    if (before !== undefined && e.content <= before + vh + MERGE) continue;
+    ys.push(e.y);
+  }
   ys.sort((a, b) => a - b);
   const out: number[] = [];
   for (const y of ys) {
@@ -146,7 +176,11 @@ export function startStepping(animate: (y: number, done: () => void) => void): S
     const dir = Math.sign(e.deltaY);
     if (!dir) return;
     const stops = collectStops();
-    if (stops.length === 0) return;
+    if (stops.length === 0) {
+      // A page without stops scrolls freely: the rest of this gesture must not be swallowed.
+      free = true;
+      return;
+    }
     const y = window.scrollY;
     const here = at(stops, y);
     const next = nextOf(stops, y, dir);

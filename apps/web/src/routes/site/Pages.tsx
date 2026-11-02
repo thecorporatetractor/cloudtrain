@@ -12,7 +12,7 @@ import { linkKey, Paragraphs, SignInLink, SiteAnchor, useDocumentTitle } from '@
  * (content/site.yaml); the pages only lay it out.
  */
 
-function SitePage({ title, eyebrow, lead, children, narrow }: { title: string; eyebrow?: string; lead?: ReactNode; children: ReactNode; narrow?: boolean }) {
+export function SitePage({ title, eyebrow, lead, children, narrow }: { title: string; eyebrow?: string; lead?: ReactNode; children: ReactNode; narrow?: boolean }) {
   const site = useSite();
   useDocumentTitle(title);
   if (site.isPending) {

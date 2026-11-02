@@ -240,6 +240,9 @@ export async function inviteUser(ps: PlatformService, p: Principal, req: InviteU
         link,
         '',
         `This invitation expires on ${result.inv.expires_at.toISOString().slice(0, 10)}.`,
+        '',
+        `${result.org.name} manages your account and can see your progress. How your data is handled, and your rights: ${ps.config.webUrl}/legal/privacy`,
+        `Not expecting this, or want your data removed? ${ps.config.webUrl}/legal/privacy-request`,
       ].join('\n'),
     });
     emailSent = true;

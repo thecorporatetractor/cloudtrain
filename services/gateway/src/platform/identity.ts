@@ -147,13 +147,18 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
 
   const platformClaim = c.identityProvider && opts.platformIdps.includes(c.identityProvider) ? c.idpRoles.includes('CloudTrain.PlatformAdmin') : undefined;
 
+  // A closed account stays closed until an admin reopens it (src/gdpr, docs/gdpr.md).
+  const closed = await withTenant(db, { userId: c.sub }, (tx) => tx.selectFrom('users').select('closed_at').where('id', '=', c.sub).executeTakeFirst());
+  if (closed?.closed_at) return { ok: false, reason: 'deactivated', message: 'This account is closed. Write to us if you would like it reopened.' };
+
   // Upsert the user (RLS: a user may always write its own row).
   const user = await withTenant(db, { userId: c.sub, orgId: ssoOrg?.org_id ?? null }, async (tx) => {
     const prev = await tx.selectFrom('users').select(['platform_roles']).where('id', '=', c.sub).executeTakeFirst();
     let platformRoles = prev?.platform_roles ?? [];
     if (platformClaim === true && !platformRoles.includes('platform_admin')) platformRoles = [...platformRoles, 'platform_admin'];
     if (platformClaim === false) platformRoles = platformRoles.filter((r) => r !== 'platform_admin');
-    const values = { email, name: c.name || email, last_login_at: new Date(), last_idp: c.identityProvider ?? 'local', platform_roles: platformRoles, ...(c.title ? { title: c.title } : {}) };
+    // Signing in answers an inactivity warning.
+    const values = { email, name: c.name || email, last_login_at: new Date(), last_idp: c.identityProvider ?? 'local', platform_roles: platformRoles, inactivity_warned_at: null, ...(c.title ? { title: c.title } : {}) };
     await tx
       .insertInto('users')
       .values({ id: c.sub, ...values })
@@ -258,7 +263,7 @@ export async function acceptInvitations(db: Db, userId: string, email: string): 
 export async function loadPrincipal(db: Db, userId: string, orgId: string | null): Promise<Principal | null> {
   return withTenant(db, { orgId, userId }, async (tx) => {
     const user = await tx.selectFrom('users').selectAll().where('id', '=', userId).executeTakeFirst();
-    if (!user) return null;
+    if (!user || user.closed_at) return null;
     const platformAdmin = user.platform_roles.includes('platform_admin');
     const base: Principal = {
       sub: user.id,

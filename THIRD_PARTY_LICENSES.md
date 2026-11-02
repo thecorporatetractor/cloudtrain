@@ -18,6 +18,21 @@ vulnerability DB (public advisory data, under each source's terms).
 
 | Package | Version | License |
 |---|---|---|
+| @azure/abort-controller | 2.2.0 | MIT |
+| @azure/core-auth | 1.11.0 | MIT |
+| @azure/core-client | 1.11.1 | MIT |
+| @azure/core-paging | 1.7.0 | MIT |
+| @azure/core-process | 1.0.0 | MIT |
+| @azure/core-rest-pipeline | 1.25.0 | MIT |
+| @azure/core-tracing | 1.4.0 | MIT |
+| @azure/core-util | 1.14.0 | MIT |
+| @azure/core-xml | 1.6.0 | MIT |
+| @azure/data-tables | 13.3.2 | MIT |
+| @azure/identity | 4.14.1 | MIT |
+| @azure/logger | 1.4.0 | MIT |
+| @azure/msal-browser | 5.27.0 | MIT |
+| @azure/msal-common | 16.15.0 | MIT |
+| @azure/msal-node | 7.1.2 | MIT |
 | @fastify/ajv-compiler | 4.0.7 | MIT |
 | @fastify/cookie | 11.1.3 | MIT |
 | @fastify/deepmerge | 3.2.2 | MIT |
@@ -36,6 +51,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | @jsep-plugin/assignment | 1.4.0 | MIT |
 | @jsep-plugin/regex | 1.1.0 | MIT |
 | @kubernetes/client-node | 2.0.0 | Apache-2.0 |
+| @nodable/entities | 3.1.0 | MIT |
 | @pinojs/redact | 0.4.0 | MIT |
 | @radix-ui/primitive | 1.2.0 | MIT |
 | @radix-ui/react-arrow | 1.1.17 | MIT |
@@ -88,14 +104,16 @@ vulnerability DB (public advisory data, under each source's terms).
 | @types/react | 19.3.0 | MIT |
 | @types/react-dom | 19.3.0 | MIT |
 | @types/stream-buffers | 3.0.8 | MIT |
+| @typespec/ts-http-runtime | 0.3.9 | MIT |
 | @xterm/addon-fit | 0.11.0 | MIT |
 | @xterm/xterm | 6.0.0 | MIT |
 | @xyflow/react | 12.12.0 | MIT |
 | @xyflow/system | 0.0.83 | MIT |
 | abstract-logging | 2.0.1 | MIT |
-| agent-base | 9.0.0 | MIT |
+| agent-base | 7.1.4, 9.0.0 | MIT |
 | ajv | 8.20.0 | MIT |
 | ajv-formats | 3.0.1 | MIT |
+| anynum | 1.0.1 | MIT |
 | argparse | 2.0.1 | Python-2.0 |
 | aria-hidden | 1.2.6 | MIT |
 | asynckit | 0.4.0 | MIT |
@@ -107,6 +125,8 @@ vulnerability DB (public advisory data, under each source's terms).
 | bare-path | 3.1.2 | Apache-2.0 |
 | bare-stream | 2.13.4 | Apache-2.0 |
 | bare-url | 2.5.5 | Apache-2.0 |
+| buffer-equal-constant-time | 1.0.1 | BSD-3-Clause |
+| bundle-name | 4.1.1 | MIT |
 | call-bind-apply-helpers | 1.0.2 | MIT |
 | classcat | 5.0.5 | MIT |
 | cmdk | 1.1.1 | MIT |
@@ -124,11 +144,15 @@ vulnerability DB (public advisory data, under each source's terms).
 | d3-transition | 3.0.1 | ISC |
 | d3-zoom | 3.0.0 | ISC |
 | debug | 4.4.3 | MIT |
+| default-browser | 5.5.1 | MIT |
+| default-browser-id | 5.0.1 | MIT |
+| define-lazy-prop | 3.0.0 | MIT |
 | delayed-stream | 1.0.0 | MIT |
 | dequal | 2.0.3 | MIT |
 | detect-node-es | 1.1.0 | MIT |
 | dunder-proto | 1.0.1 | MIT |
 | duplexify | 4.1.3 | MIT |
+| ecdsa-sig-formatter | 1.0.11 | Apache-2.0 |
 | end-of-stream | 1.4.5 | MIT |
 | es-define-property | 1.0.1 | MIT |
 | es-errors | 1.3.0 | MIT |
@@ -141,6 +165,8 @@ vulnerability DB (public advisory data, under each source's terms).
 | fast-json-stringify | 7.1.0 | MIT |
 | fast-querystring | 1.1.2 | MIT |
 | fast-uri | 3.1.8, 4.2.2 | BSD-3-Clause |
+| fast-xml-builder | 1.3.1 | MIT |
+| fast-xml-parser | 5.11.2 | MIT |
 | fastify | 5.12.7 | MIT |
 | fastify-plugin | 6.0.1 | MIT |
 | fastq | 1.20.3 | ISC |
@@ -156,9 +182,16 @@ vulnerability DB (public advisory data, under each source's terms).
 | has-tostringtag | 1.0.2 | MIT |
 | hasown | 2.0.4 | MIT |
 | hpagent | 1.2.0 | MIT |
+| http-proxy-agent | 7.0.2 | MIT |
+| https-proxy-agent | 7.0.6 | MIT |
 | inherits | 2.0.4 | ISC |
 | ip-address | 10.7.4 | MIT |
 | ipaddr.js | 2.5.0 | MIT |
+| is-docker | 3.0.0 | MIT |
+| is-in-ssh | 1.0.0 | MIT |
+| is-inside-container | 1.0.0 | MIT |
+| is-unsafe | 2.0.2 | MIT |
+| is-wsl | 3.1.1 | MIT |
 | isbot | 5.2.2 | Unlicense |
 | isomorphic-ws | 5.0.0 | MIT |
 | jose | 6.2.12 | MIT |
@@ -167,19 +200,31 @@ vulnerability DB (public advisory data, under each source's terms).
 | json-schema-ref-resolver | 3.0.1 | MIT |
 | json-schema-traverse | 1.0.0 | MIT |
 | jsonpath-plus | 10.4.0 | MIT |
+| jsonwebtoken | 9.0.3 | MIT |
+| jwa | 2.0.1 | MIT |
+| jws | 4.0.1 | MIT |
 | kysely | 0.29.6 | MIT |
 | lenis | 1.3.27 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
+| lodash.includes | 4.3.0 | MIT |
+| lodash.isboolean | 3.0.3 | MIT |
+| lodash.isinteger | 4.0.4 | MIT |
+| lodash.isnumber | 3.0.3 | MIT |
+| lodash.isplainobject | 4.0.6 | MIT |
+| lodash.isstring | 4.0.1 | MIT |
+| lodash.once | 4.1.1 | MIT |
 | lucide-react | 1.57.0 | ISC |
 | math-intrinsics | 1.1.0 | MIT |
 | mime-db | 1.52.0 | MIT |
 | mime-types | 2.1.35 | MIT |
 | ms | 2.1.3 | MIT |
-| nodemailer | 10.1.0 | MIT-0 |
+| nodemailer | 10.1.4 | MIT-0 |
 | oauth4webapi | 3.8.8 | MIT |
 | on-exit-leak-free | 2.1.2 | MIT |
 | once | 1.4.0 | ISC |
+| open | 11.0.4 | MIT |
 | openid-client | 6.8.8 | MIT |
+| path-expression-matcher | 1.6.2 | MIT |
 | pg | 8.23.1 | MIT |
 | pg-cloudflare | 1.4.1 | MIT |
 | pg-connection-string | 2.14.1 | MIT |
@@ -195,6 +240,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | postgres-bytea | 1.0.1 | MIT |
 | postgres-date | 1.0.7 | MIT |
 | postgres-interval | 1.2.0 | MIT |
+| powershell-utils | 0.2.1 | MIT |
 | process-warning | 5.1.1 | MIT |
 | pump | 3.0.4 | MIT |
 | quick-format-unescaped | 4.0.4 | MIT |
@@ -211,6 +257,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | reusify | 1.1.0 | MIT |
 | rfc4648 | 1.5.4 | MIT |
 | rfdc | 1.4.1 | MIT |
+| run-applescript | 7.1.0 | MIT |
 | safe-buffer | 5.2.1 | MIT |
 | safe-regex2 | 5.1.2 | MIT |
 | safe-stable-stringify | 2.5.0 | MIT |
@@ -229,6 +276,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | stream-shift | 1.0.3 | MIT |
 | streamx | 2.28.1 | MIT |
 | string_decoder | 1.3.0 | MIT |
+| strnum | 2.5.1 | MIT |
 | tar-fs | 3.1.3 | MIT |
 | tar-stream | 3.2.2 | MIT |
 | teex | 1.0.1 | MIT |
@@ -236,7 +284,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | thread-stream | 4.2.0 | MIT |
 | toad-cache | 3.7.4 | MIT |
 | tslib | 2.8.1 | 0BSD |
-| undici | 8.12.1 | MIT |
+| undici | 8.12.3 | MIT |
 | undici-types | 6.21.0, 8.9.0 | MIT |
 | use-callback-ref | 1.3.3 | MIT |
 | use-sidecar | 1.1.3 | MIT |
@@ -244,6 +292,8 @@ vulnerability DB (public advisory data, under each source's terms).
 | util-deprecate | 1.0.2 | MIT |
 | wrappy | 1.0.2 | ISC |
 | ws | 8.22.0 | MIT |
+| wsl-utils | 1.0.1 | MIT |
+| xml-naming | 0.3.0 | MIT |
 | xtend | 4.0.2 | MIT |
 | yaml | 2.9.1 | ISC |
 | zustand | 4.5.7 | MIT |

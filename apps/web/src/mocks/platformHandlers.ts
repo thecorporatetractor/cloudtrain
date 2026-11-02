@@ -96,6 +96,14 @@ const unauthenticated = () => HttpResponse.json({ error: 'Not signed in', code: 
 /* ------------------------------------------------------------------ */
 
 const SESSION_KEY = 'ct.mock.session';
+/** Screenshots and manual checks: the first-sign-in notice, until it is acknowledged. */
+const mockNoticeRequired = () => {
+  try {
+    return localStorage.getItem('ct.mock.notice') === 'required';
+  } catch {
+    return false;
+  }
+};
 interface MockSession {
   userId: string;
   orgId: string;
@@ -169,6 +177,7 @@ function buildMe(s: MockSession): Me | undefined {
     cohorts: cohortSeeds.filter((c) => c.memberIds.includes(p.id) && c.orgId === s.orgId).map((c) => ({ id: c.id, name: c.name })),
     platformAdmin: !!p.platformAdmin,
     csrfToken: 'mock-csrf-token',
+    privacyNotice: { required: mockNoticeRequired(), version: '2026-11' },
     auth: s.impersonated
       ? { method: 'dev-impersonation', impersonated: true, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() }
       : { method: 'dev', idp: s.orgId === ORG_QUILLMOOR.id && !p.platformAdmin ? 'quillmoor-entra' : undefined, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() },

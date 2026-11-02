@@ -27,15 +27,21 @@ import { loadSiteConfig } from './site/config.js';
 import { BillingService } from './billing/service.js';
 import { StripeApi, maskKey } from './billing/stripe.js';
 import { PgWaitlistStore } from './waitlist/store.js';
+import { createLedger } from './gdpr/ledger.js';
+import { GdprService } from './gdpr/service.js';
+import { sweepRetention } from './gdpr/retention.js';
 
 async function main() {
   const config = loadConfig();
   for (const [k, v] of [
     ['CT_OIDC_CLIENT_SECRET', config.oidc.clientSecret],
     ['CT_SESSION_SECRET', config.sessionSecret],
+    // Fail closed: without it there is no subject key, so no evidence and no rights flow.
+    ['CT_GDPR_HMAC_KEY', config.gdpr.hmacKey],
   ] as const) {
     if (!v) throw new Error(`${k} must be set`);
   }
+  if (process.env.NODE_ENV === 'production' && (config.gdpr.hmacKey.length < 32 || config.gdpr.hmacKey.startsWith('dev-only'))) throw new Error('CT_GDPR_HMAC_KEY must be at least 32 characters of real key material in production');
   const content = await loadContent(config.contentDir, config.extraLabDirs);
   const site = await loadSiteConfig(config.siteConfigFile);
   const compiler = new LabctlCompiler(config.labctl);
@@ -75,10 +81,11 @@ async function main() {
   // Exam simulations: attempts, results and retake grants in Postgres (RLS),
   // evidence into the learner model, teams from teams/team_members.
   const examCatalog = await loadExamCatalog(content, config.contentDir, config.curriculumFile, config.extraExamFiles);
+  const examCluster = new KubeExamCluster(kc, config.namespace);
   const exams = new ExamService(
     examCatalog,
     content,
-    new KubeExamCluster(kc, config.namespace),
+    examCluster,
     new LabctlExamCompiler(config.labctl, [path.join(config.contentDir, 'packs'), ...config.extraLabDirs]),
     new PgExamStore(db),
     new PgEvidenceSink(db, content),
@@ -105,6 +112,35 @@ async function main() {
     log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
   });
 
+  // Data-subject rights and their evidence (docs/gdpr.md). The ledger is Azure Tables when
+  // CT_GDPR_LEDGER_TABLE_URL is set, else the append-only Postgres table.
+  const waitlist = new PgWaitlistStore(db);
+  const ledger = await createLedger(config.gdpr.ledger, db, [config.gdpr.hmacKey, ...config.gdpr.previousHmacKeys]);
+  const stripe = config.billing.enabled ? new StripeApi(config.billing.secretKey) : undefined;
+  const gdpr = new GdprService({
+    db,
+    ledger,
+    hmacKey: config.gdpr.hmacKey,
+    previousHmacKeys: config.gdpr.previousHmacKeys,
+    sealer: new Sealer(config.sessionSecret),
+    mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
+    webUrl: config.webUrl,
+    waitlist,
+    brand: site.brand.name,
+    cluster,
+    exams: examCluster,
+    kc: kcAdmin,
+    ...(stripe ? { stripe } : {}),
+    billing,
+    store,
+    tokenTtlMs: config.gdpr.tokenTtlMinutes * 60_000,
+    recentSignInMs: config.gdpr.recentSignInMinutes * 60_000,
+    closureDays: config.retention.closedDays,
+    contact: config.gdpr.contact,
+    identityAccountUrl: config.gdpr.identityAccountUrl,
+    log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
+  });
+
   const app = await buildApp({
     content,
     auth: new OidcAuthenticator(db, store, oidc),
@@ -119,11 +155,12 @@ async function main() {
     events,
     logger: { level: config.logLevel },
     devImpersonate: config.devImpersonate,
-    site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute, waitlist: { store: new PgWaitlistStore(db), perHour: config.waitlistRatePerHour } },
+    site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute, waitlist: { store: waitlist, perHour: config.waitlistRatePerHour } },
     trustProxy: config.trustProxy,
     corsOrigins: config.corsOrigins,
     readiness: { postgres: () => sql`SELECT 1`.execute(db) },
     billing,
+    gdpr: { service: gdpr, perHour: config.gdpr.perHour },
   });
   log = app.log;
   for (const i of examCatalog.issues) app.log.warn({ file: i.file }, `exams skipped: ${i.message}`);
@@ -146,7 +183,13 @@ async function main() {
     return new Date(Number.isNaN(exp) ? Date.now() : Math.min(exp, Date.now()));
   };
   const billingSweep = config.billing.sweepMs > 0 ? setInterval(() => void billing.sweep(sessionEnd).catch((e: unknown) => app.log.warn({ err: e }, 'billing sweep failed')), config.billing.sweepMs) : undefined;
+  const gdprSweep = config.gdpr.sweepMs > 0 ? setInterval(() => void gdpr.sweep().catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'gdpr sweep failed')), config.gdpr.sweepMs) : undefined;
+  const retention = () => void sweepRetention({ db, waitlist, ledger, accounts: gdpr, config: config.retention, log: app.log }).catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'retention sweep failed'));
+  const retentionSweep = config.retention.sweepMs > 0 ? setInterval(retention, config.retention.sweepMs) : undefined;
   const close = async () => {
+    if (gdprSweep) clearInterval(gdprSweep);
+    if (retentionSweep) clearInterval(retentionSweep);
+    await gdpr.settled();
     if (sweep) clearInterval(sweep);
     if (billingSweep) clearInterval(billingSweep);
     await billing.settle();

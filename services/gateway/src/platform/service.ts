@@ -39,6 +39,9 @@ import { phaseOf, revealedHints } from '../sessions/map.js';
 import { labelValue, type SessionHooks } from '../sessions/service.js';
 import { membershipsOf } from './identity.js';
 
+/** Change it when the first-sign-in notice says something materially new: everyone sees it once more. */
+export const PRIVACY_NOTICE_VERSION = '2026-11';
+
 export interface PlatformConfig {
   webUrl: string;
   publicUrl: string;
@@ -225,9 +228,21 @@ export class PlatformService implements SessionHooks {
 
   /* ------------------------------------------------------- session hooks */
 
+  /** Art. 18: no new labs or exams for someone who restricted processing (docs/gdpr.md). */
+  async assertNotRestricted(tx: Tx, userId: string): Promise<void> {
+    const u = await tx.selectFrom('users').select('restricted_at').where('id', '=', userId).executeTakeFirst();
+    if (u?.restricted_at) throw new HttpError(409, 'You have restricted processing of your data, so labs and exams cannot start. You can lift this under Privacy in your account.', { code: 'conflict' });
+  }
+
+  /** The same check for a caller outside a transaction: exam starts. */
+  async ensureNotRestricted(p: Principal): Promise<void> {
+    await this.tx(p, (tx) => this.assertNotRestricted(tx, p.sub));
+  }
+
   async beforeStart(p: Principal, lab: ContentLab): Promise<{ ttlMinutes?: number }> {
     if (!p.orgId) throw new HttpError(409, 'Select an organization before starting a lab.', { code: 'conflict' });
     return this.tx(p, async (tx) => {
+      await this.assertNotRestricted(tx, p.sub);
       if (!this.labVisible(await this.visibility(tx), lab.lab.metadata.id)) throw notFound('Lab');
       const q = await this.quotas(tx, p.orgId);
       const live = (await this.liveClusterSessions(p.orgId)).length;
@@ -342,6 +357,7 @@ export class PlatformService implements SessionHooks {
           return { attempts, user, cohorts, logoUrl: org?.settings.logoUrl };
         })
       : { attempts: [] as AttemptLite[], user: undefined, cohorts: [] as { id: string; name: string }[], logoUrl: undefined };
+    const noticeRow = await withTenant(this.db, { userId: p.sub, orgId: p.orgId || null }, (tx) => tx.selectFrom('users').select('privacy_notice_version').where('id', '=', p.sub).executeTakeFirst());
     const now = this.now();
     const cohortName = new Map(stats.cohorts.map((c) => [c.id, c.name]));
     const userRefFull = { id: p.sub, name: p.name, email: p.email, ...(p.title ? { title: p.title } : {}), ...(stats.user?.avatar_url ? { avatarUrl: stats.user.avatar_url } : {}), ...(stats.user?.last_login_at ? { lastLoginAt: stats.user.last_login_at.toISOString() } : {}) };
@@ -368,6 +384,8 @@ export class PlatformService implements SessionHooks {
       cohorts: p.cohortIds.map((id) => ({ id, name: cohortName.get(id) ?? id })),
       platformAdmin: p.platformAdmin,
       csrfToken: p.session?.csrf ?? '',
+      // Someone acting in another's name must not answer the notice for them.
+      privacyNotice: { required: !p.session?.impersonated && noticeRow?.privacy_notice_version !== PRIVACY_NOTICE_VERSION, version: PRIVACY_NOTICE_VERSION },
       auth: {
         method: p.session?.method ?? 'dev',
         ...(p.session?.idp ? { idp: p.session.idp } : {}),

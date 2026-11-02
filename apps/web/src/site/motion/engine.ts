@@ -18,7 +18,7 @@
 import { gsap } from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
 import Lenis from 'lenis';
-import { startRestSnapping, startStepping, stopElementFor, stopFor, type Stepper } from './stops';
+import { siteZoom, startRestSnapping, startStepping, stopElementFor, stopFor, type Stepper } from './stops';
 import { DUR, EASE, RISE, SCROLL_LERP, SCROLL_TO_DURATION } from './tokens';
 
 gsap.registerPlugin(ScrollTrigger);
@@ -54,8 +54,8 @@ function startLenis() {
   locks.observe(document.body, { attributes: true, attributeFilter: ['data-scroll-locked'] });
 }
 
-/** Where the sticky header ends: anchors scroll to just below it. */
-const headerHeight = () => (document.querySelector('.site-header') as HTMLElement | null)?.offsetHeight ?? 0;
+/** Where the sticky header ends: anchors scroll to just below it (window pixels, stops.ts). */
+const headerHeight = () => document.querySelector('.site-header')?.getBoundingClientRect().height ?? 0;
 
 /** Scrolls to an element (below the header, honouring its scroll-margin-top) or to a position. */
 export function scrollTo(target: Element | number, opts: { immediate?: boolean; duration?: number } = {}) {
@@ -64,7 +64,7 @@ export function scrollTo(target: Element | number, opts: { immediate?: boolean; 
     // A link target that is (or holds, or sits in) a stop lands on that stop, like a step would.
     const stop = stopElementFor(target);
     if (stop && stepper && !opts.immediate) return stepper.go(stopFor(stop));
-    const margin = parseFloat(getComputedStyle(target).scrollMarginTop) || 0;
+    const margin = (parseFloat(getComputedStyle(target).scrollMarginTop) || 0) * siteZoom();
     offset = -(margin || headerHeight());
   }
   if (lenis) {
@@ -154,11 +154,16 @@ export function scanFigures(root: ParentNode = document) {
     const from = Number(input.min) || 0;
     if (!(to > from)) continue;
     const n = { v: from };
+    const span = (Number(input.max) || 100) - from;
+    const write = (v: number) => {
+      input.value = String(v);
+      input.style.setProperty('--pct', `${((v - from) / span) * 100}%`); // the filled part of the track (site.css .pm-range)
+    };
     ScrollTrigger.create({
       trigger: el,
       start: 'top 88%',
       once: true,
-      onEnter: () => gsap.fromTo(n, { v: from }, { v: to, duration: 1.1, ease: EASE.expo, onUpdate: () => (input.value = String(n.v)), onComplete: () => (input.value = String(to)) }),
+      onEnter: () => gsap.fromTo(n, { v: from }, { v: to, duration: 1.1, ease: EASE.expo, onUpdate: () => write(n.v), onComplete: () => write(to) }),
     });
   }
   for (const el of fresh('[data-grow]')) {

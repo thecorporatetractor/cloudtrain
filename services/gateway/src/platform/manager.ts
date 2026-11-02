@@ -77,6 +77,8 @@ async function teamMembers(tx: Tx, teamId: string): Promise<MemberRow[]> {
     .innerJoin('users as u', 'u.id', 'tm.user_id')
     .select(['u.id', 'u.name', 'u.email', 'u.title', 'u.avatar_url', 'tm.role', 'u.last_login_at'])
     .where('tm.team_id', '=', teamId)
+    // Art. 18: someone who restricted processing drops out of dashboards and progress exports (docs/gdpr.md).
+    .where('u.restricted_at', 'is', null)
     .orderBy('u.name')
     .execute();
 }

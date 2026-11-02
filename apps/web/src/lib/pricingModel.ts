@@ -82,6 +82,59 @@ export function readCompute(plans: SitePlans | undefined): ComputeModel | undefi
   };
 }
 
+export interface ComputePack {
+  /** What the pack costs, in minor units. */
+  price: number;
+  bonusPercent: number;
+  /** The compute credit it buys, in minor units: the price plus the bonus. */
+  credit: number;
+}
+
+export interface ComputePacks {
+  /** A proposal, not yet an offer. */
+  proposal: boolean;
+  validMonths: number;
+  note?: string;
+  items: ComputePack[];
+  /** The best bonus on offer, in percent. */
+  maxBonus: number;
+}
+
+/** The prepaid compute packs (`plans.compute.packs`), ascending by price, or undefined when none are configured. */
+export function readPacks(plans: SitePlans | undefined): ComputePacks | undefined {
+  const c = rec(rec(plans)?.compute);
+  const k = rec(c?.packs);
+  if (!k || !Array.isArray(k.items)) return undefined;
+  const items: ComputePack[] = [];
+  for (const raw of k.items) {
+    const it = rec(raw);
+    const price = num(it?.price);
+    if (price === undefined || price <= 0) continue;
+    const bonusPercent = Math.min(100, Math.floor(num(it?.bonusPercent) ?? 0));
+    items.push({ price, bonusPercent, credit: Math.round(price * (1 + bonusPercent / 100)) });
+  }
+  if (items.length === 0) return undefined;
+  items.sort((a, b) => a.price - b.price);
+  const validMonths = Math.max(1, Math.floor(num(k.validMonths) ?? 12));
+  return { proposal: k.proposal === true, validMonths, ...(typeof k.note === 'string' && k.note ? { note: k.note } : {}), items, maxBonus: Math.max(...items.map((p) => p.bonusPercent)) };
+}
+
+/** A pack fits a spend when the spend uses at least this share of its credit within the validity. */
+const PACK_USE = 0.9;
+
+/**
+ * The pack that pays off for a monthly spend: the best bonus among the packs whose credit the
+ * spend (mostly) uses up within the validity. Undefined when no pack with a bonus fits (a small spend).
+ */
+export function bestPack(packs: ComputePacks | undefined, monthlyCost: number): ComputePack | undefined {
+  if (!packs || !(monthlyCost > 0)) return undefined;
+  const budget = monthlyCost * packs.validMonths;
+  return packs.items.filter((p) => p.bonusPercent > 0 && p.credit * PACK_USE <= budget).reduce<ComputePack | undefined>((best, p) => (!best || p.bonusPercent > best.bonusPercent ? p : best), undefined);
+}
+
+/** What a cost comes to when paid from a pack's credit: the pack's price for its credit, pro rata (minor units). */
+export const withPack = (cost: number, pack: ComputePack): number => Math.round((cost * pack.price) / pack.credit);
+
 /** The free trial (`plans.free`), or undefined when none is configured. */
 export function readFreeTrial(plans: SitePlans | undefined): FreeTrial | undefined {
   const f = rec(rec(plans)?.free);

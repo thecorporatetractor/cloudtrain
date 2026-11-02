@@ -1,24 +1,28 @@
 import { useRef, type ReactNode } from 'react';
 import type { SiteConfig } from '@/api/types';
 import { cn } from '@/lib/utils';
-import { LabPreview, STORY_LINE_COUNT, STORY_PASSED } from './LabPreview';
-import { DUR, EASE } from './motion/tokens';
+import { LabPreview, LINE, LINE_COUNT, STORY_PASSED } from './LabPreview';
+import { DUR, EASE, STORY } from './motion/tokens';
 import { useScrollScene, type Motion } from './motion';
 
 /*
  * The hero and the story of a lab, as one section. Left, the hero copy and then
  * the four stages of a lab (content/site.yaml `howItWorks`: choose, start, work,
- * validate); right, the lab window (LabPreview in story mode), which stays in
- * view (sticky) while the stages scroll past. The window plays an idle sequence
- * when the page opens (the environment comes up, a first command runs) and the
- * story is four scenes with fixed stops the page steps between (motion/stops.ts):
- * each step types the commands, brings the nodes up or ticks the checks, and
- * settles on the next scene. On phones the window sits above the stages and
- * stays below the header.
+ * validate); right, the lab window (LabPreview), which stays in view (sticky)
+ * while the stages scroll past. At the top of the page the window is the cluster
+ * view of the lab (the cards, the wires, the objective, a terminal beside the
+ * facts of the session) and plays a short idle sequence when the page opens (the
+ * first command runs, worker-1 turns out to be NotReady). The story is four
+ * scenes with fixed stops the page steps between (motion/stops.ts): the first
+ * step morphs the cluster view into the compact window (the cards shrink into
+ * the pills of the topology, the terminal takes the width) and every step after
+ * types the commands, brings the nodes up or ticks the checks. The copy of a
+ * stage fades in as its stop arrives and out as it leaves. On phones the window
+ * sits above the stages and stays below the header.
  *
  * Without motion (prefers-reduced-motion, a prerendered page before its script,
  * an engine that did not load) the markup is the complete page: every stage is
- * readable, the lab shows its end state, nothing is sticky.
+ * readable, the lab shows its cluster view and its whole session, nothing is sticky.
  */
 
 export function HeroStory({ site, children, className }: { site: SiteConfig; children: ReactNode; className?: string }) {
@@ -34,7 +38,7 @@ export function HeroStory({ site, children, className }: { site: SiteConfig; chi
       <div className="site-container site-hero-inner story-grid">
         <div className="site-hero-copy story-hero-copy">{children}</div>
         <div className="site-hero-visual story-visual">
-          <LabPreview mode="story" />
+          <LabPreview />
         </div>
         <div className="story-stages-wrap">
           <h2 id="how-title" className="sr-only">
@@ -60,49 +64,62 @@ export function HeroStory({ site, children, className }: { site: SiteConfig; chi
   );
 }
 
+/** The least room under the last stage, in the site's px (the hero's bottom padding with motion). */
+const STORY_TAIL = 48;
 /** The terminal shows at most this many lines: older ones scroll off the top. Beside the checks, fewer. */
 const TERM_LINES = { alone: 8, withChecks: 5 } as const;
+/** The lines the hero's terminal shows: its command, the table, the prompt. */
+const HERO_LINES = LINE.heroEnd - LINE.hero + 2;
+
+type NodeState = 'up' | 'down' | 'off';
 
 /**
- * The story as scenes with stops. Time runs in stops: 0 is the hero (the window
- * after its idle sequence: environment up, first command and its output), 1 the
- * lab chosen (a clean window and the topology), 2 started (the nodes come up,
- * the first command runs), 3 worked (the diagnosis and the fix, worker-1 up),
- * 4 validated (the checks ticked, three of four passed). The scroll position
- * maps onto that time through the stops of the stages, so every stop of the page
- * is one scene and the same scroll position always gives the same frame. All of
- * it is scripted here and in LabPreview: nothing comes from the API.
+ * The story as scenes with stops. Time runs in stops: 0 is the hero (the cluster
+ * view after its idle sequence: `kubectl get nodes`, worker-1 NotReady), 1 the lab
+ * chosen (the cluster view has morphed into the compact window, the terminal
+ * unchanged), 2 started (`ct start`, the nodes come up), 3 worked (the diagnosis
+ * and the fix, worker-1 up), 4 validated (the checks ticked, three of four
+ * passed). The scroll position maps onto that time through the stops of the
+ * stages, so every stop of the page is one scene and the same scroll position
+ * always gives the same frame. All of it is scripted here and in LabPreview:
+ * nothing comes from the API.
+ *
+ * Everything on screen is a function of the one time value: the scenes and the
+ * stage copy in `tl`, the morph in `morph` (rebuilt from measurements whenever
+ * the layout changes, then rendered at the same time again), and the node states
+ * from `setState`. Nothing is left to a tween that could be interrupted half-way.
  */
 function buildStory({ gsap, ScrollTrigger, stopFor, compact }: Motion, root: HTMLElement) {
   const q = gsap.utils.selector(root);
   const lab = q<HTMLElement>('.lab-preview')[0];
   const stages = q<HTMLElement>('.story-stage');
+  const copies = q<HTMLElement>('.story-stage-in');
   const visual = q<HTMLElement>('.story-visual')[0]!;
   if (!lab || stages.length < 4) return;
   const last = 4;
 
   const term = q<HTMLElement>('.lab-preview-term')[0]!;
-  const boot = q<HTMLElement>('.lab-preview-boot');
   const idle = q<HTMLElement>('.lab-preview-idle');
-  const typed = q<HTMLElement>('.lab-preview-lines > .lab-preview-line:not(.lab-preview-boot):not(.lab-preview-idle):not(.lab-preview-rest)').slice(0, STORY_LINE_COUNT);
+  const lines = q<HTMLElement>('.lab-preview-lines > .lab-preview-line:not(.lab-preview-idle):not(.lab-preview-rest)').slice(0, LINE_COUNT);
   const rest = q<HTMLElement>('.lab-preview-rest');
   const checks = q<HTMLElement>('.lab-preview-checks')[0]!;
   const items = q('.lab-preview-checks li');
   const icons = q('.lab-preview-check-icon');
   const passed = q<HTMLElement>('.lab-preview-passed')[0];
-  const status = (name: string) => q(`.lab-preview-node[data-node="${name}"] .lab-preview-status`);
-  const up = [...status('cp-1'), ...status('worker-2')];
-  const w1 = status('worker-1');
+  const heroCopy = q<HTMLElement>('.story-hero-copy')[0]!;
+  const nodeEls = (name: string) => [...q(`.lab-preview-node[data-node="${name}"] .lab-preview-status`), ...q(`.lab-preview-card[data-node="${name}"]`)];
+  const up = [...nodeEls('cp-1'), ...nodeEls('worker-2')];
+  const w1 = nodeEls('worker-1');
 
   root.classList.add('is-live');
 
   // The terminal is sized to its content, up to a few lines; beyond that the lines scroll up
   // (a terminal scrolls, it does not fade). Heights are tweened so the window never jumps.
   const linesEl = q<HTMLElement>('.lab-preview-lines')[0]!;
-  const lineH = parseFloat(getComputedStyle(typed[0] ?? term).lineHeight) || 20;
+  const lineH = parseFloat(getComputedStyle(lines[0] ?? term).lineHeight) || 20;
   const termStyle = getComputedStyle(term);
   const pad = (parseFloat(termStyle.paddingTop) || 0) + (parseFloat(termStyle.paddingBottom) || 0);
-  const termH = (lines: number) => lines * lineH + pad;
+  const termH = (n: number) => n * lineH + pad;
   const checksH = checks.scrollHeight;
   /** The terminal after `n` lines are showing, with room for `cap` of them. */
   const fit = (tl: gsap.core.Timeline, at: number, n: number, cap: number = TERM_LINES.alone) => {
@@ -120,30 +137,44 @@ function buildStory({ gsap, ScrollTrigger, stopFor, compact }: Motion, root: HTM
   };
 
   // The window sits centred in the viewport below the header, whatever its height (the stops
-  // of the stages centre the copy the same way, motion/stops.ts). On a phone it sits under the header.
-  const header = () => (document.querySelector('.site-header') as HTMLElement | null)?.offsetHeight ?? 0;
+  // of the stages centre the copy the same way, motion/stops.ts). On a phone it sits under the
+  // header. Measured in window pixels, written in the site's own (its zoom, motion/stops.ts).
+  const zoom = () => (lab.offsetWidth ? lab.getBoundingClientRect().width / lab.offsetWidth : 1);
+  const header = () => document.querySelector('.site-header')?.getBoundingClientRect().height ?? 0;
   const place = () => {
     if (compact) return;
     const h = header();
-    visual.style.setProperty('--story-top', `${Math.max(h + 12, Math.round(h + (window.innerHeight - h - visual.offsetHeight) / 2))}px`);
+    const z = zoom();
+    const vh = visual.getBoundingClientRect().height;
+    const top = Math.max(h + 12 * z, Math.round(h + (window.innerHeight - h - vh) / 2));
+    visual.style.setProperty('--story-top', `${Math.round(top / z)}px`);
+    // The room under the last stage: the hero's bottom padding, or more when the window (centred
+    // like the stage) is taller than a stage, so it is still stuck beside it at the last stop. No
+    // more than that: the step from the last stage to the next section must stay within a viewport.
+    const stageH = stages[stages.length - 1]!.getBoundingClientRect().height;
+    root.style.setProperty('--story-tail', `${Math.ceil(Math.max(STORY_TAIL * z, (vh - stageH) / 2 + 2) / z)}px`);
   };
   const sizes = new ResizeObserver(place);
   sizes.observe(visual);
   window.addEventListener('resize', place);
   place();
 
-  // The state that is not a tween, from the story time: node status, the meter, the active stage copy.
+  /** The story time, the one value everything on screen follows. */
+  const time = { t: 0 };
+
+  // The state that is not a tween, from the story time: node status, the meter, the active stage.
   let booting: boolean | undefined;
   let w1State = '';
   let active = -1;
+  let w1Hold: NodeState | undefined; // the idle sequence holds worker-1 grey until its NotReady line prints
   const setState = (t: number) => {
-    const isBooting = t >= 0.4 && t < 1.45;
+    const isBooting = t >= 1.12 && t < 1.5;
     if (isBooting !== booting) {
       booting = isBooting;
       lab.classList.toggle('is-booting', isBooting);
       up.forEach((el) => el.setAttribute('data-state', isBooting ? 'off' : 'up'));
     }
-    const next = isBooting ? 'off' : t < 0.4 || (t >= 1.9 && t < 2.92) ? 'down' : t >= 2.92 ? 'up' : 'off';
+    const next: NodeState = w1Hold ?? (isBooting ? 'off' : t < 2.92 ? 'down' : 'up');
     if (next !== w1State) {
       w1State = next;
       w1.forEach((el) => el.setAttribute('data-state', next));
@@ -155,52 +186,48 @@ function buildStory({ gsap, ScrollTrigger, stopFor, compact }: Motion, root: HTM
     }
   };
 
-  // The window before any scene: an empty prompt, the checks still to come (set now, not as
-  // zero-time members of a paused timeline, which would not render at time 0).
+  // The window before any scene: the hero's lines, no checks (set now, not as zero-time
+  // members of a paused timeline, which would not render at time 0).
+  const hero = lines.slice(LINE.hero, LINE.heroEnd + 1);
+  gsap.set(lines, { display: 'none' });
+  gsap.set(idle, { display: 'block' });
   gsap.set(term, { height: termH(1) });
   gsap.set(linesEl, { y: 0 });
   gsap.set(checks, { height: 0, opacity: 0 });
 
   // The scenes, in stop time.
   const tl = gsap.timeline({ paused: true, defaults: { ease: EASE.none } });
-  // 0 -> 1, chosen: the window clears, the topology stands alone.
-  hide(tl, [...boot, ...typed, ...rest], 0.4);
-  show(tl, idle, 0.4);
-  fit(tl, 0.4, 1);
-  // 1 -> 2, started: the environment comes up, the first command runs.
-  show(tl, [boot[0]!], 1.1);
-  fit(tl, 1.1, 2);
-  show(tl, [boot[1]!], 1.25);
-  fit(tl, 1.25, 3);
-  show(tl, [boot[2]!], 1.4);
-  fit(tl, 1.4, 4);
-  hide(tl, idle, 1.55);
-  type(tl, typed[0]!, 1.55, 0.2);
-  show(tl, [typed[1]!], 1.8);
-  fit(tl, 1.8, 5);
-  show(tl, [typed[2]!], 1.85);
-  fit(tl, 1.85, 6);
-  show(tl, [typed[3]!], 1.9);
-  fit(tl, 1.9, 7);
-  show(tl, rest, 1.96);
-  fit(tl, 1.96, 8);
+  // 0 -> 1, chosen: the window morphs (below); the terminal keeps the hero's lines.
+  // 1 -> 2, started: `ct start`, the environment comes up, the session begins.
+  let n = HERO_LINES;
+  hide(tl, rest, 1.1);
+  type(tl, lines[LINE.start]!, 1.1, 0.2);
+  fit(tl, 1.1, n);
+  show(tl, [lines[LINE.start + 1]!], 1.35);
+  fit(tl, 1.35, ++n);
+  show(tl, [lines[LINE.start + 2]!], 1.5);
+  fit(tl, 1.5, ++n);
+  show(tl, [lines[LINE.start + 3]!], 1.65);
+  fit(tl, 1.65, ++n);
+  show(tl, rest, 1.82);
+  fit(tl, 1.82, ++n);
   // 2 -> 3, worked: the diagnosis and the fix; worker-1 comes up on the last `Ready` line.
   hide(tl, rest, 2.05);
-  type(tl, typed[4]!, 2.05, 0.2);
-  show(tl, [typed[5]!], 2.3);
-  fit(tl, 2.3, 9);
-  type(tl, typed[6]!, 2.4, 0.22);
-  fit(tl, 2.4, 10);
-  type(tl, typed[7]!, 2.7, 0.14);
-  fit(tl, 2.7, 11);
-  show(tl, [typed[8]!], 2.92);
-  fit(tl, 2.92, 12);
+  type(tl, lines[LINE.work]!, 2.05, 0.2);
+  show(tl, [lines[LINE.work + 1]!], 2.3);
+  fit(tl, 2.3, ++n);
+  type(tl, lines[LINE.work + 2]!, 2.4, 0.22);
+  fit(tl, 2.4, ++n);
+  type(tl, lines[LINE.work + 3]!, 2.7, 0.14);
+  fit(tl, 2.7, ++n);
+  show(tl, [lines[LINE.work + 4]!], 2.92);
+  fit(tl, 2.92, ++n);
   show(tl, rest, 2.97);
-  fit(tl, 2.97, 13);
+  fit(tl, 2.97, ++n);
   // 3 -> 4, validated: `ct validate`, the checks panel takes the lower part of the window, the checks tick.
   hide(tl, rest, 3.05);
-  type(tl, typed[9]!, 3.05, 0.14);
-  fit(tl, 3.28, 13, TERM_LINES.withChecks);
+  type(tl, lines[LINE.validate]!, 3.05, 0.14);
+  fit(tl, 3.28, n, TERM_LINES.withChecks);
   tl.to(checks, { height: checksH, opacity: 1, duration: 0.16 }, 3.28);
   tl.from(items, { opacity: 0, x: -8, duration: 0.08, stagger: 0.1 }, 3.48);
   tl.from(icons, { scale: 0.4, transformOrigin: '50% 50%', duration: 0.08, ease: 'back.out(3)', stagger: 0.1 }, 3.48);
@@ -210,32 +237,79 @@ function buildStory({ gsap, ScrollTrigger, stopFor, compact }: Motion, root: HTM
     tl.to(counter, { n: STORY_PASSED, duration: 0.1 * STORY_PASSED, snap: { n: 1 }, onUpdate: () => (passed.textContent = String(counter.n)) }, 3.52);
   }
   show(tl, rest, 3.9);
-  fit(tl, 3.9, 14, TERM_LINES.withChecks);
+  fit(tl, 3.9, ++n, TERM_LINES.withChecks);
   tl.to({}, { duration: 0.02 }, last - 0.02);
 
-  // The idle sequence of the hero: the environment comes up, a first command runs (once, on arrival).
-  gsap.set([...boot, ...typed, ...rest], { display: 'none' });
-  gsap.set(idle, { display: 'block' });
-  const idleTl = gsap.timeline({ paused: true, defaults: { ease: EASE.none } });
-  idleTl.call(() => setState(1.0), [], 0.05);
-  show(idleTl, [boot[0]!], 0.7);
-  fit(idleTl, 0.7, 2);
-  show(idleTl, [boot[1]!], 1.3);
-  fit(idleTl, 1.3, 3);
-  idleTl.call(() => setState(1.5), [], 1.5);
-  show(idleTl, [boot[2]!], 1.7);
-  fit(idleTl, 1.7, 4);
-  hide(idleTl, idle, 2.1);
-  type(idleTl, typed[0]!, 2.1, 0.4);
-  show(idleTl, [typed[1]!], 2.75);
-  fit(idleTl, 2.75, 5);
-  show(idleTl, [typed[2]!], 2.85);
-  fit(idleTl, 2.85, 6);
-  show(idleTl, [typed[3]!], 2.95);
-  fit(idleTl, 2.95, 7);
-  idleTl.call(() => setState(0), [], 2.95);
-  show(idleTl, rest, 3.15);
-  fit(idleTl, 3.15, 8);
+  // The copy: the hero's fades up and away over the first step; each stage's copy fades in (rising,
+  // sharpening) as its stop arrives and out as it leaves, a function of the time like everything else.
+  const { copyFloor: floor, copyRise: rise, copyBlur: blur } = STORY;
+  tl.fromTo(heroCopy, { opacity: 1, y: 0 }, { opacity: floor, y: -rise, duration: 0.5 }, 0);
+  copies.forEach((el, i) => {
+    const at = i + 1;
+    tl.fromTo(el, { opacity: floor, y: rise, filter: `blur(${blur}px)` }, { opacity: 1, y: 0, filter: 'blur(0px)', duration: 0.5 }, at - 0.5);
+    if (i < copies.length - 1) tl.to(el, { opacity: floor, y: -rise, filter: `blur(${blur}px)`, duration: 0.5 }, at);
+  });
+
+  /*
+   * The morph, 0 -> 1: the cluster view becomes the compact window. Each card travels and shrinks
+   * so that its status dot lands on its pill's (a transform about that dot), its details fading
+   * first and its frame last, while the pills come in under it; the objective and the wires fade;
+   * the stage shrinks from the canvas's height to the topology's; the facts panel folds away and
+   * the terminal takes the width. Built from measurements, so it is rebuilt whenever they change.
+   */
+  const stage = q<HTMLElement>('.lab-preview-stage')[0]!;
+  const canvas = q<HTMLElement>('.lab-preview-canvas')[0]!;
+  const canvasBg = q<HTMLElement>('.lab-preview-canvas-bg');
+  const objective = q<HTMLElement>('.lab-preview-objective');
+  const wires = q<HTMLElement>('.lab-preview-wires');
+  const topo = q<HTMLElement>('.lab-preview-topo')[0]!;
+  const cards = q<HTMLElement>('.lab-preview-card');
+  const details = q<HTMLElement>('.lab-preview-card-lines, .lab-preview-badge, .lab-preview-tab');
+  const body = q<HTMLElement>('.lab-preview-body')[0]!;
+  const kv = q<HTMLElement>('.lab-preview-kv')[0]!;
+  const { morphFrom: m0, morphTo: m1 } = STORY;
+  const span = m1 - m0;
+  let morph: gsap.core.Timeline | undefined;
+  const measureMorph = () => {
+    // Measure at rest: the old morph at its start puts every card back where the layout has it.
+    morph?.progress(0).kill();
+    const sh = canvas.offsetHeight;
+    const th = topo.offsetHeight;
+    const kvW = kv.offsetWidth;
+    const z = zoom(); // rects are in window pixels, the transforms in the site's own
+    const m = (morph = gsap.timeline({ paused: true, defaults: { ease: EASE.none } }));
+    const seg = (from: number, to: number) => ({ at: m0 + from * span, duration: (to - from) * span });
+    const s1 = seg(0, 1);
+    m.fromTo(stage, { height: sh }, { height: th, ...s1 }, s1.at);
+    m.fromTo(objective, { opacity: 1, y: 0 }, { opacity: 0, y: -6, ...seg(0, 0.35) }, seg(0, 0.35).at);
+    m.fromTo(wires, { opacity: 1 }, { opacity: 0, ...seg(0, 0.4) }, seg(0, 0.4).at);
+    m.fromTo(details, { opacity: 1 }, { opacity: 0, ...seg(0, 0.25) }, seg(0, 0.25).at);
+    m.fromTo(canvasBg, { opacity: 1 }, { opacity: 0, ...seg(0.2, 0.8) }, seg(0.2, 0.8).at);
+    for (const card of cards) {
+      const name = card.dataset.node!;
+      const dot = card.querySelector<HTMLElement>('.lab-preview-dot');
+      const pill = topo.querySelector<SVGGElement>(`.lab-preview-node[data-node="${name}"]`);
+      const pillDot = pill?.querySelector<SVGCircleElement>('.lab-preview-status');
+      if (!dot || !pill || !pillDot) continue;
+      const c = card.getBoundingClientRect();
+      const d = dot.getBoundingClientRect();
+      const p = pill.getBoundingClientRect();
+      const pd = pillDot.getBoundingClientRect();
+      // Shrinks to a little more than the pill's height, about its dot, so its name lands by the pill's.
+      const scale = Math.min(0.7, Math.max(0.4, (1.3 * p.height) / c.height));
+      const dx = (pd.left + pd.width / 2 - (d.left + d.width / 2)) / z;
+      const dy = (pd.top + pd.height / 2 - (d.top + d.height / 2)) / z;
+      m.fromTo(card, { x: 0, y: 0, scale: 1, transformOrigin: `${(d.left + d.width / 2 - c.left) / z}px ${(d.top + d.height / 2 - c.top) / z}px` }, { x: dx, y: dy, scale, ...s1 }, s1.at);
+      m.fromTo(card, { opacity: 1 }, { opacity: 0, ...seg(0.3, 0.75) }, seg(0.3, 0.75).at);
+    }
+    m.fromTo(topo, { autoAlpha: 0 }, { autoAlpha: 1, ...seg(0.5, 1) }, seg(0.5, 1).at);
+    m.set(canvas, { visibility: 'hidden' }, m1);
+    if (kvW > 0) {
+      m.fromTo(kv, { opacity: 1, x: 0 }, { opacity: 0, x: 10, ...seg(0, 0.5) }, seg(0, 0.5).at);
+      m.fromTo(body, { '--lp-kv': `${kvW}px` }, { '--lp-kv': '0px', ...seg(0.1, 0.85) }, seg(0.1, 0.85).at);
+    }
+    m.time(Math.min(1, time.t), true);
+  };
 
   // Scroll -> story time: piecewise linear through the stops of the stages (recomputed on each
   // update, so a resize moves the scenes with the stops). The hero is time 0 at the top.
@@ -251,37 +325,94 @@ function buildStory({ gsap, ScrollTrigger, stopFor, compact }: Motion, root: HTM
     }
     return Math.min(last, t);
   };
+  const render = () => {
+    tl.time(time.t);
+    morph?.time(Math.min(1, time.t));
+    setState(time.t);
+  };
   const sync = (immediate = false) => {
     stops = stages.map((el) => stopFor(el));
     const t = timeAt(window.scrollY);
     if (t > 0.02 && idleTl.isActive()) idleTl.progress(1);
     if (t === lastT) return;
     lastT = t;
-    if (immediate) tl.time(t);
-    else gsap.to(tl, { time: t, duration: 0.35, ease: EASE.soft, overwrite: true });
-    setState(t);
+    if (immediate) {
+      gsap.killTweensOf(time);
+      time.t = t;
+      render();
+    } else gsap.to(time, { t, duration: DUR.fast, ease: EASE.soft, overwrite: true, onUpdate: render });
   };
-  const trigger = ScrollTrigger.create({ start: 0, end: 'max', onUpdate: () => sync(), onRefresh: () => sync(true) });
+  // The idle sequence of the hero: the first command runs and prints the table; worker-1, grey until
+  // then, turns out NotReady on its line (once, on arrival).
+  const idleTl = gsap.timeline({ paused: true, defaults: { ease: EASE.none } });
+  idleTl.call(() => ((w1Hold = 'off'), setState(time.t)), [], 0);
+  hide(idleTl, idle, 0.5);
+  type(idleTl, hero[0]!, 0.5, 0.45);
+  show(idleTl, [hero[1]!], 1.15);
+  fit(idleTl, 1.15, 2);
+  show(idleTl, [hero[2]!], 1.25);
+  fit(idleTl, 1.25, 3);
+  show(idleTl, [hero[3]!], 1.35);
+  fit(idleTl, 1.35, 4);
+  idleTl.call(() => ((w1Hold = undefined), setState(time.t)), [], 1.35);
+  show(idleTl, [hero[4]!], 1.45);
+  fit(idleTl, 1.45, 5);
+  show(idleTl, rest, 1.7);
+  fit(idleTl, 1.7, 6);
+  const settle = () => {
+    // The hero's lines, whatever the idle sequence got to (a tab in the background, a scroll).
+    w1Hold = undefined;
+    gsap.set(idle, { display: 'none' });
+    gsap.set([...hero, ...rest], { display: 'block', clipPath: 'none' });
+    gsap.set(term, { height: termH(HERO_LINES) });
+    gsap.set(linesEl, { y: 0 });
+    setState(time.t);
+  };
+  idleTl.eventCallback('onComplete', settle);
 
+  const trigger = ScrollTrigger.create({ start: 0, end: 'max', onUpdate: () => sync(), onRefresh: () => (measureMorph(), sync(true)) });
+
+  // Measurements follow the layout: the window's width (not its height, which the morph itself
+  // changes), the loaded face, the pills' geometry (not the topology's own style, which the morph sets).
+  let remeasure = 0;
+  const scheduleMeasure = () => {
+    cancelAnimationFrame(remeasure);
+    remeasure = requestAnimationFrame(measureMorph);
+  };
+  let labW = lab.offsetWidth;
+  const labSize = new ResizeObserver(() => {
+    if (lab.offsetWidth === labW) return;
+    labW = lab.offsetWidth;
+    scheduleMeasure();
+  });
+  labSize.observe(lab);
+  const topoChange = new MutationObserver(scheduleMeasure);
+  topoChange.observe(topo.querySelector('svg')!, { attributes: true, subtree: true, attributeFilter: ['transform', 'width', 'd', 'x', 'y'] });
+  document.fonts?.ready.then(scheduleMeasure);
+
+  measureMorph();
   sync(true);
   if (window.scrollY < 2 && document.visibilityState === 'visible') idleTl.play();
   else {
     idleTl.progress(1);
-    if (window.scrollY < 2) {
-      gsap.set([...boot, ...typed.slice(0, 4), ...rest], { display: 'block', clipPath: 'none' });
-      gsap.set(term, { height: termH(TERM_LINES.alone) });
-    }
+    settle();
   }
 
   return () => {
     trigger.kill();
     sizes.disconnect();
+    labSize.disconnect();
+    topoChange.disconnect();
+    cancelAnimationFrame(remeasure);
+    gsap.killTweensOf(time);
+    morph?.kill();
     window.removeEventListener('resize', place);
     visual.style.removeProperty('--story-top');
+    root.style.removeProperty('--story-tail');
     root.classList.remove('is-live');
     lab.classList.remove('is-booting');
     stages.forEach((el) => el.classList.remove('is-active'));
-    [...up, ...w1].forEach((el) => el.removeAttribute('data-state'));
+    [...up, ...w1].forEach((el) => el.setAttribute('data-state', el.matches('.lab-preview-card[data-node="worker-1"]') ? 'down' : 'up'));
     if (passed) passed.textContent = String(STORY_PASSED);
   };
 }
