@@ -392,11 +392,34 @@ export interface SiteConfig {
   waitlist?: SiteWaitlist;
   /** Pre-launch (`coming-soon`) or the full website (`live`, the default). */
   launch?: SiteLaunch;
+  /** What search engines and link previews show. */
+  seo?: SiteSeo;
   /** Customer logos and quotes; labelled as placeholders while `placeholder` is set. */
   socialProof?: SiteSocialProof;
 }
 
 export type SiteLaunchMode = 'coming-soon' | 'live';
+
+export interface SiteSeoPage {
+  title: string;
+  description: string;
+  noindex?: boolean;
+  h1?: string;
+  lead?: string;
+}
+
+export interface SiteSeoDomain {
+  name: string;
+  title: string;
+  description: string;
+  h1: string;
+  lead: string;
+}
+
+export interface SiteSeo {
+  pages?: Record<string, SiteSeoPage>;
+  domains?: Record<string, SiteSeoDomain>;
+}
 
 export interface SitePoint {
   icon?: SiteFeatureIcon;

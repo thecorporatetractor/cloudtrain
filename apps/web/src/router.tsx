@@ -64,6 +64,8 @@ const AccountPrivacy = lazyRouteComponent(() => import('./routes/AccountPrivacy'
 const PlatformPrivacy = lazyRouteComponent(() => import('./routes/AccountPrivacy'), 'PlatformPrivacy');
 const PrivacyRequestPage = lazyRouteComponent(() => import('./site/PrivacyRequest'), 'PrivacyRequestPage');
 const Cookies = lazyRouteComponent(() => import('./routes/site/Pages'), 'Cookies');
+const SiteNotFound = lazyRouteComponent(() => import('./routes/site/Pages'), 'SiteNotFound');
+const Learn = lazyRouteComponent(() => import('./routes/site/Learn'), 'Learn');
 const AccountBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AccountBilling');
 const AdminBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AdminBilling');
 
@@ -108,6 +110,10 @@ export const termsRoute = createRoute({ getParentRoute: () => rootRoute, path: '
 export const privacyRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy', component: Privacy });
 export const privacyRequestRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy-request', component: PrivacyRequestPage });
 export const cookiesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/cookies', component: Cookies });
+/** The public labs, paths, exams and domains: one component, a document per URL (scripts/learn-pages.mjs). */
+export const learnRoute = createRoute({ getParentRoute: () => rootRoute, path: '/learn/$', component: Learn });
+/** What the build prerenders into 404.html; the file is served for unknown paths, and this path is not one of the site's pages. */
+export const notFoundPageRoute = createRoute({ getParentRoute: () => rootRoute, path: '/404', component: SiteNotFound });
 
 /* ------------------------------------------------------------------ auth */
 
@@ -401,6 +407,8 @@ const routeTree = rootRoute.addChildren([
   privacyRoute,
   privacyRequestRoute,
   cookiesRoute,
+  learnRoute,
+  notFoundPageRoute,
   catalogRoute,
   accountBillingRoute,
   accountPrivacyRoute,

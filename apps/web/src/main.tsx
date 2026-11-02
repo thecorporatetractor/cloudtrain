@@ -1,4 +1,4 @@
-import { startTransition, StrictMode } from 'react';
+import { startTransition, StrictMode, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider } from '@tanstack/react-router';
@@ -19,12 +19,19 @@ import { SiteTheme } from './site/SiteTheme';
 import { queries } from './api/client';
 import { publicQueries } from './api/public';
 import { STATIC_SITE } from './lib/siteMode';
+import { isComingSoon } from './site/launch';
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 10_000 },
   },
 });
+
+/** The prerendered markup is gone once the app has committed its first render. */
+function Mounted() {
+  useEffect(() => document.getElementById('root')?.removeAttribute('data-prerendered'), []);
+  return null;
+}
 
 async function boot() {
   // The env check is inlined (not API_MODE) so the bundler drops the MSW chunk from builds that
@@ -40,7 +47,11 @@ async function boot() {
   if (STATIC_SITE) {
     // The static website ships prerendered HTML (build-site.mjs): mount once the public data is
     // in the cache, so the first render is that same page instead of a skeleton.
-    await Promise.allSettled([queryClient.prefetchQuery(queries.me()), queryClient.prefetchQuery(publicQueries.site()), queryClient.prefetchQuery(publicQueries.catalog()), router.load()]);
+    // Each page waits for what it shows and nothing else: the full catalog is the heaviest document.
+    const { pathname } = window.location;
+    const live = !isComingSoon(undefined);
+    const pageData = pathname.startsWith('/learn/') ? [publicQueries.learn(pathname)] : pathname === '/' && !live ? [publicQueries.catalogSummary()] : pathname === '/' || pathname.startsWith('/catalog') ? [publicQueries.catalog()] : [];
+    await Promise.allSettled([queryClient.prefetchQuery(queries.me()), queryClient.prefetchQuery(publicQueries.site()), ...pageData.map((q) => queryClient.prefetchQuery(q as Parameters<typeof queryClient.prefetchQuery>[0])), router.load()]);
   }
   const app = (
     <StrictMode>
@@ -48,6 +59,7 @@ async function boot() {
         <ThemeProvider>
           <TooltipProvider delayDuration={400} skipDelayDuration={200}>
             <SiteTheme />
+            <Mounted />
             <RouterProvider router={router} />
           </TooltipProvider>
         </ThemeProvider>

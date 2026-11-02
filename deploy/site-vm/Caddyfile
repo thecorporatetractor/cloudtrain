@@ -23,6 +23,20 @@
 	}
 }
 
+(security_headers) {
+	# The same headers as the static build's _headers file (apps/web/scripts/site-hosting.mjs,
+	# csp('') for a same-origin API), plus HSTS. A handler's headers do not reach an error page, so
+	# handle_errors imports them too.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+		-Server
+	}
+}
+
 www.{$SITE_HOST}:443 {
 	import origin_tls
 	redir https://{$SITE_HOST}{uri} permanent
@@ -33,16 +47,7 @@ www.{$SITE_HOST}:443 {
 	# Cloudflare compresses for the browser too; gzip here keeps the origin's memory low (zstd keeps large windows).
 	encode gzip
 
-	# The same headers as the static build's _headers file (apps/web/scripts/site-hosting.mjs,
-	# csp('') for a same-origin API), plus HSTS.
-	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
-		X-Content-Type-Options nosniff
-		Referrer-Policy strict-origin-when-cross-origin
-		Permissions-Policy "camera=(), microphone=(), geolocation=()"
-		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-		-Server
-	}
+	import security_headers
 
 	# Only these reach the sidecar. Every other /api path, and any other method, is a 404 here.
 	@api {
@@ -64,22 +69,72 @@ www.{$SITE_HOST}:443 {
 		root * /srv/site
 		@immutable path /assets/*
 		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		# The public documents: fetched by the pages, never a search result. robots.txt must not block
+		# them (a crawler renders pages with them), so this says it instead.
 		@data path /data/*
 		header @data Cache-Control "public, max-age=300"
-		@nocache path / /index.html /shell.html /runtime-config.js /site-boot.js /theme-init.js
+		header @data X-Robots-Tag noindex
+		# Every page, and the files that name the current build, are revalidated on each load.
+		@nocache not path /assets/* /data/* /brand/* /site/* /favicon.ico /manifest.webmanifest
 		header @nocache Cache-Control no-cache
-		# Deep links get the app shell (index.html carries the prerendered landing page,
-		# which only / serves).
+
+		# One URL per page: no trailing slash, no index.html.
+		@slash path_regexp slash ^(.+)/$
+		redir @slash {re.slash.1}{?query} permanent
+		@homefile path /index.html
+		redir @homefile /{?query} permanent
+		@indexfile path_regexp indexfile ^(.+)/index\.html$
+		redir @indexfile {re.indexfile.1}{?query} permanent
+
+		# Build files for other hosts, the route manifest and the 404 page's own address.
+		@internal path /_headers /_redirects /.nojekyll /staticwebapp.config.json /routes.json /shell.html /404.html /404
+		error @internal 404
+
+		# Website pages that coming-soon mode folds into the one landing page (HIDDEN_ROUTE_REDIRECTS in
+		# apps/web/scripts/site-hosting.mjs): only while no page exists there, so a live build keeps them.
+		@to_pricing {
+			path /pricing
+			not file {path}/index.html
+		}
+		redir @to_pricing /#pricing permanent
+		@to_faq {
+			path /faq /contact
+			not file {path}/index.html
+		}
+		redir @to_faq /#faq permanent
+		@to_what {
+			path /about
+			not file {path}/index.html
+		}
+		redir @to_what /#what permanent
+		@to_labs {
+			path /catalog /labs /learn
+			not file {path}/index.html
+		}
+		redir @to_labs /learn/labs permanent
+
+		# A known route is a directory with a page in it (routes.json lists them). Anything else that
+		# is not a file is a 404 below: there is no fallback to an app shell.
 		@landing path /
 		rewrite @landing /index.html
-		try_files {path} /shell.html
+		try_files {path} {path}/index.html
 		file_server {
 			disable_canonical_uris
 		}
 	}
 
+	# Unknown paths: the branded page, noindex, with a real 404 status.
+	handle_errors 404 {
+		import security_headers
+		root * /srv/site
+		header Cache-Control no-cache
+		rewrite * /404.html
+		file_server
+	}
+
 	# The sidecar stopped or restarting (also the kill switch): the form shows its own message.
 	handle_errors 502 503 504 {
+		import security_headers
 		header Content-Type "application/json; charset=utf-8"
 		header Cache-Control no-store
 		respond `{"error":"Not available right now, try again in a few minutes","code":"upstream"}` 503

@@ -53,6 +53,7 @@ export function headersFile(apiBase) {
     '  Cache-Control: public, max-age=31536000, immutable',
     '/data/*',
     '  Cache-Control: public, max-age=300',
+    '  X-Robots-Tag: noindex',
     '/runtime-config.js',
     '  Cache-Control: no-cache',
     '/index.html',
@@ -64,24 +65,47 @@ export function headersFile(apiBase) {
 }
 
 /**
- * Cloudflare Pages and Netlify `_redirects`: every unknown path gets the single-page app. The
- * app shell is `shell.html` (index.html without the prerendered landing page, which only `/`
- * serves), so a deep link never shows the landing page before its own.
+ * Website paths that have no page of their own in coming-soon mode (src/site/launch.ts) but that
+ * people or old links may use: each goes to where the same content now is. Every host applies them
+ * only when no page exists at the path, so `live` keeps its pages.
  */
-export const redirectsFile = '/*  /shell.html  200\n';
+export const HIDDEN_ROUTE_REDIRECTS = [
+  ['/pricing', '/#pricing'],
+  ['/faq', '/#faq'],
+  ['/about', '/#what'],
+  ['/contact', '/#faq'],
+  ['/catalog', '/learn/labs'],
+  ['/labs', '/learn/labs'],
+  ['/learn', '/learn/labs'],
+];
+
+/**
+ * Cloudflare Pages and Netlify `_redirects`. Every page is a file of its own and an unknown path gets
+ * 404.html with a 404 status, so there is no catch-all. `appFallback` keeps one for a live site that
+ * hands app paths over to the platform in the browser (src/lib/surface.ts): those paths have no file.
+ */
+export function redirectsFile({ mode = 'coming-soon', appFallback = false } = {}) {
+  const rules = mode === 'coming-soon' ? HIDDEN_ROUTE_REDIRECTS.map(([from, to]) => `${from}  ${to}  301`) : [];
+  return [...rules, ...(appFallback ? ['/*  /shell.html  200'] : []), ''].join('\n');
+}
 
 /** Azure Static Web Apps `staticwebapp.config.json`. */
-export function staticWebAppConfig(apiBase) {
+export function staticWebAppConfig(apiBase, { mode = 'coming-soon', appFallback = false } = {}) {
   return (
     JSON.stringify(
       {
-        navigationFallback: { rewrite: '/shell.html', exclude: ['/assets/*', '/data/*', '/brand/*', '/site/*', '/*.{js,css,json,webmanifest,svg,png,webp,ico,txt,xml}'] },
+        ...(appFallback ? { navigationFallback: { rewrite: '/shell.html', exclude: ['/assets/*', '/data/*', '/brand/*', '/site/*', '/*.{js,css,json,webmanifest,svg,png,webp,ico,txt,xml}'] } } : {}),
+        responseOverrides: { 404: { rewrite: '/404.html', statusCode: 404 } },
         globalHeaders: {
           'X-Content-Type-Options': 'nosniff',
           'Referrer-Policy': 'strict-origin-when-cross-origin',
           'Content-Security-Policy': csp(apiBase),
         },
-        routes: [{ route: '/assets/*', headers: { 'Cache-Control': 'public, max-age=31536000, immutable' } }],
+        routes: [
+          { route: '/assets/*', headers: { 'Cache-Control': 'public, max-age=31536000, immutable' } },
+          { route: '/data/*', headers: { 'X-Robots-Tag': 'noindex' } },
+          ...(mode === 'coming-soon' ? HIDDEN_ROUTE_REDIRECTS.map(([route, redirect]) => ({ route, redirect, statusCode: 301 })) : []),
+        ],
       },
       null,
       2,
@@ -89,7 +113,8 @@ export function staticWebAppConfig(apiBase) {
   );
 }
 
-export const robotsTxt = 'User-agent: *\nAllow: /\n';
+/** The API is off limits; everything else, scripts and styles too, stays crawlable. */
+export const robotsTxt = 'User-agent: *\nDisallow: /api/\nAllow: /\n';
 
 /** robots.txt; names the sitemap when the site's own origin is known. */
 export function robotsFor(siteUrl) {
@@ -97,12 +122,12 @@ export function robotsFor(siteUrl) {
 }
 
 /**
- * The pages a crawler should know. Coming soon: the landing page, the features page and the
- * legal pages (every other path shows the same landing). Live: the website pages, plus every
- * public path and exam detail page.
+ * The pages of the website outside /learn (learn-pages.mjs). Coming soon: the landing page, the
+ * features page and the legal pages. Live: the website pages, plus every public path and exam detail
+ * page. `/legal/privacy-request` is a page in both, for the links in mail: never for a crawler.
  */
 export function sitePaths({ mode, pricing, catalog, cookies = false, features = false, paths = [], exams = [] }) {
-  const legal = ['/legal/terms', '/legal/privacy', ...(cookies ? ['/legal/cookies'] : [])];
+  const legal = ['/legal/terms', '/legal/privacy', ...(cookies ? ['/legal/cookies'] : []), '/legal/privacy-request'];
   const featurePage = features ? ['/features'] : [];
   if (mode === 'coming-soon') return ['/', ...featurePage, ...legal];
   return [
@@ -116,14 +141,6 @@ export function sitePaths({ mode, pricing, catalog, cookies = false, features = 
     ...legal,
     ...(catalog ? [...paths.map((id) => `/catalog/paths/${id}`), ...exams.map((id) => `/catalog/exams/${id}`)] : []),
   ];
-}
-
-const xmlEsc = (s) => s.replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&apos;', '"': '&quot;' })[c]);
-
-/** sitemap.xml for absolute page URLs under the site's origin. */
-export function sitemapXml(siteUrl, paths, lastmod) {
-  const urls = paths.map((p) => `  <url><loc>${xmlEsc(siteUrl + p)}</loc>${lastmod ? `<lastmod>${lastmod}</lastmod>` : ''}</url>`);
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join('\n')}\n</urlset>\n`;
 }
 
 const attrEsc = (s) => s.replace(/[&"<>]/g, (c) => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' })[c]);

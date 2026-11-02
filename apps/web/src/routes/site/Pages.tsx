@@ -223,4 +223,31 @@ export function Cookies() {
   return <LegalPage doc={useSite().data?.legal.cookies} />;
 }
 
+/* ---------------------------------------------------------------------- 404 */
+
+/** The page in 404.html, which runs no app: only plain links. */
+export function SiteNotFound() {
+  return (
+    <SitePage title="This page does not exist" eyebrow="Not found" narrow lead="The link may be out of date, or the address may have a typo.">
+      <ul style={{ display: 'flex', gap: 10, flexWrap: 'wrap', listStyle: 'none', margin: 0, padding: 0 }}>
+        <li>
+          <a href="/" className="btn btn-primary btn-md">
+            Go to the home page
+          </a>
+        </li>
+        <li>
+          <a href="/learn/labs" className="btn btn-secondary btn-md">
+            Browse the labs
+          </a>
+        </li>
+        <li>
+          <a href="/features" className="btn btn-secondary btn-md">
+            See the features
+          </a>
+        </li>
+      </ul>
+    </SitePage>
+  );
+}
+
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');

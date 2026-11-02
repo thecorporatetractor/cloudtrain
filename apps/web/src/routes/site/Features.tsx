@@ -87,7 +87,8 @@ export function Features() {
                         onClick={() => setOpen(first + j)}
                         aria-label={`Enlarge: ${figure.alt}`}
                       >
-                        <FeatureShot figure={figure} sizes="(max-width: 1023px) 100vw, 740px" />
+                        {/* The first screen is in the first viewport: it must not wait for lazy loading. */}
+                        <FeatureShot figure={figure} sizes="(max-width: 1023px) 100vw, 740px" priority={first + j === 0} />
                       </button>
                     ))}
                   </div>

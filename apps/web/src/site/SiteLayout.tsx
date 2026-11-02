@@ -15,6 +15,7 @@ import { ComingSoonChrome } from './ComingSoonChrome';
 import { SiteBrand, SiteFooter, themeIcon } from './Footer';
 import { isComingSoon, keepsOwnPage, launchKnown } from './launch';
 import { loadMotion, sitePageEnter, siteScrollTo } from './motion';
+import { applyPageHead } from './seoHead';
 import { SignInLink } from './util';
 
 
@@ -98,6 +99,7 @@ function useSiteScroll() {
   const lastPath = useRef<string | null>(null);
   useEffect(() => {
     // A new page (not the first): it rises in; the stops of the page are read from its markup as it scrolls.
+    const arrivedFirst = first.current;
     if (first.current) first.current = false;
     else sitePageEnter(document.getElementById('main'));
     const arrived = lastPath.current !== pathname;
@@ -105,7 +107,9 @@ function useSiteScroll() {
     let timer = 0;
     // After the frame in which the drawer closes and returns focus, so the scroll is not cancelled.
     timer = window.setTimeout(() => {
-      if (!hash) return siteScrollTo(0, { immediate: true });
+      // A first load without a section link is where the browser put it: at the top, or where the
+      // visitor scrolled to in the prerendered page before the app arrived.
+      if (!hash) return arrivedFirst ? undefined : siteScrollTo(0, { immediate: true });
       // On arrival the page is still growing (data, the story's pinned length): aim once it holds still.
       if (arrived) {
         const start = performance.now();
@@ -136,12 +140,18 @@ function useSiteScroll() {
 
 export function SiteLayout({ children }: { children: ReactNode }) {
   useSiteScroll();
-  // The motion engine (smooth scroll, reveals, the hero story) loads once the page is up; never with reduced motion.
-  useEffect(() => {
-    void loadMotion();
-  }, []);
   const site = useSite().data;
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  // The motion engine (smooth scroll, reveals, the hero story) loads once the page is up; never with
+  // reduced motion, and not for the /learn pages, which are lists to read and link between.
+  const stillPage = pathname.startsWith('/learn/');
+  useEffect(() => {
+    if (!stillPage) void loadMotion();
+  }, [stillPage]);
+  // The /learn pages know their own head (routes/site/Learn.tsx).
+  useEffect(() => {
+    if (!pathname.startsWith('/learn/')) applyPageHead(pathname, site?.seo?.pages?.[pathname]);
+  }, [pathname, site]);
   // Until the configuration says which website this is, neither chrome is drawn (no flash of the other one).
   if (!launchKnown(site)) {
     return (

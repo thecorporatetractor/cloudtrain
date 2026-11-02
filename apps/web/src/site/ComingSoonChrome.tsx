@@ -12,6 +12,9 @@ import { siteScrollTo } from './motion';
  * itself (ComingSoon.tsx) is loaded lazily, this stays small.
  */
 
+/** The index of the public lab pages (routes/site/Learn.tsx). */
+export const LEARN_LABS = '/learn/labs';
+
 /** A link to a section of the coming-soon page, from any path. */
 export function CsLink({ id, children, className }: { id: string; children: ReactNode; className?: string }) {
   return (
@@ -39,6 +42,9 @@ export function ComingSoonChrome({ children, themeMenu }: { children: ReactNode;
             <CsLink id="what" className="site-nav-link">
               What it is
             </CsLink>
+            <Link to={LEARN_LABS as '/'} className="site-nav-link">
+              Labs
+            </Link>
             {site?.featurePage && (
               <Link to="/features" className="site-nav-link">
                 Features

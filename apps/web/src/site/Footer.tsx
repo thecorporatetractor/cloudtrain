@@ -11,7 +11,7 @@ import { linkKey, SiteAnchor } from './util';
 /*
  * The footer of the public website, shared by the live chrome (SiteLayout) and
  * the coming-soon chrome: the brand lockup with its tagline, the link columns
- * from content/site.yaml `footer.columns` (Product, Company, Resources, Legal)
+ * from content/site.yaml `footer.columns` (Labs, Product, Company, Resources, Legal)
  * with the contact address under Company, the alignment notice, the copyright
  * line with the licence note. In coming-soon mode the links into the platform
  * are dropped and /pricing and /faq become links to the sections of the one page.
@@ -43,7 +43,7 @@ function retarget(l: FooterLink, site: SiteConfig, soon: boolean): FooterLink | 
   if (soon) {
     if (route === '/pricing') return site.pricing?.model ? { ...l, to: '/#pricing' } : undefined;
     if (route === '/faq') return { ...l, to: '/#faq' };
-    if (route === '/' || route.startsWith('/legal') || route === '/features') return l;
+    if (route === '/' || route.startsWith('/legal') || route === '/features' || route.startsWith('/learn')) return l;
     return undefined;
   }
   if (route === '/features' && !site.featurePage) return undefined;
@@ -78,7 +78,7 @@ export function SiteFooter() {
           </div>
           {columns.map((c, i) => (
             <nav key={c.title} className="site-footer-col" aria-label={c.title}>
-              <h3>{c.title}</h3>
+              <h2>{c.title}</h2>
               <ul>
                 {c.links.map((l) => (
                   <li key={linkKey(l)}>

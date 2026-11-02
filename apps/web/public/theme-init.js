@@ -13,3 +13,7 @@ try {
     document.documentElement.setAttribute('data-theme', t);
   }
 } catch (e) {}
+// A privacy link from a mail (#token=...): site.css keeps the prerendered form off screen until the app has rendered the confirmation.
+try {
+  if (window.location.hash.indexOf('#token=') === 0) document.documentElement.classList.add('ct-token-link');
+} catch (e) {}

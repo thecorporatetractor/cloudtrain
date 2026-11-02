@@ -3422,6 +3422,29 @@ export interface Site {
       };
     };
   };
+  /**
+   * What search engines and link previews show: the title and description of a website route, and the hub of a domain under /learn. Read by apps/web/scripts/build-site.mjs.
+   */
+  seo?: {
+    pages?: {
+      [k: string]: {
+        title: string;
+        description: string;
+        noindex?: boolean;
+        h1?: string;
+        lead?: string;
+      };
+    };
+    domains?: {
+      [k: string]: {
+        name: string;
+        title: string;
+        description: string;
+        h1: string;
+        lead: string;
+      };
+    };
+  };
 }
 /**
  * This interface was referenced by `Site`'s JSON-Schema

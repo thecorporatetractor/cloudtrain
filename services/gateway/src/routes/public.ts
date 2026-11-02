@@ -68,6 +68,9 @@ export function publicExam(cat: ExamCatalog, id: string): PublicExam | undefined
   const ex = cat.exams.get(id);
   if (!ex) return undefined;
   const def = ex.def;
+  // rules.notes are the exam author's: how the environment is built, what to fix before a live run. The
+  // signed-in exam page has its own route (examRules); the public documents never carry them.
+  const { notes: _authorNotes, ...rules } = examRules(def);
   return {
     id: def.id,
     title: def.title,
@@ -82,7 +85,7 @@ export function publicExam(cat: ExamCatalog, id: string): PublicExam | undefined
     environment: def.environment,
     availability: ex.availability,
     ...(ex.availabilityNote ? { availabilityNote: ex.availabilityNote } : {}),
-    rules: examRules(def),
+    rules,
     retakePolicy: retakePolicy(def),
   };
 }
@@ -93,7 +96,6 @@ export function publicExamDetail(cat: ExamCatalog, id: string): PublicExamDetail
   if (!ex || !summary) return undefined;
   return {
     ...summary,
-    ...(ex.def.description ? { description: ex.def.description } : {}),
     ...(ex.def.simulationNote ? { simulationNote: ex.def.simulationNote } : {}),
     objectives: objectives(cat, ex),
     reportIncludes: ex.def.scoreReport.includes ?? [],

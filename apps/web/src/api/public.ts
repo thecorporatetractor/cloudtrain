@@ -1,7 +1,8 @@
 import { queryOptions, useQuery } from '@tanstack/react-query';
-import type { PublicCatalog, PublicExamDetail, PublicPathDetail, SiteConfig } from './types';
+import type { PublicCatalog, PublicDomain, PublicExamDetail, PublicPathDetail, SiteConfig } from './types';
 import { ApiError, request } from './client';
 import { STATIC_SITE, staticDataUrl } from '@/lib/siteMode';
+import type { LearnDoc } from '@/site/learnDoc';
 
 /*
  * The public website API (packages/api-types/public.d.ts): the site configuration
@@ -21,15 +22,33 @@ const get = <T>(api: string, file: string): Promise<T> =>
     : request<T>(api);
 const HOUR = 3_600_000;
 
+/** What the coming-soon page shows of the catalog: the static build writes it apart, a fraction of the size. */
+export interface CatalogSummary {
+  domains: PublicDomain[];
+  counts: { labs: number; paths: number; exams: number };
+}
+
 export const publicQueries = {
   site: () => queryOptions({ queryKey: ['public', 'site'], queryFn: () => get<SiteConfig>('/api/public/site', 'site.json'), staleTime: HOUR, gcTime: 2 * HOUR }),
   catalog: () => queryOptions({ queryKey: ['public', 'catalog'], queryFn: () => get<PublicCatalog>('/api/public/catalog', 'catalog.json'), staleTime: 10 * 60_000 }),
+  catalogSummary: () =>
+    queryOptions({
+      queryKey: ['public', 'catalog-summary'],
+      queryFn: (): Promise<CatalogSummary> =>
+        STATIC_SITE
+          ? get<CatalogSummary>('/api/public/catalog', 'catalog-summary.json')
+          : get<PublicCatalog>('/api/public/catalog', 'catalog.json').then((c) => ({ domains: c.domains, counts: { labs: c.labs.length, paths: c.paths.length, exams: c.exams.length } })),
+      staleTime: 10 * 60_000,
+    }),
   path: (id: string) => queryOptions({ queryKey: ['public', 'path', id], queryFn: () => get<PublicPathDetail>(`/api/public/paths/${enc(id)}`, `paths/${enc(id)}.json`), staleTime: 10 * 60_000 }),
   exam: (id: string) => queryOptions({ queryKey: ['public', 'exam', id], queryFn: () => get<PublicExamDetail>(`/api/public/exams/${enc(id)}`, `exams/${enc(id)}.json`), staleTime: 10 * 60_000 }),
+  /** A /learn page's document; only the static website build has them (scripts/learn-pages.mjs). */
+  learn: (pathname: string) => queryOptions({ queryKey: ['public', 'learn', pathname], queryFn: () => get<LearnDoc>(`/api/public${pathname}`, `${pathname.slice(1)}.json`), staleTime: 10 * 60_000, retry: false }),
 };
 
 export const useSite = () => useQuery(publicQueries.site());
 export const usePublicCatalog = (enabled = true) => useQuery({ ...publicQueries.catalog(), enabled });
+export const useCatalogSummary = (enabled = true) => useQuery({ ...publicQueries.catalogSummary(), enabled });
 export const usePublicPath = (id: string) => useQuery(publicQueries.path(id));
 export const usePublicExam = (id: string) => useQuery(publicQueries.exam(id));
 
