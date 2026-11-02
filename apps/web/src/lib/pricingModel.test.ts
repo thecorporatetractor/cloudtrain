@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SitePlans } from '@/api/types';
-import { billedMinutes, earlyAccessFor, planFeatures, formatMinutes, formatMoney, rateLabels, readCompute, readFreeTrial, sessionCost } from './pricingModel';
+import { bestPack, billedMinutes, earlyAccessFor, planFeatures, formatMinutes, formatMoney, rateLabels, readCompute, readFreeTrial, readPacks, sessionCost, withPack } from './pricingModel';
 
 const base = {
   currency: 'EUR',
@@ -69,6 +69,37 @@ describe('readCompute', () => {
     ]);
     expect(m?.placeholder).toBe(true);
     expect(m?.minimumMinutes).toBe(1);
+  });
+});
+
+describe('prepaid packs', () => {
+  const packs = withCompute({ packs: { proposal: true, validMonths: 12, items: [{ price: 10000, bonusPercent: 15 }, { price: 2500 }, { price: 5000, bonusPercent: 10 }, { price: 25000, bonusPercent: 20 }, { price: 'x' }] } });
+
+  it('reads the packs ascending, with the credit the bonus gives', () => {
+    expect(readPacks(undefined)).toBeUndefined();
+    expect(readPacks(base)).toBeUndefined();
+    expect(readPacks(withCompute({ packs: { items: [] } }))).toBeUndefined();
+    const k = readPacks(packs)!;
+    expect(k.proposal).toBe(true);
+    expect(k.validMonths).toBe(12);
+    expect(k.maxBonus).toBe(20);
+    expect(k.items).toEqual([
+      { price: 2500, bonusPercent: 0, credit: 2500 },
+      { price: 5000, bonusPercent: 10, credit: 5500 },
+      { price: 10000, bonusPercent: 15, credit: 11500 },
+      { price: 25000, bonusPercent: 20, credit: 30000 },
+    ]);
+  });
+
+  it('picks the best bonus a spend uses up within the validity, and prices the spend from it', () => {
+    const k = readPacks(packs)!;
+    expect(bestPack(k, 0)).toBeUndefined();
+    expect(bestPack(k, 300)).toBeUndefined(); // 36 a year: no pack with a bonus fits
+    expect(bestPack(k, 450)?.price).toBe(5000); // 54 a year
+    expect(bestPack(k, 1000)?.price).toBe(10000); // 120 a year
+    expect(bestPack(k, 3000)?.price).toBe(25000);
+    expect(withPack(450, bestPack(k, 450)!)).toBe(409);
+    expect(withPack(3000, bestPack(k, 3000)!)).toBe(2500);
   });
 });
 

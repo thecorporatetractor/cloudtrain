@@ -9,7 +9,7 @@ import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Button, Field, Input } from '@/components/ui';
 import { signInRoute } from '@/router';
 import { apiUrl } from '@/lib/runtimeConfig';
-import { ON_SITE, signInHref, siteHomeHref, surfaceConfig } from '@/lib/surface';
+import { hrefFor, ON_SITE, signInHref, siteHomeHref, surfaceConfig } from '@/lib/surface';
 
 /**
  * Identity-first sign-in. Step 1 asks for the email; the gateway's discovery
@@ -257,6 +257,14 @@ function PlatformSignIn() {
       <p className="signin-foot xs subtle">
         {tagline} ·{' '}
         <WebsiteLink className="link-quiet">Back to the website</WebsiteLink>
+        {' · '}
+        <a className="link-quiet" href={hrefFor(surfaceConfig, '/legal/privacy')}>
+          Privacy notice
+        </a>
+        {' · '}
+        <a className="link-quiet" href={hrefFor(surfaceConfig, '/legal/privacy-request')}>
+          Privacy request
+        </a>
       </p>
     </div>
   );

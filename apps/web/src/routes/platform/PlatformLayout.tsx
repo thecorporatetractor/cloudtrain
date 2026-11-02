@@ -7,6 +7,7 @@ const TABS: { to: string; label: string; exact?: boolean }[] = [
   { to: '/platform', label: 'Organisations', exact: true },
   { to: '/platform/capacity', label: 'Capacity' },
   { to: '/platform/content', label: 'Global content' },
+  { to: '/platform/privacy', label: 'Privacy requests' },
 ];
 
 export function PlatformLayout() {

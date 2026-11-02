@@ -69,6 +69,8 @@ export interface NewSession {
   userAgent?: string;
   /** Dev sign-in-as: no IdP behind the session, so no access-token expiry to refresh. */
   impersonated?: boolean;
+  /** The ID token's auth_time. Absent: no proof of a recent sign-in. */
+  authenticatedAt?: Date;
 }
 
 export class SessionStore {
@@ -89,6 +91,7 @@ export class SessionStore {
       .insertInto('auth_sessions')
       .values({
         id_hash: hashToken(token),
+        authenticated_at: s.authenticatedAt ?? null,
         user_id: s.userId,
         org_id: s.orgId,
         csrf,
@@ -229,6 +232,7 @@ export class OidcAuthenticator implements Authenticator {
         csrf: row.csrf,
         ...(row.idp && !impersonated ? { idp: row.idp } : {}),
         expiresAt: row.expires_at.toISOString(),
+        ...(row.authenticated_at ? { authenticatedAt: row.authenticated_at.toISOString() } : {}),
         method: impersonated ? 'dev-impersonation' : 'oidc',
         ...(impersonated ? { impersonated: true } : {}),
       },

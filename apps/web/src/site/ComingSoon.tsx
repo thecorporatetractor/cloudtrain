@@ -5,7 +5,7 @@ import { PageSkeleton } from '@/components/ui';
 import { CsLink as Section } from './ComingSoonChrome';
 import { DomainMarquee } from './Flourish';
 import { HeroStory } from './LabStory';
-import { ComputeTiers, Estimator, PlanComparison, PricingPaths, PricingSteps, WorkedExamples } from './PricingModel';
+import { ComputePacks, ComputeSplit, ComputeTiers, PlanComparison, PricingPaths, PricingSteps } from './PricingModel';
 import { FeatureIcon, useDocumentTitle } from './util';
 import { WaitlistSection } from './Waitlist';
 
@@ -142,32 +142,37 @@ export function PricingExplained({ site, id = 'pricing', headingLevel = 2 }: { s
   return (
     <section className="site-section site-section-alt pm" id={id} aria-labelledby={`${id}-title`}>
       <div className="site-container">
-        <div className="site-section-head pm-head">
-          <div className="site-section-head-copy" data-reveal="children">
-            <p className="site-eyebrow">{m.eyebrow ?? 'Pricing'}</p>
-            <H id={`${id}-title`} className={headingLevel === 1 ? 'site-h1 site-display' : 'site-h2'}>
-              {m.title}
-            </H>
-            {m.intro && <p className="site-section-lead">{m.intro}</p>}
+        {/* The head and the three ways fill the first viewport of the section; the rest starts below the fold. */}
+        <div className="pm-fold">
+          <div className="site-section-head pm-head">
+            <div className="site-section-head-copy" data-reveal="children">
+              <p className="site-eyebrow">{m.eyebrow ?? 'Pricing'}</p>
+              <H id={`${id}-title`} className={headingLevel === 1 ? 'site-h1 site-display' : 'site-h2'}>
+                {m.title}
+              </H>
+              {m.intro && <p className="site-section-lead">{m.intro}</p>}
+            </div>
           </div>
+          <PricingPaths site={site} />
         </div>
-        <PricingPaths site={site} />
         {m.paths && m.paths.length > 0 && <h3 className="pm-subhead">The hosted service, step by step</h3>}
         <PricingSteps model={m} />
-        <h3 className="pm-subhead">Compute, by the minute</h3>
-        <ComputeTiers site={site} />
-        <div className="pm-split">
-          <Estimator site={site} />
-          <div className="pm-split-examples">
-            <h3 className="pm-subhead pm-subhead-tight">Worked examples</h3>
-            <WorkedExamples site={site} />
-          </div>
+        {/* One view, one stop (motion/stops.ts): the tiers, the packs and the estimator with its examples. */}
+        <div className="pm-compute">
+          <h3 className="pm-subhead">Compute, by the minute</h3>
+          <ComputeTiers site={site} />
+          <ComputePacks site={site} />
+          <ComputeSplit site={site} />
         </div>
         {site.plans && site.plans.items.length > 0 && (
-          <>
-            <h3 className="pm-subhead">Hosted plans compared</h3>
+          // A viewport of its own, so the next section is not in view with it (site.css .pm-compare-block)
+          <div className="pm-compare-block">
+            <div className="pm-compare-head">
+              <h3 className="pm-subhead">Hosted plans compared</h3>
+              {site.plans.billingNote && <p className="pm-compare-intro">{site.plans.billingNote}</p>}
+            </div>
             <PlanComparison site={site} />
-          </>
+          </div>
         )}
       </div>
     </section>
@@ -180,7 +185,7 @@ function Questions({ site }: { site: SiteConfig }) {
   const items = groups?.length ? site.faq.filter((f) => f.group && groups.includes(f.group)) : site.faq.filter((f) => f.featured || (pricingGroup && f.group === pricingGroup));
   if (items.length === 0) return null;
   return (
-    <section className="site-section" id="faq" aria-labelledby="faq-title">
+    <section className="site-section site-section-tall" id="faq" aria-labelledby="faq-title">
       <div className="site-container cs-faq">
         <div className="site-section-head-copy" data-reveal="children">
           <p className="site-eyebrow">Questions</p>

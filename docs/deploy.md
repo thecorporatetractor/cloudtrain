@@ -82,7 +82,8 @@ kubectl -n cloudtrain create secret generic cloudtrain-gateway \
   --from-literal=CT_DATABASE_URL='postgres://cloudtrain_app:<app password>@<host>:5432/cloudtrain' \
   --from-literal=CT_DATABASE_OWNER_URL='postgres://cloudtrain_owner:<owner password>@<host>:5432/cloudtrain' \
   --from-literal=CT_OIDC_CLIENT_SECRET='<client secret>' \
-  --from-literal=CT_SESSION_SECRET="$(openssl rand -base64 36)"
+  --from-literal=CT_SESSION_SECRET="$(openssl rand -base64 36)" \
+  --from-literal=CT_GDPR_HMAC_KEY="$(openssl rand -base64 48)"
   # optional: --from-literal=CT_KEYCLOAK_ADMIN_CLIENT_SECRET=...
 
 # 4. The release's catalog overlay (lab images by digest), from the GitHub release

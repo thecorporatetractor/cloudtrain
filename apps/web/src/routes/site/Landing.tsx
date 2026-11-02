@@ -481,7 +481,7 @@ function Audiences({ site }: { site: SiteConfig }) {
 
 function Trust({ items }: { items: SiteConfig['faq'] }) {
   return (
-    <section className="site-section" id="questions" aria-labelledby="trust-title">
+    <section className="site-section site-section-tall" id="questions" aria-labelledby="trust-title">
       <div className="site-container">
         <SectionHead
           id="trust-title"

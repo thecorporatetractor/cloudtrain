@@ -187,6 +187,11 @@ const VIEWS = [
   ['event-new', 'manager', '/events', 'Depot gateway night', async (p) => (await p.getByRole('button', { name: 'New event' }).click(), await p.getByText('New CTF event').waitFor())],
   ['exams', 'learner', '/exams', 'Exam simulations'],
   // Billing (Stripe test mode in the mock): the person's plan, then after a mock checkout; the org admin's plan with seats.
+  ['privacy-request', 'none', '/legal/privacy-request', 'Email me a confirmation link'],
+  ['first-sign-in-notice', 'learner', '/', 'Home', async (p) => (await p.evaluate(() => localStorage.setItem('ct.mock.notice', 'required')), await p.reload(), await p.getByRole('button', { name: 'Got it' }).waitFor())],
+  ['account-privacy', 'learner', '/account/privacy', 'Delete my account'],
+  ['account-privacy-blocked', 'org_admin', '/account/privacy', 'cannot be deleted yet'],
+  ['platform-privacy', 'platform_admin', '/platform/privacy', 'Chain verifies'],
   ['account-billing', 'learner', '/account/billing', 'Plans for you'],
   ['account-billing-subscribed', 'learner', '/account/billing', 'Plans for you', async (p) => (await p.getByRole('button', { name: 'Subscribe to Pro' }).click(), await p.getByText('Checkout complete').first().waitFor(), await p.getByText('Subscribed').first().waitFor(), await p.waitForTimeout(400))],
   ['admin-billing', 'org_admin', '/admin/billing', 'Organisation plans'],

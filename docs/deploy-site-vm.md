@@ -123,7 +123,7 @@ Run these steps from a checkout of the repository, on your machine, unless a ste
    ```sh
    cd /opt/cloudtrain-site
    sudo cp .env.example .env && sudo chmod 600 .env
-   for k in POSTGRES_PASSWORD CT_OWNER_PASSWORD CT_APP_PASSWORD CT_SESSION_SECRET; do
+   for k in POSTGRES_PASSWORD CT_OWNER_PASSWORD CT_APP_PASSWORD CT_SESSION_SECRET CT_GDPR_HMAC_KEY; do
      sudo sed -i "s|^$k=.*|$k=$(openssl rand -hex 24)|" .env
    done
    sudo grep -E '^(SITE_HOST|ACME_EMAIL|GATEWAY_IMAGE)=' .env   # check these three
@@ -162,7 +162,7 @@ All commands run on the VM, in `/opt/cloudtrain-site`, with `sudo`.
 | Update the site copy or the build | Run install steps 1 to 3 again, then `docker compose restart gateway`. The gateway reads `site.yaml` only at start; Caddy serves new files in `site/` at once |
 | Update the gateway | Set `GATEWAY_IMAGE` in `.env` to the new digest (`docker buildx imagetools inspect ghcr.io/thecorporatetractor/cloudtrain/gateway:main`), then `docker compose up -d`. The `migrate` service applies new migrations first |
 | Backup | `backup.sh` runs nightly from cron (cloud-init above): a `pg_dump` into `/var/backups/cloudtrain-site`, kept for 14 days. Run it by hand before an upgrade |
-| Restore | `docker compose exec -T postgres pg_restore -U postgres -d cloudtrain --clean --if-exists < /var/backups/cloudtrain-site/<file>.dump` |
+| Restore | `docker compose exec -T postgres pg_restore -U postgres -d cloudtrain --clean --if-exists < /var/backups/cloudtrain-site/<file>.dump`, then re-apply erasures: `docker compose run --rm gateway dist/gdpr/cli.js reapply --ledger-file <newest gdpr-ledger-*.jsonl>` (docs/gdpr.md, "Backups") |
 | Rotate a database password | Change it in Postgres (`ALTER ROLE cloudtrain_app PASSWORD '...'`) and in `.env`, then `docker compose up -d`. The init script reads `.env` only on an empty volume |
 
 Keep the dumps on the VM, or copy them off only to storage that the privacy notice

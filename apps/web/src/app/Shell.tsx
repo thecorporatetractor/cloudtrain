@@ -1,7 +1,7 @@
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { BookOpen, Building2, CreditCard, Flag, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
+import { BookOpen, Building2, CreditCard, FileText, Flag, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Mail, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, ShieldCheck, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
 import { useMe } from '@/api/client';
 import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
@@ -20,6 +20,8 @@ import { CommandPalette } from './CommandPalette';
 import { PersonaSwitcher } from './PersonaSwitcher';
 import { ShellProvider, useShell } from './shell-context';
 import { ShortcutsDialog } from './ShortcutsDialog';
+import { PrivacyNoticeDialog } from './PrivacyNotice';
+import { hrefFor, surfaceConfig } from '@/lib/surface';
 
 export function Shell() {
   return (
@@ -140,6 +142,7 @@ function ShellInner() {
     );
   }
 
+  const privacyNotice = principal?.privacyNotice?.required ? <PrivacyNoticeDialog version={principal.privacyNotice.version} orgName={principal.activeOrg?.name} /> : null;
   const navMode = shell.navMode;
   const panel = (mode: 'full' | 'rail', inDrawer = false) => (
     <NavPanel mode={mode} inDrawer={inDrawer} inWorkspace={inWorkspace} pathname={pathname} sections={visibleSections} principal={principal} theme={theme} setTheme={setTheme} onClose={() => setDrawerOpen(false)} />
@@ -183,6 +186,7 @@ function ShellInner() {
         {principal?.auth.impersonated && <DevImpersonationBanner me={principal} />}
         <CommandPalette />
         <ShortcutsDialog />
+        {privacyNotice}
         <Toasts />
       </div>
     );
@@ -203,6 +207,7 @@ function ShellInner() {
       {principal?.auth.impersonated && <DevImpersonationBanner me={principal} />}
       <CommandPalette />
       <ShortcutsDialog />
+      {privacyNotice}
       <Toasts />
     </div>
   );
@@ -429,6 +434,24 @@ function UserMenu({ me, navMode, side = 'right', onBeforeAction }: { me: Me | un
           }}
         >
           <CreditCard size={14} /> Plan and billing
+        </Dropdown.Item>
+        <Dropdown.Item
+          onSelect={() => {
+            onBeforeAction?.();
+            void navigate({ to: '/account/privacy' });
+          }}
+        >
+          <ShieldCheck size={14} /> Privacy
+        </Dropdown.Item>
+        <Dropdown.Item asChild>
+          <a href={hrefFor(surfaceConfig, '/legal/privacy')}>
+            <FileText size={14} /> Privacy notice
+          </a>
+        </Dropdown.Item>
+        <Dropdown.Item asChild>
+          <a href={hrefFor(surfaceConfig, '/legal/privacy-request')}>
+            <Mail size={14} /> Privacy request by email
+          </a>
         </Dropdown.Item>
         <Dropdown.Item disabled>
           <Settings size={14} /> Preferences

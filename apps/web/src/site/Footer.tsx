@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import { ArrowUpRight, Mail, Moon, ShieldCheck, Sun, Sunset } from 'lucide-react';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { DEFAULT_BRAND, useSite } from '@/api/public';
 import type { SiteConfig } from '@/api/types';
 import { BrandLockup, BrandMark, BrandName, useBrandName } from '@/components/brand';
@@ -66,7 +66,7 @@ export function SiteFooter() {
   return (
     <footer className="site-footer">
       <div className="site-container">
-        <div className="site-footer-grid" data-reveal="children">
+        <div className="site-footer-grid" style={{ '--footer-cols': columns.length } as CSSProperties} data-reveal="children">
           <div className="site-footer-brand">
             <Link to="/" className="site-brand" aria-label={`${brand} home`}>
               <SiteBrand height={24} />

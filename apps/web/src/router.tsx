@@ -59,6 +59,9 @@ const Faq = lazyRouteComponent(() => import('./routes/site/Pages'), 'Faq');
 const Contact = lazyRouteComponent(() => import('./routes/site/Pages'), 'Contact');
 const Terms = lazyRouteComponent(() => import('./routes/site/Pages'), 'Terms');
 const Privacy = lazyRouteComponent(() => import('./routes/site/Pages'), 'Privacy');
+const AccountPrivacy = lazyRouteComponent(() => import('./routes/AccountPrivacy'), 'AccountPrivacy');
+const PlatformPrivacy = lazyRouteComponent(() => import('./routes/AccountPrivacy'), 'PlatformPrivacy');
+const PrivacyRequestPage = lazyRouteComponent(() => import('./site/PrivacyRequest'), 'PrivacyRequestPage');
 const AccountBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AccountBilling');
 const AdminBilling = lazyRouteComponent(() => import('./routes/Billing'), 'AdminBilling');
 
@@ -100,6 +103,7 @@ export const faqRoute = createRoute({ getParentRoute: () => rootRoute, path: '/f
 export const contactRoute = createRoute({ getParentRoute: () => rootRoute, path: '/contact', component: Contact });
 export const termsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/terms', component: Terms });
 export const privacyRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy', component: Privacy });
+export const privacyRequestRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy-request', component: PrivacyRequestPage });
 
 /* ------------------------------------------------------------------ auth */
 
@@ -135,6 +139,7 @@ const billingSearch = (s: Record<string, unknown>): BillingSearch => ({
   ...(s.setup === 'success' || s.setup === 'cancelled' ? { setup: s.setup } : {}),
 });
 /** The signed-in person's plan, entitlements and subscription (docs/billing.md). */
+export const accountPrivacyRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/privacy', component: AccountPrivacy });
 export const accountBillingRoute = createRoute({ getParentRoute: () => rootRoute, path: '/account/billing', validateSearch: billingSearch, component: AccountBilling });
 
 export interface CatalogSearch {
@@ -375,6 +380,7 @@ export const platformOrgsRoute = createRoute({
   component: PlatformOrgs,
 });
 export const platformCapacityRoute = createRoute({ getParentRoute: () => platformRoute, path: '/capacity', component: PlatformCapacity });
+export const platformPrivacyRoute = createRoute({ getParentRoute: () => platformRoute, path: '/privacy', component: PlatformPrivacy });
 export const platformContentRoute = createRoute({ getParentRoute: () => platformRoute, path: '/content', component: PlatformContent });
 
 const routeTree = rootRoute.addChildren([
@@ -388,8 +394,10 @@ const routeTree = rootRoute.addChildren([
   contactRoute,
   termsRoute,
   privacyRoute,
+  privacyRequestRoute,
   catalogRoute,
   accountBillingRoute,
+  accountPrivacyRoute,
   labRoute,
   workspaceRoute,
   skillsRoute,
@@ -414,7 +422,7 @@ const routeTree = rootRoute.addChildren([
   cohortBoardRoute,
   observeRoute,
   adminRoute.addChildren([adminIndexRoute, adminUsersRoute, adminTeamsRoute, adminSsoRoute, adminContentRoute, adminSessionsRoute, adminUsageRoute, adminAuditRoute, adminSettingsRoute, adminBillingRoute]),
-  platformRoute.addChildren([platformOrgsRoute, platformCapacityRoute, platformContentRoute]),
+  platformRoute.addChildren([platformOrgsRoute, platformCapacityRoute, platformContentRoute, platformPrivacyRoute]),
 ]);
 
 export const router = createRouter({

@@ -1,3 +1,4 @@
+import { retentionConfig, type RetentionConfig } from './gdpr/retention.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isLiveKey, isTestKey } from './billing/stripe.js';
@@ -89,6 +90,9 @@ export interface Config {
    * The key is never logged.
    */
   billing: BillingConfig;
+  /** Data-subject rights (src/gdpr, docs/gdpr.md). `hmacKey` is empty in production unless set; main.ts refuses to start then. */
+  gdpr: { hmacKey: string; previousHmacKeys: string[]; ledger: { tableUrl?: string; table?: string; clientId?: string }; sweepMs: number; perHour: number; tokenTtlMinutes: number; recentSignInMinutes: number; contact: string; identityAccountUrl: string };
+  retention: RetentionConfig;
   /**
    * DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1). loadConfig refuses
    * to return a config with it on in production or on a non-loopback URL.
@@ -275,5 +279,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(num(env.CT_EXAM_DURATION_MINUTES, 0) > 0 ? { examDurationMinutes: num(env.CT_EXAM_DURATION_MINUTES, 0) } : {}),
     devImpersonate,
     billing: billingConfig(env),
+    gdpr: {
+      hmacKey: env.CT_GDPR_HMAC_KEY ?? (prod ? '' : 'dev-only-gdpr-hmac-key-not-for-production'),
+      ledger: { ...(env.CT_GDPR_LEDGER_TABLE_URL ? { tableUrl: env.CT_GDPR_LEDGER_TABLE_URL } : {}), ...(env.CT_GDPR_LEDGER_TABLE ? { table: env.CT_GDPR_LEDGER_TABLE } : {}), ...(env.AZURE_CLIENT_ID ? { clientId: env.AZURE_CLIENT_ID } : {}) },
+      sweepMs: num(env.CT_GDPR_SWEEP_MS, 60_000),
+      perHour: Math.max(1, num(env.CT_PRIVACY_RATE_PER_HOUR, 10)),
+      tokenTtlMinutes: Math.max(1, num(env.CT_GDPR_LINK_TTL_MINUTES, 1440)),
+      previousHmacKeys: (env.CT_GDPR_HMAC_KEY_PREVIOUS ?? '').split(',').map((k) => k.trim()).filter(Boolean),
+      recentSignInMinutes: Math.max(1, num(env.CT_GDPR_RECENT_SIGNIN_MINUTES, 15)),
+      contact: env.CT_GDPR_CONTACT ?? 'gdpr@cloudtrain.app',
+      identityAccountUrl: `${env.CT_OIDC_ISSUER ?? `${kcBase}/realms/${realm}`}/account/`,
+    },
+    retention: retentionConfig(env),
   };
 }

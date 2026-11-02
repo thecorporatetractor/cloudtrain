@@ -9,6 +9,7 @@ import type { SessionStore } from '../oidc/sessions.js';
 import { audit } from '../platform/audit.js';
 import { loadPrincipal, membershipsOf, orgForDomain, orgForIdp, provision, type IdentityClaims } from '../platform/identity.js';
 import type { PlatformService } from '../platform/service.js';
+import { RateLimiter } from './public.js';
 
 export interface AuthRouteDeps {
   ps: PlatformService;
@@ -17,6 +18,8 @@ export interface AuthRouteDeps {
 }
 
 const STATE_TTL_MS = 15 * 60_000;
+/** Starting a login writes a state row. Per IP, and high enough for an office behind one address. */
+const LOGIN_PER_MINUTE = 120;
 
 /** Only same-app relative paths: no scheme, no protocol-relative `//host`. */
 export function safeReturnTo(v: unknown): string {
@@ -44,6 +47,7 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
   const { ps, oidc, store } = d;
   const web = ps.config.webUrl;
   const pub = { public: true } as const;
+  const loginLimiter = new RateLimiter(LOGIN_PER_MINUTE);
 
   const loginError = (reply: FastifyReply, reason: string, message: string) => reply.redirect(`${web}/login?error=${encodeURIComponent(reason)}&message=${encodeURIComponent(message)}`, 302);
 
@@ -68,7 +72,8 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
   });
 
   /** Identity-first: email -> org by verified domain -> the org's IdP (kc_idp_hint) or Keycloak's local login. */
-  app.get<{ Querystring: { email?: string; returnTo?: string; org?: string; idp?: string; invite?: string } }>('/api/auth/login', { config: pub }, async (req, reply) => {
+  app.get<{ Querystring: { email?: string; returnTo?: string; org?: string; idp?: string; invite?: string } }>('/api/auth/login', { config: { ...pub, rateLimit: { perMinute: LOGIN_PER_MINUTE } } }, async (req, reply) => {
+    if (!loginLimiter.take(req.ip)) throw new HttpError(429, 'Too many requests, try again later', { code: 'rate_limited', details: { retryAfterSeconds: loginLimiter.resetIn(req.ip) } });
     const q = req.query;
     let orgId: string | null = null;
     let idpHint: string | undefined;
@@ -91,7 +96,7 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
       .insertInto('auth_login_states')
       .values({ state, verifier, nonce, return_to: safeReturnTo(q.returnTo), email: q.email?.trim().toLowerCase() ?? null, org_id: orgId, invite: q.invite ?? null })
       .execute();
-    const url = await oidc.authorizationUrl({ state, nonce, verifier, ...(q.email ? { loginHint: q.email.trim() } : {}), ...(idpHint ? { idpHint } : {}) });
+    const url = await oidc.authorizationUrl({ state, nonce, verifier, ...(q.email ? { loginHint: q.email.trim() } : {}), ...(idpHint ? { idpHint } : {}), ...((q as { reauth?: string }).reauth === '1' ? { prompt: 'login' } : {}) });
     return reply.redirect(url, 302);
   });
 
@@ -126,6 +131,7 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
       tokens,
       ...(typeof idt.sid === 'string' ? { kcSid: idt.sid } : {}),
       idp: claims.identityProvider ?? 'local',
+      ...(typeof idt.auth_time === 'number' ? { authenticatedAt: new Date(idt.auth_time * 1000) } : {}),
       ip: req.ip,
       ...(req.headers['user-agent'] ? { userAgent: req.headers['user-agent'] } : {}),
     });

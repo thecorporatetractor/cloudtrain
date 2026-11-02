@@ -15,6 +15,7 @@ import type { LabAccess } from './billing.js';
 
 export * from './platform.js';
 export * from './ctf.js';
+export * from './privacy.js';
 
 export type Domain = 'kubernetes' | 'linux' | 'containers' | 'iac' | 'automation' | 'networking';
 export type Difficulty = 'easy' | 'medium' | 'hard';

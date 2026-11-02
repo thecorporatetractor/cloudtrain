@@ -109,6 +109,8 @@ export interface PlanPrice {
 export interface SitePlan {
   id: string;
   name: string;
+  /** One line on who the plan is for (the plan comparison). */
+  audience?: string;
   kind: PlanKind;
   /** Tier level for premium labs (free 0; default 1 for paid plans). Seated organisation members get their organisation plan's level. */
   level?: number;
@@ -168,6 +170,25 @@ export interface SiteCompute {
   minimumMinutes?: number;
   placeholder?: boolean;
   tiers: Record<ComputeTier, SiteComputeTier>;
+  /** Prepaid compute packs (website only until billing sells them). */
+  packs?: SiteComputePacks;
+}
+
+export interface SiteComputePack {
+  /** What the pack costs, in minor units. */
+  price: number;
+  /** Bonus credit on top of the price, in percent (default 0). */
+  bonusPercent?: number;
+  lookupKey?: string;
+}
+
+export interface SiteComputePacks {
+  /** A proposal, not yet an offer; the page says so. */
+  proposal?: boolean;
+  /** How long the credit is valid from purchase (default 12). */
+  validMonths?: number;
+  note?: string;
+  items: SiteComputePack[];
 }
 
 export interface SiteSpendLimit {

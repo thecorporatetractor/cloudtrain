@@ -33,6 +33,14 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
     return { start: auth, cb };
   }
 
+  it('limits how often one address can start a login', async () => {
+    const from = { remoteAddress: '203.0.113.77' };
+    for (let i = 0; i < 120; i++) expect((await h.app.inject({ url: '/api/auth/login', ...from })).statusCode).toBe(302);
+    const over = await h.app.inject({ url: '/api/auth/login', ...from });
+    expect(over.statusCode).toBe(429);
+    expect((await h.app.inject({ url: '/api/auth/login', remoteAddress: '203.0.113.78' })).statusCode).toBe(302);
+  });
+
   it('discovers the org by verified email domain', async () => {
     expect((await h.app.inject('/api/auth/discover?email=hannah.vogel@acme-freight.example')).json()).toMatchObject({ method: 'sso', idpAlias: 'acme-idp', org: { slug: 'acme-freight' } });
     expect((await h.app.inject('/api/auth/discover?email=priya.raman@quillmoor.example')).json()).toMatchObject({ method: 'local', org: { slug: 'quillmoor' } });
@@ -157,5 +165,48 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
     const start = await h.app.inject('/api/auth/login?returnTo=%2F%2Fevil.example%2Fx');
     const { code, state } = op.authorize(start.headers.location as string, { sub: Q.sofia, email: 'sofia.lindqvist@quillmoor.example', name: 'Sofia Lindqvist' });
     expect((await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`)).headers.location).toBe('http://web.test/');
+  });
+});
+
+describe('recent sign-in before a download or a deletion', () => {
+  it('asks again once auth_time is older than the window, and login with reauth=1 forces the prompt', async () => {
+    const oidc = await new FakeOidcProvider().start();
+    const h = await harness({ oidc, gdpr: { recentSignInMs: 60_000 } });
+    try {
+      const login = await h.app.inject({ method: 'GET', url: `/api/auth/login?email=${encodeURIComponent('lucas.brandt@quillmoor.example')}&reauth=1` });
+      expect(new URL(login.headers.location as string).searchParams.get('prompt')).toBe('login');
+      const plain = await h.app.inject({ method: 'GET', url: '/api/auth/login' });
+      expect(new URL(plain.headers.location as string).searchParams.get('prompt')).toBeNull();
+
+      const p = await h.t.owner.selectFrom('users').select(['id', 'email', 'name']).where('id', '=', Q.lucas).executeTakeFirstOrThrow();
+      const principal = { sub: p.id, email: p.email, name: p.name, orgId: h.orgs.quillmoor, orgName: '', orgSlug: '', team: '', roles: ['learner' as const], teams: [], managedTeamIds: [], instructedCohortIds: [], cohortIds: [], platformAdmin: false };
+      const session = (at?: Date) => ({ idHash: 'x', csrf: 'x', expiresAt: '', method: 'oidc' as const, ...(at ? { authenticatedAt: at.toISOString() } : {}) });
+      const stale = { ...principal, session: session(new Date(Date.now() - 61_000)) };
+      const fresh = { ...principal, session: session(new Date(Date.now() - 59_000)) };
+      await expect(h.gdpr.exportAccount(stale)).rejects.toMatchObject({ status: 403, extra: { code: 'reauth_required' } });
+      await expect(h.gdpr.deleteAccount(stale, p.email)).rejects.toMatchObject({ status: 403, extra: { code: 'reauth_required' } });
+      // No auth_time at all is not proof of anything.
+      await expect(h.gdpr.exportAccount({ ...principal, session: session() })).rejects.toMatchObject({ extra: { code: 'reauth_required' } });
+      expect((await h.gdpr.summary(stale)).recentSignIn).toBe(false);
+      expect((await h.gdpr.summary(fresh)).recentSignIn).toBe(true);
+      await expect(h.gdpr.exportAccount(fresh)).resolves.toMatchObject({ profile: { id: p.id } });
+
+      // The whole way through: an old auth_time in the ID token reaches the session and the route.
+      const start = await h.app.inject(`/api/auth/login?email=${encodeURIComponent(p.email)}`);
+      const { code, state } = oidc.authorize(start.headers.location as string, { sub: p.id, email: p.email, name: p.name, auth_time: Math.floor(Date.now() / 1000) - 3600 });
+      const cb = await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`);
+      const cookie = ([cb.headers['set-cookie']].flat() as string[]).find((c) => c.startsWith('ct_session='))!.split(';')[0]!;
+      const row = await h.t.owner.selectFrom('auth_sessions').select('authenticated_at').where('user_id', '=', p.id).orderBy('created_at', 'desc').limit(1).executeTakeFirstOrThrow();
+      expect(row.authenticated_at!.getTime()).toBeLessThan(Date.now() - 3000_000);
+      const me = await h.app.inject({ method: 'GET', url: '/api/me', headers: { cookie } });
+      const csrf = me.json().csrfToken as string;
+      expect((await h.app.inject({ method: 'GET', url: '/api/me/privacy', headers: { cookie } })).json().recentSignIn).toBe(false);
+      const refused = await h.app.inject({ method: 'POST', url: '/api/me/privacy/export', headers: { cookie, 'x-csrf-token': csrf } });
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json().code).toBe('reauth_required');
+    } finally {
+      await h.close();
+      await oidc.stop();
+    }
   });
 });

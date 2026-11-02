@@ -4,8 +4,8 @@ How the contact addresses for `cloudtrain.app` are set up in Microsoft 365, and 
 records they need. The website lists one address, `hello@cloudtrain.app`
 (`contact.email` and `contact.salesEmail` in `content/site.yaml`).
 
-Neither the website nor the gateway sends email today. The waitlist stores entries, and
-nobody gets an automatic message. Outgoing application mail is covered at the end.
+The waitlist stores entries, and nobody gets an automatic message. Privacy requests do send one:
+a confirmation link through the gateway's `Mailer` (docs/gdpr.md), so that flow needs outgoing mail. Outgoing application mail is covered at the end.
 
 ## Mailbox layout
 
@@ -20,6 +20,7 @@ itself.
 | `hello@cloudtrain.app` | Shared mailbox | Contact page, general questions, Let's Encrypt and budget alerts |
 | `sales@cloudtrain.app` | Alias of `hello@` | Team and pilot enquiries. Point `contact.salesEmail` here once it exists |
 | `privacy@cloudtrain.app` | Alias of `hello@` | Data requests (the privacy notice should name it) |
+| `gdpr@cloudtrain.app` | Alias of `hello@` | Objections and restrictions raised in the app (`CT_GDPR_CONTACT`, docs/gdpr.md). **Must exist** before those reach anyone |
 | `security@cloudtrain.app` | Alias of `hello@` | Vulnerability reports (`SECURITY.md`, a future `security.txt`) |
 | `billing@cloudtrain.app` | Alias of `hello@` | Invoices and payment questions once billing is live |
 | `legal@cloudtrain.app` | Alias of `hello@` | Licensing and contract questions |
@@ -43,7 +44,7 @@ send to them.
    alias from the table as an SMTP address. In Exchange Online PowerShell:
 
    ```powershell
-   Set-Mailbox hello@cloudtrain.app -EmailAddresses @{add='smtp:sales@cloudtrain.app','smtp:privacy@cloudtrain.app','smtp:security@cloudtrain.app','smtp:billing@cloudtrain.app','smtp:legal@cloudtrain.app','smtp:dmarc@cloudtrain.app','smtp:postmaster@cloudtrain.app','smtp:abuse@cloudtrain.app'}
+   Set-Mailbox hello@cloudtrain.app -EmailAddresses @{add='smtp:sales@cloudtrain.app','smtp:privacy@cloudtrain.app','smtp:gdpr@cloudtrain.app','smtp:security@cloudtrain.app','smtp:billing@cloudtrain.app','smtp:legal@cloudtrain.app','smtp:dmarc@cloudtrain.app','smtp:postmaster@cloudtrain.app','smtp:abuse@cloudtrain.app'}
    ```
 
 5. **Let replies go out from the shared address.** Run

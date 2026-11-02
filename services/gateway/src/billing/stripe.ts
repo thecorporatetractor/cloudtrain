@@ -153,6 +153,8 @@ export class StripeApi {
     create: (p: { email?: string; name?: string; metadata?: Record<string, string> }, idempotencyKey?: string) => this.request<StripeCustomer>('POST', '/v1/customers', p, { idempotencyKey }),
     retrieve: (id: string) => this.request<StripeCustomer>('GET', `/v1/customers/${encodeURIComponent(id)}`),
     update: (id: string, p: { invoice_settings?: { default_payment_method?: string }; metadata?: Record<string, string> }) => this.request<StripeCustomer>('POST', `/v1/customers/${encodeURIComponent(id)}`, p),
+    /** Permanently deletes the customer (and cancels what is left of its subscriptions). Stripe keeps the invoices. */
+    del: (id: string) => this.request<{ id: string; deleted: boolean }>('DELETE', `/v1/customers/${encodeURIComponent(id)}`),
   };
   products = {
     search: (query: string) => this.request<StripeList<StripeProduct>>('GET', '/v1/products/search', { query, limit: 10 }),

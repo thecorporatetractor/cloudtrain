@@ -253,7 +253,7 @@ export function WaitlistSection({ site }: { site: SiteConfig }) {
   const cfg = site.waitlist;
   if (!cfg?.enabled) return null;
   return (
-    <section id="waitlist" className="site-section site-section-alt" aria-labelledby="waitlist-title">
+    <section id="waitlist" className="site-section site-section-alt site-section-tall" aria-labelledby="waitlist-title">
       <div className="site-container">
         <WaitlistPanel cfg={cfg} />
       </div>

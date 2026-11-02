@@ -69,6 +69,10 @@ export class FakeStripe {
       this.customers.set(c.id, c);
       return remember(c);
     }
+    if (method === 'DELETE' && path.startsWith('/v1/customers/')) {
+      if (!this.customers.delete(last())) return err(404, 'No such customer');
+      return ok({ id: last(), deleted: true });
+    }
     if (method === 'POST' && path.startsWith('/v1/customers/')) {
       const c = this.customers.get(last());
       if (!c) return err(404, 'No such customer');

@@ -43,6 +43,8 @@ declare module 'fastify' {
     public?: boolean;
     /** Also allowed without an active org (platform admins, /me). */
     anyOrg?: boolean;
+    /** Declares the route's limit; the handler enforces it with its RateLimiter. */
+    rateLimit?: { perMinute: number };
   }
 }
 

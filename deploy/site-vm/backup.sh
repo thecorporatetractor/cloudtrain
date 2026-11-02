@@ -13,4 +13,15 @@ out="$BACKUP_DIR/cloudtrain-$(date -u +%Y%m%dT%H%M%SZ).dump"
 docker compose exec -T postgres pg_dump -U postgres -d cloudtrain --format=custom > "$out.tmp"
 mv "$out.tmp" "$out"
 find "$BACKUP_DIR" -name 'cloudtrain-*.dump' -mtime +"$KEEP_DAYS" -delete
+# The erasure evidence, apart from the dumps: a restore rolls the Postgres ledger back, and gdpr:reapply
+# needs what was erased after the dump (docs/gdpr.md). No addresses in it, so it may outlive them.
+# Copy this file off the VM: on the VM alone it is lost with the disk. With the Azure ledger it stays empty.
+ledger="$BACKUP_DIR/gdpr-ledger-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
+if docker compose exec -T postgres psql -U postgres -d cloudtrain -Atq -c "SELECT json_build_object('kind', 'checkpoint', 'checkpoint', record::json) FROM gdpr_ledger_checkpoints ORDER BY through_seq DESC LIMIT 1; SELECT record FROM gdpr_ledger ORDER BY seq" > "$ledger.tmp"; then
+  mv "$ledger.tmp" "$ledger"
+  find "$BACKUP_DIR" -name 'gdpr-ledger-*.jsonl' -mtime +"${LEDGER_KEEP_DAYS:-1095}" -delete
+else
+  rm -f "$ledger.tmp"
+  echo "$(date -u +%FT%TZ) backup: could not export the GDPR ledger" >&2
+fi
 echo "$(date -u +%FT%TZ) backup: $out ($(wc -c < "$out") bytes)"

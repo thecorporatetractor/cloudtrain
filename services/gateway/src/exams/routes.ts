@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import type { Principal } from '../auth.js';
 import type { FlagTaskRequest, GrantExamRetakeRequest, VoidExamAttemptRequest } from '@cloudtrain/api-types';
 import { HttpError } from '../errors.js';
 import type { LabCluster } from '../kube/cluster.js';
@@ -33,7 +34,7 @@ export function planExamTerminal(ls: LabSession, node: string): TerminalPlan {
  * scope, plus the CSRF header on writes); the service checks the exact scope
  * (own attempts, a managed team, the candidate's teams/cohorts).
  */
-export function registerExamRoutes(app: FastifyInstance, exams: ExamService, labs: LabCluster): void {
+export function registerExamRoutes(app: FastifyInstance, exams: ExamService, labs: LabCluster, assertMayStart?: (p: Principal) => Promise<void>): void {
   const run = { config: { permission: 'lab.run' as const } };
   const team = { config: { permission: 'progress.read.team' as const } };
   const control = { config: { permission: 'session.control' as const } };
@@ -56,6 +57,7 @@ export function registerExamRoutes(app: FastifyInstance, exams: ExamService, lab
   });
   app.get<{ Params: { examId: string } }>('/api/exams/:examId', run, async (req) => exams.detail(req.principal, req.params.examId));
   app.post<{ Params: { examId: string } }>('/api/exams/:examId/attempts', run, async (req, reply) => {
+    await assertMayStart?.(req.principal);
     const attempt = await exams.start(req.principal, req.params.examId, req.ip);
     return reply.code(201).send({ attempt });
   });

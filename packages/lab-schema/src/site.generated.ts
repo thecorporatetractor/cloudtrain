@@ -2184,6 +2184,548 @@ export interface Site {
           unitsPerMinute: number;
         };
       };
+      /**
+       * Prepaid compute packs: credit bought up front, with bonus credit on the larger packs, valid `validMonths` months and spent at the tier rates on every paid plan. Shown on the pricing pages; billing does not sell packs yet.
+       */
+      packs?: {
+        /**
+         * The packs are a proposal, not yet an offer; the page says so.
+         */
+        proposal?: boolean;
+        /**
+         * How long the credit is valid from purchase.
+         */
+        validMonths?: number;
+        /**
+         * One line of small print shown with the packs.
+         */
+        note?: string;
+        /**
+         * @minItems 1
+         * @maxItems 8
+         */
+        items:
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ]
+          | [
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              },
+              {
+                /**
+                 * What the pack costs, in minor units of `currency`.
+                 */
+                price: number;
+                /**
+                 * Bonus credit on top of the price: a 5000 pack at 10 gives 5500 of compute.
+                 */
+                bonusPercent?: number;
+                /**
+                 * Lookup key of the Stripe Price, once billing sells the pack.
+                 */
+                lookupKey?: string;
+              }
+            ];
+      };
     };
     /**
      * Default spend caps for an individual account and an organisation.
@@ -3112,6 +3654,10 @@ export interface TokenMap {
 export interface Plan {
   id: string;
   name: string;
+  /**
+   * One line on who the plan is for, shown in the plan comparison.
+   */
+  audience?: string;
   /**
    * free: no price; individual: one person, monthly or yearly; organisation: per seat, monthly or yearly.
    */

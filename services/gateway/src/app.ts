@@ -34,6 +34,8 @@ import { registerAnswerRoutes } from './answers/routes.js';
 import type { AnswerService } from './answers/service.js';
 import { registerEventRoutes } from './events/routes.js';
 import type { EventService } from './events/service.js';
+import { registerGdprRoutes } from './gdpr/routes.js';
+import type { GdprService } from './gdpr/service.js';
 
 export interface AppDeps {
   content: Content;
@@ -71,6 +73,8 @@ export interface AppDeps {
   site?: { config: SiteConfig; exams?: ExamCatalog; ratePerMinute?: number; waitlist?: { store?: WaitlistStore; perHour?: number } };
   /** Plans, entitlements and Stripe (test mode) under `/api/billing/*`; omitted = not served. */
   billing?: BillingService;
+  /** Data-subject rights (`/api/public/privacy/*`, `/api/me/privacy*`); omitted = not served. */
+  gdpr?: { service: GdprService; perHour?: number };
 }
 
 /** Each readiness check must answer within this time, or the pod reports not ready. */
@@ -310,9 +314,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (deps.site) registerPublicRoutes(app, { content, site: deps.site.config, ...(deps.site.exams ? { exams: deps.site.exams } : {}), ...(deps.site.ratePerMinute ? { ratePerMinute: deps.site.ratePerMinute } : {}) });
   if (deps.site) registerWaitlistRoutes(app, { site: deps.site.config, ...(deps.site.waitlist?.store ? { store: deps.site.waitlist.store } : {}), ...(deps.site.waitlist?.perHour ? { perHour: deps.site.waitlist.perHour } : {}) });
 
+  if (deps.gdpr) registerGdprRoutes(app, { gdpr: deps.gdpr.service, ...(deps.oidc ? { store: deps.oidc.store } : {}), ...(deps.gdpr.perHour ? { perHour: deps.gdpr.perHour } : {}) });
+
   /* ---------------------------------- exams ---------------------------------- */
 
-  if (deps.exams) registerExamRoutes(app, deps.exams, cluster);
+  if (deps.exams) registerExamRoutes(app, deps.exams, cluster, ps ? (p) => ps.ensureNotRestricted(p) : undefined);
 
   return app;
 }

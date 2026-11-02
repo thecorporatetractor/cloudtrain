@@ -19,6 +19,22 @@ export const publicHandlers = [
     waitlist.add(email.toLowerCase());
     return HttpResponse.json({ status: 'created' }, { status: 201 });
   }),
+  http.post('/api/public/privacy/requests', async ({ request }) => {
+    await delay(220);
+    const b = (await request.json().catch(() => null)) as { email?: unknown; type?: unknown } | null;
+    const email = typeof b?.email === 'string' ? b.email.trim() : '';
+    const fields: Record<string, string> = {};
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) fields.email = 'Enter a valid email address';
+    if (!['erasure', 'withdrawal', 'export'].includes(String(b?.type))) fields.type = 'Choose what you would like us to do';
+    if (Object.keys(fields).length) return HttpResponse.json({ error: 'Check the highlighted fields', code: 'invalid', details: { fields } }, { status: 422 });
+    return HttpResponse.json({ status: 'accepted', message: 'If this address can receive email, a confirmation link is on its way. It works once and expires after a day.' }, { status: 202 });
+  }),
+  http.post('/api/public/privacy/confirm', async ({ request }) => {
+    await delay(220);
+    const b = (await request.json().catch(() => null)) as { token?: unknown } | null;
+    if (b?.token === 'expired') return HttpResponse.json({ error: 'This link is invalid, has expired or was already used. You can send a new request.', code: 'invalid' }, { status: 410 });
+    return HttpResponse.json({ status: 'completed', type: 'erasure', removed: 1 });
+  }),
   http.get('/api/public/site', async () => {
     await delay(80);
     return HttpResponse.json(site, { headers: { 'cache-control': 'public, max-age=300' } });
