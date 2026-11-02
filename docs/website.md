@@ -27,6 +27,26 @@ Implementation: `apps/web/src/site/` (layout, theme hook, helpers), `apps/web/sr
 (pages), `apps/web/src/app/auth.tsx` (`SITE_PATHS`, `HYBRID_PATHS`: `/` and `/catalog` render
 the website for visitors and the app for signed-in users), `apps/web/src/styles/site.css`.
 
+On the static website every route is a prerendered file, and an unknown path is a real `404`
+([deploy-website.md](deploy-website.md), [deploy-site-vm.md](deploy-site-vm.md#routes)). The static build
+adds the public lab pages, in both launch modes:
+
+| Path | Page |
+|---|---|
+| `/learn/labs` | The labs index: domains, learning paths, exam simulations |
+| `/learn/<domain>` | A domain's hub: its paths, simulations and published labs, by competency |
+| `/learn/paths`, `/learn/paths/<id>` | The learning paths of `content/curriculum.yaml` that have a published lab |
+| `/learn/exams`, `/learn/exams/<id>` | The exam simulations |
+| `/learn/labs/<id>` | A published lab: status `verified`, listed by the public catalog, and not `type: exam` |
+
+`scripts/learn-pages.mjs` writes a document per URL to `/data/learn`, from curriculum titles and
+descriptions and from what the catalog already publishes: never a solution, check, hint, mutation or
+misconception, and no framework, alignment or disclaimer, since those name certification marks. Labs of
+`type: exam` are the pools the simulations draw from: they get no page, link or count, and `site-check.mjs`
+fails the build if an id or statement of one appears on a page, in a document or in the sitemap. A lab with
+fewer than 30 words of its own (`THIN_WORDS`) and a path with fewer than 3 labs are `noindex`. A dev
+server has no such documents, so `/learn` shows the not-found page there; build the site to see it.
+
 ## Gateway endpoints
 
 All public (no session), served from `content/` and the site configuration only, never
@@ -154,8 +174,8 @@ to its sections, the theme menu and "Join the waitlist" in the header; the hero 
 lab, what CloudTrain is (`launch.points`, the catalog figures), how pricing works
 (`pricing.model`, the compute tiers, the estimator, worked examples and the plans compared), the
 waitlist, the questions, and a footer with the legal pages, the contact address and the source.
-Every website path except `/legal/*` and `/features` shows that page; nothing on it leads into the
-platform (no sign-in, no checkout, no catalog). The features page keeps its own page, linked from
+Every website path except `/legal/*`, `/features` and the `/learn` lab pages shows that page; nothing on
+it leads into the platform (no sign-in, no checkout, no way to start a lab). The features page keeps its own page, linked from
 the callout after "what it is", the header and the footer. Signed-in users of a combined deployment still get the app at
 `/`, and `/sign-in` still works for those who know it.
 
@@ -171,6 +191,23 @@ editing the file (`apps/web/src/site/launch.ts`):
 The hero's lab (`apps/web/src/site/LabPreview.tsx`) is drawn in HTML and SVG from the theme
 tokens and plays its sequence once; with `prefers-reduced-motion: reduce` it shows the end state
 and nothing moves (the same holds for every animation on the website).
+
+In coming-soon mode, the static build's `/pricing`, `/faq`, `/about`, `/contact`, `/catalog` and `/labs` are
+`301` redirects to where that content now is (`HIDDEN_ROUTE_REDIRECTS` in `scripts/site-hosting.mjs`), not a
+second copy of the landing page under another URL.
+
+## Search engines
+
+`seo` in `content/site.yaml` holds the title and description of each website route and of each domain's
+hub. Everything else in a page's head is generated. `scripts/site-check.mjs` runs at the end of
+`build:site` and fails it on a duplicate title or canonical, a missing `h1`, a skipped heading level, a
+canonical that is not the page itself, a sitemap URL outside `routes.json`, invalid JSON-LD, a certification
+mark, a Google tag, a third-party request or private lab text on a page. JSON-LD is a data block, which
+`script-src 'self'` does not block; `FAQPage` is built from the questions the page shows. There is no
+analytics or verification tag: Search Console is verified through DNS.
+
+The lab count on the coming-soon page is the number of `verified` labs in `content/curriculum.yaml`
+(`data/catalog-summary.json`), checked by the build. `/learn` lists its own published labs, a smaller number.
 
 ## Early-access waitlist
 

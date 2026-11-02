@@ -51,7 +51,7 @@ export async function checkSite(file, ctx, findings) {
   for (const [p, to] of links) {
     if (!to.startsWith("/")) continue;
     const route = to.split(/[?#]/)[0];
-    if (!SITE_ROUTES.includes(route) && !route.startsWith("/catalog/")) err(p, `internal link '${to}' is not a website route (${SITE_ROUTES.join(", ")})`);
+    if (!SITE_ROUTES.includes(route) && !route.startsWith("/catalog/") && !route.startsWith("/learn/")) err(p, `internal link '${to}' is not a website route (${SITE_ROUTES.join(", ")})`);
     if (route === "/pricing" && !doc.flags.showPricing) warn(p, "links to /pricing while flags.showPricing is off");
     if (route === "/features" && !doc.featurePage) warn(p, "links to /features without a featurePage");
     if (route.startsWith("/catalog") && !doc.flags.showCatalog) warn(p, "links to the catalog while flags.showCatalog is off");

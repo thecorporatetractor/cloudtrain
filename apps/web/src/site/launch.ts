@@ -4,8 +4,8 @@ import { isRealApi } from '@/api/mode';
 /*
  * Launch mode of the public website (content/site.yaml `launch.mode`).
  *
- * `coming-soon` replaces every website page except the legal ones with one
- * standalone landing (src/site/ComingSoon.tsx) and hides sign-in, checkout and
+ * `coming-soon` replaces every website page except the legal ones, the features page
+ * and the /learn hubs with one standalone landing (src/site/ComingSoon.tsx) and hides sign-in, checkout and
  * links into the platform; `live` is the full website. Without a `launch`
  * block the site is live.
  *
@@ -35,8 +35,8 @@ export function launchMode(site: SiteConfig | undefined): SiteLaunchMode {
 
 export const isComingSoon = (site: SiteConfig | undefined) => launchMode(site) === 'coming-soon';
 
-/** Website paths that keep their own page in coming-soon mode (the legal texts, the features page); every other one shows the coming-soon landing. */
-const KEPT = ['/legal', '/features'];
+/** Website paths that keep their own page in coming-soon mode (the legal texts, the features page, the /learn hubs, the 404 page); every other one shows the coming-soon landing. */
+const KEPT = ['/legal', '/features', '/learn', '/404'];
 export const keepsOwnPage = (pathname: string) => KEPT.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 
 /** The mode is known: from an override, or once the configuration has loaded (until then neither chrome is drawn). */

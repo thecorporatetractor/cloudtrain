@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { csp, deferEntry, headersFile, injectRoot, siteBootJs, originOf, redirectsFile, rewriteHead, robotsFor, runtimeConfigJs, sitemapXml, sitePaths, staticWebAppConfig } from './site-hosting.mjs';
+import { csp, deferEntry, HIDDEN_ROUTE_REDIRECTS, headersFile, injectRoot, siteBootJs, originOf, redirectsFile, rewriteHead, robotsFor, runtimeConfigJs, sitePaths, staticWebAppConfig } from './site-hosting.mjs';
 
 describe('static site host files', () => {
   it('originOf accepts an origin, normalises it and refuses paths and other schemes', () => {
@@ -65,42 +65,59 @@ describe('static site host files', () => {
     expect(caddy.match(/reverse_proxy/g)).toHaveLength(1);
   });
 
+  it('deploy/site-vm/Caddyfile has no fallback to the app shell, and redirects what coming soon folds into the landing page', () => {
+    const caddy = readFileSync(new URL('../../../deploy/site-vm/Caddyfile', import.meta.url), 'utf8');
+    expect(caddy).toMatch(/try_files \{path\} \{path\}\/index\.html\n/);
+    expect(caddy).not.toMatch(/try_files[^\n]*shell\.html/);
+    expect(caddy).toMatch(/handle_errors 404 \{[\s\S]*?rewrite \* \/404\.html/);
+    for (const [from, to] of HIDDEN_ROUTE_REDIRECTS) {
+      expect(caddy.split('\n').some((l) => l.trim().startsWith('path ') && l.trim().split(' ').includes(from)), from).toBe(true);
+      expect(caddy, to).toContain(` ${to} permanent`);
+    }
+  });
+
   it('the source index.html has no analytics snippet in it', () => {
     expect(readFileSync(new URL('../index.html', import.meta.url), 'utf8')).not.toMatch(/googletagmanager|google-analytics|gtag\(/);
   });
 
-  it('the cookie notice is in the sitemap only when it exists', () => {
+  it('the cookie notice is a page only when it exists', () => {
     expect(sitePaths({ mode: 'live', catalog: false, cookies: true })).toContain('/legal/cookies');
     expect(sitePaths({ mode: 'live', catalog: false })).not.toContain('/legal/cookies');
   });
 
-  it('headers, redirects and the Azure config cover the single-page fallback and caching', () => {
+  it('headers, redirects and the Azure config send unknown paths to a real 404 and keep caching', () => {
     expect(headersFile('')).toMatch(/\/assets\/\*\n {2}Cache-Control: public, max-age=31536000, immutable/);
     expect(headersFile('')).toContain('Content-Security-Policy:');
-    expect(redirectsFile).toBe('/*  /shell.html  200\n');
+    expect(headersFile('')).toMatch(/\/data\/\*\n {2}Cache-Control: public, max-age=300\n {2}X-Robots-Tag: noindex/);
+    expect(redirectsFile()).not.toContain('shell.html');
+    expect(redirectsFile()).toContain('/pricing  /#pricing  301');
     const azure = JSON.parse(staticWebAppConfig('https://api.example.com'));
-    expect(azure.navigationFallback.rewrite).toBe('/shell.html');
+    expect(azure.navigationFallback).toBeUndefined();
+    expect(azure.responseOverrides[404]).toEqual({ rewrite: '/404.html', statusCode: 404 });
     expect(azure.globalHeaders['Content-Security-Policy']).toContain('https://api.example.com');
   });
 
+  it('only a live site handing app paths to the platform keeps a fallback to the app shell', () => {
+    expect(redirectsFile({ mode: 'live' })).toBe('');
+    expect(redirectsFile({ mode: 'live', appFallback: true })).toBe('/*  /shell.html  200\n');
+    expect(JSON.parse(staticWebAppConfig('', { mode: 'live', appFallback: true })).navigationFallback.rewrite).toBe('/shell.html');
+  });
+
   it('robots.txt names the sitemap only when the origin is known', () => {
-    expect(robotsFor('')).toBe('User-agent: *\nAllow: /\n');
+    expect(robotsFor('')).toBe('User-agent: *\nDisallow: /api/\nAllow: /\n');
     expect(robotsFor('https://www.example.com')).toContain('Sitemap: https://www.example.com/sitemap.xml');
   });
 
-  it('the sitemap lists the landing and legal pages when coming soon, every website page when live', () => {
-    expect(sitePaths({ mode: 'coming-soon', pricing: true, catalog: true, paths: ['p'] })).toEqual(['/', '/legal/terms', '/legal/privacy']);
+  it('the website pages are the landing and legal pages when coming soon, every website page when live', () => {
+    expect(sitePaths({ mode: 'coming-soon', pricing: true, catalog: true, paths: ['p'] })).toEqual(['/', '/legal/terms', '/legal/privacy', '/legal/privacy-request']);
     // The features page keeps its own page in both modes (src/site/launch.ts), so a crawler may know it.
-    expect(sitePaths({ mode: 'coming-soon', pricing: true, catalog: true, features: true })).toEqual(['/', '/features', '/legal/terms', '/legal/privacy']);
+    expect(sitePaths({ mode: 'coming-soon', pricing: true, catalog: true, features: true })).toEqual(['/', '/features', '/legal/terms', '/legal/privacy', '/legal/privacy-request']);
     expect(sitePaths({ mode: 'live', pricing: true, catalog: true, features: true })).toContain('/features');
     expect(sitePaths({ mode: 'live', pricing: true, catalog: true })).not.toContain('/features');
     const live = sitePaths({ mode: 'live', pricing: false, catalog: true, paths: ['cks'], exams: ['sim'] });
     expect(live).toContain('/catalog/paths/cks');
     expect(live).toContain('/catalog/exams/sim');
     expect(live).not.toContain('/pricing');
-    const xml = sitemapXml('https://www.example.com', ['/', '/a&b'], '2026-10-21');
-    expect(xml).toContain('<loc>https://www.example.com/</loc><lastmod>2026-10-21</lastmod>');
-    expect(xml).toContain('https://www.example.com/a&amp;b');
   });
 
   it('rewrites the head with absolute social URLs and a canonical link', () => {

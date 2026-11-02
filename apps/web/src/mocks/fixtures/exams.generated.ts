@@ -1401,7 +1401,7 @@ export const fixtureExams: FixtureExam[] = [
   "description": "CloudTrain's internal capstone. One shared Quillmoor Logistics estate (build VMs, a kubeadm cluster, a vcluster tenant, an FRR edge and a lab registry) where the candidate takes the harbour-tracking service from host baseline to a hardened, routed, autoscaled deployment and then handles an injected incident. Tasks build on each other's environment but are graded independently, so an early miss does not zero later tasks.",
   "durationMinutes": 240,
   "passMark": 70,
-  "passMarkNote": "CloudTrain setting; calibrate after the pilot cohort.",
+  "passMarkNote": "CloudTrain setting; may be recalibrated from pilot data.",
   "taskCount": 10,
   "environment": "shared",
   "rules": {

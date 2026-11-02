@@ -4,14 +4,19 @@ import { useEffect, type CSSProperties, type ReactNode } from 'react';
 import { isInternalHref } from '@/api/public';
 import type { SiteFeatureIcon, SiteFigure, SiteLink } from '@/api/types';
 import { useBrandName } from '@/components/brand';
+import { STATIC_SITE } from '@/lib/siteMode';
 import { hrefFor, signInHref, surfaceConfig } from '@/lib/surface';
 import { useTheme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 
-/** Sets the document title for the public pages: "Page · Brand" (or just the brand). */
+/**
+ * Sets the document title for the public pages: "Page · Brand" (or just the brand). Not on the static
+ * website, whose pages carry their title in the HTML (src/site/seoHead.ts for in-app navigation).
+ */
 export function useDocumentTitle(page?: string) {
   const brand = useBrandName();
   useEffect(() => {
+    if (STATIC_SITE) return;
     const previous = document.title;
     document.title = page ? `${page} · ${brand}` : brand;
     return () => {

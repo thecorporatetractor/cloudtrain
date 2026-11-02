@@ -100,6 +100,11 @@ describe('public website API', () => {
     expect(ex.body).not.toMatch(/"pool"/);
     expect((await app.inject('/api/public/paths/nope')).statusCode).toBe(404);
     expect((await app.inject('/api/public/exams/nope')).statusCode).toBe(404);
+    // The exam author's notes and descriptions stay out of what is public.
+    for (const e of [ex.json(), ...(await app.inject('/api/public/catalog')).json().exams]) {
+      expect(e.rules.notes).toBeUndefined();
+      expect(e.description).toBeUndefined();
+    }
   });
 
   it('keeps the signed-in routes closed while the public ones stay open', async () => {

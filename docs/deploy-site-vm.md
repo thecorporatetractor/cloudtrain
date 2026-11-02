@@ -98,6 +98,28 @@ The prerendered site needs no API: the site configuration is exported at build t
 `/data/site.json`, and `build-site.mjs` fails if the page calls `/api/*` while loading. The catalog,
 path and exam documents come from `/data` too. `task dev:site` with a real gateway is unchanged.
 
+## Routes
+
+Each page is a file: `/learn/labs/x` is `site/learn/labs/x/index.html`, and `routes.json` in the build
+lists them all (the route manifest; the sitemap is generated from it). Caddy serves a known path and
+nothing else: there is no fallback to an app shell.
+
+| Request | Answer |
+|---|---|
+| A path in the manifest | `200`, the prerendered page |
+| Any other path, `/wp-login.php`, `/sign-in`, `/assets/gone.js` | `404`, the branded page in `404.html`, `noindex`, no app |
+| `/x/`, `/x/index.html`, `/index.html` | `301` to the one URL of the page |
+| `/pricing`, `/faq`, `/about`, `/contact` | `301` to a section of the landing page, while no page exists there (a live build has one) |
+| `/catalog`, `/labs`, `/learn` | `301` to `/learn/labs`, likewise |
+| `/_headers`, `/routes.json`, `/404.html` and the like | `404`: files for other hosts and for the build |
+| `/data/*` | `200` with `X-Robots-Tag: noindex`: the pages need them, a search result does not |
+
+`/legal/privacy-request`, where the links in mail land, is a page like any other, but `noindex` and not
+in the sitemap. Its token stays in the fragment, which never reaches Caddy.
+
+`node deploy/site-vm/test-routes.mjs apps/web/dist-site` checks all of this: the real `Caddyfile` in the
+pinned image, on a local port, with throwaway certificates. It needs Docker and nothing else.
+
 ## Limits
 
 | Limit | Where | Default | Over it |
@@ -360,7 +382,7 @@ On the VM, in `/opt/cloudtrain-site`, with `sudo`.
 | Task | How |
 |---|---|
 | Status, logs | `docker compose ps`, `docker compose logs -f --tail 100 site-proxy` |
-| Update the site | Install steps 1, 2 and 4. Caddy serves new files at once. **A changed consent label or notice date also needs step 3** |
+| Update the site | Install steps 1, 2 and 4. Caddy serves new files at once. A changed `Caddyfile` also needs `docker compose up -d --force-recreate caddy` (a few seconds: the admin API is off, so there is no reload, and rsync replaces the file a running container has mounted). **A changed consent label or notice date also needs step 3** |
 | Update the sidecar | Set `SITE_PROXY_IMAGE` to the new digest, then `docker compose up -d`. The limiter's counts start over |
 | Renew the origin pull CA | Before 2029-11-01: step 4's download, then the `chown` and `chmod` of step 5, then `docker compose restart caddy` |
 | Read the waitlist | Azure portal or `az storage entity query`, as someone with a data role. There is no admin page |
@@ -469,6 +491,9 @@ keep the instance count low. The VM's bill does not change with traffic. Cloudfl
 no charge for traffic.
 
 ## What has been tested, and what has not
+
+`deploy/site-vm/test-routes.mjs` runs the real `Caddyfile` against a built site: every route in the
+manifest, unknown paths, redirects, the API routes and the headers (see "Routes").
 
 `dev/run-local.sh` and `dev/integration.mjs` in `services/site-api` run the real Caddy and sidecar
 containers, with a real browser driving the form, against the real handlers and storage SDKs on

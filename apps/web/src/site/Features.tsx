@@ -41,13 +41,13 @@ export function figureSources(figure: SiteFigure, theme: string): { src: string;
  * serves the dark theme, the light one the light and cream themes; a 2x image, when the
  * figure has one, is offered to high-density screens through `srcset`.
  */
-export function FeatureShot({ figure, sizes, className }: { figure: SiteFigure; sizes: string; className?: string }) {
+export function FeatureShot({ figure, sizes, className, priority }: { figure: SiteFigure; sizes: string; className?: string; priority?: boolean }) {
   const { theme } = useTheme();
   const { src, src2x } = figureSources(figure, theme);
   const width = figure.width ?? 1440;
   return (
     <span className={cn('site-shot', className)}>
-      <img src={src} {...(src2x ? { srcSet: `${src} ${width}w, ${src2x} ${width * 2}w` } : {})} sizes={sizes} alt={figure.alt} width={width} height={figure.height ?? 900} loading="lazy" decoding="async" />
+      <img src={src} {...(src2x ? { srcSet: `${src} ${width}w, ${src2x} ${width * 2}w` } : {})} sizes={sizes} alt={figure.alt} width={width} height={figure.height ?? 900} {...(priority ? { fetchPriority: 'high' as const } : { loading: 'lazy' as const })} decoding="async" />
     </span>
   );
 }

@@ -1,8 +1,9 @@
+import { Link } from '@tanstack/react-router';
 import { ArrowRight } from 'lucide-react';
-import { usePublicCatalog, useSite } from '@/api/public';
-import type { PublicCatalog, SiteConfig } from '@/api/types';
+import { useCatalogSummary, useSite, type CatalogSummary } from '@/api/public';
+import type { SiteConfig } from '@/api/types';
 import { PageSkeleton } from '@/components/ui';
-import { CsLink as Section } from './ComingSoonChrome';
+import { CsLink as Section, LEARN_LABS } from './ComingSoonChrome';
 import { FeatureCallout } from './Features';
 import { DomainMarquee } from './Flourish';
 import { HeroStory } from './LabStory';
@@ -22,7 +23,7 @@ import { WaitlistSection } from './Waitlist';
 
 export function ComingSoon() {
   const site = useSite();
-  const catalog = usePublicCatalog(site.data?.flags.showCatalog !== false);
+  const catalog = useCatalogSummary(site.data?.flags.showCatalog !== false);
   useDocumentTitle(site.data?.launch?.status ? undefined : 'Coming soon');
   if (site.isPending) {
     return (
@@ -42,7 +43,7 @@ export function ComingSoon() {
   return (
     <>
       <Hero site={s} />
-      {s.flags.showCatalog !== false && <DomainMarquee site={s} cat={catalog.data} label="Domains at launch" />}
+      {s.flags.showCatalog !== false && <DomainMarquee site={s} cat={catalog.data} label="Domains at launch" hubs />}
       <What site={s} cat={catalog.data} />
       <FeatureCallout site={s} />
       <PricingExplained site={s} />
@@ -81,14 +82,14 @@ function Hero({ site }: { site: SiteConfig }) {
   );
 }
 
-function What({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined }) {
+function What({ site, cat }: { site: SiteConfig; cat: CatalogSummary | undefined }) {
   const points = site.launch?.points ?? [];
   const figures: [number, string][] = cat
     ? (
         [
-          [cat.labs.length, 'hands-on labs'],
-          [cat.paths.length, 'paths and courses'],
-          [cat.exams.length, 'exam simulations'],
+          [cat.counts.labs, 'hands-on labs'],
+          [cat.counts.paths, 'paths and courses'],
+          [cat.counts.exams, 'exam simulations'],
           [cat.domains.filter((d) => d.labCount > 0).length, 'domains'],
         ] as [number, string][]
       ).filter(([n]) => n > 0)
@@ -118,6 +119,11 @@ function What({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
             ))}
           </dl>
         )}
+        <p className="cs-browse" data-reveal>
+          <Link to={LEARN_LABS as '/'} className="link-quiet">
+            Browse the labs, learning paths and exam simulations <ArrowRight size={13} aria-hidden />
+          </Link>
+        </p>
         {points.length > 0 && (
           <ul className="cs-points" data-reveal="children">
             {points.map((p) => (

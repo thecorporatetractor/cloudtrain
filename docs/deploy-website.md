@@ -46,11 +46,24 @@ What the build does:
    mock service worker). In this mode the site reads the JSON above instead of the API,
    nobody is signed in, and the only API call is `POST /api/public/waitlist`.
 3. Adds `runtime-config.js` (the API origin; edit it on the host to repoint the form
-   without a rebuild) and the host files: `404.html` (the app, for GitHub Pages),
-   `_redirects` and `_headers` (Cloudflare Pages, Netlify), `staticwebapp.config.json`
-   (Azure Static Web Apps), `.nojekyll`, `robots.txt` and, with `--site-url`, `sitemap.xml`.
+   without a rebuild) and the host files: `404.html` (the branded page for unknown paths, on
+   every host), `_redirects` and `_headers` (Cloudflare Pages, Netlify),
+   `staticwebapp.config.json` (Azure Static Web Apps), `.nojekyll`, `robots.txt`, `routes.json`
+   (the route manifest) and, with `--site-url`, the sitemap (`sitemap.xml` is an index over
+   `sitemap-pages.xml` and `sitemap-labs.xml`, dated from git, and has no `noindex` page).
    The CSP allows scripts from the site only and `connect-src` to the API origin only.
-4. Rewrites the head of `index.html` (and `404.html`) for the launch mode: title, description,
+4. Generates the public lab pages under `/learn` from `content/curriculum.yaml`
+   (`scripts/learn-pages.mjs`): a labs index, a hub per domain, a page per path, exam simulation
+   and published lab (`verified` and not `type: exam`). They publish a lab's title, description, domain, difficulty, duration, skill
+   names and links, and no solution, check, hint, mutation or feedback: those are not an input.
+5. Prerenders every route in a headless browser into a file of its own
+   (`learn/labs/x/index.html`), and writes its head: `content/site.yaml` `seo`, or the generated
+   values under `/learn`. The title, description and `<link rel="canonical">` are the page's own, with
+   its Open Graph and Twitter tags, `noindex` where set, and its JSON-LD. Then
+   `scripts/site-check.mjs` reads the finished pages and **fails the build** on a duplicate title or
+   canonical, a missing `h1`, a canonical that is not the page itself, a sitemap URL outside the
+   manifest, invalid JSON-LD, private lab text on a page, or a certification mark.
+6. Sets the head every page starts from: title, description,
    Open Graph and Twitter card with `/site/og-image.png`
    (`node apps/web/scripts/og-image.mjs` renders it), the canonical link, and a preload of
    `data/site.json`. The favicon, apple-touch icon and `manifest.webmanifest` are in the
@@ -98,8 +111,9 @@ pnpm --filter web build:site
 
 Check it locally: `pnpm --filter web exec vite preview --outDir dist-site --port 6990`, then
 open `http://localhost:6990/` (the coming-soon page), `/legal/privacy` (the privacy notice the
-waitlist consent links to), `/robots.txt` and `/sitemap.xml`. Any other path, `/pricing` for
-example, shows the same coming-soon page.
+waitlist consent links to), `/learn/labs`, `/robots.txt` and `/sitemap.xml`. `vite preview` falls back
+to `index.html` for unknown paths; the real answers (a `404` for an unknown path, a `301` from
+`/pricing` to `/#pricing`) come from the host: `node deploy/site-vm/test-routes.mjs apps/web/dist-site`.
 
 **Gateway for the waitlist**
 
@@ -179,7 +193,7 @@ configuration before building: the section disappears and nothing posts to a mis
 | Account needed | The GitHub org, which exists | A Cloudflare account | An Azure subscription | None beyond the cluster |
 | Custom domain and TLS | Yes (a `CNAME` file or the repository setting), automatic certificate | Yes, automatic certificate | Yes, automatic certificate | Ingress host and cert-manager, as for the platform |
 | Response headers (CSP) | Not configurable: no `_headers`, the CSP in the bundle's files is not applied | `_headers` is applied | `staticwebapp.config.json` is applied | nginx config, already in the image |
-| Unknown paths | `404.html` is served with a 404 status (works, but crawlers see 404s) | `_redirects` rewrites with 200 | `navigationFallback` rewrites with 200 | `try_files` fallback, 200 |
+| Unknown paths | `404.html` with a 404 status | `404.html` with a 404 status | `responseOverrides` serves `404.html` with a 404 status | `try_files` fallback, 200 (this image is the app, not the static build) |
 | Waitlist API | Cross-origin to the gateway (CORS) | Cross-origin (CORS) | Cross-origin (CORS) | Same origin, no CORS |
 | Cost | Free for public repositories | Free tier | Free tier | The cluster you already run |
 | Fit | Quickest to try, weakest headers | Good default for a marketing site | Fits if the rest is on Azure | No second host to run, but the marketing site goes down with the platform |
@@ -197,7 +211,7 @@ single-page fallback answers unknown paths with status 404.
 Either direct upload of `dist-site/` (`wrangler pages deploy`), or a Git-connected project
 with the build command `pnpm install --frozen-lockfile && pnpm --filter web build:site` (set
 `CT_API_BASE` and optionally `CT_APP_URL` as build variables) and the output directory
-`apps/web/dist-site`. `_headers` and `_redirects` are picked up as they are.
+`apps/web/dist-site`. `_headers` and `_redirects` are picked up as they are. A live site with `--app-url` keeps one catch-all to `shell.html`, so that app paths can hand over to the platform in the browser: those paths answer `200` rather than `404`.
 
 ### Azure Static Web Apps
 

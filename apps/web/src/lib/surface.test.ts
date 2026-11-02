@@ -31,7 +31,7 @@ describe('resolveSurface', () => {
 
 describe('ownerOf', () => {
   it('splits the routes between the website and the app', () => {
-    for (const p of ['/features', '/pricing', '/about', '/faq', '/contact', '/legal/terms', '/legal/privacy', '/legal/cookies', '/catalog/paths/cka', '/catalog/exams/cks-sim']) expect(ownerOf(p), p).toBe('site');
+    for (const p of ['/features', '/pricing', '/about', '/faq', '/contact', '/legal/terms', '/legal/privacy', '/legal/cookies', '/catalog/paths/cka', '/catalog/exams/cks-sim', '/learn/labs', '/learn/labs/x', '/learn/kubernetes', '/404']) expect(ownerOf(p), p).toBe('site');
     for (const p of ['/', '/catalog']) expect(ownerOf(p), p).toBe('both');
     for (const p of ['/sign-in', '/labs/x', '/labs/x/work', '/exams', '/account/billing', '/admin/billing', '/platform', '/nope', '/pricingx', '/catalogue']) expect(ownerOf(p), p).toBe('app');
   });
