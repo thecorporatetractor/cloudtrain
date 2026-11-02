@@ -23,8 +23,9 @@ spec:
     `/usr/local/bin/cl-policy-eval` evaluates an image against the three policies and
     prints one `PASS`/`FAIL` line per policy plus an overall `PASS`/`FAIL`.
 
-    First record a baseline scan of the pushed image as **`~/scout-before.json`**
-    (`docker scout cves`). Then fix all three: fewer fixable highs (bump the base per
+    First record a baseline vulnerability scan of the pushed image as JSON in
+    **`~/scan-before.json`** (`trivy image`; the host is offline, so use the vulnerability
+    database copied to `/srv/scan-db` instead of an online update). Then fix all three: fewer fixable highs (bump the base per
     `/srv/scan-db/fixed-base.txt`), attach build provenance, and run as a named non-root
     user. Rebuild, push under the
     **same tag**, and show `cl-policy-eval localhost:5000/catalogue-api:{{rel}}` reports
@@ -58,7 +59,12 @@ spec:
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         docker rm -f registry >/dev/null 2>&1 || true
-        rm -rf /srv/registry /srv/scan-db; install -d /srv/registry /srv/scan-db
+        # the offline Trivy DB baked into docker-vm:29 (/var/lib/trivy), copied to a cache dir the
+        # learner owns (trivy opens the DB read-write and writes its scan cache next to it)
+        test -s /var/lib/trivy/db/trivy.db || { echo "this lab needs the offline trivy database in /var/lib/trivy (docker-vm:29)" >&2; exit 1; }
+        rm -rf /srv/registry /srv/scan-db; install -d /srv/registry; install -d -o learner -g learner /srv/scan-db
+        cp -a /var/lib/trivy/db /srv/scan-db/db; chown -R learner:learner /srv/scan-db
+        rm -f /home/learner/scan-before.json
         docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
         for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
         echo "copperleaf/pybase:1.1" > /srv/scan-db/fixed-base.txt
@@ -93,13 +99,13 @@ spec:
         docker image inspect --format '{{json .Config.User}}' localhost:5000/catalogue-api:{{rel}} > /srv/scan-db/before-user.json
   checks:
     - id: before-scan-recorded
-      description: scout-before.json is a scan report naming catalogue-api
+      description: scan-before.json is a trivy report of the pushed catalogue-api image
       type: shell
       timeoutSec: 60
       on: cl-catalogue-05
       skills: [containers.supply-chain.policy, containers.supply-chain.scanning]
       weight: 1
-      command: grep -q 'catalogue-api' /home/learner/scout-before.json 2>/dev/null && echo ok || echo missing
+      command: jq -r '.ArtifactName // "none"' /home/learner/scan-before.json 2>/dev/null | grep -q 'catalogue-api:{{rel}}' && echo ok || echo missing
       expect: {match: exact, value: ok}
     - id: policy-pass
       description: cl-policy-eval reports PASS on every line for the pushed image
@@ -120,6 +126,9 @@ spec:
       command: cl-policy-eval localhost:5000/catalogue-api:{{rel}} 2>/dev/null | tail -n 1
       expect: {match: exact, value: PASS}
   hints:
+    - title: Scanning offline
+      body: "`trivy image --skip-db-update --offline-scan --cache-dir /srv/scan-db --format json -o ~/scan-before.json <ref>` scans with the copied database and writes a JSON report."
+      cost: 1
     - title: Provenance needs the right driver
       body: "The default `docker` driver on the containerd image store attaches provenance when you push: `docker buildx build --provenance=mode=max --push` stores it as an attestation alongside the image."
       cost: 1
@@ -162,7 +171,7 @@ spec:
       - on: cl-catalogue-05
         as: learner
         run: |
-          docker scout cves --format sarif --output ~/scout-before.json localhost:5000/catalogue-api:{{rel}}
+          trivy image --skip-db-update --offline-scan --cache-dir /srv/scan-db --format json -o ~/scan-before.json localhost:5000/catalogue-api:{{rel}}
           cd ~/catalogue-api
           printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN adduser -D -u 10010 svc' 'RUN echo "catalogue-api {{rel}}" > /version' 'USER svc' 'CMD ["cat", "/version"]' > Dockerfile
           docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
@@ -174,7 +183,7 @@ spec:
           - on: cl-catalogue-05
             as: learner
             run: |
-              docker scout cves --only-severity high,critical --format sarif --output ~/scout-before.json localhost:5000/catalogue-api:{{rel}}
+              trivy image --skip-db-update --offline-scan --cache-dir /srv/scan-db --severity HIGH,CRITICAL --format json -o ~/scan-before.json localhost:5000/catalogue-api:{{rel}}
               cd ~/catalogue-api
               printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN echo "catalogue-api {{rel}}" > /version' 'USER 10010' 'CMD ["cat", "/version"]' > Dockerfile
               docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
