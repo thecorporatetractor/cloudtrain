@@ -480,7 +480,7 @@ GHCR is the signed source of every image CloudTrain publishes:
 |---|---|---|
 | Platform: `lab-orchestrator`, `gateway`, `web` | `.github/workflows/images.yml` | `ghcr.io/<owner>/<repo>/<name>` |
 | Lab containers marked `publishable: true` in `deploy/images/catalog.yaml` (jumphost, frr, nettools, netsvc, oci-registry, iac-ws-tofu, ansible-ctl, kql-ws) | the same workflow | `ghcr.io/<owner>/<repo>/<publishName>` |
-| Lab containerDisks (kubeadm-node v1.37, v1.36-upgrade and v1.37-full, etcd-host, docker-vm) | `.github/workflows/vm-images.yml` on GitHub-hosted KVM runners | `ghcr.io/<owner>/<repo>/<publishName>`, see [Publishing containerDisks](#publishing-containerdisks) |
+| Lab containerDisks (kubeadm-node v1.37, v1.36-upgrade and v1.37-full, etcd-host, docker-vm, docker-vm-28-upgrade) | `.github/workflows/vm-images.yml` on GitHub-hosted KVM runners | `ghcr.io/<owner>/<repo>/<publishName>`, see [Publishing containerDisks](#publishing-containerdisks) |
 | `el-vm`, `ubuntu-vm` and the tier-A Linux pods (el-lab, deb-lab) | locally or on the verify VM (they need the package mirror) | not yet |
 | Helm charts `cloudtrain` and `cloudtrain-crds` | the `publish` job of `.github/workflows/charts.yml` | `oci://ghcr.io/<owner>/<repo>/charts/<chart>:<version>`, see [Charts](#charts) |
 
@@ -647,7 +647,7 @@ cosign verify ghcr.io/<owner>/<repo>/charts/cloudtrain:0.1.0 \
 `ubuntu-24.04` runners, which expose `/dev/kvm` once a udev rule makes it writable
 (`.github/actions/build-vm-image`). The list is `tools/images/vm-images.yaml`:
 `kubeadm-node` (catalog `kubeadm:1.37`), `kubeadm-upgrade` (`kubeadm:1.36`), `etcd-host`,
-`docker-vm`, then `kubeadm-full` (`kubeadm:1.37-full` and `-sec`) in a second stage,
+`docker-vm`, `docker-vm-upgrade` (`docker-vm:28-upgrade`), then `kubeadm-full` (`kubeadm:1.37-full` and `-sec`) in a second stage,
 because it layers on the published `kubeadm-node` (pulled by digest, signature verified).
 
 | Event | What runs |

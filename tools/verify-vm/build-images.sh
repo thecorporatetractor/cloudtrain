@@ -8,7 +8,7 @@ OUT=/srv/ct-work/logs/images; mkdir -p "$OUT"
 export DOCKERIO_MIRROR=mirror.gcr.io
 export GUESTFS_KVM=${GUESTFS_KVM:-1} LOAD_INTO_KIND=1
 REV=$(git rev-parse HEAD)
-STEPS=${STEPS:-"prewarm kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm linux-pod iac-ws-terraform mirror published"}
+STEPS=${STEPS:-"prewarm kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm docker-vm-upgrade linux-pod iac-ws-terraform mirror published"}
 want() { [[ " $STEPS " == *" $1 "* ]]; }
 timed() { # timed <name> <cmd...>
   local name=$1 t0=$SECONDS rc; shift
@@ -22,13 +22,13 @@ pull_pub() { # pull_pub <ghcr name> <local tag>
   echo "pulling $src"; docker pull -q "$src" && docker tag "$src" "$2"
 }
 # 0. shared downloads + builder image, once, sequentially (build.sh writes shared cache files non-atomically)
-want prewarm && timed prewarm bash -c 'for v in kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm; do LOCK_ONLY=1 bash tools/images/build.sh $v || exit 1; done
+want prewarm && timed prewarm bash -c 'for v in kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm docker-vm-upgrade; do LOCK_ONLY=1 bash tools/images/build.sh $v || exit 1; done
   B="cloudtrain/image-builder:$( { cat tools/images/builder/Dockerfile; grep ^UBUNTU_APT_SNAPSHOT= deploy/versions.env | cut -d= -f2; } | sha256sum | cut -c1-12)"
   docker image inspect "$B" >/dev/null 2>&1 || docker build -q -t "$B" --build-arg UBUNTU_APT_SNAPSHOT=$(grep ^UBUNTU_APT_SNAPSHOT= deploy/versions.env | cut -d= -f2) tools/images/builder'
 # 1. everything independent, in parallel
 pids=()
 want kubeadm-node && { ( timed kubeadm-node bash tools/images/build.sh kubeadm-node && timed kubeadm-full bash tools/images/build.sh kubeadm-full ) & pids+=($!); }
-for v in kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm; do want "$v" && { timed "$v" bash tools/images/build.sh "$v" & pids+=($!); }; done
+for v in kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm docker-vm-upgrade; do want "$v" && { timed "$v" bash tools/images/build.sh "$v" & pids+=($!); }; done
 want linux-pod && { timed linux-pod bash tools/images/build-linux-pod.sh & pids+=($!); }
 want iac-ws-terraform && { timed iac-ws-terraform bash tools/images/build-iac-ws.sh terraform & pids+=($!); }
 want mirror && { ( timed mirror bash deploy/scripts/mirrors-up.sh ) & pids+=($!); }

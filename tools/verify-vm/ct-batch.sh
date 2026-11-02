@@ -85,8 +85,8 @@ IMG_BUILD_TIMEOUT=${IMG_BUILD_TIMEOUT:-3h}
 IMG_REQUEUE=${IMG_REQUEUE:-1}
 IMG_MIN_FREE_GB=${IMG_MIN_FREE_GB:-100}   # free GB on the Docker root before a build starts (kubelet disk-pressure eviction is near 85% used)
 IMGD=$RES/state/images
-VM_IMAGES="kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm"
-IMG_ORDER="workloads jumphost linux-pod frr nettools netsvc ansible-ctl iac-ws-terraform iac-ws-tofu kql-ws oci-registry kubeadm-node kubeadm-full kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm mirror"
+VM_IMAGES="kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm docker-vm-upgrade"
+IMG_ORDER="workloads jumphost linux-pod frr nettools netsvc ansible-ctl iac-ws-terraform iac-ws-tofu kql-ws oci-registry kubeadm-node kubeadm-full kubeadm-upgrade etcd-host el-vm ubuntu-vm docker-vm docker-vm-upgrade mirror"
 
 image_targets() { # stdin: changed repo paths; prints the affected image targets (words, in any order)
   local p
@@ -109,6 +109,7 @@ image_targets() { # stdin: changed repo paths; prints the affected image targets
       tools/images/scripts/guest-etcd-host.sh) echo etcd-host ;;
       tools/images/scripts/guest-el-vm.sh) echo el-vm ;;
       tools/images/scripts/guest-ubuntu-vm.sh) echo ubuntu-vm ;;
+      tools/images/scripts/guest-docker-vm-upgrade.sh | tools/images/docker-vm/preload-images-upgrade.txt | tools/images/lock/docker-vm-upgrade.lock) echo docker-vm-upgrade ;;
       tools/images/scripts/guest-docker-vm.sh | tools/images/docker-vm/* | tools/images/lock/docker-vm.lock) echo docker-vm ;;
       tools/mirrors/lock/el10.lock | tools/mirrors/packages-el10.txt) echo el-vm mirror ;;
       tools/mirrors/lock/noble.lock | tools/mirrors/packages-noble.txt) echo ubuntu-vm mirror ;;
@@ -135,7 +136,7 @@ target_cmd() { # the build+load command of a target, run from $REPO (the scripts
     kql-ws) echo 'bash tools/images/build-kql-ws.sh' ;;
     oci-registry) echo 'bash tools/images/build-oci-registry.sh' ;;
     kubeadm-node) echo 'bash tools/images/build.sh kubeadm-node && bash tools/images/build.sh kubeadm-full' ;;
-    kubeadm-full | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm) echo "bash tools/images/build.sh $1" ;;
+    kubeadm-full | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm | docker-vm-upgrade) echo "bash tools/images/build.sh $1" ;;
     mirror) echo 'bash deploy/scripts/mirrors-up.sh' ;;
     *) return 1 ;;
   esac
@@ -145,6 +146,7 @@ target_rx() { # regex over catalog image names: the refs (and so the labs) a tar
     jumphost) echo '^cloudtrain/jumphost:' ;;
     linux-pod) echo '^cloudtrain/(el|deb)-lab:' ;;
     frr | nettools | netsvc | ansible-ctl | kql-ws | oci-registry | etcd-host | el-vm | ubuntu-vm | docker-vm) echo "^cloudtrain/$1:" ;;
+    docker-vm-upgrade) echo "^cloudtrain/docker-vm:28-upgrade" ;;
     iac-ws-terraform | iac-ws-tofu) echo '^cloudtrain/iac-ws:' ;;
     kubeadm-node) echo '^cloudtrain/kubeadm-node:v[0-9.]+(-full)?$' ;;
     kubeadm-full) echo '^cloudtrain/kubeadm-node:.*-full$' ;;
