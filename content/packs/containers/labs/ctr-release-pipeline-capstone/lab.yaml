@@ -63,6 +63,9 @@ spec:
         set -eu
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # offline host: Docker Hub names resolve to loopback, so BuildKit's registry lookup of the SBOM scanner
+        # image fails at once and it uses the preloaded copy (each DNS timeout here costs ~40 s per lookup)
+        grep -q 'cloudtrain-offline-hub' /etc/hosts || echo '127.0.0.1 registry-1.docker.io auth.docker.io index.docker.io # cloudtrain-offline-hub' >> /etc/hosts
         command -v cosign >/dev/null || { echo "this lab needs cosign on the host image (not built yet)" >&2; exit 1; }
         docker image inspect moby/buildkit:v0.23.2 >/dev/null 2>&1 || { echo "this lab needs moby/buildkit and the buildkit-syft-scanner image on the host image (not built yet)" >&2; exit 1; }
         docker rm -f release-registry >/dev/null 2>&1 || true
@@ -75,7 +78,11 @@ spec:
         # serve the base image from the lab registry
         docker tag busybox:1.37 127.0.0.1:{{port}}/busybox:1.37
         docker push -q 127.0.0.1:{{port}}/busybox:1.37 >/dev/null
-        printf '[registry."127.0.0.1:{{port}}"]\n  http = true\n  insecure = true\n' > /srv/release/buildkitd.toml
+        # BuildKit pulls the SBOM scanner (docker/buildkit-syft-scanner) for --sbom: the builder mirrors
+        # docker.io through the lab registry, which serves the preloaded copy
+        docker tag docker/buildkit-syft-scanner:stable-1 127.0.0.1:{{port}}/docker/buildkit-syft-scanner:stable-1
+        docker push -q --platform linux/amd64 127.0.0.1:{{port}}/docker/buildkit-syft-scanner:stable-1 >/dev/null
+        printf '[registry."127.0.0.1:{{port}}"]\n  http = true\n  insecure = true\n[registry."docker.io"]\n  mirrors = ["127.0.0.1:{{port}}"]\n' > /srv/release/buildkitd.toml
         cd /srv/release/src
         echo "catalogue-api 5.0.0 revision {{rev}}" > index.html
         cat > Dockerfile <<'DF'
