@@ -4,6 +4,55 @@ import { harness, Q, type Harness } from './harness.js';
 import { pgAvailable } from './pg.js';
 import { Sealer, SessionStore } from '../src/oidc/sessions.js';
 import { createDb } from '../src/db/index.js';
+import { inviteUser } from '../src/platform/admin.js';
+import { loadPrincipal, provision } from '../src/platform/identity.js';
+import { repairTenantIdps } from '../src/keycloak/repair.js';
+
+/** Keycloak users with IdP links: the admin calls invitations and the address guard make. */
+class FakeKcUsers {
+  users = new Map<string, { id: string; email: string; links: string[]; credentials: number; origin?: string }>();
+  failReads = false;
+  created: string[] = [];
+  deleted: string[] = [];
+  unlinked: [string, string][] = [];
+  add(u: { id: string; email: string; links: string[]; credentials?: number; origin?: string }) {
+    this.users.set(u.id, { credentials: 0, ...u });
+  }
+  async getUser(id: string) {
+    if (this.failReads) throw Object.assign(new Error('Keycloak unavailable'), { status: 503 });
+    const u = this.users.get(id);
+    return u ? { id, username: u.email, email: u.email, enabled: true, attributes: u.origin ? { ct_broker_origin: [u.origin] } : {} } : null;
+  }
+  async findUserByEmail(email: string) {
+    return [...this.users.values()].find((u) => u.email === email) ?? null;
+  }
+  async findUserByUsername(username: string) {
+    return this.findUserByEmail(username);
+  }
+  async createUser(u: { email: string }) {
+    this.created.push(u.email);
+    this.add({ id: `kc-new-${this.created.length}`, email: u.email, links: [] });
+    return `kc-new-${this.created.length}`;
+  }
+  async addOrgMember() {}
+  async sendActionsEmail() {}
+  async federatedIdentities(id: string) {
+    if (this.failReads) throw Object.assign(new Error('Keycloak unavailable'), { status: 503 });
+    return (this.users.get(id)?.links ?? []).map((identityProvider) => ({ identityProvider }));
+  }
+  async dropBrokeredLinks(id: string, aliases: string[]) {
+    const u = this.users.get(id);
+    if (!u) return 'none';
+    if (u.links.every((l) => aliases.includes(l)) && !u.credentials) {
+      this.users.delete(id);
+      this.deleted.push(id);
+      return 'deleted';
+    }
+    for (const a of aliases) this.unlinked.push([id, a]);
+    u.links = u.links.filter((l) => !aliases.includes(l));
+    return 'unlinked';
+  }
+}
 
 const available = await pgAvailable();
 
@@ -254,6 +303,233 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
     const start = await h.app.inject('/api/auth/login?returnTo=%2F%2Fevil.example%2Fx');
     const { code, state } = op.authorize(start.headers.location as string, { sub: Q.sofia, email: 'sofia.lindqvist@quillmoor.example', name: 'Sofia Lindqvist' });
     expect((await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`)).headers.location).toBe('http://web.test/');
+  });
+
+  describe('invitations and pre-provisioned identities only go to a trusted email', () => {
+    /** Quillmoor (priya) invites `email`; returns the pending user id and the link token. */
+    async function invite(email: string) {
+      const priya = (await loadPrincipal(h.t.db, Q.priya, h.orgs.quillmoor))!;
+      const r = await inviteUser(h.ps, priya, { email, roles: ['learner', 'org_admin'] });
+      const token = /\/api\/auth\/invite\/([A-Za-z0-9_-]+)/.exec(h.mailer.sent.at(-1)!.text)![1]!;
+      return { userId: r.user.id, token };
+    }
+    const membership = (userId: string) => h.t.owner.selectFrom('memberships').select(['status', 'user_id']).where('org_id', '=', h.orgs.quillmoor).where('user_id', '=', userId).executeTakeFirst();
+    /** Runs `fn` with `kc` as the gateway's Keycloak admin client. */
+    async function withKc<T>(kc: FakeKcUsers, fn: () => Promise<T>): Promise<T> {
+      const ps = h.ps as unknown as { kc: unknown };
+      const before = ps.kc;
+      ps.kc = kc;
+      try {
+        return await fn();
+      } finally {
+        ps.kc = before;
+      }
+    }
+
+    it("another org's IdP cannot take over an invitation by asserting the invited email", async () => {
+      // Acme's org admin controls acme-idp; the invited address is on a Quillmoor domain, then on nobody's.
+      for (const email of ['zoe.invited@quillmoor.example', 'zoe.invited@freemail.example']) {
+        const { userId } = await invite(email);
+        expect(userId).toMatch(/^pending-/);
+        const { cb } = await signIn(email, { sub: `kc-mallory-${email}`, email, name: 'Mallory', identity_provider: 'acme-idp', idp_roles: ['CloudTrain.Learner'] });
+        expect(cb.headers.location).toMatch(/error=email_conflict/);
+        expect(cookieOf(cb)).toBeUndefined();
+        expect(await membership(userId)).toMatchObject({ status: 'invited' });
+      }
+    });
+
+    it('an unverified email claims nothing, unless the login came through the invitation link', async () => {
+      const email = 'yusuf.invited@quillmoor.example';
+      const { userId, token } = await invite(email);
+      const plain = await signIn(email, { sub: 'kc-yusuf', email, email_verified: false, name: 'Yusuf' });
+      expect(plain.cb.headers.location).toMatch(/error=email_conflict/);
+      expect(await membership(userId)).toMatchObject({ status: 'invited' });
+
+      // A forged invite parameter on the plain login route is ignored.
+      const forged = await signIn(email, { sub: 'kc-yusuf', email, email_verified: false, name: 'Yusuf' }, '&invite=1');
+      expect(forged.cb.headers.location).toMatch(/error=email_conflict/);
+
+      // The link went to the invited mailbox: holding it proves the address for that invitation.
+      const link = await h.app.inject(`/api/auth/invite/${token}`);
+      expect(link.statusCode).toBe(302);
+      const { code, state } = op.authorize(link.headers.location as string, { sub: 'kc-yusuf', email, email_verified: false, name: 'Yusuf' });
+      const cb = await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`);
+      expect(cb.headers.location).toBe('http://web.test/');
+      expect(await membership('kc-yusuf')).toMatchObject({ status: 'active' });
+    });
+
+    it("a hostile IdP's login before the invitation does not lock the owner out of the address", async () => {
+      // An address on a domain no org verified (an address on a verified domain is refused outright, below).
+      const email = 'nora.first@freemail.example';
+      const mallory = { sub: 'kc-mallory-nora', email, name: 'Mallory', identity_provider: 'acme-idp', idp_roles: ['CloudTrain.Learner'] };
+      // Mallory signs in first: her account gets the address, untrusted (acme does not own freemail.example).
+      expect((await signIn(email, mallory)).cb.headers.location).not.toMatch(/error=/);
+      // Quillmoor then invites the address: the invitation lands on Mallory's account, which may not accept it.
+      const { userId } = await invite(email);
+      expect(userId).toBe('kc-mallory-nora');
+      await signIn(email, mallory);
+      expect(await membership('kc-mallory-nora')).toMatchObject({ status: 'invited' });
+
+      // Nora signs in with the verified address: she takes it over, with Quillmoor's invitation.
+      const { cb } = await signIn(email, { sub: 'kc-nora', email, name: 'Nora' });
+      expect(cb.headers.location).toBe('http://web.test/team');
+      expect(await membership('kc-nora')).toMatchObject({ status: 'active' });
+      expect(await membership('kc-mallory-nora')).toBeUndefined();
+      const users = await h.t.owner.selectFrom('users').select(['id', 'email']).where('id', 'in', ['kc-nora', 'kc-mallory-nora']).orderBy('id').execute();
+      expect(users[0]).toMatchObject({ id: 'kc-mallory-nora', email: expect.stringMatching(/@invalid$/) });
+      expect(users[1]).toMatchObject({ id: 'kc-nora', email });
+      const reclaimed = await h.t.owner.selectFrom('audit_log').select(['org_id', 'target_id']).where('action', '=', 'auth.email_reclaimed').execute();
+      expect(reclaimed).toEqual(expect.arrayContaining([expect.objectContaining({ org_id: h.orgs.quillmoor, target_id: 'kc-mallory-nora' })]));
+
+      // Mallory cannot take it back, and an untrusted login never takes an address over.
+      expect((await signIn(email, mallory)).cb.headers.location).toMatch(/error=email_conflict/);
+      expect((await signIn(email, { sub: 'kc-other', email, email_verified: false, name: 'Other' })).cb.headers.location).toMatch(/error=email_conflict/);
+      expect(await h.t.owner.selectFrom('users').select('email').where('id', '=', 'kc-nora').executeTakeFirst()).toEqual({ email });
+    });
+
+    it('a brokered account that adds a password and signs in locally is still judged by its IdP', async () => {
+      // Mallory (acme-idp's admin) brokers an address on a domain no org verified, then sets a password
+      // in Keycloak's account console: her password login has no identity_provider claim.
+      const email = 'vic.victim@freemail.example';
+      const kc = new FakeKcUsers();
+      kc.add({ id: 'kc-mallory-vic', email, links: ['acme-idp'], credentials: 1, origin: 'acme-idp' });
+      await withKc(kc, async () => {
+        expect((await signIn(email, { sub: 'kc-mallory-vic', email, name: 'Mallory', identity_provider: 'acme-idp', idp_roles: ['CloudTrain.Learner'] })).cb.headers.location).not.toMatch(/error=/);
+        const { userId } = await invite(email);
+        expect(userId).toBe('kc-mallory-vic');
+        // The password login does not make her email trusted: Quillmoor's invitation stays open.
+        await signIn(email, { sub: 'kc-mallory-vic', email, name: 'Mallory' });
+        expect(await membership('kc-mallory-vic')).toMatchObject({ status: 'invited' });
+        // Unlinking the IdP changes nothing: the origin stamp stays, and so does last_idp.
+        kc.users.get('kc-mallory-vic')!.links = [];
+        await signIn(email, { sub: 'kc-mallory-vic', email, name: 'Mallory' });
+        expect(await membership('kc-mallory-vic')).toMatchObject({ status: 'invited' });
+        expect(await h.t.owner.selectFrom('users').select('last_idp').where('id', '=', 'kc-mallory-vic').executeTakeFirst()).toEqual({ last_idp: 'acme-idp' });
+        // So the real owner can still take the address over.
+        const { cb } = await signIn(email, { sub: 'kc-vic', email, name: 'Vic' });
+        expect(cb.headers.location).toBe('http://web.test/team');
+        expect(await membership('kc-vic')).toMatchObject({ status: 'active' });
+      });
+    });
+
+    it('a brokered-origin account whose first gateway login is local cannot claim a pending identity', async () => {
+      const email = 'wes.pending@freemail.example';
+      const { userId } = await invite(email);
+      expect(userId).toMatch(/^pending-/);
+      const kc = new FakeKcUsers();
+      // Brokered by acme-idp, then a password set and the link removed before ever reaching the gateway.
+      kc.add({ id: 'kc-mallory-wes', email, links: [], credentials: 1, origin: 'acme-idp' });
+      await withKc(kc, async () => {
+        expect((await signIn(email, { sub: 'kc-mallory-wes', email, name: 'Mallory' })).cb.headers.location).toMatch(/error=email_conflict/);
+        expect(await membership(userId)).toMatchObject({ status: 'invited' });
+        // Keycloak unreachable: a local login is not trusted either.
+        kc.failReads = true;
+        expect((await signIn(email, { sub: 'kc-someone-wes', email, name: 'Someone' })).cb.headers.location).toMatch(/error=email_conflict/);
+        expect(await membership(userId)).toMatchObject({ status: 'invited' });
+        // A plain local account (no IdP origin) claims it.
+        kc.failReads = false;
+        expect((await signIn(email, { sub: 'kc-wes', email, name: 'Wes' })).cb.headers.location).toBe('http://web.test/team');
+        expect(await membership('kc-wes')).toMatchObject({ status: 'active' });
+      });
+    });
+
+    it('the gateway re-applies the tenant IdP protections itself (no kc:sync needed)', async () => {
+      const calls: string[] = [];
+      const users = [
+        { id: 'u-own', email: 'own@acme-freight.example', attributes: { ct_broker_origin: ['acme-idp'] } },
+        { id: 'u-old', email: 'old@freemail.example' },
+        { id: 'u-foreign', email: 'foreign@quillmoor.example', attributes: { ct_broker_origin: ['acme-idp'] } },
+      ];
+      const kc = {
+        allowUnmanagedAttributes: async () => false,
+        ensureTenantBrokerFlow: async () => void calls.push('flow'),
+        getIdp: async (alias: string) => ({ alias, providerId: 'oidc', enabled: true, firstBrokerLoginFlowAlias: 'first broker login', config: {} }),
+        updateIdp: async (idp: { alias: string; firstBrokerLoginFlowAlias: string }) => void calls.push(`idp ${idp.alias} -> ${idp.firstBrokerLoginFlowAlias}`),
+        ensureBrokerOriginMapper: async (alias: string) => void calls.push(`mapper ${alias}`),
+        idpUsers: async () => users,
+        addUserAttribute: async (id: string, _n: string, v: string) => void calls.push(`mark ${id} ${v}`),
+        federatedIdentities: async () => [{ identityProvider: 'acme-idp' }],
+        dropBrokeredLinks: async (id: string, aliases: string[]) => (calls.push(`drop ${id} ${aliases.join(',')}`), 'unlinked' as const),
+      };
+      const r = await repairTenantIdps(h.t.db, kc as never);
+      expect(calls).toEqual(['flow', 'idp acme-idp -> cloudtrain tenant broker login', 'mapper acme-idp', 'mark u-old acme-idp', 'drop u-foreign acme-idp']);
+      expect(r).toEqual({ brokerFlowFixed: ['acme-idp'], foreignReleased: ['acme-idp/u-foreign'], untrustedLinks: ['acme-idp/u-old'], originsMarked: ['acme-idp/u-old'] });
+    });
+
+    it('a trusted login never takes an address from an account that holds it trusted', async () => {
+      const email = 'otto.local@quillmoor.example';
+      await signIn(email, { sub: 'kc-otto', email, name: 'Otto' }); // a local account, no org yet
+      expect((await invite(email)).userId).toBe('kc-otto');
+      expect((await signIn(email, { sub: 'kc-otto-2', email, name: 'Otto 2' })).cb.headers.location).toMatch(/error=email_conflict/);
+      expect(await h.t.owner.selectFrom('users').select('email').where('id', '=', 'kc-otto').executeTakeFirst()).toEqual({ email });
+    });
+
+    it("an IdP may not sign in an address on another org's verified domain; its Keycloak user is dropped", async () => {
+      const email = 'nadia.owner@quillmoor.example';
+      const kc = new FakeKcUsers();
+      kc.add({ id: 'kc-mallory-nadia', email, links: ['acme-idp'] }); // brokered by acme-idp, nothing else
+      kc.add({ id: 'kc-linked-local', email: 'leo.local@quillmoor.example', links: ['acme-idp'], credentials: 1 });
+      kc.add({ id: 'kc-squatter', email: 'quinn.new@quillmoor.example', links: ['acme-idp'] });
+      await withKc(kc, async () => {
+        const { cb } = await signIn(email, { sub: 'kc-mallory-nadia', email, name: 'Mallory', identity_provider: 'acme-idp', idp_roles: ['CloudTrain.Learner'] });
+        expect(cb.headers.location).toMatch(/error=email_conflict/);
+        expect(cookieOf(cb)).toBeUndefined();
+        // Keycloak no longer holds the address for acme-idp: its owner's first login is not refused there.
+        expect(kc.deleted).toEqual(['kc-mallory-nadia']);
+        expect(await h.t.owner.selectFrom('users').select('id').where('id', '=', 'kc-mallory-nadia').executeTakeFirst()).toBeUndefined();
+        const denied = await h.t.owner.selectFrom('audit_log').select(['org_id', 'target_id']).where('action', '=', 'auth.login_denied').where('target_id', '=', 'kc-mallory-nadia').execute();
+        expect(denied).toEqual([{ org_id: h.orgs.quillmoor, target_id: 'kc-mallory-nadia' }]);
+
+        // Starting a login for an address on a verified domain drops another org's link there too.
+        // An account with more than that link (here a password) keeps everything else.
+        const start = await h.app.inject(`/api/auth/login?email=${encodeURIComponent('leo.local@quillmoor.example')}`);
+        expect(start.statusCode).toBe(302);
+        expect(kc.unlinked).toEqual([['kc-linked-local', 'acme-idp']]);
+        expect(kc.deleted).toEqual(['kc-mallory-nadia']);
+
+        // Inviting an address another org's IdP brought into Keycloak frees it and creates the real account.
+        const { userId } = await invite('quinn.new@quillmoor.example');
+        expect(kc.deleted).toEqual(['kc-mallory-nadia', 'kc-squatter']);
+        expect(kc.created).toEqual(['quinn.new@quillmoor.example']);
+        expect(userId).toBe('kc-new-1');
+      });
+    });
+
+    it('inviting an SSO user of another org creates no Keycloak user, and their first SSO login accepts it', async () => {
+      // Quillmoor (local login here, with Keycloak) invites an address on Acme's verified, SSO-enforced domain.
+      const email = 'ingrid.sso@acme-freight.example';
+      const kc = new FakeKcUsers();
+      const { userId, token } = await withKc(kc, () => invite(email));
+      expect(userId).toMatch(/^pending-/);
+      expect(kc.created).toEqual([]);
+      expect(h.mailer.sent.at(-1)!.text).toContain('Sign in with your Acme Freight account (single sign-on)');
+      // The link sends her to Acme's IdP.
+      const link = await h.app.inject(`/api/auth/invite/${token}`);
+      expect(new URL(link.headers.location as string).searchParams.get('kc_idp_hint')).toBe('acme-idp');
+      // Her first login through Acme's IdP (trusted: Acme verified the domain) claims the identity and accepts.
+      const { cb } = await signIn(email, { sub: 'kc-ingrid', email, name: 'Ingrid', identity_provider: 'acme-idp', idp_roles: ['CloudTrain.Learner'] });
+      expect(cb.headers.location).not.toMatch(/error=/);
+      expect(await membership('kc-ingrid')).toMatchObject({ status: 'active' });
+      expect(await h.t.owner.selectFrom('users').select('id').where('id', '=', userId).executeTakeFirst()).toBeUndefined();
+    });
+
+    it('a platform IdP with no org of its own is not trusted for other orgs\' invitations (documented); the link works', async () => {
+      const email = 'pia.platform@freemail.example';
+      const { userId } = await invite(email);
+      const claims = { sub: 'kc-pia', email, emailVerified: true, name: 'Pia', identityProvider: 'azarguard-entra', idpRoles: [], idpGroups: [] };
+      expect(await provision(h.t.db, claims, { platformIdps: ['azarguard-entra'] })).toMatchObject({ ok: false, reason: 'email_conflict' });
+      expect(await membership(userId)).toMatchObject({ status: 'invited' });
+      expect(await provision(h.t.db, claims, { platformIdps: ['azarguard-entra'], invitation: { orgId: h.orgs.quillmoor, email } })).toMatchObject({ ok: true });
+      expect(await membership('kc-pia')).toMatchObject({ status: 'active' });
+    });
+
+    it('a verified email accepts its invitations on a normal sign-in', async () => {
+      const email = 'vera.invited@quillmoor.example';
+      await invite(email);
+      const { cb } = await signIn(email, { sub: 'kc-vera', email, name: 'Vera' });
+      expect(cb.headers.location).toBe('http://web.test/team');
+      expect(await membership('kc-vera')).toMatchObject({ status: 'active' });
+    });
   });
 });
 

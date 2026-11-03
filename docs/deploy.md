@@ -51,7 +51,10 @@ The web app has no OIDC settings: the gateway is the OIDC client (BFF).
   not a superuser, has no BYPASSRLS and does not own the tables, so row-level security
   applies. `deploy/dev/postgres/init.sql` shows the grants.
 - An OIDC provider (Keycloak, Entra ID, ...) with a confidential client (code flow +
-  PKCE). Keycloak's admin API is optional (SSO connections, invitations).
+  PKCE). Keycloak's admin API is optional (SSO connections, invitations). With it,
+  the gateway re-applies the tenant IdP protections at startup and every
+  `CT_KC_REPAIR_MS` (default 15 minutes; `0` = startup only): no `kc:sync` Job is
+  needed in production (docs/platform-identity.md).
 - For labs: KubeVirt + CDI, Multus, Kube-OVN, and `/dev/kvm` on the lab nodes (VM
   labs). See [any-kubernetes.md](any-kubernetes.md) section 3 per provider.
 

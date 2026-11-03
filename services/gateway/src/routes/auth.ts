@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { sql } from 'kysely';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { AuthDiscovery, LogoutResponse, SwitchOrgRequest } from '@cloudtrain/api-types';
 import { withTenant } from '../db/index.js';
 import { badRequest, HttpError, unauthenticated } from '../errors.js';
@@ -8,6 +8,7 @@ import { randomToken, type OidcClient } from '../oidc/client.js';
 import type { SessionStore } from '../oidc/sessions.js';
 import { audit } from '../platform/audit.js';
 import { loadPrincipal, membershipsOf, orgForDomain, orgForIdp, provision, type IdentityClaims } from '../platform/identity.js';
+import { brokerOrigins, releaseForeignAddress } from '../platform/kc-address.js';
 import type { PlatformService } from '../platform/service.js';
 import { RateLimiter } from './public.js';
 
@@ -35,6 +36,8 @@ export function claimsOf(t: Record<string, unknown>): IdentityClaims {
   return {
     sub: String(t.sub),
     email,
+    // Only an explicit true: a provider that does not say has not verified it.
+    emailVerified: t.email_verified === true,
     name,
     ...(typeof t.title === 'string' && t.title ? { title: t.title } : {}),
     ...(typeof t.identity_provider === 'string' && t.identity_provider ? { identityProvider: t.identity_provider } : {}),
@@ -71,9 +74,45 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
     return discovery(req.query.email);
   });
 
-  /** Identity-first: email -> org by verified domain -> the org's IdP (kc_idp_hint) or Keycloak's local login. */
-  app.get<{ Querystring: { email?: string; returnTo?: string; org?: string; idp?: string; invite?: string } }>('/api/auth/login', { config: { ...pub, rateLimit: { perMinute: LOGIN_PER_MINUTE } } }, async (req, reply) => {
+  /** A live (not revoked, not expired) invitation by the hash of its link token; accepted ones too unless `open`. */
+  async function invitationByHash(hash: string, open = false) {
+    const inv = (await sql<{ org_id: string; email: string; expires_at: Date; accepted_at: Date | null; revoked_at: Date | null }>`SELECT * FROM auth_invitation_by_token(${hash})`.execute(ps.db)).rows[0];
+    return inv && !inv.revoked_at && inv.expires_at >= new Date() && !(open && inv.accepted_at) ? inv : null;
+  }
+
+  /**
+   * Frees an address on a verified domain that another org's IdP brought into Keycloak
+   * (platform/kc-address.ts): otherwise Keycloak refuses its owner's first login (through the
+   * owner's own IdP, or the local account an invitation creates). Best effort: a Keycloak
+   * outage does not stop the login.
+   */
+  async function freeAddress(req: FastifyRequest, email: string) {
+    if (!ps.kc) return;
+    try {
+      const released = await releaseForeignAddress(ps.db, ps.kc, email);
+      if (released.length) req.log.warn({ released }, 'keycloak: dropped links of other orgs\' IdPs holding an address on a verified domain');
+    } catch (e) {
+      req.log.warn({ err: e }, 'keycloak: could not check the address for foreign IdP links');
+    }
+  }
+
+  /** Writes the login state and sends the browser to the provider. `invite` is set only by the invitation link. */
+  async function startLogin(req: FastifyRequest, reply: FastifyReply, p: { email?: string; returnTo?: string; orgId: string | null; idpHint?: string; invite?: string; reauth?: boolean }) {
     if (!loginLimiter.take(req.ip)) throw new HttpError(429, 'Too many requests, try again later', { code: 'rate_limited', details: { retryAfterSeconds: loginLimiter.resetIn(req.ip) } });
+    const state = randomToken(24);
+    const nonce = randomToken(24);
+    const verifier = randomToken(48);
+    await ps.db.deleteFrom('auth_login_states').where('created_at', '<', new Date(Date.now() - STATE_TTL_MS)).execute();
+    await ps.db
+      .insertInto('auth_login_states')
+      .values({ state, verifier, nonce, return_to: safeReturnTo(p.returnTo), email: p.email?.trim().toLowerCase() ?? null, org_id: p.orgId, invite: p.invite ?? null })
+      .execute();
+    const url = await oidc.authorizationUrl({ state, nonce, verifier, ...(p.email ? { loginHint: p.email.trim() } : {}), ...(p.idpHint ? { idpHint: p.idpHint } : {}), ...(p.reauth ? { prompt: 'login' } : {}) });
+    return reply.redirect(url, 302);
+  }
+
+  /** Identity-first: email -> org by verified domain -> the org's IdP (kc_idp_hint) or Keycloak's local login. */
+  app.get<{ Querystring: { email?: string; returnTo?: string; org?: string; idp?: string; reauth?: string } }>('/api/auth/login', { config: { ...pub, rateLimit: { perMinute: LOGIN_PER_MINUTE } } }, async (req, reply) => {
     const q = req.query;
     let orgId: string | null = null;
     let idpHint: string | undefined;
@@ -85,19 +124,11 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
     } else if (q.email?.includes('@')) {
       const disc = await discovery(q.email);
       if (disc.method === 'sso') idpHint = disc.idpAlias;
+      await freeAddress(req, q.email);
       orgId = disc.org?.id ?? null;
     }
     if (q.org && /^[0-9a-f-]{36}$/.test(q.org)) orgId = q.org;
-    const state = randomToken(24);
-    const nonce = randomToken(24);
-    const verifier = randomToken(48);
-    await ps.db.deleteFrom('auth_login_states').where('created_at', '<', new Date(Date.now() - STATE_TTL_MS)).execute();
-    await ps.db
-      .insertInto('auth_login_states')
-      .values({ state, verifier, nonce, return_to: safeReturnTo(q.returnTo), email: q.email?.trim().toLowerCase() ?? null, org_id: orgId, invite: q.invite ?? null })
-      .execute();
-    const url = await oidc.authorizationUrl({ state, nonce, verifier, ...(q.email ? { loginHint: q.email.trim() } : {}), ...(idpHint ? { idpHint } : {}), ...((q as { reauth?: string }).reauth === '1' ? { prompt: 'login' } : {}) });
-    return reply.redirect(url, 302);
+    return startLogin(req, reply, { ...(q.email ? { email: q.email } : {}), ...(q.returnTo ? { returnTo: q.returnTo } : {}), orgId, ...(idpHint ? { idpHint } : {}), reauth: q.reauth === '1' });
   });
 
   app.get<{ Querystring: { code?: string; state?: string; error?: string; error_description?: string } }>('/api/auth/callback', { config: pub }, async (req, reply) => {
@@ -118,8 +149,20 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
     }
     const claims = claimsOf(idt);
     if (!claims.email) return loginError(reply, 'no_email', 'Your identity provider did not send an email address.');
-    const result = await provision(ps.db, claims, { platformIdps: ps.config.platformIdps, preferredOrgId: st.org_id, ip: req.ip });
+    // A password login carries no identity_provider claim, even for an account a tenant IdP brokered
+    // (its user may add a password in the account console): ask Keycloak where the account came from.
+    if (!claims.identityProvider && ps.kc) {
+      try {
+        claims.brokerOrigins = await brokerOrigins(ps.kc, claims.sub);
+      } catch (e) {
+        req.log.warn({ err: e }, 'keycloak: could not read the IdP links of a local login; its email is not trusted for this login');
+        claims.brokerOrigins = null;
+      }
+    }
+    const invitation = st.invite ? await invitationByHash(st.invite, true) : null;
+    const result = await provision(ps.db, claims, { platformIdps: ps.config.platformIdps, preferredOrgId: st.org_id, invitation: invitation ? { orgId: invitation.org_id, email: invitation.email } : null, ip: req.ip });
     if (!result.ok) {
+      if (result.reason === 'email_conflict' && claims.identityProvider) await freeAddress(req, claims.email);
       if (result.orgId) {
         await withTenant(ps.db, { orgId: result.orgId }, (tx) => audit(tx, { orgId: result.orgId!, actorId: null, actorName: claims.email, ip: req.ip }, 'auth.login_denied', 'user', claims.sub, { reason: result.reason, idp: claims.identityProvider ?? 'local' }, claims.email)).catch(() => undefined);
       }
@@ -170,11 +213,14 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
   });
 
   /** Invitation link: resolves the invitation, then identity-first login with the invited email and org. */
-  app.get<{ Params: { token: string } }>('/api/auth/invite/:token', { config: pub }, async (req, reply) => {
+  app.get<{ Params: { token: string } }>('/api/auth/invite/:token', { config: { ...pub, rateLimit: { perMinute: LOGIN_PER_MINUTE } } }, async (req, reply) => {
     const hash = createHash('sha256').update(req.params.token).digest('hex');
-    const inv = (await sql<{ org_id: string; email: string; expires_at: Date; accepted_at: Date | null; revoked_at: Date | null }>`SELECT * FROM auth_invitation_by_token(${hash})`.execute(ps.db)).rows[0];
-    if (!inv || inv.revoked_at || inv.expires_at < new Date()) return loginError(reply, 'invitation_invalid', 'This invitation link is invalid or has expired.');
-    return reply.redirect(`${ps.config.publicUrl}/api/auth/login?email=${encodeURIComponent(inv.email)}&org=${inv.org_id}&invite=1`, 302);
+    const inv = await invitationByHash(hash);
+    if (!inv) return loginError(reply, 'invitation_invalid', 'This invitation link is invalid or has expired.');
+    // The login state carries the token's hash, binding the invitation to this sign-in.
+    const disc = await discovery(inv.email);
+    await freeAddress(req, inv.email);
+    return startLogin(req, reply, { email: inv.email, orgId: inv.org_id, ...(disc.method === 'sso' && disc.idpAlias ? { idpHint: disc.idpAlias } : {}), invite: hash });
   });
 
   app.get('/api/me', { config: { permission: 'progress.read.self', anyOrg: true } }, async (req) => ps.me(req.principal));

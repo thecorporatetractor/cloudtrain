@@ -22,7 +22,7 @@ async function main() {
   });
   try {
     const r = await syncKeycloak(ps, kc, db);
-    console.log(`keycloak: organizations ${r.orgs.join(', ') || 'none'}; linked IdPs ${r.linkedIdps.join(', ') || 'none'}; ${r.members} local members`);
+    console.log(`keycloak: organizations ${r.orgs.join(', ') || 'none'}; linked IdPs ${r.linkedIdps.join(', ') || 'none'}; ${r.brokerFlowFixed.length ? `moved to the tenant broker flow: ${r.brokerFlowFixed.join(', ')}; ` : ''}${r.foreignReleased.length ? `released addresses on other orgs' verified domains: ${r.foreignReleased.join(', ')}; ` : ''}${r.untrustedLinks.length ? `brokered users with unverified-domain email (review): ${r.untrustedLinks.join(', ')}; ` : ''}${r.originsMarked.length ? `brokered users stamped with their IdP: ${r.originsMarked.length}; ` : ''}${r.members} local members`);
     if (r.entra === 'absent') console.log(`entra: ${ENTRA_ENV_FILE} not found; skipping the azarguard-entra IdP (see docs/dev-environment.md)`);
     else if (r.entra === 'incomplete') console.log(`entra: ${ENTRA_ENV_FILE} lacks tenant id, client id or client secret; skipping (values not shown)`);
     else console.log('entra: azarguard-entra IdP configured (values not shown)');

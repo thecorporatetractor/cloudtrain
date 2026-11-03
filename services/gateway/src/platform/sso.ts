@@ -6,7 +6,7 @@ import { authorize, ORG_ROLES } from '../authz.js';
 import type { Tx } from '../db/index.js';
 import type { SsoConnectionRow } from '../db/schema.js';
 import { badRequest, conflict, HttpError, notFound } from '../errors.js';
-import type { KcIdentityProvider, KeycloakAdmin } from '../keycloak/admin.js';
+import { TENANT_BROKER_FLOW, type KcIdentityProvider, type KeycloakAdmin } from '../keycloak/admin.js';
 import { actorOf, audit } from './audit.js';
 import { orgOf } from './admin.js';
 import { orgForDomain } from './identity.js';
@@ -100,15 +100,23 @@ async function discover(url: string): Promise<{ issuer: string; authorization_en
   return d as never;
 }
 
-function oidcIdp(alias: string, displayName: string, d: Awaited<ReturnType<typeof discover>>, o: { clientId: string; clientSecret: string; scopes?: string[] }): KcIdentityProvider {
+/**
+ * Keycloak settings every tenant IdP gets. The first-broker-login flow never
+ * links a brokered identity to an existing Keycloak user (TENANT_BROKER_FLOW):
+ * an org admin controls what its IdP asserts, so an IdP asserting another
+ * org's user's email must not sign in as that user. trustEmail only makes
+ * Keycloak report the IdP's email as verified (no verify-email step); the
+ * gateway still trusts a brokered email only for a verified domain of the
+ * IdP's own org (identity.ts, emailTrusted).
+ */
+export const TENANT_IDP = { enabled: true, trustEmail: true, hideOnLogin: true, firstBrokerLoginFlowAlias: TENANT_BROKER_FLOW } as const;
+
+export function oidcIdp(alias: string, displayName: string, d: Awaited<ReturnType<typeof discover>>, o: { clientId: string; clientSecret: string; scopes?: string[] }): KcIdentityProvider {
   return {
     alias,
     displayName,
     providerId: 'oidc',
-    enabled: true,
-    trustEmail: true,
-    firstBrokerLoginFlowAlias: 'first broker login',
-    hideOnLogin: true,
+    ...TENANT_IDP,
     config: {
       issuer: d.issuer,
       authorizationUrl: d.authorization_endpoint,
@@ -158,6 +166,7 @@ export async function createConnection(ps: PlatformService, p: Principal, req: C
     const o = req.oidc;
     if (!o?.discoveryUrl || !o.clientId || !o.clientSecret) throw badRequest('oidc.discoveryUrl, clientId and clientSecret are required', { oidc: 'required' });
     const d = await discover(o.discoveryUrl);
+    await kc.ensureTenantBrokerFlow();
     await kc.createIdp(oidcIdp(alias, req.displayName.trim(), d, o));
     const roleClaim = o.roleClaim ?? 'roles';
     await kc.ensureAttributeMapper(alias, 'oidc', 'cloudtrain roles', roleClaim, ROLE_ATTRIBUTE);
@@ -167,11 +176,14 @@ export async function createConnection(ps: PlatformService, p: Principal, req: C
     const s = req.saml;
     if (!s?.metadataUrl) throw badRequest('saml.metadataUrl is required (metadata XML upload: use the URL form for now)', { saml: 'required' });
     const config = await kc.importIdpConfig('saml', s.metadataUrl);
-    await kc.createIdp({ alias, displayName: req.displayName.trim(), providerId: 'saml', enabled: true, trustEmail: true, hideOnLogin: true, firstBrokerLoginFlowAlias: 'first broker login', config: { ...config, syncMode: 'FORCE', principalType: 'SUBJECT' } });
+    await kc.ensureTenantBrokerFlow();
+    await kc.createIdp({ alias, displayName: req.displayName.trim(), providerId: 'saml', ...TENANT_IDP, config: { ...config, syncMode: 'FORCE', principalType: 'SUBJECT' } });
     const groupAttribute = s.groupAttribute ?? 'groups';
     await kc.ensureAttributeMapper(alias, 'saml', 'cloudtrain groups', groupAttribute, GROUP_ATTRIBUTE);
     settings = { metadataUrl: s.metadataUrl, entityId: config.idpEntityId ?? config.entityId, groupAttribute };
   }
+  // Every user this IdP brokers carries its alias for good (BROKER_ORIGIN_ATTRIBUTE).
+  await kc.ensureBrokerOriginMapper(alias);
   await linkToOrganization(
     kc,
     prepared.org.kc_org_id,

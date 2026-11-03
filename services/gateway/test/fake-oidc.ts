@@ -92,7 +92,7 @@ export class FakeOidcProvider {
       } else return json(400, { error: 'unsupported_grant_type' });
       const refresh = randomUUID();
       this.refresh.set(refresh, { claims, sid });
-      return json(200, { access_token: randomUUID(), refresh_token: refresh, expires_in: this.accessTtl, token_type: 'Bearer', id_token: await this.sign({ auth_time: Math.floor(Date.now() / 1000), ...claims, sid, ...(nonce ? { nonce } : {}) }) });
+      return json(200, { access_token: randomUUID(), refresh_token: refresh, expires_in: this.accessTtl, token_type: 'Bearer', id_token: await this.sign({ auth_time: Math.floor(Date.now() / 1000), ...(claims.email ? { email_verified: true } : {}), ...claims, sid, ...(nonce ? { nonce } : {}) }) });
     }
     return json(404, { error: 'not found' });
   }

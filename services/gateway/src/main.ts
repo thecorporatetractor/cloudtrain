@@ -12,6 +12,7 @@ import { KubeClusterInfo } from './kube/capacity.js';
 import { KubeLabCluster, kubeConfigFor } from './kube/client.js';
 import { LabctlCompiler } from './kube/compile.js';
 import { KeycloakAdmin } from './keycloak/admin.js';
+import { scheduleTenantIdpRepair } from './keycloak/repair.js';
 import { SmtpMailer } from './mail.js';
 import { OidcClient } from './oidc/client.js';
 import { OidcAuthenticator, Sealer, SessionStore } from './oidc/sessions.js';
@@ -225,7 +226,11 @@ async function main() {
   const gdprSweep = config.gdpr.sweepMs > 0 ? setInterval(() => void gdpr.sweep().catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'gdpr sweep failed')), config.gdpr.sweepMs) : undefined;
   const retention = () => void sweepRetention({ db, waitlist, ledger, accounts: gdpr, config: config.retention, log: app.log }).catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'retention sweep failed'));
   const retentionSweep = config.retention.sweepMs > 0 ? setInterval(retention, config.retention.sweepMs) : undefined;
+  // Tenant IdP protections (broker flow, origin stamps, foreign addresses) hold without kc:sync.
+  const stopKcRepair = kcAdmin ? scheduleTenantIdpRepair(db, kcAdmin, config.keycloak.repairMs, app.log) : undefined;
+  if (!kcAdmin) app.log.warn({}, 'keycloak: no admin client (CT_KEYCLOAK_ADMIN_CLIENT_SECRET unset); tenant IdP protections are not re-applied and local logins are not checked for IdP origins');
   const close = async () => {
+    stopKcRepair?.();
     if (gdprSweep) clearInterval(gdprSweep);
     if (retentionSweep) clearInterval(retentionSweep);
     await gdpr.settled();

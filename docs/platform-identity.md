@@ -13,6 +13,79 @@ and web (`apps/web`) build against this document and the types in
   tenant table). A request can only ever see one org.
 - A user belongs to one or more orgs (`memberships`); the active org is chosen at
   login (identity-first by email domain) and switchable in the user menu.
+- **Matching by email.** A login claims a pre-provisioned identity (seed or
+  invitation, `pending-…`) and accepts open invitations by email only when the
+  email is trusted: the ID token says `email_verified: true`, and for a brokered
+  login (a tenant IdP) the email's domain is a verified domain of that IdP's own
+  org. An org admin controls what its IdP asserts, so its IdP cannot pick up
+  invitations other orgs sent. An untrusted login may still accept invitations
+  of the IdP's own org, and the one invitation whose link started the sign-in
+  (the link went to the invited mailbox; the login state stores the token hash,
+  never a query parameter). Anything else is refused as `email_conflict`.
+- **An untrusted login does not keep an address from its owner.** When an
+  untrusted login came first (another org's IdP asserted the address) and its
+  account holds the address, a later login that proves it (a trusted email, or
+  the invitation link) takes the address over: the earlier account keeps its
+  memberships under a placeholder address (`unverified-…@invalid`), and the open
+  invitations other orgs made out to the address move to the new account
+  (`auth.email_reclaimed` in the audit log). A local account, or one whose IdP's
+  org owns the domain, keeps its address. Keycloak keeps its own copy: the
+  brokered Keycloak user created by the untrusted login still holds the email
+  there, so for an address on a domain no org verified, a brokered or newly
+  registered Keycloak account for the same address is refused until a realm
+  admin removes or renames that user (`kc:sync` lists such users for review).
+- **No IdP signs in another org's verified domain.** A brokered login whose
+  address is on a domain verified by an org other than the IdP's own is refused
+  (`email_conflict`, audited in the domain owner's org). Because tenant IdPs only
+  ever create Keycloak users, whoever first brings an address into Keycloak keeps
+  it there, and Keycloak would refuse the owner's own first login before the
+  gateway sees it. So the gateway drops the Keycloak link of such a user to the
+  foreign IdP (`platform/kc-address.ts`; the user is deleted when it has nothing
+  else, no other link and no credential): when that login is refused, when a
+  login or invitation link starts for an address on a verified domain, and when an
+  org invites such an address. `kc:sync` sweeps every IdP's brokered users the
+  same way, and so does the gateway itself at startup and every `CT_KC_REPAIR_MS`
+  (default 15 minutes, `keycloak/repair.ts`). A remaining window: an address held
+  in Keycloak by a foreign IdP whose owner signs in through the plain IdP button
+  (no address given) before the next repair run.
+- **A password does not launder a brokered account.** Keycloak's account console
+  lets a brokered user add a password, and a password login carries no
+  `identity_provider` claim. Every tenant IdP therefore stamps the users it
+  brokers with the attribute `ct_broker_origin` (a hardcoded-attribute mapper;
+  users cannot edit unmanaged attributes, which are admin-edit only), and on a
+  local login the gateway asks Keycloak for the user's IdP links and that stamp.
+  An account with an IdP origin is trusted only as that IdP would be (its org's
+  verified domains), even after it unlinks the IdP; `users.last_idp` keeps that
+  origin, so the account still gives up the address to its proven owner. If
+  Keycloak cannot be asked, the local login is untrusted (invitation link only).
+  Users brokered before the stamp existed get it from the repair run.
+- **Inviting an SSO user of another org** (an address on a domain verified by an
+  org with an IdP) creates no Keycloak account, only a `pending-…` identity: a
+  local Keycloak account holding the address would make Keycloak refuse the
+  owner's first login through their own IdP. Their first login through that IdP
+  is trusted and claims the identity with the invitation.
+- **Platform IdPs** (`CT_PLATFORM_IDPS`, the operator's Entra) are trusted for
+  email matching like tenant IdPs: for verified domains of their own org only. A
+  platform IdP with no org of its own (Entra before the AzarGuard org exists), or
+  an address outside those domains, accepts another org's invitation only
+  through the invitation link; a plain sign-in that would claim it is refused as
+  `email_conflict`.
+- Brokered users of tenant IdPs join the org's Keycloak organization on the next
+  `kc:sync`, not at first login (the tenant flow has no onboarding step).
+- **No account linking for tenant IdPs.** Org SSO connections use the Keycloak
+  first-broker-login flow `cloudtrain tenant broker login`: *Create User If
+  Unique*, required, and nothing else. A brokered identity whose email or username
+  already belongs to a Keycloak user is refused instead of linked, so an IdP that
+  asserts another user's email never receives that user's `sub` (which would skip
+  every gateway email check). The gateway creates the flow when it creates a
+  connection, and the gateway's repair run (and `kc:sync`) moves connections created
+  earlier onto it. A user with
+  a local Keycloak account cannot start using a newly added org IdP under the same
+  email; remove or rename the local account first. The operator's own platform
+  IdPs (Entra, `CT_PLATFORM_IDPS`) keep the built-in flow. The repair run puts the
+  flow back every time (a step loosened in the admin console is disabled again).
+  Not yet checked against a live Keycloak: on the dev realm, IdP A asserting the
+  email of an existing user of org B must be refused, not linked.
 - **Platform** scope is outside any org (CloudTrain operators): orgs, capacity,
   global content packs. Only `platform_admin` reaches it.
 

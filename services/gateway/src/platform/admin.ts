@@ -37,6 +37,7 @@ import { labelValue } from '../sessions/service.js';
 import { endAttempt } from '../learner/learning.js';
 import { actorOf, audit } from './audit.js';
 import { normalizeRoles, orgForDomain } from './identity.js';
+import { releaseForeignAddress } from './kc-address.js';
 import { csvLine, teamsWithStats } from './manager.js';
 import { DEFAULT_SETTINGS, decodeCursor, encodeCursor, pageLimit, userRef, UNKNOWN_USER, type PlatformService } from './service.js';
 
@@ -188,7 +189,12 @@ export async function inviteUser(ps: PlatformService, p: Principal, req: InviteU
   const days = Math.min(30, Math.max(1, Math.floor(Number(req.expiresInDays ?? 7)) || 7));
   const domain = email.split('@')[1]!;
   const domainOrg = await orgForDomain(ps.db, domain);
-  const viaSso = !!(domainOrg?.idp_alias && domainOrg.org_id === p.orgId);
+  // The address signs in through an org's IdP: this org's, or the IdP of the org that verified its
+  // domain. No Keycloak user is created for it then (a 'pending-' identity, claimed at first login):
+  // a local Keycloak user holding the address would make Keycloak refuse the owner's first brokered
+  // login (TENANT_BROKER_FLOW never links), so any org admin could lock another org's SSO user out.
+  const viaSso = !!(domainOrg?.idp_alias && (domainOrg.org_id === p.orgId || domainOrg.verified));
+  const ssoName = domainOrg?.org_id === p.orgId ? null : domainOrg?.name;
 
   const existing = (await sql<{ id: string }>`SELECT id FROM auth_user_by_email(${email})`.execute(ps.db)).rows[0];
   let userId = existing?.id;
@@ -196,6 +202,8 @@ export async function inviteUser(ps: PlatformService, p: Principal, req: InviteU
   if (!userId) {
     // Local-login orgs get a Keycloak account now (sub known); SSO domains are claimed at first login.
     if (!viaSso && ps.kc) {
+      // Another org's IdP holding the address (domain verified by this org) must not get the account.
+      await releaseForeignAddress(ps.db, ps.kc, email);
       const found = await ps.kc.findUserByEmail(email);
       const [first, ...rest] = (req.name ?? email.split('@')[0]!).split(/\s+/);
       userId = found?.id ?? (await ps.kc.createUser({ email, firstName: first, lastName: rest.join(' ') || undefined }));
@@ -236,7 +244,7 @@ export async function inviteUser(ps: PlatformService, p: Principal, req: InviteU
         `Hello${req.name ? ` ${req.name}` : ''},`,
         '',
         `${p.name} invited you to join ${result.org.name} on CloudTrain as ${roles.join(', ')}.`,
-        viaSso ? `Sign in with your ${result.org.name} account (single sign-on):` : kcCreated ? 'Accept the invitation, then set your password from the separate "Update your account" email:' : 'Accept the invitation:',
+        viaSso ? `Sign in with your ${ssoName ?? result.org.name} account (single sign-on):` : kcCreated ? 'Accept the invitation, then set your password from the separate "Update your account" email:' : 'Accept the invitation:',
         link,
         '',
         `This invitation expires on ${result.inv.expires_at.toISOString().slice(0, 10)}.`,
