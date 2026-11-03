@@ -235,11 +235,8 @@ const coreHandlers = [
 ];
 
 
-/**
- * Scenario Studio has no backend yet: in real API mode (VITE_API_MODE=real)
- * only these run in the browser and every other request goes to the gateway.
- */
-export const sampleOnlyHandlers = [
+/** Scenario Studio (no gateway backend yet: the screens are switched off with a real API). */
+const studioHandlers = [
   http.get('/api/studio/drafts', async () => {
     await latency();
     drafts.forEach(progressGates);
@@ -289,4 +286,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...publicHandlers, ...privacyHandlers, ...billingHandlers, ...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...eventHandlers, ...examHandlers, ...sampleOnlyHandlers];
+export const handlers = [...publicHandlers, ...privacyHandlers, ...billingHandlers, ...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...eventHandlers, ...examHandlers, ...studioHandlers];

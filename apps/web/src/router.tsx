@@ -5,7 +5,6 @@ import { NotFound } from './app/NotFound';
 import { RouteError } from './app/RouteError';
 import { PageSkeleton } from './components/ui';
 import { CatalogIndex, RootIndex } from './routes/site/Hybrid';
-import { ensureSampleMocks } from './mocks/sample';
 import { surfaceConfig, surfaceRedirect } from './lib/surface';
 
 // Screens that pull in React Flow or xterm are loaded on demand so the other
@@ -248,9 +247,9 @@ export const examResultsRoute = createRoute({ getParentRoute: () => rootRoute, p
 
 /* ------------------------------------------------------------------ author */
 
-// Real mode: Studio's sample data lives in MSW, registered on first use (mocks/sample.ts).
-export const studioRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio', beforeLoad: () => ensureSampleMocks(), component: Studio });
-export const studioDraftRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio/$draftId', beforeLoad: () => ensureSampleMocks(), component: StudioDraft });
+// Studio has no backend yet: with a real API the screens say so (ROUTE_ACCESS demoOnly).
+export const studioRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio', component: Studio });
+export const studioDraftRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio/$draftId', component: StudioDraft });
 
 /* ------------------------------------------------------------------ manager */
 

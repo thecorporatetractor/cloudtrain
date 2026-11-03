@@ -1,9 +1,9 @@
 import { setupWorker } from 'msw/browser';
-import { handlers, sampleOnlyHandlers } from './handlers';
+import { handlers } from './handlers';
 
-/** `sampleOnly`: real API mode, where MSW answers just the endpoints without a backend (team, studio). */
-export async function startMocks({ sampleOnly = false }: { sampleOnly?: boolean } = {}) {
-  const worker = setupWorker(...(sampleOnly ? sampleOnlyHandlers : handlers));
+/** Mock mode only: the whole API in the browser. A real-API build never starts a service worker. */
+export async function startMocks() {
+  const worker = setupWorker(...handlers);
   await worker.start({
     onUnhandledFrame: 'bypass',
     quiet: true,

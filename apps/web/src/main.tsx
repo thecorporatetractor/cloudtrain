@@ -20,6 +20,7 @@ import { queries } from './api/client';
 import { publicQueries } from './api/public';
 import { STATIC_SITE } from './lib/siteMode';
 import { isComingSoon } from './site/launch';
+import { removeMockWorkers } from './lib/mockWorker';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -35,11 +36,11 @@ function Mounted() {
 
 async function boot() {
   // The env check is inlined (not API_MODE) so the bundler drops the MSW chunk from builds that
-  // never start it; Rolldown does not constant-fold the imported const. In real mode the gateway
-  // serves everything except Scenario Studio, whose sample worker starts when a Studio route
-  // loads (mocks/sample.ts): no service worker sits in front of the public website.
+  // never start it; Rolldown does not constant-fold the imported const. In real mode no service
+  // worker runs at all; one left by an earlier build (Studio used to register a sample worker)
+  // is removed so it no longer sits in front of the app.
   if (import.meta.env.VITE_API_MODE === 'real') {
-    /* nothing at boot */
+    void removeMockWorkers(typeof navigator === 'undefined' ? undefined : navigator.serviceWorker);
   } else if (import.meta.env.DEV || import.meta.env.VITE_MOCK_API === '1') {
     const { startMocks } = await import('./mocks/browser');
     await startMocks();

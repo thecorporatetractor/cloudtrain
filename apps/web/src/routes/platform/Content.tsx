@@ -7,7 +7,7 @@ import { Badge, Card, EmptyState, ErrorState, TableSkeleton, TableWrap } from '@
 
 export function PlatformContent() {
   return (
-    <RequireAccess path="/platform">
+    <RequireAccess path="/platform/content">
       <Screen />
     </RequireAccess>
   );
