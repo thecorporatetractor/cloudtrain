@@ -100,7 +100,8 @@ describe('probes', () => {
     const a = await make({ postgres: async () => Promise.reject(new Error('connection refused')) });
     const r = await a.inject('/readyz');
     expect(r.statusCode).toBe(503);
-    expect(r.json()).toEqual({ ok: false, checks: { content: 'ok', postgres: 'connection refused' } });
+    expect(r.json()).toEqual({ ok: false, checks: { content: 'ok', postgres: 'failed' } });
+    expect(r.body).not.toContain('connection refused');
   });
 
   it('times out a hanging check', async () => {

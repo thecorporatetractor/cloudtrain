@@ -100,6 +100,8 @@ export interface ApiError {
   scope?: string;
   /** On 422: field -> message. On 429: the quota that was hit (`QuotaExceededDetails`). */
   details?: Record<string, unknown>;
+  /** On an unexpected 5xx: the id the gateway logged the error under (quote it to support). */
+  requestId?: string;
 }
 
 export interface QuotaExceededDetails {
