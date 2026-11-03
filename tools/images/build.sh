@@ -328,10 +328,28 @@ if [[ $GUEST == el-vm || $GUEST == ubuntu-vm ]]; then
   MIRROR="$CACHE/mirror/$MIRROR_SNAPSHOT"
   repo=$([[ $GUEST == el-vm ]] && echo el10 || echo noble)
   [[ -f $MIRROR/$repo/${repo}.lock ]] || die "no mirror content $MIRROR/$repo (run: task mirror:content)"
+  # A cache from an older lock builds without error but lacks packages, which only shows when a lab installs them.
+  lock_names() { grep -v '^#' "$1" | sed -E 's/=.*$//; s/-[0-9]+:[^:]*$//' | sort -u; }
+  missing=$(comm -23 <(lock_names "$REPO_ROOT/tools/mirrors/lock/${repo}.lock") <(lock_names "$MIRROR/$repo/${repo}.lock"))
+  [[ -z $missing ]] || die "mirror content $MIRROR/$repo lacks packages of tools/mirrors/lock/${repo}.lock: $(echo $missing | cut -c1-200) (run: task mirror:content)"
   rm -rf "$WORK/in/repo"; mkdir -p "$WORK/in/repo"
   cp -al "$MIRROR/$repo" "$WORK/in/repo/$repo" 2>/dev/null || cp -a "$MIRROR/$repo" "$WORK/in/repo/$repo"
   rm -f "$WORK/in/repo/$repo/.wanted" "$WORK/in/repo/$repo/.missing"
   cp "$REPO_ROOT/tools/mirrors/keys/cloudtrain-mirror.asc" "$WORK/in/"
+fi
+if [[ $GUEST == el-vm && ${LOCK_ONLY:-0} != 1 ]]; then
+  # Container image archives for labs that run Podman (ov-execution-environment-build): files only, the
+  # lab's setup installs Podman and `podman load`s them. Nothing is added to the other labs' environment.
+  bash "$HERE/build-ee-base.sh"
+  OCI_REGISTRY_IMAGE=$(yq -r '.images["oci-registry:3"].image' "$CATALOG")
+  LOAD_INTO_KIND=0 bash "$HERE/build-oci-registry.sh"
+  mkdir -p "$WORK/in/lab-images"
+  while read -r src name file; do
+    docker tag "$src" "localhost/$name"
+    docker save "localhost/$name" | gzip -9 > "$WORK/in/lab-images/$file"
+    docker rmi "localhost/$name" >/dev/null
+  done <<<"$OCI_REGISTRY_IMAGE ov-registry:3 ov-registry-3.tar.gz
+$EE_BASE_IMAGE ov-ee-base:1 ov-ee-base-1.tar.gz"
 fi
 [[ ${LOCK_ONLY:-0} == 1 ]] && { log "lock files ok"; exit 0; }
 

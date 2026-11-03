@@ -12,7 +12,10 @@ also ships ansible-rulebook and drools_jpy (Apache-2.0) with OpenJDK 17 from the
 (GPL-2.0 with the Classpath Exception) and psycopg (LGPL-3.0), as separate programs. The Docker
 host VM image (docker-vm:29) ships cosign, notation and Trivy (Apache-2.0) as unmodified release
 binaries, the BuildKit and buildkit-syft-scanner images (Apache-2.0) and an offline Trivy
-vulnerability DB (public advisory data, under each source's terms).
+vulnerability DB (public advisory data, under each source's terms). The Linux host VM image
+(el-vm:10) ships two container image archives for a lab: the CNCF Distribution registry
+(Apache-2.0) and an execution environment base with ansible-core and community.general
+(GPL-3.0-or-later) as separate programs with their licence texts.
 
 ## JavaScript / TypeScript (pnpm workspace)
 
@@ -60,7 +63,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | @fontsource-variable/jetbrains-mono | 5.3.0 | OFL-1.1 |
 | @jsep-plugin/assignment | 1.4.0 | MIT |
 | @jsep-plugin/regex | 1.1.0 | MIT |
-| @kubernetes/client-node | 2.0.0 | Apache-2.0 |
+| @kubernetes/client-node | 2.0.1 | Apache-2.0 |
 | @nodable/entities | 3.1.0 | MIT |
 | @pinojs/redact | 0.4.0 | MIT |
 | @radix-ui/primitive | 1.2.0 | MIT |
@@ -97,11 +100,11 @@ vulnerability DB (public advisory data, under each source's terms).
 | @radix-ui/react-visually-hidden | 1.2.13 | MIT |
 | @radix-ui/rect | 1.1.3 | MIT |
 | @tanstack/history | 1.162.5 | MIT |
-| @tanstack/query-core | 5.104.2 | MIT |
-| @tanstack/react-query | 5.104.2 | MIT |
-| @tanstack/react-router | 1.170.44 | MIT |
+| @tanstack/query-core | 5.104.5 | MIT |
+| @tanstack/react-query | 5.104.5 | MIT |
+| @tanstack/react-router | 1.170.46 | MIT |
 | @tanstack/react-store | 0.11.2 | MIT |
-| @tanstack/router-core | 1.171.37 | MIT |
+| @tanstack/router-core | 1.171.39 | MIT |
 | @tanstack/store | 0.11.2 | MIT |
 | @types/d3-color | 3.1.3 | MIT |
 | @types/d3-drag | 3.0.7 | MIT |
@@ -110,7 +113,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | @types/d3-transition | 3.0.9 | MIT |
 | @types/d3-zoom | 3.0.9 | MIT |
 | @types/js-yaml | 4.0.9 | MIT |
-| @types/node | 22.20.5, 25.9.9, 26.6.5 | MIT |
+| @types/node | 22.20.5, 25.9.9, 26.6.6 | MIT |
 | @types/react | 19.3.0 | MIT |
 | @types/react-dom | 19.3.0 | MIT |
 | @types/stream-buffers | 3.0.8 | MIT |
@@ -125,7 +128,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | ajv-formats | 3.0.1 | MIT |
 | anynum | 1.0.1 | MIT |
 | apache-arrow | 21.2.0 | Apache-2.0 |
-| argparse | 2.0.1 | Python-2.0 |
+| argparse | 3.0.4 | PSF-2.0 |
 | aria-hidden | 1.2.6 | MIT |
 | asynckit | 0.4.0 | MIT |
 | atomic-sleep | 1.0.0 | MIT |
@@ -198,7 +201,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | http-proxy-agent | 7.0.2 | MIT |
 | https-proxy-agent | 7.0.6 | MIT |
 | inherits | 2.0.4 | ISC |
-| ip-address | 10.7.4 | MIT |
+| ip-address | 10.7.5 | MIT |
 | ipaddr.js | 2.5.0 | MIT |
 | is-docker | 3.0.0 | MIT |
 | is-in-ssh | 1.0.0 | MIT |
@@ -207,8 +210,8 @@ vulnerability DB (public advisory data, under each source's terms).
 | is-wsl | 3.1.1 | MIT |
 | isbot | 5.2.2 | Unlicense |
 | isomorphic-ws | 5.0.0 | MIT |
-| jose | 6.2.12 | MIT |
-| js-yaml | 5.4.3 | MIT |
+| jose | 6.2.13 | MIT |
+| js-yaml | 5.5.0 | MIT |
 | jsep | 1.6.0 | MIT |
 | json-schema-ref-resolver | 3.0.1 | MIT |
 | json-schema-traverse | 1.0.0 | MIT |
@@ -218,7 +221,7 @@ vulnerability DB (public advisory data, under each source's terms).
 | jwa | 2.0.1 | MIT |
 | jws | 4.0.1 | MIT |
 | jwt-decode | 4.0.0 | MIT |
-| kysely | 0.29.6 | MIT |
+| kysely | 0.29.7 | MIT |
 | lenis | 1.3.27 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
 | lodash.includes | 4.3.0 | MIT |
@@ -228,12 +231,12 @@ vulnerability DB (public advisory data, under each source's terms).
 | lodash.isplainobject | 4.0.6 | MIT |
 | lodash.isstring | 4.0.1 | MIT |
 | lodash.once | 4.1.1 | MIT |
-| lucide-react | 1.57.0 | ISC |
+| lucide-react | 1.61.0 | ISC |
 | math-intrinsics | 1.1.0 | MIT |
 | mime-db | 1.52.0 | MIT |
 | mime-types | 2.1.35 | MIT |
 | ms | 2.1.3 | MIT |
-| nodemailer | 10.1.4 | MIT-0 |
+| nodemailer | 10.2.1 | MIT-0 |
 | oauth4webapi | 3.8.8 | MIT |
 | on-exit-leak-free | 2.1.2 | MIT |
 | once | 1.4.0 | ISC |
@@ -259,11 +262,11 @@ vulnerability DB (public advisory data, under each source's terms).
 | process-warning | 5.1.1 | MIT |
 | pump | 3.0.4 | MIT |
 | quick-format-unescaped | 4.0.4 | MIT |
-| react | 19.3.0 | MIT |
-| react-dom | 19.3.0 | MIT |
+| react | 19.3.1 | MIT |
+| react-dom | 19.3.1 | MIT |
 | react-remove-scroll | 2.7.2 | MIT |
 | react-remove-scroll-bar | 2.3.8 | MIT |
-| react-resizable-panels | 4.14.4 | MIT |
+| react-resizable-panels | 4.15.0 | MIT |
 | react-style-singleton | 2.2.3 | MIT |
 | readable-stream | 3.6.2 | MIT |
 | real-require | 1.0.0 | MIT |
@@ -279,8 +282,8 @@ vulnerability DB (public advisory data, under each source's terms).
 | scheduler | 0.28.0 | MIT |
 | secure-json-parse | 4.1.1 | BSD-3-Clause |
 | semver | 7.8.5 | ISC |
-| seroval | 1.6.9 | MIT |
-| seroval-plugins | 1.6.9 | MIT |
+| seroval | 1.7.6 | MIT |
+| seroval-plugins | 1.7.6 | MIT |
 | set-cookie-parser | 3.1.3 | MIT |
 | smart-buffer | 4.2.0 | MIT |
 | socks | 2.8.10 | MIT |

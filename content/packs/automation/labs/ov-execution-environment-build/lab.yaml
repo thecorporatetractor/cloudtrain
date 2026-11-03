@@ -7,7 +7,7 @@ metadata:
   frameworks: [ex374-aligned:execution-environments]
   difficulty: hard
   estimatedMinutes: 45
-  tags: [ansible, execution-environments, ansible-builder, podman, tier-c, blocked]
+  tags: [ansible, execution-environments, ansible-builder, podman, tier-c]
   version: 1
 spec:
   description: |
@@ -53,9 +53,8 @@ spec:
         rpm -q rsync >/dev/null 2>&1 || dnf -y -q install rsync >/dev/null
         loginctl enable-linger ovauto
         grep -q '^ovauto:' /etc/subuid || usermod --add-subuids 200000-265535 --add-subgids 200000-265535 ovauto
-        for i in ov-registry:3 ov-ee-base:1; do
-          podman image exists localhost/$i || { echo "blocked: image localhost/$i is not preloaded in this el-vm image (needs the registry image and the mirrored EE base image)" >&2; exit 1; }
-        done
+        podman image exists localhost/ov-registry:3 || podman load -q -i /opt/cloudtrain/lab-images/ov-registry-3.tar.gz >/dev/null
+        podman image exists localhost/ov-ee-base:1 || podman load -q -i /opt/cloudtrain/lab-images/ov-ee-base-1.tar.gz >/dev/null
         podman run -d --name ov-registry --restart=always -p 5000:5000 localhost/ov-registry:3 >/dev/null
         printf '[[registry]]\nlocation = "ov-ee-1:5000"\ninsecure = true\n' > /etc/containers/registries.conf.d/ov-registry.conf
         podman tag localhost/ov-ee-base:1 ov-ee-1:5000/ov/ee-base:1
@@ -200,6 +199,12 @@ spec:
             - src: collections/orrinvale-claims-1.0.0.tar.gz
               dest: collections
           EOF
+          cat > requirements.yml <<'EOF'
+          collections:
+            - name: collections/orrinvale-claims-1.0.0.tar.gz
+              type: file
+          EOF
+          echo jmespath > requirements.txt
           ansible-builder create -f execution-environment.yml --context context
     - id: no-collection
       description: "Builds an environment with the Python package but without the claims collection."
@@ -230,7 +235,7 @@ spec:
           echo jmespath > requirements.txt
           ansible-builder create -f execution-environment.yml --context context
           rsync -a --delete context/ ov-ee-1:ee-context/
-          ssh ov-ee-1 'cd ee-context && sudo podman build -f Containerfile -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
+          ssh ov-ee-1 'cd ee-context && sudo podman build -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
           ssh ov-ee-1 'sudo podman push --tls-verify=false ov-ee-1:5000/ov/claims-ee:{{eetag}}'
           mkdir -p artifacts
           rsync -a --exclude context --exclude artifacts ./ ov-ee-1:ee-run/
@@ -269,7 +274,7 @@ spec:
           echo jmespath > requirements.txt
           ansible-builder create -f execution-environment.yml --context context
           rsync -a --delete context/ ov-ee-1:ee-context/
-          ssh ov-ee-1 'cd ee-context && sudo podman build -f Containerfile -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
+          ssh ov-ee-1 'cd ee-context && sudo podman build -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
           ssh ov-ee-1 'sudo podman push --tls-verify=false ov-ee-1:5000/ov/claims-ee:{{eetag}}'
           mkdir -p artifacts
           rsync -a --exclude context --exclude artifacts ./ ov-ee-1:ee-run/
@@ -305,7 +310,7 @@ spec:
               echo jmespath > requirements.txt
               ansible-builder create -f execution-environment.yml --context context
               rsync -a --delete context/ ov-ee-1:ee-context/
-              ssh ov-ee-1 'cd ee-context && sudo podman build -f Containerfile -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
+              ssh ov-ee-1 'cd ee-context && sudo podman build -t ov-ee-1:5000/ov/claims-ee:{{eetag}} .'
               ssh ov-ee-1 'sudo podman push --tls-verify=false ov-ee-1:5000/ov/claims-ee:{{eetag}}; sudo podman tag ov-ee-1:5000/ov/claims-ee:{{eetag}} ov-ee-1:5000/ov/claims-ee:latest'
               mkdir -p artifacts
               rsync -a --exclude context --exclude artifacts ./ ov-ee-1:ee-run/
