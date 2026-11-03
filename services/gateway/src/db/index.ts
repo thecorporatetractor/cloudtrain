@@ -75,7 +75,11 @@ export async function migrateToLatest(ownerDb: Kysely<unknown>, appRole = 'cloud
     const { error, results } = await migrator.migrateUp();
     if (error) throw error instanceof Error ? error : new Error(String(error));
     const done = (results ?? []).filter((r) => r.status === 'Success').map((r) => r.migrationName);
-    if (done.length === 0) return applied;
+    if (done.length === 0) break;
     applied.push(...done);
   }
+  // The gateway (app role) waits on this list before it serves (src/db/role.ts, waitForSchema).
+  // After the loop, not inside it: the loop only ends here, so the grant is never skipped.
+  await sql`GRANT SELECT ON kysely_migration TO ${sql.id(appRole)}`.execute(ownerDb);
+  return applied;
 }

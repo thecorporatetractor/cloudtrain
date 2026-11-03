@@ -112,8 +112,8 @@ stringData:
   {{- end }}
   {{- if not .Values.postgres.demo.enabled }}
   CT_DATABASE_URL: {{ required "gateway.secrets.databaseUrl is required (or postgres.demo.enabled)" $g.secrets.databaseUrl | quote }}
-  {{- with $g.secrets.databaseOwnerUrl }}
-  CT_DATABASE_OWNER_URL: {{ . | quote }}
+  {{- if $g.migrate }}
+  CT_DATABASE_OWNER_URL: {{ required "gateway.secrets.databaseOwnerUrl is required with gateway.migrate (the migrate Job runs as the schema owner)" $g.secrets.databaseOwnerUrl | quote }}
   {{- end }}
   {{- end }}
 {{- end }}
@@ -167,10 +167,11 @@ spec:
       {{- include "ct.podSecurity" . | nindent 6 }}
       {{- if $g.migrate }}
       initContainers:
-        - name: migrate
+        # Waits, as the app role, until the migrate Job has applied this build's migrations.
+        - name: wait-for-schema
           image: {{ include "ct.image" (list . $g) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
-          args: [dist/db/cli.js, migrate]
+          args: [dist/db/cli.js, wait]
           env:
             {{- include "ct.gatewayDbEnv" . | nindent 12 }}
           {{- include "ct.containerSecurity" . | nindent 10 }}
@@ -266,4 +267,41 @@ spec:
                   matchLabels:
                     {{- include "ct.selector" (list . "gateway") | nindent 20 }}
         {{- end }}
+{{- if $g.migrate }}
+---
+{{- /*
+  Schema migrations as the owner role, in a Job of their own: the gateway pods
+  never see owner credentials. The name carries a hash of the whole pod
+  template (labels included), so a new image (or new settings) runs a new Job
+  and an unchanged release keeps the finished one; a Job's template is
+  immutable, so nothing in it may change under the same name. The pod template
+  carries fixed labels only (no chart version): a chart bump alone neither
+  renames the Job nor changes its template. The gateway's wait-for-schema init
+  container holds the rollout until it is done. A Job that failed for good
+  keeps its name too, so it is never retried by itself: bump
+  gateway.migrateRetry (hashed into the name) or delete the Job (docs/deploy.md).
+*/}}
+{{- $tag := $g.image.tag | default .Values.global.imageTag | default .Chart.AppVersion }}
+{{- if and (has $tag (list "main" "latest")) (not $g.migrateMutableTag) }}
+{{- fail (printf "gateway.migrate needs an immutable image tag (a release version or sha-<commit>), not %q: the migrate Job is named by the image reference, so a new build under the same tag would never be migrated. Set global.imageTag (or gateway.image.tag), or gateway.migrateMutableTag=true for development and bump gateway.migrateRetry after each new build (docs/deploy.md)." $tag) }}
+{{- end }}
+{{- $podTemplate := printf "metadata:\n  labels:\n    app.kubernetes.io/part-of: cloudtrain\n    app.kubernetes.io/instance: %s\n    app.kubernetes.io/managed-by: %s\n    app.kubernetes.io/component: gateway-migrate\nspec:\n%s" .Release.Name .Release.Service (include "ct.gatewayMigrateSpec" (dict "ctx" . "name" $name) | indent 2) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-migrate-%s" $name (printf "%s\nretry=%v" $podTemplate ($g.migrateRetry | default 0) | sha256sum | trunc 8) }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-migrate
+  annotations:
+    # The finished Job is kept on purpose: it is what keeps an unchanged release
+    # from running the migrations again. With a TTL, every upgrade after it
+    # expired would re-create and re-run the (idempotent) Job.
+    ignore-check.kube-linter.io/job-ttl-seconds-after-finished: "kept so an unchanged release does not re-run the migrations"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 1800
+  template:
+    {{- $podTemplate | nindent 4 }}
+{{- end }}
 {{- end }}
