@@ -1,10 +1,10 @@
 import { Link } from '@tanstack/react-router';
 import { Construction, Lock } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { useMe } from '@/api/client';
+import { ApiError, useMe } from '@/api/client';
 import { isRealApi } from '@/api/mode';
 import type { Me, Permission } from '@/api/types';
-import { EmptyState, PageSkeleton } from '@/components/ui';
+import { EmptyState, ErrorState, PageSkeleton } from '@/components/ui';
 
 /**
  * Screens that are not for everyone. The UI only hides; the gateway enforces.
@@ -83,9 +83,30 @@ export function RequireAccess({ path, children }: { path: string; children: Reac
       </div>
     );
   }
+  // A failed /api/me is not a missing permission: say so and offer a retry.
+  if (accountLoadFailed(me)) return <AccountUnavailable error={me.error} onRetry={() => void me.refetch()} />;
   if (isUnavailable(path)) return <NotAvailable path={path} />;
   if (!canAccess(me.data, path)) return <Forbidden path={path} />;
   return <>{children}</>;
+}
+
+/**
+ * `/api/me` failed with nothing cached, for a reason a retry may fix. Not when signed out (401)
+ * or refused (403: the principal lacks progress.read.self): those keep the forbidden page,
+ * since "could not reach the server, try again" would be wrong and retrying cannot help.
+ */
+export const accountLoadFailed = (me: { data?: Me; isError: boolean; error: unknown }) => me.isError && me.data === undefined && !(me.error instanceof ApiError && (me.error.status === 401 || me.error.status === 403));
+
+/** Shown in place of an app page while the account cannot be loaded (cold gateway, network). */
+export function AccountUnavailable({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  return (
+    <div className="page page-narrow">
+      <ErrorState title="Could not load your account" error={error} onRetry={onRetry} />
+      <p className="small muted" style={{ textAlign: 'center' }}>
+        CloudTrain could not reach its server. Your labs keep running; try again in a moment.
+      </p>
+    </div>
+  );
 }
 
 export function Forbidden({ path, permission }: { path?: string; permission?: string }) {

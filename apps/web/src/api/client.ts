@@ -88,6 +88,14 @@ export interface SkillsData {
   ctf?: CtfTotals;
 }
 
+/**
+ * `/api/me` retries anything but a 401/403 for about half a minute (1, 2, 4, 8, 16 s): a
+ * cold gateway after a scale-to-zero or a deploy answers 5xx or not at all for a while,
+ * and without a principal the app has no navigation and no CSRF token.
+ */
+export const ME_RETRIES = 5;
+export const retryMe = (count: number, err: unknown) => !(err instanceof ApiError && (err.status === 401 || err.status === 403)) && count < ME_RETRIES;
+
 export const queries = {
   me: () =>
     queryOptions({
@@ -100,7 +108,7 @@ export const queries = {
         return me;
       },
       staleTime: 5 * 60_000,
-      retry: (count, err) => !(err instanceof ApiError && (err.status === 401 || err.status === 403)) && count < 1,
+      retry: retryMe,
       // A visitor's 401 is a stable answer: every component mounting useMe() must not refetch it.
       retryOnMount: false,
     }),

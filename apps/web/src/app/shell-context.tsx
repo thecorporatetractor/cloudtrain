@@ -25,9 +25,15 @@ interface ShellState {
   /** Screen-specific shortcut groups shown in the cheatsheet. */
   extraShortcuts: ShortcutGroup[];
   setExtraShortcuts: (g: ShortcutGroup[]) => void;
-  toast: (t: { title: string; description?: string; tone?: 'ok' | 'warn' | 'err' | 'neutral' }) => void;
+  /** A toast with an `action` (e.g. Try again) stays until it is used or dismissed. */
+  toast: (t: { title: string; description?: string; tone?: 'ok' | 'warn' | 'err' | 'neutral'; action?: ToastAction }) => void;
   toasts: ToastItem[];
   dismissToast: (id: number) => void;
+}
+
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
 }
 
 export interface ToastItem {
@@ -35,7 +41,11 @@ export interface ToastItem {
   title: string;
   description?: string;
   tone: 'ok' | 'warn' | 'err' | 'neutral';
+  action?: ToastAction;
 }
+
+/** How long a toast stays; one with an action (a retry) stays until used or dismissed (WCAG 2.2.1). */
+export const autoDismissMs = (t: { action?: ToastAction }): number | undefined => (t.action ? undefined : 4200);
 
 const Ctx = createContext<ShellState | null>(null);
 
@@ -73,10 +83,11 @@ export function ShellProvider({ children }: { children: ReactNode }) {
 
   const dismissToast = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), []);
   const toast = useCallback<ShellState['toast']>(
-    ({ title, description, tone = 'neutral' }) => {
+    ({ title, description, tone = 'neutral', action }) => {
       const id = Date.now() + Math.random();
-      setToasts((t) => [...t.slice(-3), { id, title, description, tone }]);
-      window.setTimeout(() => dismissToast(id), 4200);
+      setToasts((t) => [...t.slice(-3), { id, title, description, tone, action }]);
+      const ms = autoDismissMs({ action });
+      if (ms !== undefined) window.setTimeout(() => dismissToast(id), ms);
     },
     [dismissToast],
   );

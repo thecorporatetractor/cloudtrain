@@ -6,11 +6,15 @@ import { PersistedGroup } from '@/components/ui/panels';
 import { useAttempt, useFlagTask, useSubmitExam } from '@/api/exams';
 import type { ExamAttemptState, ExamTaskView, ExamTerminalTarget } from '@/api/types';
 import { ExamTerminal } from '@/components/exams/ExamTerminal';
+import { AutoSubmitFailed, SubmitFailed } from '@/components/exams/SubmitErrors';
 import { Disclaimer, ExamTimer, PhaseBadge, useServerClock } from '@/components/exams/ui';
 import { Prose } from '@/components/prose';
 import { Badge, Button, Dialog, ErrorState, Meter, Skeleton, Tooltip } from '@/components/ui';
 import { examAttemptRoute } from '@/router';
 import { useMediaQuery } from '@/lib/media';
+import { attemptErrorPage, attemptLoadError, errorToast, loadView } from '@/lib/loadState';
+import { useShell } from '@/app/shell-context';
+import { ConnectionBanner } from '@/components/workspace/ConnectionBanner';
 import { cn } from '@/lib/utils';
 import { RequireAccess } from '@/app/access';
 
@@ -167,6 +171,7 @@ function ExamWorkspaceScreen() {
   const flag = useFlagTask(attemptId);
   const submit = useSubmitExam(attemptId);
   const navigate = useNavigate();
+  const { toast } = useShell();
   const now = useServerClock(attempt.data?.serverTime);
   const { visited, visit } = useVisited(attemptId);
   const [current, setCurrent] = useState(1);
@@ -204,10 +209,27 @@ function ExamWorkspaceScreen() {
       </div>
     );
   }
-  if (attempt.isError || !a) {
+  const view = loadView(attempt);
+  // An attempt that never loaded is an error page. A failed background poll keeps the exam and
+  // its terminals mounted (the clock keeps running) with a banner, unless it answers 403/404:
+  // access is gone or the attempt was removed, and no reconnect will bring it back.
+  if (attemptErrorPage(view, attempt.error) || !a) {
+    const copy = attemptLoadError(attempt.error);
     return (
       <div className="page page-narrow">
-        <ErrorState title="Attempt unavailable" error={attempt.error} onRetry={() => void attempt.refetch()} />
+        <ErrorState title={copy.title} error={attempt.error} onRetry={() => void attempt.refetch()} />
+        <p className="small muted" style={{ textAlign: 'center' }}>
+          {copy.description}{' '}
+          {a ? (
+            <Link to="/exams/$examId" params={{ examId: a.examId }} className="link-quiet">
+              Back to the exam
+            </Link>
+          ) : (
+            <Link to="/exams" className="link-quiet">
+              Back to exams
+            </Link>
+          )}
+        </p>
       </div>
     );
   }
@@ -216,6 +238,15 @@ function ExamWorkspaceScreen() {
   const flaggedTasks = a.tasks.filter((t) => t.flagged);
   const unopened = a.tasks.filter((t) => !visited.has(t.index));
   const closed = a.phase !== 'in-progress' || timeUp;
+  const banner = view === 'stale' && <ConnectionBanner what="the exam service" error={attempt.error} retrying={attempt.isFetching} onRetry={() => void attempt.refetch()} />;
+  const submitNow = () => submit.mutate(undefined, { onSuccess: () => setConfirm(false) });
+  // The dialog starts clean each time: an old failure is not shown as the current state.
+  // Not once time is up: the failed auto-submit drives the time-up overlay's "Submit again",
+  // and the auto-submit effect does not fire twice, so a reset would hide the only retry.
+  const openConfirm = (open: boolean) => {
+    if (!submit.isPending && !timeUp) submit.reset();
+    setConfirm(open);
+  };
 
   const header = (
     <header className="exam-ws-header">
@@ -232,18 +263,24 @@ function ExamWorkspaceScreen() {
       <div className="row" style={{ gap: 10 }}>
         <ExamTimer deadline={a.deadline} now={now} durationMinutes={a.durationMinutes} />
         {a.phase === 'in-progress' && (
-          <Button variant="primary" size="sm" icon={<Send size={13} />} disabled={timeUp} loading={submit.isPending} onClick={() => setConfirm(true)}>
+          <Button variant="primary" size="sm" icon={<Send size={13} />} disabled={timeUp} loading={submit.isPending} onClick={() => openConfirm(true)}>
             Submit exam
           </Button>
         )}
       </div>
     </header>
   );
+  const top = (
+    <>
+      {header}
+      {banner}
+    </>
+  );
 
   if (a.phase === 'preparing') {
     return (
       <div className="exam-ws">
-        {header}
+        {top}
         <StateCard>
           <div className="row" style={{ gap: 8 }}>
             <Loader2 size={16} className="spin subtle" aria-hidden />
@@ -265,7 +302,7 @@ function ExamWorkspaceScreen() {
   if (a.phase === 'failed') {
     return (
       <div className="exam-ws">
-        {header}
+        {top}
         <StateCard>
           <div className="row" style={{ gap: 8 }}>
             <AlertTriangle size={16} className="text-warn" />
@@ -285,7 +322,7 @@ function ExamWorkspaceScreen() {
   if (a.phase === 'grading' || a.phase === 'completed') {
     return (
       <div className="exam-ws">
-        {header}
+        {top}
         <StateCard>
           <div className="row" style={{ gap: 8 }}>
             {a.phase === 'grading' ? <Loader2 size={16} className="spin subtle" aria-hidden /> : <CheckCircle2 size={16} className="text-ok" />}
@@ -315,7 +352,7 @@ function ExamWorkspaceScreen() {
 
   return (
     <div className="exam-ws">
-      {header}
+      {top}
       <Navigator tasks={a.tasks} current={task?.index ?? 1} visited={visited} onSelect={setCurrent} />
       <div className="exam-ws-body">
         <PersistedGroup key={String(stacked)} orientation={stacked ? 'vertical' : 'horizontal'} storageId={stacked ? 'ct.exam.stacked' : 'ct.exam.h'}>
@@ -326,7 +363,7 @@ function ExamWorkspaceScreen() {
                 total={a.tasks.length}
                 flagEnabled={a.rules.flagForReview}
                 flagging={flag.isPending && flag.variables?.index === task.index}
-                onFlag={(f) => flag.mutate({ index: task.index, flagged: f })}
+                onFlag={(f) => flag.mutate({ index: task.index, flagged: f }, { onError: (e) => toast(errorToast(f ? 'Could not flag the task' : 'Could not remove the flag', e)) })}
                 onMove={(d) => setCurrent((c) => Math.min(a.tasks.length, Math.max(1, c + d)))}
               />
             )}
@@ -341,8 +378,14 @@ function ExamWorkspaceScreen() {
                     <Lock size={16} />
                     <h2>Time is up</h2>
                   </div>
-                  <p className="small muted">Your work has been submitted automatically and the environment is closing. Grading starts in a moment.</p>
-                  <Loader2 size={16} className="spin subtle" aria-hidden />
+                  {submit.isError ? (
+                    <AutoSubmitFailed error={submit.error} retrying={submit.isPending} onRetry={() => submit.mutate()} />
+                  ) : (
+                    <>
+                      <p className="small muted">Your work has been submitted automatically and the environment is closing. Grading starts in a moment.</p>
+                      <Loader2 size={16} className="spin subtle" aria-hidden />
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -350,7 +393,7 @@ function ExamWorkspaceScreen() {
         </PersistedGroup>
       </div>
 
-      <Dialog open={confirm} onOpenChange={setConfirm} title="Submit your exam?" description="Submitting ends the exam for good: the environment closes and your work is graded. You cannot come back to it.">
+      <Dialog open={confirm} onOpenChange={openConfirm} title="Submit your exam?" description="Submitting ends the exam for good: the environment closes and your work is graded. You cannot come back to it.">
         <div className="stack" style={{ gap: 10 }}>
           {flaggedTasks.length > 0 && (
             <p className="small row" style={{ gap: 6 }}>
@@ -367,21 +410,18 @@ function ExamWorkspaceScreen() {
               Time left: <ExamTimer deadline={a.deadline} now={now} durationMinutes={a.durationMinutes} />
             </p>
           )}
+          {submit.isError && <SubmitFailed error={submit.error} />}
           <div className="row" style={{ gap: 8, justifyContent: 'flex-end', marginTop: 6 }}>
-            <Button variant="ghost" onClick={() => setConfirm(false)}>
+            <Button variant="ghost" onClick={() => openConfirm(false)}>
               Keep working
             </Button>
             <Button
               variant="danger"
               icon={<Send size={13} />}
               loading={submit.isPending}
-              onClick={() =>
-                submit.mutate(undefined, {
-                  onSuccess: () => setConfirm(false),
-                })
-              }
+              onClick={submitNow}
             >
-              Submit and end the exam
+              {submit.isError ? 'Try again' : 'Submit and end the exam'}
             </Button>
           </div>
         </div>
