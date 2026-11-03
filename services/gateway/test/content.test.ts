@@ -181,3 +181,23 @@ describe.skipIf(!existsSync(labctl))('labctl compiler', () => {
     await expect(new LabctlCompiler(labctl).compile(path.join(repo, 'package.json'))).rejects.toThrow(/labctl compile/);
   });
 });
+
+describe('answer patterns at load time', () => {
+  it('refuses a lab whose regex answer is outside the shared RE2 subset', async () => {
+    const { mkdtemp, mkdir, readFile, writeFile, rm } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const { loadContent } = await import('../src/content/load.js');
+    const src = await readFile(path.join(repo, 'content/packs/linux/labs/ctf-ticket-gate-breach/lab.yaml'), 'utf8');
+    const bad = src.replace('value: "python-requests/2\\\\.{{uaminor}}(\\\\.0)?"', 'value: "python-requests/(?=2)2\\\\.{{uaminor}}"');
+    expect(bad).not.toBe(src);
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'ct-regex-'));
+    try {
+      await mkdir(path.join(dir, 'bad-lab'));
+      await writeFile(path.join(dir, 'bad-lab', 'lab.yaml'), bad);
+      const c = await loadContent(path.join(repo, 'content'), [dir]);
+      expect(c.issues).toEqual([expect.objectContaining({ message: expect.stringMatching(/answer pattern: .*lookaround/) })]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

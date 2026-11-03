@@ -5,6 +5,8 @@
  * proves exactly what learners are graded with.
  */
 
+import { LinearRegex, RegexSyntaxError } from './linear-regex.js';
+
 export type AnswerMatch = 'exact' | 'number' | 'regex' | 'any-of';
 export type AnswerWhitespace = 'trim' | 'collapse' | 'remove' | 'none';
 
@@ -54,6 +56,39 @@ export function parseNumber(s: string): number | undefined {
 
 export class BrokenAnswerError extends Error {}
 
+const compiled = new Map<string, LinearRegex>();
+const MAX_CACHED = 512;
+
+/**
+ * Compiles an answer pattern for the linear-time engine (see linear-regex.ts):
+ * JavaScript's backtracking RegExp never runs it, so no pattern, however
+ * written, templated or computed, can stall the gateway. Throws
+ * RegexSyntaxError for a pattern outside the subset Go RE2 and JavaScript
+ * share.
+ */
+export function compileAnswerPattern(pattern: string, caseSensitive: boolean): LinearRegex {
+  const key = `${caseSensitive ? 's' : 'i'}:${pattern}`;
+  let re = compiled.get(key);
+  if (re) return re;
+  // The engine's parser accepts only the subset Go RE2 and JavaScript share (no JavaScript RegExp
+  // is built from the pattern, not even to check its syntax).
+  re = new LinearRegex(pattern, { caseInsensitive: !caseSensitive });
+  if (compiled.size >= MAX_CACHED) compiled.delete(compiled.keys().next().value!);
+  compiled.set(key, re);
+  return re;
+}
+
+/** Why `pattern` cannot be an answer pattern, or null. */
+export function answerPatternProblem(pattern: string): string | null {
+  try {
+    compileAnswerPattern(pattern, true);
+    return null;
+  } catch (e) {
+    if (e instanceof RegexSyntaxError) return e.message;
+    throw e;
+  }
+}
+
 /**
  * Whether `submitted` matches one of `expected`. Throws BrokenAnswerError when
  * the lab itself is broken (an expected number that does not parse, an
@@ -77,11 +112,12 @@ export function matchAnswer(rules: MatchRules, expected: string[], submitted: st
       return Math.abs(have - want) <= tol + 1e-9 * Math.max(1, Math.abs(want));
     }
     case 'regex': {
-      let re: RegExp;
+      let re: LinearRegex;
       try {
-        re = new RegExp(`^(?:${expected[0]})$`, cs ? '' : 'i');
+        re = compileAnswerPattern(expected[0]!, cs);
       } catch (e) {
-        throw new BrokenAnswerError(`invalid regex: ${(e as Error).message}`);
+        if (e instanceof RegexSyntaxError) throw new BrokenAnswerError(`invalid regex: ${e.message}`);
+        throw e;
       }
       return re.test(got);
     }

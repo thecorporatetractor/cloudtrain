@@ -69,7 +69,7 @@ is ASCII whitespace plus the no-break space), then lower-cased unless
 |---|---|---|
 | `exact` | `value` or computed output | the normalised answer equals the normalised expected value |
 | `number` | `value` or computed output (a decimal number) | a plain decimal number (sign, fraction, exponent; no hex, `Infinity` or thousands separators) within `tolerance` (absolute, default 0) |
-| `regex` | `value` (a pattern) or computed output | the normalised answer **fully** matches the pattern (`^(?:...)$`), case-insensitive unless `caseSensitive`. Use the subset Go RE2 and JavaScript share: no lookaround or backreferences. Template values are inserted verbatim; escape dots in IPs and versions (`2\\.{{minor}}`) |
+| `regex` | `value` (a pattern) or computed output | the normalised answer **fully** matches the pattern (`^(?:...)$`), case-insensitive unless `caseSensitive`. Use the subset Go RE2 and JavaScript share: no lookaround, backreferences, inline flags (`(?i)`), POSIX classes (`[[:alpha:]]`), possessive quantifiers, `\u` escapes (write `\xHH`) or a leading `]` in a class; repeat counts up to 1000. Semantics are Go's: `.` is any character but newline, `\s` is `[\t\n\f\r ]`, `\d` and `\w` are ASCII. The gateway runs patterns on its own linear-time matcher (never on JavaScript's backtracking engine), so any pattern is safe to grade with; a pattern outside the subset, or one that expands to more than 5000 states, fails the lab at load time. Template values are inserted verbatim; escape dots in IPs and versions (`2\\.{{minor}}`) |
 | `any-of` | `values`, or each non-empty line of the computed output | equal to any one of them |
 
 The Go matcher (`services/lab-orchestrator/internal/answer`, used by `labctl
