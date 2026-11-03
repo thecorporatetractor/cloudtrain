@@ -278,7 +278,7 @@ authorized_keys and a NOPASSWD drop-in; ansible.cfg remote_user ovauto):
 | ov-automate-cron-timers | db-1, db-2 + web1 | cron service stopped in setup |
 | ov-reboot-persistence-fix | web1, web2 | persistent vs running state |
 | ov-async-patching | db-1, db-2 | `ov-patch` sleeps; boot-id graded; longest lab |
-| ov-execution-environment-build | ov-ee-1 (podman) | BLOCKED, see below |
+| ov-execution-environment-build | ov-ee-1 (podman) | verified, see below |
 
 Network labs (frr:10 routers linked to ov-ctl on eth3, bridged by `ct-fleet-net`; OSPF between
 routers on eth1/eth2): ov-net-inventory-facts, ov-net-ospf-branch-config,
@@ -300,7 +300,7 @@ Blockers per lab:
 | Lab | Blocker |
 |---|---|
 | ov-system-role-timesync | fixed in the image (2026-10-19): `fedora.linux_system_roles` 2.5.0 is in `ansible-ctl:2.21` and the Ansible mirror; the setup guard still exists and now passes. Minor still open: the uses-role scan stops at the first `include_role` |
-| ov-execution-environment-build | still blocked, see "Image gaps closed" below for the exact remaining work; the base image must ship community.general |
+| ov-execution-environment-build | verified on el-vm:10, see "Image gaps closed" below |
 | ov-net-inventory-facts, ov-net-ospf-branch-config, ov-net-branch-template-role, ov-net-parse-neighbors | fixed in the image (2026-10-19): `frr:10` now has openssh-server, sudo, shadow (useradd) and python3. The labs use the plain `ssh` connection, so no network collection is needed. Content finding: ov-net-inventory-facts alternative `template-file` reports `changed=3` on the grader's re-run |
 | ov-net-srlinux-interfaces | `frr:10` gap fixed; `srlinux:25` is still not in the catalog (the FRR-only VLAN fallback stays) |
 | ov-net-config-backup-restore | `frr:10` gap fixed; the Git repo is a bare repo on ov-ctl (no gitea) |
@@ -349,16 +349,11 @@ ov-net-ospf-branch-config pass, ov-net-inventory-facts solution 5/5 on both seed
 caught, only the `template-file` alternative fails (content, above). The two xan system-role tasks
 are back in the sim-el-automation roles pool (6 tasks for a draw of 2).
 
-ov-execution-environment-build stays blocked. What it needs, precisely: (1) an el-vm variant
-whose root Podman store holds `localhost/ov-registry:3` (registry:3 by digest) and
-`localhost/ov-ee-base:1`, pulled into containers-storage at image build time; (2) that EE base
-built from an upstream EE (for example community-ee-minimal, by digest) plus community.general
-(site.yml calls `community.general.json_query`) and an offline wheelhouse with
-`PIP_NO_INDEX=1 PIP_FIND_LINKS=...` set in the image, because ansible-builder's builder stage
-pip-installs bindep, PyYAML and packaging and the lab's `jmespath`, and lab VMs have no PyPI;
-(3) the lab's ov-ee-1 node pointing at that variant instead of `el-vm:10`. Not done in this round:
-the variant needs its own build path in `tools/images/build.sh` and a catalog ref, and the EE
-base build is untested.
+ov-execution-environment-build is verified. el-vm:10 carries `/opt/cloudtrain/lab-images/ov-registry-3.tar.gz`
+(oci-registry:3) and `ov-ee-base-1.tar.gz` (tools/images/ee-base: community.general and a wheelhouse with
+`PIP_NO_INDEX=1 PIP_FIND_LINKS=/opt/wheelhouse`, because ansible-builder's stages pip-install bindep, PyYAML, packaging and
+dumb-init, and the lab's `jmespath`, and lab VMs have no PyPI). They are archives rather than a filled Podman store, so
+Podman stays out of the image for the other labs; the lab's setup installs Podman and loads them.
 
 ## Verify queue (testing round, grouped by slot kind)
 

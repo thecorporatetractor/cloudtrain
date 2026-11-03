@@ -107,7 +107,7 @@ image_targets() { # stdin: changed repo paths; prints the affected image targets
       tools/images/lock/addons.lock | tools/images/lock/buildah-images.lock | tools/images/kubeadm-addons/* | tools/images/scripts/guest-kubeadm-addons.sh) echo kubeadm-full ;;
       tools/images/lock/kubernetes-*.lock | tools/images/lock/calico.lock | tools/images/scripts/guest-kubeadm.sh) echo kubeadm-node kubeadm-upgrade ;;
       tools/images/scripts/guest-etcd-host.sh) echo etcd-host ;;
-      tools/images/scripts/guest-el-vm.sh) echo el-vm ;;
+      tools/images/scripts/guest-el-vm.sh | tools/images/ee-base/*) echo el-vm ;;
       tools/images/scripts/guest-ubuntu-vm.sh) echo ubuntu-vm ;;
       tools/images/scripts/guest-docker-vm-upgrade.sh | tools/images/docker-vm/preload-images-upgrade.txt | tools/images/lock/docker-vm-upgrade.lock) echo docker-vm-upgrade ;;
       tools/images/scripts/guest-docker-vm.sh | tools/images/docker-vm/* | tools/images/lock/docker-vm.lock) echo docker-vm ;;

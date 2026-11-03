@@ -7,6 +7,8 @@
 #   - SELinux enforcing (targeted), firewalld installed and enabled, auditd, chrony
 #   - admin/storage tools for Linux labs (LVM, mdadm, parted, xfsprogs, nfs-utils, ...)
 #   - PSI enabled (psi=1 kernel argument)
+#   - container image archives in /opt/cloudtrain/lab-images for labs that run Podman: files only,
+#     Podman is not installed and no image store exists until a lab's setup does that
 # No users or keys are baked in: the runtime injects `learner` (passwordless sudo), root's
 # authorized_keys and the ssh host key through cloud-init.
 set -euxo pipefail
@@ -62,6 +64,11 @@ if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub && ! grep -q '^GRUB_CMDLINE_
 fi
 n=$(grubby --info=ALL | grep -c '^args=')
 [ "$n" -gt 0 ] && [ "$(grubby --info=ALL | grep '^args=' | grep -cw 'psi=1')" = "$n" ]
+
+install -d /opt/cloudtrain/lab-images
+mv "$B"/lab-images/*.tar.gz /opt/cloudtrain/lab-images/
+chmod -R a+rX /opt/cloudtrain/lab-images
+ls -l /opt/cloudtrain/lab-images
 
 cat > /etc/cloudtrain-release <<R
 CLOUDTRAIN_IMAGE=${CLOUDTRAIN_IMAGE##*/}

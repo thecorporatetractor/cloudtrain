@@ -747,6 +747,9 @@ Status and measurements: `docs/handoffs/foundations.md`.
   mirror snapshot is baked in as the only, local repo (`/opt/cloudtrain/repo/<el10|noble>`),
   because lab VPCs have no route to cluster services. Extra blank disks: topology
   `resources.disks: ["2Gi", "2Gi"]` -> `/dev/vdb..`, `/dev/disk/by-id/virtio-ct-dataN`.
+  `el-vm:10` also holds `podman load`-able archives in `/opt/cloudtrain/lab-images` (`ov-registry-3`,
+  `ov-ee-base-1`, from `task image:build:ee-base`); Podman itself is not installed. `build.sh` refuses a
+  mirror cache that lacks packages of `tools/mirrors/lock/<repo>.lock`.
 - **Mirrors** (`task mirror:content`, `task mirror:up`): namespace `cloudtrain-mirrors`.
   Labs reference `http://mirror.cloudtrain-mirrors.svc/el10/`, `/noble/` (key
   `/keys/cloudtrain-mirror.asc`), `/pypi/simple/`, `/ansible/`; registry

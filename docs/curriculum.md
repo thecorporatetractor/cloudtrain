@@ -16,10 +16,10 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Linux administration | 11 | 160 | 119 | 3 | 276 | 3 | 0 | A 82, B 71, C 126 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 128 | 7 | 0 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
-| Configuration management and automation | 7 | 61 | 36 | 1 | 86 | 2 | 9 | A 41, B 5, C 45, N 6 | 26 |
+| Configuration management and automation | 7 | 61 | 36 | 1 | 87 | 1 | 9 | A 41, B 5, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 33 | 1 | 72 | 0 | 6 | N 78 | 15 |
 | Security operations | 3 | 42 | 25 | 1 | 0 | 0 | 67 | A 61, C 4, K 2 | 22 |
-| **Total** | 46 | 542 | 405 | 14 | 851 | 14 | 82 | A 237, B 148, C 240, K 114, V 124, N 84 | 183 |
+| **Total** | 46 | 542 | 405 | 14 | 852 | 13 | 82 | A 237, B 148, C 240, K 114, V 124, N 84 | 183 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 53, do 374, fix 87, hack 19, ctf 9. New skills proposed: 236.
 
@@ -1008,7 +1008,7 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certifie
 | `ov-build-publish-collection` | Publish the claims platform collection to the team share | do | hard | 35 | A | verified | ex374-aligned:collections | Package the claims_web role and a helper module as collection orrinvale.claims version 1.2.0, build it, publish it to the team share served over HTTP and install it from there into a fresh project. |
 | `ov-custom-filter-plugin` | Write a filter that masks policy numbers | do | medium | 25 | A | verified | ex374-aligned:collections | Reports must never show full policy numbers; add a filter plugin mask_policy to the collection that keeps the last four characters, use it in the claims report template and ship it in the collection build. |
 | `ov-python-module-check-mode` | Write a module that manages branch printer queues | do | hard | 45 | A | verified |  | Write a Python module ov_print_queue that adds or removes a queue entry in /etc/ov/printers.conf, reports changed correctly, honours check mode and returns the final queue list. |
-| `ov-execution-environment-build` | Build and run an execution environment for the claims project | do | hard | 45 | C | built | ex374-aligned:execution-environments | Write an execution-environment definition that adds the orrinvale.claims collection and the jmespath Python package to the mirrored base image, build it with ansible-builder, push it to the in-lab registry and run the site playbook in it with navigator. |
+| `ov-execution-environment-build` | Build and run an execution environment for the claims project | do | hard | 45 | C | verified | ex374-aligned:execution-environments | Write an execution-environment definition that adds the orrinvale.claims collection and the jmespath Python package to the mirrored base image, build it with ansible-builder, push it to the in-lab registry and run the site playbook in it with navigator. |
 | `ov-awx-org-rbac` | Model the claims and branch teams in the controller | do | medium | 25 | A | proposed | ex467-aligned:rbac | In the controller, create organisation OrrinVale with teams claims-ops and branch-ops, give claims-ops execute rights on claims templates only and branch-ops admin on the branch inventory, and prove a branch user cannot launch a claims job. |
 | `ov-awx-project-template` | Turn the claims playbook into a controller job template | do | medium | 25 | A | proposed | ex467-aligned:projects-templates, ex467-aligned:inventories-credentials | Create a project synced from the claims-automation Git repository, an inventory with the claims hosts, a machine credential and a job template that runs site.yml, then launch it successfully. |
 | `ov-awx-survey-schedule` | Let branch staff restart services through a survey | do | medium | 25 | A | proposed | ex467-aligned:surveys-schedules-notifications | Add a survey to the restart template that offers only the three approved services and a branch code with validation, schedule a nightly run at 03:00 and send failures to the in-lab webhook receiver. |
