@@ -57,6 +57,8 @@ type RuntimeOptions struct {
 	UserNamespaces bool
 	// DenyLearnerSudo refuses labs whose entry node sets learnerSudo.
 	DenyLearnerSudo bool
+	// RequireIsolation: the production isolation profile (isolation.go).
+	RequireIsolation bool
 	// NamespaceAccess, when set, binds the manager's session permissions in
 	// the namespaces drivers create (vcluster host namespaces).
 	NamespaceAccess NamespaceAccess
@@ -106,6 +108,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		RuntimeClassName: o.RuntimeClassName, Sandboxes: o.Sandboxes, Executor: o.Executor, Catalog: o.Catalog,
 		PersistentHome: o.PersistentHome, HomeStorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
 		UserNamespaces: o.UserNamespaces, DenyLearnerSudo: o.DenyLearnerSudo,
+		RequireIsolation: o.RequireIsolation,
 	}
 	disks := o.VMDisks
 	if disks.StorageClass == "" {

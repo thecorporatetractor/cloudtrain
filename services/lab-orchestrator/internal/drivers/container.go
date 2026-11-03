@@ -106,6 +106,10 @@ type ContainerDriver struct {
 	// DenyLearnerSudo refuses entry nodes with learnerSudo (manager flag
 	// --allow-learner-sudo=false).
 	DenyLearnerSudo bool
+	// RequireIsolation (--isolation-profile=production) refuses every lab
+	// pod that would run neither in a sandbox RuntimeClass nor in a user
+	// namespace (see isolation.go).
+	RequireIsolation bool
 }
 
 var (
@@ -229,6 +233,7 @@ func (d *ContainerDriver) BuildPod(ref NodeRef) *corev1.Pod {
 	if isEntry(ref) {
 		d.decorateEntryPod(ref, pod)
 	}
+	hardenPod(pod)
 	return pod
 }
 
@@ -300,6 +305,12 @@ func (d *ContainerDriver) createIfAbsent(ctx context.Context, ref NodeRef, obj c
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
+	}
+	if pod, ok := obj.(*corev1.Pod); ok {
+		// Every lab pod of the container and netdev drivers is created here.
+		if err := d.checkIsolation(ref, pod); err != nil {
+			return err
+		}
 	}
 	err = d.Client.Create(ctx, obj)
 	if err == nil {
