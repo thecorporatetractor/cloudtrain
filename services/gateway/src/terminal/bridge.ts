@@ -10,10 +10,16 @@ import type { TerminalPlan } from './target.js';
  *
  *   client -> gateway  text   {"t":"i","d":"<keystrokes>"}      input
  *                      text   {"t":"r","c":<cols>,"r":<rows>}  resize
+ *                      text   {"t":"p"}                        keepalive (ignored, like any unknown frame)
  *   gateway -> client  binary <bytes>                         terminal output
  *                      text   {"t":"ready","via":"..."}       exec attached
  *                      text   {"t":"exit","code":<n>}         process ended
  *                      text   {"t":"error","m":"..."}         could not attach
+ *
+ * Close codes: 1000 the process exited; 1008 refused for good (400/403/404/409 while
+ * planning: the client does not retry); 1011 a failure that may pass (planning hit a DB or
+ * cluster error, or the exec failed: the client retries with backoff); 1013 the client read
+ * terminal output too slowly (the backpressure limit was hit: the client reconnects).
  */
 export type ClientFrame = { t: 'i'; d: string } | { t: 'r'; c: number; r: number };
 export type ServerFrame = { t: 'ready'; via: string } | { t: 'exit'; code: number } | { t: 'error'; m: string } | { t: 'notice'; notice: SessionNotice } | { t: 'observe'; readOnly: true; m: string };
@@ -176,10 +182,18 @@ export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promis
   try {
     plan = await planned;
   } catch (e) {
-    // HttpErrors are written for the learner; anything else (Kubernetes, Postgres) stays in the log.
-    if (!(e instanceof HttpError)) log.warn({ err: e }, 'terminal planning failed');
-    send(ws, { t: 'error', m: e instanceof HttpError ? e.message : 'The terminal could not be opened. Please try again.' });
-    ws.close(1008, 'unavailable');
+    // 1008 tells the client not to retry, so it is kept for answers that will not change by
+    // retrying (bad node, not yours, gone, not ready/closed). Anything else (a DB or cluster
+    // blip) closes with 1011 and the client reconnects with backoff. HttpErrors are written for
+    // the learner; anything else (Kubernetes, Postgres) stays in the log.
+    if (isRefusal(e)) {
+      send(ws, { t: 'error', m: e.message });
+      ws.close(1008, 'unavailable');
+    } else {
+      if (!(e instanceof HttpError)) log.warn({ err: e }, 'terminal planning failed');
+      send(ws, { t: 'error', m: e instanceof HttpError ? e.message : 'The terminal could not be opened just now. Please try again.' });
+      ws.close(1011, 'planning failed');
+    }
     return;
   }
   if (closed) return;
@@ -201,4 +215,21 @@ export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promis
   const code = await handle.exited;
   send(ws, { t: 'exit', code });
   if (ws.readyState === ws.OPEN) ws.close(1000, 'exit');
+}
+
+const REFUSAL_STATUSES = new Set([400, 403, 404, 409]);
+
+/** A planning error the client should not retry: see the 1008/1011 split in bridge(). */
+export function isRefusal(e: unknown): e is HttpError {
+  return e instanceof HttpError && REFUSAL_STATUSES.has(e.status);
+}
+
+/**
+ * How an observe connection that could not start is closed: the same split as bridge().
+ * Refusals (400/403/404/409) close with 1008 and the observer stops; anything else (a DB
+ * blip) closes with 1011 and a generic message, and the observer's client retries.
+ */
+export function observeFailure(e: unknown): { m: string; code: 1008 | 1011; reason: string } {
+  if (isRefusal(e)) return { m: e.status === 403 ? 'You may not observe this session.' : e.message, code: 1008, reason: 'forbidden' };
+  return { m: e instanceof HttpError ? e.message : 'The terminal could not be observed just now. Please try again.', code: 1011, reason: 'observe failed' };
 }

@@ -9,6 +9,7 @@ import { Bar } from '@/components/charts';
 import { PhaseBadge, When } from '@/components/platform';
 import { Badge, Button, ConfirmDialog, Dot, ErrorState, PageSkeleton, Tooltip } from '@/components/ui';
 import { ObserveTerminal, type ObserveState } from '@/components/workspace/ObserveTerminal';
+import { ScreenReaderToggle } from '@/components/workspace/TerminalStatus';
 import { Timer } from '@/components/workspace/Timer';
 import { cn } from '@/lib/utils';
 import { observeRoute } from '@/router';
@@ -183,6 +184,7 @@ function ObserveScreen() {
           <p className="xs subtle" style={{ marginTop: 16 }}>
             Node <span className="mono">{entry}</span> · session <span className="mono">{sessionId}</span>
           </p>
+          <ScreenReaderToggle className="observe-sr" />
         </aside>
         <div className="observe-term">
           <ObserveTerminal
