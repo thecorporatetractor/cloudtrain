@@ -110,6 +110,12 @@ export class PlatformService implements SessionHooks {
   readonly kc: KeycloakAdmin | null;
   readonly now: () => Date;
   readonly log?: PlatformDeps['log'];
+  /**
+   * Meters the end of a lab an instructor, admin or offboarding ended (set by
+   * buildApp when billing is on): billed from its first Ready up to now, at
+   * most until expiry, and not at all if it never became ready.
+   */
+  labEnded?: (orgId: string, ls: LabSession) => Promise<void>;
 
   constructor(d: PlatformDeps) {
     this.db = d.db;

@@ -5,7 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import type { SiteConfig } from '@cloudtrain/api-types';
 import { buildApp } from '../src/app.js';
 import { computeTierOf, PricingModel } from '../src/billing/compute.js';
-import { BillingService } from '../src/billing/service.js';
+import { BillingService, type BillingDeps, type SessionEndResolver } from '../src/billing/service.js';
 import { signWebhook, StripeApi } from '../src/billing/stripe.js';
 import type { Content } from '../src/content/load.js';
 import * as m0009 from '../src/db/migrations/0009_billing_compute.js';
@@ -101,6 +101,11 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     const r = await app.inject({ method: 'POST', url: '/api/billing/webhook', payload: body, headers: { 'content-type': 'application/json', 'stripe-signature': signWebhook(body, SECRET, Math.floor(clock.getTime() / 1000)) } });
     expect(r.statusCode).toBe(200);
     return r.json() as { status: string };
+  };
+  /** Plays the orchestrator: the session became ready at `at` (billing starts there). */
+  const ready = (id: string, at: Date | null) => {
+    const s = cluster.sessions.get(id);
+    if (s) s.status = { ...s.status, ...(at ? { readyAt: at.toISOString() } : { readyAt: undefined }) };
   };
   /** Starts a lab and moves the clock to the session's start. */
   const start = async (user: string, lab: string) => {
@@ -239,6 +244,106 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     expect(me.usage).toMatchObject({ minutes: 13, units: 26, estimate: 4.33, running: 0, byTier: [{ tier: 'pod', minutes: 13, units: 26, amount: 4.33 }] });
     expect(me.usage.sessions[0]).toMatchObject({ labId: STANDARD, payer: 'user', report: 'sent', amount: 4.33 });
     expect(me.limit).toMatchObject({ monthlyCap: 5000, hardStop: true, source: 'default', spent: 4.33, reached: false });
+  });
+
+  it('bills from the first Ready: provisioning time and labs that never became ready are free, usage stops at expiry', async () => {
+    // Ready after 4 minutes of provisioning, ended 10 minutes after the start: 6 minutes.
+    let r = await start(Q.mei, STANDARD);
+    let id = r.json().id as string;
+    ready(id, new Date(clock.getTime() + 4 * 60_000));
+    clock = new Date(clock.getTime() + 10 * 60_000);
+    expect((await as(Q.mei).del(`/api/sessions/${id}`)).statusCode).toBe(204);
+    await billing.settle();
+    expect(await usage(id)).toMatchObject({ minutes: 6, units: 12 });
+
+    // Never ready (ended while provisioning): nothing billed, no meter event.
+    r = await start(Q.mei, STANDARD);
+    id = r.json().id as string;
+    ready(id, null);
+    clock = new Date(clock.getTime() + 12 * 60_000);
+    expect((await as(Q.mei).del(`/api/sessions/${id}`)).statusCode).toBe(204);
+    await billing.settle();
+    const never = await usage(id);
+    expect(never).toMatchObject({ minutes: 0, units: 0 });
+    expect(await h.t.owner.selectFrom('billing_meter_outbox').select('id').where('usage_id', '=', never.id).execute()).toHaveLength(0);
+
+    // Ended (deleted) long after its expiry: billed up to the expiry only.
+    r = await start(Q.mei, STANDARD);
+    id = r.json().id as string;
+    const s = cluster.sessions.get(id)!;
+    s.status = { ...s.status, expiresAt: new Date(clock.getTime() + 20 * 60_000).toISOString() };
+    clock = new Date(clock.getTime() + 3 * 60 * 60_000);
+    expect((await as(Q.mei).del(`/api/sessions/${id}`)).statusCode).toBe(204);
+    await billing.settle();
+    expect(await usage(id)).toMatchObject({ minutes: 20, units: 40 });
+  });
+
+  it('running estimates (the spend cap, /billing) count from the first Ready like the final charge', async () => {
+    // The resolver main.ts wires: a running lab answers its first Ready.
+    const resolver: SessionEndResolver = async (name) => {
+      const ls = cluster.sessions.get(name);
+      if (!ls) return 'missing';
+      const at = Date.parse(ls.status?.readyAt ?? '');
+      return { readyAt: Number.isNaN(at) ? null : new Date(at) };
+    };
+    const deps = (billing as unknown as { d: BillingDeps }).d;
+    deps.sessionEnd = resolver;
+    try {
+      // The month so far (earlier tests), before this lab starts.
+      let me = (await as(Q.mei).get('/api/billing/me')).json();
+      const before = { minutes: me.usage.minutes as number, estimate: me.usage.estimate as number, spent: me.limit.spent as number };
+      // Still provisioning 10 minutes after the start: nothing counts yet.
+      const r = await start(Q.mei, STANDARD);
+      const id = r.json().id as string;
+      ready(id, null);
+      clock = new Date(clock.getTime() + 10 * 60_000);
+      me = (await as(Q.mei).get('/api/billing/me')).json();
+      const row = () => (me.usage.sessions as { sessionName: string; minutes: number; amount: number }[]).find((x) => x.sessionName === id);
+      expect(me.usage.running).toBe(1);
+      expect(row()).toMatchObject({ minutes: 0, amount: 0 });
+      expect(me.usage).toMatchObject({ minutes: before.minutes, estimate: before.estimate });
+      expect(me.limit.spent).toBe(before.spent);
+      // Ready at 10 minutes, 6 minutes later: 6 minutes, as the final charge will be.
+      ready(id, clock);
+      clock = new Date(clock.getTime() + 6 * 60_000);
+      me = (await as(Q.mei).get('/api/billing/me')).json();
+      expect(row()).toMatchObject({ minutes: 6, units: 12 });
+      expect(me.usage.minutes).toBe(before.minutes + 6);
+      // The spend cap counts the same 6 minutes.
+      expect(me.limit.spent - before.spent).toBeGreaterThan(0);
+      expect(me.limit.spent - before.spent).toBeCloseTo(me.usage.estimate - before.estimate, 2);
+      expect((await as(Q.mei).del(`/api/sessions/${id}`)).statusCode).toBe(204);
+      await billing.settle();
+      expect(await usage(id)).toMatchObject({ minutes: 6, units: 12 });
+      me = (await as(Q.mei).get('/api/billing/me')).json();
+      expect(me.usage.running).toBe(0);
+      expect(me.usage.minutes).toBe(before.minutes + 6);
+    } finally {
+      delete deps.sessionEnd;
+    }
+  });
+
+  it('an instructor or admin terminate meters like the learner\'s own end: a lab that never became ready is free', async () => {
+    // Stuck provisioning on a cold pool for 20 minutes, then ended by the org admin.
+    let r = await start(Q.mei, STANDARD);
+    let id = r.json().id as string;
+    ready(id, null);
+    clock = new Date(clock.getTime() + 20 * 60_000);
+    expect((await as(Q.priya).post(`/api/sessions/${id}/terminate`)).statusCode).toBe(200);
+    await billing.settle();
+    const never = await usage(id);
+    expect(never).toMatchObject({ minutes: 0, units: 0 });
+    expect(never.ended_at).not.toBeNull();
+    expect(await h.t.owner.selectFrom('billing_meter_outbox').select('id').where('usage_id', '=', never.id).execute()).toHaveLength(0);
+
+    // Ready after 5 minutes, terminated 12 minutes after the start: 7 minutes.
+    r = await start(Q.mei, STANDARD);
+    id = r.json().id as string;
+    ready(id, new Date(clock.getTime() + 5 * 60_000));
+    clock = new Date(clock.getTime() + 12 * 60_000);
+    expect((await as(Q.priya).post(`/api/sessions/${id}/terminate`)).statusCode).toBe(200);
+    await billing.settle();
+    expect(await usage(id)).toMatchObject({ minutes: 7, units: 14 });
   });
 
   it('retries failed meter reports from the outbox with backoff and dead-letters permanent failures', async () => {

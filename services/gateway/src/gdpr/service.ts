@@ -10,6 +10,8 @@ import { monthsBefore } from './retention.js';
 import type { ExamCluster } from '../exams/kube.js';
 import type { KeycloakAdmin } from '../keycloak/admin.js';
 import { LABEL_LEARNER } from '../kube/types.js';
+import type { UsageEnd } from '../billing/service.js';
+import { usageEnd } from '../sessions/usage.js';
 import type { LabCluster } from '../kube/cluster.js';
 import type { Mailer } from '../mail.js';
 import type { Sealer, SessionStore } from '../oidc/sessions.js';
@@ -52,7 +54,8 @@ export interface GdprDeps {
   exams?: Pick<ExamCluster, 'deleteExamSession'>;
   kc?: Pick<KeycloakAdmin, 'deleteUser' | 'logoutUser' | 'setUserEnabled' | 'getUser'> | null;
   stripe?: { customers: { del(id: string): Promise<unknown> } };
-  billing?: { meterEnd(orgId: string, sessionName: string): Promise<void>; flushOutbox(): Promise<unknown> };
+  /** Lab usage ends are metered like the learner's own end (sessions/usage.ts: from the first Ready, at most until expiry). */
+  billing?: { meterEnd(orgId: string, sessionName: string, ended?: UsageEnd): Promise<void>; flushOutbox(): Promise<unknown> };
   store?: Pick<SessionStore, 'revokeUser'>;
   log?: { info(o: object, m: string): void; warn(o: object, m: string): void };
   now?: () => Date;
@@ -364,7 +367,7 @@ export class GdprService {
       try {
         for (const ls of (await this.d.cluster.listSessions(`${LABEL_LEARNER}=${labelValue(p.sub)}`)).filter((s) => s.spec.learner.id === p.sub)) {
           await this.d.cluster.deleteSession(ls.metadata.name);
-          await this.d.billing?.meterEnd(ls.spec.learner.org ?? '', ls.metadata.name).catch(() => undefined);
+          await this.d.billing?.meterEnd(ls.spec.learner.org ?? '', ls.metadata.name, usageEnd(ls, this.now().getTime())).catch(() => undefined);
           endedLabs++;
         }
       } catch (e) {
@@ -521,7 +524,7 @@ export class GdprService {
       if (this.d.cluster) {
         for (const ls of (await this.d.cluster.listSessions(`${LABEL_LEARNER}=${labelValue(p.sub)}`)).filter((s) => s.spec.learner.id === p.sub)) {
           await this.d.cluster.deleteSession(ls.metadata.name);
-          await this.d.billing?.meterEnd(ls.spec.learner.org ?? '', ls.metadata.name).catch(() => undefined);
+          await this.d.billing?.meterEnd(ls.spec.learner.org ?? '', ls.metadata.name, usageEnd(ls, this.now().getTime())).catch(() => undefined);
         }
       }
     } catch (e) {
@@ -781,7 +784,7 @@ export class GdprService {
           const live = (await this.d.cluster.listSessions(`${LABEL_LEARNER}=${labelValue(userId)}`)).filter((ls) => ls.spec.learner.id === userId);
           for (const ls of live) {
             await this.d.cluster.deleteSession(ls.metadata.name);
-            await this.d.billing?.meterEnd(ls.spec.learner.org ?? '', ls.metadata.name).catch(() => undefined);
+            await this.d.billing?.meterEnd(ls.spec.learner.org ?? '', ls.metadata.name, usageEnd(ls, this.now().getTime())).catch(() => undefined);
             labs++;
           }
         }

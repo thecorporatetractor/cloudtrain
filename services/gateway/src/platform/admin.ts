@@ -280,6 +280,7 @@ export async function cutOff(ps: PlatformService, orgId: string, userId: string)
   for (const ls of labs) {
     if (ls.spec.learner.id !== userId || ls.metadata.deletionTimestamp) continue;
     await ps.cluster.deleteSession(ls.metadata.name);
+    await ps.labEnded?.(orgId, ls).catch((e: unknown) => ps.log?.warn({ err: e, session: ls.metadata.name }, 'billing: could not record usage end'));
     await ps.orgTx(orgId, null, (tx) => endAttempt(tx, ls.metadata.name, ps.now()));
     terminatedLabs++;
   }

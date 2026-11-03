@@ -37,6 +37,7 @@ import { registerEventRoutes } from './events/routes.js';
 import type { EventService } from './events/service.js';
 import { registerGdprRoutes } from './gdpr/routes.js';
 import type { GdprService } from './gdpr/service.js';
+import { usageEnd } from './sessions/usage.js';
 
 export interface AppDeps {
   content: Content;
@@ -116,6 +117,11 @@ const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
  */
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { content, auth, sessions, cluster, platform: ps } = deps;
+  // Labs ended by an instructor, admin or offboarding are metered like the learner's own end.
+  if (ps && deps.billing) {
+    const billing = deps.billing;
+    ps.labEnded = (orgId, ls) => billing.meterEnd(orgId, ls.metadata.name, usageEnd(ls, billing.now().getTime()));
+  }
   const hub = deps.hub ?? new TerminalHub();
   // Request ids are unique across replicas and restarts: a client quotes one from an error, the log has it.
   const options: FastifyServerOptions = { logger: deps.logger ?? false, trustProxy: deps.trustProxy ?? '127.0.0.1', genReqId: () => randomUUID() };
@@ -298,8 +304,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.get('/api/sessions', run, async (req) => sessions.list(req.principal));
   app.get<{ Params: { id: string } }>('/api/sessions/:id', run, async (req) => sessions.get(req.principal, req.params.id));
   app.delete<{ Params: { id: string } }>('/api/sessions/:id', run, async (req, reply) => {
-    await sessions.end(req.principal, req.params.id);
-    if (req.principal.orgId) await deps.billing?.meterEnd(req.principal.orgId, req.params.id).catch((e: unknown) => req.log.error({ err: e, session: req.params.id }, 'billing: could not record usage end'));
+    const ended = await sessions.end(req.principal, req.params.id);
+    // Billed from the first Ready up to now (at most until expiry); a lab that never became ready is free.
+    const billing = deps.billing;
+    if (req.principal.orgId && billing) await billing.meterEnd(req.principal.orgId, req.params.id, usageEnd(ended, billing.now().getTime())).catch((e: unknown) => req.log.error({ err: e, session: req.params.id }, 'billing: could not record usage end'));
     return reply.code(204).send();
   });
   app.post<{ Params: { id: string } }>('/api/sessions/:id/validate', run, async (req) => sessions.validate(req.principal, req.params.id));

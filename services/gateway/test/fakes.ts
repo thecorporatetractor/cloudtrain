@@ -54,6 +54,8 @@ export class FakeCluster implements LabCluster {
   createdTemplates = 0;
   onPatch?: (s: LabSession) => void;
   onExec?: (e: FakeExec) => void;
+  /** Sessions get status.readyAt = their creation time (metering starts there). */
+  readyOnCreate = true;
   private clock = Date.parse('2026-10-13T10:00:00Z');
 
   async getTemplate(name: string) {
@@ -78,6 +80,8 @@ export class FakeCluster implements LabCluster {
     const created: LabSession = clone(s);
     created.metadata.uid = `uid-${s.metadata.name}`;
     created.metadata.creationTimestamp = new Date((this.clock += 1000)).toISOString();
+    // Billing meters from the first Ready: fake sessions are ready from their start unless a test says otherwise.
+    if (this.readyOnCreate) created.status = { ...created.status, readyAt: created.metadata.creationTimestamp };
     this.sessions.set(s.metadata.name, created);
     return clone(created);
   }
@@ -105,6 +109,7 @@ export class FakeCluster implements LabCluster {
     const s = this.sessions.get(name)!;
     s.status = {
       phase: 'Ready',
+      readyAt: s.metadata.creationTimestamp!,
       entryNode: 'workstation',
       resolvedParams: params,
       expiresAt: new Date(Date.parse(s.metadata.creationTimestamp!) + 30 * 60_000).toISOString(),
