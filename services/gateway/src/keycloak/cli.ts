@@ -18,11 +18,11 @@ async function main() {
     cluster: { listSessions: async () => [] } as never,
     mailer: new MemoryMailer(),
     kc,
-    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace },
+    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace, ssoEgress: config.ssoEgress },
   });
   try {
     const r = await syncKeycloak(ps, kc, db);
-    console.log(`keycloak: organizations ${r.orgs.join(', ') || 'none'}; linked IdPs ${r.linkedIdps.join(', ') || 'none'}; ${r.brokerFlowFixed.length ? `moved to the tenant broker flow: ${r.brokerFlowFixed.join(', ')}; ` : ''}${r.foreignReleased.length ? `released addresses on other orgs' verified domains: ${r.foreignReleased.join(', ')}; ` : ''}${r.untrustedLinks.length ? `brokered users with unverified-domain email (review): ${r.untrustedLinks.join(', ')}; ` : ''}${r.originsMarked.length ? `brokered users stamped with their IdP: ${r.originsMarked.length}; ` : ''}${r.members} local members`);
+    console.log(`keycloak: organizations ${r.orgs.join(', ') || 'none'}; linked IdPs ${r.linkedIdps.join(', ') || 'none'}; ${r.brokerFlowFixed.length ? `moved to the tenant broker flow: ${r.brokerFlowFixed.join(', ')}; ` : ''}${r.foreignReleased.length ? `released addresses on other orgs' verified domains: ${r.foreignReleased.join(', ')}; ` : ''}${r.untrustedLinks.length ? `brokered users with unverified-domain email (review): ${r.untrustedLinks.join(', ')}; ` : ''}${r.originsMarked.length ? `brokered users stamped with their IdP: ${r.originsMarked.length}; ` : ''}${r.endpointsRefused.length ? `IdPs disabled, endpoints refused by the SSO egress policy: ${r.endpointsRefused.join('; ')}; ` : ''}${r.endpointsUnresolved.length ? `IdP endpoints not checked (did not resolve): ${r.endpointsUnresolved.join('; ')}; ` : ''}${r.members} local members`);
     if (r.failures.length) console.log(`keycloak: repair steps failed (skipped, retried next run): ${r.failures.join('; ')}`);
     if (r.entra === 'absent') console.log(`entra: ${ENTRA_ENV_FILE} not found; skipping the azarguard-entra IdP (see docs/dev-environment.md)`);
     else if (r.entra === 'incomplete') console.log(`entra: ${ENTRA_ENV_FILE} lacks tenant id, client id or client secret; skipping (values not shown)`);

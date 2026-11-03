@@ -1,0 +1,55 @@
+{{- $k := .Values.networkPolicy.keycloakEgress }}
+{{- if and .Values.gateway.keycloak.url (not $k.enabled) (not $k.unrestricted) }}
+{{- fail "gateway.keycloak.url is set (org admins can add identity providers), so Keycloak calls URLs they choose: enable networkPolicy.keycloakEgress, or set networkPolicy.keycloakEgress.unrestricted=true if Keycloak's egress is restricted elsewhere (docs/platform-identity.md, SSO egress)" }}
+{{- end }}
+{{- if $k.enabled }}
+{{- $ns := required "networkPolicy.keycloakEgress.namespace is required" $k.namespace }}
+{{- if not $k.podSelector }}{{ fail "networkPolicy.keycloakEgress.podSelector is required (Keycloak's pod labels)" }}{{ end }}
+{{- $v4 := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.168.0.0/16" "198.18.0.0/15" "224.0.0.0/3" "168.63.129.16/32" }}
+{{- $v6 := list "::/96" "64:ff9b::/96" "2001::/32" "2002::/16" "fc00::/7" "fe80::/10" "ff00::/8" }}
+{{- range $c := $k.clusterCIDRs }}
+{{- if contains ":" $c }}{{ $v6 = append $v6 $c }}{{ else }}{{ $v4 = append $v4 $c }}{{ end }}
+{{- end }}
+---
+# Keycloak egress: DNS, the listed in-cluster peers, and public addresses only.
+# Keycloak calls org IdPs' token/JWKS/userinfo/SAML endpoints on every login;
+# this keeps a rebinding or redirecting IdP from reaching the cluster or VNet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ct.fullname" . }}-keycloak-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- toYaml $k.podSelector | nindent 4 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- with $k.allowTo }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml $v4 | nindent 14 }}
+        - ipBlock:
+            cidr: ::/0
+            except:
+              {{- toYaml $v6 | nindent 14 }}
+      ports:
+        {{- range $p := ($k.ports | default (list 443)) }}
+        - { protocol: TCP, port: {{ $p }} }
+        {{- end }}
+{{- end }}

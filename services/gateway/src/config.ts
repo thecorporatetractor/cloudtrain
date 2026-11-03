@@ -47,6 +47,8 @@ export interface Config {
   databaseUrl: string;
   /** Postgres as the schema owner (migrations, seed). */
   databaseOwnerUrl?: string;
+  /** SSO discovery / SAML metadata egress (CT_SSO_ALLOWED_HOSTS, CT_SSO_ALLOW_PRIVATE; src/platform/egress.ts). */
+  ssoEgress: { allowHttp: boolean; allowPrivate: boolean; allowedHosts: string[] };
   databaseAppRole: string;
   /** Where the browser reaches the gateway's /api (OIDC redirect URI base). */
   publicUrl: string;
@@ -257,6 +259,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     databaseUrl: env.CT_DATABASE_URL ?? 'postgres://cloudtrain_app:app-dev-only@127.0.0.1:55432/cloudtrain',
     ...(env.CT_DATABASE_OWNER_URL || env.NODE_ENV !== 'production' ? { databaseOwnerUrl: env.CT_DATABASE_OWNER_URL ?? 'postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:55432/cloudtrain' } : {}),
     databaseAppRole: env.CT_DATABASE_APP_ROLE ?? 'cloudtrain_app',
+    // Production: https and public addresses only. Development: the dev IdP is http://localhost.
+    ssoEgress: {
+      allowHttp: env.CT_SSO_ALLOW_PRIVATE ? env.CT_SSO_ALLOW_PRIVATE === 'true' : !prod,
+      allowPrivate: env.CT_SSO_ALLOW_PRIVATE ? env.CT_SSO_ALLOW_PRIVATE === 'true' : !prod,
+      allowedHosts: (env.CT_SSO_ALLOWED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+    },
     publicUrl,
     webUrl,
     oidc: {

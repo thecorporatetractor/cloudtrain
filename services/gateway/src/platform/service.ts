@@ -24,6 +24,7 @@ import type {
 import type { Principal } from '../auth.js';
 import { grantsOf, permissionsOf, can, authorize, legacyRole } from '../authz.js';
 import type { Content, ContentLab } from '../content/load.js';
+import type { EgressPolicy } from './egress.js';
 import { withTenant, type Db, type Tx } from '../db/index.js';
 import type { AttemptRow, OrgSettingsJson } from '../db/schema.js';
 import { HttpError, notFound } from '../errors.js';
@@ -50,6 +51,8 @@ export interface PlatformConfig {
   devDomainVerifyBypass: boolean;
   kubeContext: string;
   namespace: string;
+  /** Outbound fetches to org-admin URLs (SSO discovery, SAML metadata); omitted = strict (src/platform/egress.ts). */
+  ssoEgress?: EgressPolicy;
 }
 
 export interface PlatformDeps {

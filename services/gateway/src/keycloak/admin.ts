@@ -119,8 +119,9 @@ export class KeycloakAdmin {
 
   async request<T = unknown>(method: string, path: string, body?: unknown, raw = false): Promise<{ status: number; data: T; location?: string }> {
     const headers: Record<string, string> = { authorization: `Bearer ${await this.accessToken()}`, accept: 'application/json' };
-    if (body !== undefined) headers['content-type'] = 'application/json';
-    const r = await this.f(`${this.base}${path}`, { method, headers, ...(body !== undefined ? { body: raw ? (body as string) : JSON.stringify(body) } : {}) });
+    const form = body instanceof FormData;
+    if (body !== undefined && !form) headers['content-type'] = 'application/json';
+    const r = await this.f(`${this.base}${path}`, { method, headers, ...(body !== undefined ? { body: form ? body : raw ? (body as string) : JSON.stringify(body) } : {}) });
     const text = await r.text();
     if (!r.ok) {
       let msg = text;
@@ -261,8 +262,17 @@ export class KeycloakAdmin {
   }
 
   /** SAML/OIDC metadata import (`fromUrl`), as the admin console does. */
-  async importIdpConfig(providerId: 'oidc' | 'saml', fromUrl: string): Promise<Record<string, string>> {
-    return (await this.request<Record<string, string>>('POST', '/identity-provider/import-config', { providerId, fromUrl })).data;
+  /**
+   * Parses IdP metadata the caller already fetched (Keycloak makes no request
+   * of its own). There is deliberately no import from a URL: Keycloak would
+   * resolve and fetch an org admin's URL itself, outside the gateway's egress
+   * checks (SSRF).
+   */
+  async importIdpConfigFromDocument(providerId: 'oidc' | 'saml', document: string): Promise<Record<string, string>> {
+    const form = new FormData();
+    form.set('providerId', providerId);
+    form.set('file', new Blob([document], { type: providerId === 'saml' ? 'application/xml' : 'application/json' }), providerId === 'saml' ? 'metadata.xml' : 'openid-configuration.json');
+    return (await this.request<Record<string, string>>('POST', '/identity-provider/import-config', form)).data;
   }
 
   async idpMappers(alias: string): Promise<KcIdpMapper[]> {
