@@ -109,13 +109,15 @@ const (
 //     NET_RAW (addresses, routes, tc, tcpdump on lab links);
 //   - user-namespaced wired pods: procMount Unmasked (writable network
 //     sysctls; baseline allows it only for some versions with hostUsers: false);
-//   - net-init of router nodes without user namespaces: privileged
-//     (ip_forward and per-interface rp_filter are unsafe sysctls, and the
-//     per-interface ones do not exist yet when the sandbox is created);
-//   - FRR netdev nodes: SYS_ADMIN; KubeVirt virt-launcher pods of lab VMs.
+//   - FRR netdev nodes: SYS_ADMIN (RuntimeDefault seccomp);
+//   - systemd and privileged catalog images: privileged, only inside a VM
+//     sandbox RuntimeClass (Sandboxes); KubeVirt virt-launcher pods of lab VMs.
 //
-// Audit records baseline violations, so a cluster's audit log shows which
-// lab pods need more than baseline.
+// No container is privileged on the host kernel: the lab pod admission
+// policy (config/rbac/pod_admission_policy.yaml) holds every pod in a lab
+// namespace to exactly these exceptions, whoever creates it. Audit records
+// baseline violations, so a cluster's audit log shows which lab pods need
+// more than baseline.
 func SessionNamespacePodSecurity() map[string]string {
 	return map[string]string{
 		LabelPodSecurityEnforce:        PodSecurityPrivileged,

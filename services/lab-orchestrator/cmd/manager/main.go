@@ -46,7 +46,7 @@ func main() {
 		sandboxesFlag, sandboxesConfig, sandboxPreflight                                                          string
 		sandboxTTL                                                                                                time.Duration
 		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag                                               string
-		sessionClusterRole, serviceAccount                                                                        string
+		sessionClusterRole, serviceAccount, podAdmissionPolicy                                                    string
 		labMTU                                                                                                    int
 		linkSysctls                                                                                               bool
 		linkRateMbps                                                                                              int
@@ -85,7 +85,7 @@ func main() {
 	flag.StringVar(&vmDisks, "vm-disks", "persistent", "VM root disks: persistent (CDI DataVolume per VM, VMs can hibernate) or ephemeral (containerDisk)")
 	flag.StringVar(&vclusterPodSecurity, "vcluster-pod-security", drivers.PodSecurityBaseline, "Pod Security Standard enforced on vcluster host namespaces, where learners' virtual-cluster pods run: baseline or restricted (restricted also rejects the vcluster control plane unless the values make it non-root)")
 	flag.StringVar(&ovnCentral, "ovn-central", "kube-system/app=ovn-central", "Kube-OVN central pods (<namespace>/<label>=<value>) to set vlan-passthru on lab link switches with ovn-nbctl; empty = links drop 802.1Q-tagged frames")
-	flag.BoolVar(&linkSysctls, "link-sysctls", true, "run wired lab pods (topology links) in a user namespace with writable network sysctls (ip_forward, rp_filter, accept_ra, proxy_arp, ping_group_range) when user namespaces are available (--user-namespaces); false = privileged net-init and read-only /proc/sys")
+	flag.BoolVar(&linkSysctls, "link-sysctls", true, "run wired lab pods (topology links) in a user namespace with writable network sysctls (ip_forward, rp_filter, accept_ra, proxy_arp, ping_group_range) when user namespaces are available (--user-namespaces); false (or no user namespaces) = read-only /proc/sys in every container, and routers (netdev nodes) get their sysctls from the CNI tuning plugin, which every node then needs")
 	flag.IntVar(&linkRateMbps, "link-rate-mbps", 10, "rate limit of every lab link attachment in Mbit/s, each direction (Kube-OVN ingress_rate/egress_rate: OVS policing and an HTB queue on the host side of the port, out of the learner's reach), so a bridging loop cannot saturate the host; 0 = none")
 	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
 	flag.StringVar(&networkModeFlag, "network-mode", string(network.ModePrimary), "how wired lab pods and lab VMs reach the session network (docs/any-kubernetes.md): primary (Kube-OVN is the cluster's primary CNI; eth0 placed with ovn.kubernetes.io/logical_switch) or secondary (another CNI owns eth0, Kube-OVN runs non-primary behind Multus; eth0 = a session segment as the Multus default network, VMs with multus.default)")
@@ -97,6 +97,7 @@ func main() {
 	flag.StringVar(&vmDiskAccessModes, "vm-disk-access-modes", "ReadWriteOnce", "comma separated accessModes of VM disks (ReadWriteOnce suits every class)")
 	flag.StringVar(&storagePreflight, "storage-preflight", "warn", "startup check that the configured (or a default) StorageClass exists: warn (log), strict (exit on a missing configured class) or off")
 	flag.StringVar(&sessionClusterRole, "session-cluster-role", rbac.DefaultSessionClusterRole, "ClusterRole with the manager's permissions inside lab namespaces (config/rbac/session_role.yaml); the manager binds it to itself in every namespace labelled "+drivers.LabelLabNamespace+"=true it works in. Empty = never bind (the operator grants those permissions)")
+	flag.StringVar(&podAdmissionPolicy, "pod-admission-policy", "", "the lab pod admission policy (config/rbac/pod_admission_policy.yaml; ValidatingAdmissionPolicy and binding of this name) checked at startup: missing = the manager does not start, unless the API server lacks ValidatingAdmissionPolicy (Kubernetes < 1.30: a warning). Empty = not checked (a warning)")
 	flag.StringVar(&serviceAccount, "service-account", "", "the manager's own ServiceAccount, <namespace>/<name>, the subject of those RoleBindings; empty = $POD_NAMESPACE/$SERVICE_ACCOUNT_NAME (downward API)")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -272,6 +273,26 @@ func main() {
 	} else {
 		log.Info("tier sandboxes: off (no --sandboxes or sandbox config)")
 	}
+	{
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for the pod admission policy check")
+			os.Exit(1)
+		}
+		pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		res, err := drivers.CheckPodPolicy(pctx, direct, admissionPolicyServed(cfg), podAdmissionPolicy, sandboxes.SandboxRuntimeClasses())
+		cancel()
+		if err != nil {
+			log.Error(err, "lab pod admission policy")
+			os.Exit(1)
+		}
+		for _, w := range res.Warnings {
+			log.Info("WARNING: " + w)
+		}
+		if res.Info != "" {
+			log.Info(res.Info)
+		}
+	}
 	netMode, err := network.ParseMode(networkModeFlag)
 	if err != nil {
 		log.Error(err, "invalid --network-mode")
@@ -281,8 +302,15 @@ func main() {
 		log.Error(nil, "--lab-mtu must be 0 or 576-9000", "value", labMTU)
 		os.Exit(1)
 	}
-	netOpts := network.Options{Mode: netMode, MTU: labMTU}
-	log.Info("lab network", "mode", netMode, "segmentMTU", labMTU)
+	// Without user namespaces nothing in a wired pod can write network
+	// sysctls (no container is privileged), so routers take theirs from the
+	// CNI tuning plugin.
+	netOpts := network.Options{Mode: netMode, MTU: labMTU, RouterTuning: !(linkSysctls && useUserNS)}
+	routerSysctls := "user namespace"
+	if netOpts.RouterTuning {
+		routerSysctls = "CNI tuning plugin (needs the tuning binary of containernetworking/plugins on every node)"
+	}
+	log.Info("lab network", "mode", netMode, "segmentMTU", labMTU, "routerSysctls", routerSysctls)
 	var access *rbac.SessionAccess
 	if sessionClusterRole != "" {
 		saNS, saName, err := ownServiceAccount(serviceAccount)
@@ -432,6 +460,28 @@ func loadSandboxes(flagValue, legacy, configPath, preflightPath string) (*driver
 		}
 	}
 	return sb, nil
+}
+
+// admissionPolicyServed reports whether the API server serves
+// ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1, Kubernetes
+// 1.30+). Only a definite "not served" is false: the policy check then fails
+// open with a warning; any other discovery error is checked by reading the
+// policy.
+func admissionPolicyServed(cfg *rest.Config) bool {
+	dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return true
+	}
+	res, err := dc.ServerResourcesForGroupVersion("admissionregistration.k8s.io/v1")
+	if err != nil {
+		return !apierrors.IsNotFound(err)
+	}
+	for _, r := range res.APIResources {
+		if r.Name == "validatingadmissionpolicies" {
+			return true
+		}
+	}
+	return false
 }
 
 // kubeVirtServed reports whether the API serves kubevirt.io/v1

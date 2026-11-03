@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -149,8 +150,12 @@ func TestDecoratePod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A router without user namespaces needs the CNI tuning plugin.
+	if err := p.DecoratePod("edge-1", &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}, "node", PodOptions{ToolsImage: "t", Router: true}); err == nil {
+		t.Fatal("router without user namespace or RouterTuning must be an error")
+	}
 	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
-	if err := p.DecoratePod("edge-1", pod, "node", PodOptions{ToolsImage: "cloudtrain/nettools:1", Router: true}); err != nil {
+	if err := p.DecoratePod("edge-1", pod, "node", PodOptions{ToolsImage: "cloudtrain/nettools:1", Router: true, UserNamespace: true}); err != nil {
 		t.Fatal(err)
 	}
 	if pod.Annotations[AnnotationLogicalSwitch] != p.Mgmt.Subnet {
@@ -168,12 +173,13 @@ func TestDecoratePod(t *testing.T) {
 	if _, ok := pod.Annotations["ovn.kubernetes.io/layer2_forward"]; ok {
 		t.Error("management interface must not forward unknown MACs")
 	}
-	var nets []map[string]string
+	var nets []map[string]any
 	if err := json.Unmarshal([]byte(pod.Annotations[AnnotationNetworks]), &nets); err != nil {
 		t.Fatal(err)
 	}
 	if len(nets) != 2 || nets[0]["interface"] != "eth1" || nets[0]["name"] != p.Links[0].Segment.NAD ||
-		nets[1]["interface"] != "eth2" || nets[1]["name"] != p.Links[1].Segment.NAD || nets[1]["namespace"] != "labs" {
+		nets[1]["interface"] != "eth2" || nets[1]["name"] != p.Links[1].Segment.NAD || nets[1]["namespace"] != "labs" ||
+		nets[0]["cni-args"] != nil {
 		t.Errorf("networks = %v", nets)
 	}
 	if len(pod.Spec.InitContainers) != 1 || len(pod.Spec.Containers) != 2 || pod.Spec.Containers[1].Name != SidecarName {
@@ -205,9 +211,8 @@ func TestDecoratePod(t *testing.T) {
 	if len(caps) != 2 {
 		t.Errorf("node caps = %v", caps)
 	}
-
-	if init := pod.Spec.InitContainers[0].SecurityContext; init.Privileged == nil || !*init.Privileged || pod.Spec.HostUsers != nil {
-		t.Errorf("without user namespaces net-init must be privileged: %+v hostUsers=%v", init, pod.Spec.HostUsers)
+	if pod.Labels[LabelPodProfile] != PodProfileWired {
+		t.Errorf("pod profile label = %q", pod.Labels[LabelPodProfile])
 	}
 
 	// With user namespaces: no privileged container, unmasked /proc in
@@ -228,9 +233,10 @@ func TestDecoratePod(t *testing.T) {
 		t.Error("hostUsers not false")
 	}
 	isc := un.Spec.InitContainers[0].SecurityContext
-	if isc.Privileged != nil || isc.ProcMount == nil || *isc.ProcMount != corev1.UnmaskedProcMount || len(isc.Capabilities.Add) != 2 {
+	if isc.Privileged != nil || isc.ProcMount == nil || *isc.ProcMount != corev1.UnmaskedProcMount {
 		t.Errorf("net-init security context %+v", isc)
 	}
+	checkPlatformContainers(t, un, true)
 	if pm := un.Spec.Containers[0].SecurityContext.ProcMount; pm == nil || *pm != corev1.UnmaskedProcMount {
 		t.Error("node container /proc not unmasked")
 	}
@@ -242,6 +248,10 @@ func TestDecoratePod(t *testing.T) {
 	host := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
 	if err := p.DecoratePod("wh-host", host, "node", PodOptions{ToolsImage: "t"}); err != nil {
 		t.Fatal(err)
+	}
+	checkPlatformContainers(t, host, false)
+	if host.Spec.HostUsers != nil || !hasSysctl(host, "net.ipv4.ping_group_range") {
+		t.Errorf("host without user namespace: hostUsers=%v sysctls=%v", host.Spec.HostUsers, host.Spec.SecurityContext)
 	}
 	hs := host.Spec.InitContainers[0].Command[2]
 	if !strings.Contains(hs, "ip addr replace 10.99.0.1/31 dev eth2") || strings.Contains(hs, "ip_forward") || strings.Contains(hs, "rp_filter") || strings.Contains(hs, "linkdown") || strings.Contains(hs, "arp_ignore") {
@@ -255,6 +265,153 @@ func TestDecoratePod(t *testing.T) {
 	}
 	if err := p.DecoratePod("edge-1", &corev1.Pod{}, "node", PodOptions{}); err == nil {
 		t.Error("missing tools image must be an error")
+	}
+}
+
+// checkPlatformContainers: net-init and the sidecar are never privileged,
+// drop every capability but their own sets, cannot escalate, run on a
+// read-only root filesystem with RuntimeDefault seccomp.
+func checkPlatformContainers(t *testing.T, pod *corev1.Pod, userns bool) {
+	t.Helper()
+	var initC, side *corev1.Container
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == InitContainerName {
+			initC = &pod.Spec.InitContainers[i]
+		}
+	}
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == SidecarName {
+			side = &pod.Spec.Containers[i]
+		}
+	}
+	if initC == nil || side == nil {
+		t.Fatalf("net-init %v sidecar %v", initC, side)
+	}
+	for _, c := range []struct {
+		c    *corev1.Container
+		caps []corev1.Capability
+	}{{initC, InitCapabilities}, {side, SidecarCapabilities}} {
+		sc := c.c.SecurityContext
+		if sc == nil || sc.Privileged != nil || sc.Capabilities == nil || !slices.Equal(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) ||
+			!slices.Equal(sc.Capabilities.Add, c.caps) || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation ||
+			sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem || sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("%s security context %+v", c.c.Name, sc)
+		}
+	}
+	if got := initC.SecurityContext.ProcMount != nil; got != userns {
+		t.Errorf("net-init unmasked /proc = %v, want %v", got, userns)
+	}
+	if side.SecurityContext.ProcMount != nil {
+		t.Error("sidecar /proc unmasked")
+	}
+	if !slices.Equal(InitCapabilities, []corev1.Capability{"NET_ADMIN"}) || !slices.Equal(SidecarCapabilities, []corev1.Capability{"NET_ADMIN", "NET_RAW"}) {
+		t.Errorf("capability sets changed: update config/rbac/pod_admission_policy.yaml with them (init %v, sidecar %v)", InitCapabilities, SidecarCapabilities)
+	}
+}
+
+func hasSysctl(pod *corev1.Pod, name string) bool {
+	if pod.Spec.SecurityContext == nil {
+		return false
+	}
+	for _, s := range pod.Spec.SecurityContext.Sysctls {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRouterTuning: without user namespaces a router's link attachments
+// carry RouterSysctls as Multus cni-args, the NADs of links that touch a
+// netdev node chain the tuning plugin, net-init checks forwarding instead of
+// writing sysctls, and nothing is privileged.
+func TestRouterTuning(t *testing.T) {
+	p, err := BuildWith(sess, ospfTopology(), Options{Mode: ModePrimary, RouterTuning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
+	if err := p.DecoratePod("edge-1", pod, "node", PodOptions{ToolsImage: "t", Router: true}); err != nil {
+		t.Fatal(err)
+	}
+	checkPlatformContainers(t, pod, false)
+	if pod.Spec.HostUsers != nil || !hasSysctl(pod, "net.ipv4.ping_group_range") {
+		t.Errorf("hostUsers=%v sysctls=%v", pod.Spec.HostUsers, pod.Spec.SecurityContext)
+	}
+	var nets []struct {
+		Name    string `json:"name"`
+		CNIArgs struct {
+			Sysctl map[string]string `json:"sysctl"`
+		} `json:"cni-args"`
+	}
+	if err := json.Unmarshal([]byte(pod.Annotations[AnnotationNetworks]), &nets); err != nil {
+		t.Fatal(err)
+	}
+	if len(nets) != 2 {
+		t.Fatalf("networks = %+v", nets)
+	}
+	for _, n := range nets {
+		sc := n.CNIArgs.Sysctl
+		for k, v := range map[string]string{"net.ipv4.ip_forward": "1", "net.ipv6.conf.all.forwarding": "1", "net.ipv4.conf.IFNAME.rp_filter": "0",
+			"net.ipv4.conf.all.rp_filter": "0", "net.ipv4.conf.eth0.rp_filter": "0", "net.ipv4.conf.default.ignore_routes_with_linkdown": "1",
+			"net.ipv6.conf.IFNAME.ignore_routes_with_linkdown": "1", "net.ipv4.conf.all.arp_ignore": "1"} {
+			if sc[k] != v {
+				t.Errorf("%s: cni-args sysctl %s = %q, want %q", n.Name, k, sc[k], v)
+			}
+		}
+		for k := range sc {
+			if !strings.HasPrefix(k, "net.") {
+				t.Errorf("%s: sysctl %s outside net.*", n.Name, k)
+			}
+		}
+	}
+	script := pod.Spec.InitContainers[0].Command[2]
+	if strings.Contains(script, "sysctl -qw net.ipv4.ip_forward") || strings.Contains(script, "rp_filter") || !strings.Contains(script, "/proc/sys/net/ipv4/ip_forward") {
+		t.Errorf("router script with tuning:\n%s", script)
+	}
+	// Hosts on the same links: no cni-args, so tuning is a no-op for them.
+	host := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
+	if err := p.DecoratePod("wh-host", host, "node", PodOptions{ToolsImage: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(host.Annotations[AnnotationNetworks], "cni-args") {
+		t.Errorf("host networks: %s", host.Annotations[AnnotationNetworks])
+	}
+
+	m := &Manager{}
+	tuned := 0
+	for _, o := range m.Objects(p) {
+		if o.GetKind() != "NetworkAttachmentDefinition" {
+			continue
+		}
+		cfg, _, _ := unstructured.NestedString(o.Object, "spec", "config")
+		if strings.Contains(cfg, `"type":"tuning"`) {
+			tuned++
+			var list struct {
+				Name    string           `json:"name"`
+				Plugins []map[string]any `json:"plugins"`
+			}
+			if err := json.Unmarshal([]byte(cfg), &list); err != nil || list.Name == "" || len(list.Plugins) != 2 || list.Plugins[0]["type"] != "kube-ovn" || list.Plugins[1]["type"] != "tuning" ||
+				list.Plugins[1]["sysctl"] == nil {
+				t.Errorf("tuning NAD config %s: %v", cfg, err)
+			}
+		}
+	}
+	netdevLinks := 0
+	for _, l := range p.Links {
+		if l.Ends[0].Driver == labsv1.DriverNetdev || l.Ends[1].Driver == labsv1.DriverNetdev {
+			netdevLinks++
+		}
+	}
+	if tuned != netdevLinks || tuned == 0 || tuned == len(p.Links) {
+		t.Errorf("tuning NADs = %d, want one per link with a netdev end (%d of %d)", tuned, netdevLinks, len(p.Links))
+	}
+	// Without RouterTuning no NAD chains tuning.
+	plain, _ := Build(sess, ospfTopology())
+	for _, o := range m.Objects(plain) {
+		if cfg, _, _ := unstructured.NestedString(o.Object, "spec", "config"); strings.Contains(cfg, "tuning") {
+			t.Errorf("tuning without RouterTuning: %s", cfg)
+		}
 	}
 }
 

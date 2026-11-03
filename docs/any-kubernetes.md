@@ -89,8 +89,8 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 | Where | Assumption | Sev |
 |---|---|---|
 | `services/lab-orchestrator/internal/drivers/userns.go:67-95`, `cmd/manager/main.go:60,144-160` | `hostUsers: false` when every node's runtime handler reports `features.userNamespaces` (auto-detected, good) | portable |
-| `services/lab-orchestrator/internal/network/pod.go:122-131` | wired pods: `hostUsers: false` plus `procMount: Unmasked` (needs the `ProcMountType` feature, beta; off on some managed versions) or else a **privileged** `net-init` | P |
-| `services/lab-orchestrator/internal/drivers/netdev.go:66-69` | FRR containers add `SYS_ADMIN` | P |
+| `services/lab-orchestrator/internal/network/pod.go` | wired pods: `hostUsers: false` plus `procMount: Unmasked` (needs the `ProcMountType` feature, beta; off on some managed versions). Without user namespaces routers get their sysctls from the CNI `tuning` plugin (Multus `cni-args`), which every node then needs; `net-init` is never privileged (done 2026-10-20, [deploy.md, Wired lab pods](deploy.md#wired-lab-pods)) | P |
+| `services/lab-orchestrator/internal/drivers/netdev.go` | FRR containers add `SYS_ADMIN` (RuntimeDefault seccomp; inside the pod's user namespace where available) | P |
 | session namespace `cloudtrain-sessions` (`Taskfile.yml:198`, `services/gateway/src/config.ts:130`) created without Pod Security labels; kind enforces nothing | privileged init containers are rejected where a cluster enforces `baseline` by default (AKS deployment safeguards, GKE Autopilot, policy add-ons) | P |
 | `services/lab-orchestrator/internal/drivers/container.go:68-69,203-205` | `--runtime-class` for Kata is a free string; no check that the RuntimeClass exists or that its handler supports userns. The per-tier `--sandboxes` (`internal/drivers/sandbox.go`, section 11) do check: RuntimeClass, VM handler, schedulable nodes, preflight verdict | P |
 
@@ -162,7 +162,7 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 5. `/dev/kvm` on every node, no virt node pool (`kind/cluster.yaml:22-27`).
 6. Lab kernel modules loaded on the host by Docker (`host-prep.sh`, `lab-kernel-modules.txt`).
 7. RBAC with `bind`/`escalate` on cluster roles, cluster-wide `pods/exec` and secrets (`role.yaml`). Done 2026-10-19: [deploy.md, Orchestrator RBAC](deploy.md#orchestrator-rbac).
-8. Privileged `net-init` / `procMount: Unmasked` with no Pod Security labels on session namespaces (`network/pod.go:122-131`).
+8. Privileged `net-init` / `procMount: Unmasked` with no Pod Security labels on session namespaces (`network/pod.go:122-131`). Done 2026-10-20: no privileged `net-init`, and the [lab pod admission policy](deploy.md#lab-pod-admission-policy) rejects privileged containers in lab namespaces outside a sandbox RuntimeClass.
 9. Storage class `standard` for CDI scratch and `Filesystem` VM disks (`kubevirt/cdi-cr.yaml:33`, `drivers/kubevirt.go:108,145`; fixed, see [storage.md](storage.md)).
 10. Lab content assumes 1400-byte link MTU and fixed `192.168.99/100.0/24` lab CIDRs (`net-fix-mtu-blackhole`, `labnet.go:37-44`).
 
@@ -398,7 +398,7 @@ fail with the fix:
 | StorageClass | default class, configured classes exist, volume mode, snapshot class, CDI StorageProfile complete (from the storage branch) |
 | User namespaces | `runtimeHandlers[].features.userNamespaces` on lab nodes (the existing `DetectUserNamespaces`), `ProcMountType` usable (dry-run pod) |
 | RuntimeClass | configured RuntimeClass exists and its handler is on the lab nodes. **Sandbox section implemented** (`labctl preflight --sandboxes B=<rc>` or `--sandboxes-config configmap:<ns>/<name>` `[--probe] [--systemd-image <img>] [--sandbox-configmap <file>]`, section 11): Kata RuntimeClasses, the manager's sandbox check per tier, and with `--probe` a pod per sandbox that must boot its own kernel with the lab features (dummy, GRE, bond, VLAN, WireGuard, netem, md), a guest sized to the pod limit, a lab link between a runc pod and a sandboxed pod (MTU, 1400-byte frames with DF both ways, eth0), and a systemd image that boots and accepts `kubectl exec`. `--sandbox-configmap` writes the verdict as the ConfigMap the manager reads |
-| Pod Security / admission | session namespace accepts a privileged `net-init` (server-side dry-run), no policy engine rejects it |
+| Pod Security / admission | session namespace accepts a wired pod (NET_ADMIN, NET_RAW, `procMount: Unmasked` with `hostUsers: false`) and a netdev pod (SYS_ADMIN) as the manager (server-side dry-run), no policy engine rejects them; the lab pod admission policy is installed and rejects a privileged pod outside the sandbox RuntimeClasses |
 | Registry | every catalog image resolvable from a node (dry-run pull Job) |
 | Versions | Kubernetes minor within the KubeVirt/CDI support range |
 
