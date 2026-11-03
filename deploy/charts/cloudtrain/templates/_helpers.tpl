@@ -82,22 +82,63 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
-{{/* Database env of the gateway (and its migrate init container). */}}
+{{/* Database env of the gateway: the RLS-bound app role only, never the schema owner. */}}
 {{- define "ct.gatewayDbEnv" -}}
 {{- if .Values.postgres.demo.enabled -}}
 {{- $pg := printf "%s-postgres" (include "ct.fullname" .) -}}
 - name: PG_APP_PASSWORD
   valueFrom: {secretKeyRef: {name: {{ $pg }}, key: app-password}}
-- name: PG_OWNER_PASSWORD
-  valueFrom: {secretKeyRef: {name: {{ $pg }}, key: owner-password}}
 - name: CT_DATABASE_URL
   value: "postgres://cloudtrain_app:$(PG_APP_PASSWORD)@{{ $pg }}:5432/cloudtrain"
-- name: CT_DATABASE_OWNER_URL
-  value: "postgres://cloudtrain_owner:$(PG_OWNER_PASSWORD)@{{ $pg }}:5432/cloudtrain"
 {{- else -}}
 - name: CT_DATABASE_URL
   valueFrom: {secretKeyRef: {name: {{ include "ct.gatewaySecret" . }}, key: CT_DATABASE_URL}}
-- name: CT_DATABASE_OWNER_URL
-  valueFrom: {secretKeyRef: {name: {{ include "ct.gatewaySecret" . }}, key: CT_DATABASE_OWNER_URL, optional: true}}
 {{- end -}}
+{{- end -}}
+
+{{/* Owner credentials, for the migrate Job only. */}}
+{{- define "ct.gatewayOwnerDbEnv" -}}
+{{- if .Values.postgres.demo.enabled -}}
+{{- $pg := printf "%s-postgres" (include "ct.fullname" .) -}}
+- name: PG_OWNER_PASSWORD
+  valueFrom: {secretKeyRef: {name: {{ $pg }}, key: owner-password}}
+- name: CT_DATABASE_OWNER_URL
+  value: "postgres://cloudtrain_owner:$(PG_OWNER_PASSWORD)@{{ $pg }}:5432/cloudtrain"
+{{- else -}}
+- name: CT_DATABASE_OWNER_URL
+  valueFrom: {secretKeyRef: {name: {{ include "ct.gatewaySecret" . }}, key: CT_DATABASE_OWNER_URL}}
+{{- end -}}
+{{- end -}}
+
+{{/* Pod spec of the gateway's migrate Job (hashed into its name). */}}
+{{- define "ct.gatewayMigrateSpec" -}}
+{{- $ := .ctx -}}
+{{- $g := $.Values.gateway -}}
+restartPolicy: OnFailure
+automountServiceAccountToken: false
+{{- include "ct.pullSecrets" $ | nindent 0 }}
+{{- include "ct.podSecurity" $ | nindent 0 }}
+containers:
+  - name: migrate
+    image: {{ include "ct.image" (list $ $g) }}
+    imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+    args: [dist/db/cli.js, migrate]
+    env:
+      {{- include "ct.gatewayOwnerDbEnv" $ | nindent 6 }}
+    {{- include "ct.containerSecurity" $ | nindent 4 }}
+    resources:
+      {{- toYaml $g.resources | nindent 6 }}
+    volumeMounts:
+      - {name: tmp, mountPath: /tmp}
+volumes:
+  - name: tmp
+    emptyDir: {}
+{{- with $g.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with $g.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
 {{- end -}}

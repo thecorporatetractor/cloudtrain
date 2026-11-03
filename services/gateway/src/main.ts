@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { sql } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import { buildApp } from './app.js';
 import { AnswerService } from './answers/service.js';
 import { PgAnswerStore } from './answers/store.js';
@@ -7,6 +7,7 @@ import { EventService } from './events/service.js';
 import { loadConfig } from './config.js';
 import { loadContent } from './content/load.js';
 import { createDb } from './db/index.js';
+import { roleFacts, roleProblem } from './db/role.js';
 import { KubeClusterInfo } from './kube/capacity.js';
 import { KubeLabCluster, kubeConfigFor } from './kube/client.js';
 import { LabctlCompiler } from './kube/compile.js';
@@ -55,6 +56,10 @@ async function main() {
   } catch (e) {
     throw new Error(`Postgres not reachable at ${new URL(config.databaseUrl).host} (task dev:deps): ${(e as Error).message}`);
   }
+  // Row-level security only binds a non-owner role without BYPASSRLS (src/db/role.ts).
+  const roleIssue = roleProblem(await roleFacts(db as unknown as Kysely<unknown>));
+  if (roleIssue && process.env.NODE_ENV === 'production') throw new Error(`refusing to start: ${roleIssue}; CT_DATABASE_URL must be the RLS-bound app role, the owner only runs migrations`);
+  if (roleIssue) console.warn(`WARNING: ${roleIssue}; tenant isolation is not enforced by the database`);
   const oidc = new OidcClient({ issuer: config.oidc.issuer, clientId: config.oidc.clientId, clientSecret: config.oidc.clientSecret, redirectUri: `${config.publicUrl}/api/auth/callback` });
   const store = new SessionStore(db, new Sealer(config.sessionSecret), { maxAgeSeconds: config.sessionMaxAgeSeconds, idleSeconds: config.sessionIdleSeconds, secureCookie: config.cookieSecure });
   const kcAdmin = config.keycloak.adminClientSecret

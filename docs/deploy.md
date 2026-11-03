@@ -106,9 +106,32 @@ The install notes print the OIDC redirect URI to register with the IdP:
 are derived from `host`: the chart sets the gateway's `CT_PUBLIC_URL` and `CT_WEB_URL`
 to `https://<host>` (`http://` only with `tls.enabled=false`).
 
-Schema migrations run in the gateway's `migrate` init container on every rollout. They
-are idempotent and serialized by Kysely's migration lock. Without an owner URL, set
-`gateway.migrate=false` and run `node dist/db/cli.js migrate` yourself.
+Schema migrations run as the owner in a Job of their own (`<release>-gateway-migrate-<hash>`,
+one per image reference and settings). They are idempotent and serialized by Kysely's migration
+lock. Only that Job gets `CT_DATABASE_OWNER_URL`. The gateway pods get the app role
+alone. Their `wait-for-schema` init container (`node dist/db/cli.js wait`, as the app
+role) holds a rollout until every migration of the new image has been applied, and the
+gateway refuses to start in production when its database role owns the schema, is a
+superuser or has BYPASSRLS, because row-level security would not bind it. Without an
+owner URL, set `gateway.migrate=false` and run `node dist/db/cli.js migrate` yourself,
+with `CT_DATABASE_OWNER_URL` set, before rolling out a new image.
+
+The Job's name depends only on its spec, so a Job that failed for good (the database
+unreachable past its 30-minute deadline, or 20 failed attempts) is not retried by a
+plain `helm upgrade`, and new gateway pods wait in `wait-for-schema` until it gives up
+after 10 minutes, then restart. Fix the cause, then either run
+`helm upgrade ... --set gateway.migrateRetry=<n+1>` (a new Job name) or delete the
+failed Job (find it with `kubectl -n <ns> get jobs -l app.kubernetes.io/component=gateway-migrate`,
+then `kubectl -n <ns> delete job <release>-gateway-migrate-<hash>`) and upgrade again.
+
+The Job is named by the image reference, not the image content, so `gateway.migrate`
+needs an immutable tag: a release version or `sha-<commit>` in `global.imageTag` (or
+`gateway.image.tag`). The render fails on the moving tags `main` (the chart's default
+appVersion) and `latest`, because a new build pushed under the same tag would never be
+migrated and its pods would wait in `wait-for-schema` until they crash-loop. For
+development, `gateway.migrateMutableTag=true` allows them; then bump
+`gateway.migrateRetry` after every new build that adds migrations. Other moving tags,
+such as the kind setup's `dev`, need the same care.
 
 Upgrades: `helm upgrade cloudtrain-crds ...` first, then `helm upgrade cloudtrain ...`
 with the new release's overlay. Uninstalling `cloudtrain` keeps the CRDs, the sessions

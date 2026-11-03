@@ -13,7 +13,10 @@ fails=0
 pass() { printf 'ok   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1" >&2; fails=$((fails + 1)); }
 check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi; }
-render() { helm template ct "$CHART" -n cloudtrain "$@"; }
+# Releases pin an immutable image tag (docs/deploy.md); the examples leave it to
+# --set global.imageTag, so the tests supply one under every values file.
+printf 'global:\n  imageTag: 0.0.0-test\n' >"$OUT/ci-tag.yaml"
+render() { helm template ct "$CHART" -n cloudtrain -f "$OUT/ci-tag.yaml" "$@"; }
 q() { yq ea -e "$1" "$2" >/dev/null 2>&1; }
 
 bash "$ROOT/tools/charts/sync.sh" --check && pass "embedded files in sync" || fail "embedded files in sync (run tools/charts/sync.sh)"
@@ -24,7 +27,7 @@ check "crds: 5 CRDs, kept on uninstall" bash -c "[[ \$(yq -N 'select(.kind == \"
 
 for f in "$CHART"/examples/values-*.yaml; do
   n=$(basename "$f" .yaml)
-  if helm lint "$CHART" -f "$f" >"$OUT/$n.lint" 2>&1 && render -f "$f" >"$OUT/$n.yaml" 2>"$OUT/$n.err"; then pass "lint + render $n"; else fail "lint + render $n: $(cat "$OUT/$n.err" "$OUT/$n.lint" | tail -3)"; fi
+  if helm lint "$CHART" -f "$OUT/ci-tag.yaml" -f "$f" >"$OUT/$n.lint" 2>&1 && render -f "$f" >"$OUT/$n.yaml" 2>"$OUT/$n.err"; then pass "lint + render $n"; else fail "lint + render $n: $(cat "$OUT/$n.err" "$OUT/$n.lint" | tail -3)"; fi
 done
 
 # Every platform pod is non-root on a read-only root filesystem without privileges.
@@ -32,6 +35,27 @@ for n in values-kind values-eks-alb values-gke-gateway; do
   check "$n: hardened containers" q '[select(.kind == "Deployment") | .spec.template.spec as $s | ($s.initContainers // []) + $s.containers | .[] | (.securityContext.readOnlyRootFilesystem == true and .securityContext.allowPrivilegeEscalation == false and .securityContext.capabilities.drop[0] == "ALL")] | all' "$OUT/$n.yaml"
   check "$n: pods runAsNonRoot + RuntimeDefault seccomp" q '[select(.kind == "Deployment") | .spec.template.spec.securityContext | (.runAsNonRoot == true and .seccompProfile.type == "RuntimeDefault")] | all' "$OUT/$n.yaml"
 done
+
+# Schema owner credentials reach only the migrate Job; the gateway pods run as the app role.
+for n in values-kind values-eks-alb; do
+  check "$n: gateway pods never see owner credentials" bash -c "! yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-gateway\") | .spec.template.spec | (.initContainers // []) + .containers | .[].env[] | select(.name == \"CT_DATABASE_OWNER_URL\" or .name == \"PG_OWNER_PASSWORD\")' '$OUT/$n.yaml'"
+  check "$n: migrate Job runs as the owner, hardened, no API token" q 'select(.kind == "Job" and (.metadata.name | test("^ct-cloudtrain-gateway-migrate-[0-9a-f]{8}$"))) | .spec.template.spec | (.automountServiceAccountToken == false and .securityContext.runAsNonRoot == true and .containers[0].args[1] == "migrate" and .containers[0].securityContext.readOnlyRootFilesystem == true and ([.containers[0].env[] | select(.name == "CT_DATABASE_OWNER_URL")] | length) == 1)' "$OUT/$n.yaml"
+  check "$n: gateway waits for the schema as the app role" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-gateway") | .spec.template.spec.initContainers[0] | (.name == "wait-for-schema" and .args[1] == "wait")' "$OUT/$n.yaml"
+done
+render -f "$CHART/examples/values-kind.yaml" --set gateway.migrate=false >"$OUT/no-migrate.yaml"
+check "migrate=false: no Job, no wait" bash -c "! yq -e 'select(.kind == \"Job\")' '$OUT/no-migrate.yaml' && ! yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-gateway\") | .spec.template.spec.initContainers' '$OUT/no-migrate.yaml'"
+render -f "$CHART/examples/values-kind.yaml" --set gateway.migrateRetry=1 >"$OUT/migrate-retry.yaml"
+check "migrateRetry renames the migrate Job (a failed Job is retried)" bash -c "a=\$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/values-kind.yaml'); b=\$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/migrate-retry.yaml'); [[ -n \$a && -n \$b && \$a != \$b ]]"
+# A Job's pod template is immutable: anything in it changes the name, and a chart
+# version bump alone changes neither (no helm.sh/chart label on the template).
+mkdir -p "$OUT/bumped" && cp -rL "$CHART" "$OUT/bumped/" && sed -i 's/^version: .*/version: 99.0.0/' "$OUT/bumped/cloudtrain/Chart.yaml"
+helm template ct "$OUT/bumped/cloudtrain" -n cloudtrain -f "$OUT/ci-tag.yaml" -f "$CHART/examples/values-kind.yaml" >"$OUT/migrate-bumped.yaml" 2>/dev/null
+check "chart version bump keeps the migrate Job and its template" bash -c "[[ \$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/values-kind.yaml') == \"\$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/migrate-bumped.yaml')\" ]] && [[ \"\$(yq -o=json 'select(.kind == \"Job\") | .spec.template' '$OUT/values-kind.yaml')\" == \"\$(yq -o=json 'select(.kind == \"Job\") | .spec.template' '$OUT/migrate-bumped.yaml')\" ]]"
+check "migrate Job pod template: no chart version label" bash -c "! yq -e 'select(.kind == \"Job\") | .spec.template.metadata.labels[\"helm.sh/chart\"]' '$OUT/values-kind.yaml'"
+render -f "$CHART/examples/values-kind.yaml" --set gateway.image.tag=dev2 >"$OUT/migrate-image.yaml"
+check "a new image renames the migrate Job" bash -c "[[ \$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/values-kind.yaml') != \$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/migrate-image.yaml') ]]"
+render -f "$CHART/examples/values-kind.yaml" --set global.imageTag=main --set gateway.migrateMutableTag=true >"$OUT/migrate-mutable.yaml"
+check "migrateMutableTag allows a moving tag" q 'select(.kind == "Job") | .spec.template.spec.containers[0].image == "ct-deploy/gateway:main"' "$OUT/migrate-mutable.yaml"
 
 # Public URL, OIDC redirect base and cookies follow host and TLS.
 check "https public URL from host" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-gateway") | .spec.template.spec.containers[0].env[] | select(.name == "CT_PUBLIC_URL") | .value == "https://labs.example.com"' "$OUT/values-eks-alb.yaml"
@@ -100,6 +124,9 @@ check "web CT_API_BASE" q 'select(.kind == "Deployment" and .metadata.name == "c
 refuse() { local name=$1 want=$2; shift 2; if out=$(render "$@" 2>&1); then fail "refuse $name (rendered)"; elif grep -q -- "$want" <<<"$out"; then pass "refuse $name"; else fail "refuse $name: $out"; fi; }
 refuse "missing issuer" "gateway.oidc.issuer is required" --set gateway.existingSecret=s
 refuse "missing secret" "gateway.existingSecret" --set gateway.oidc.issuer=https://i
+refuse "migrate without owner URL" "databaseOwnerUrl is required" -f "$CHART/examples/values-eks-alb.yaml" --set gateway.existingSecret= --set gateway.secrets.create=true --set gateway.secrets.oidcClientSecret=x --set gateway.secrets.databaseUrl=postgres://a --set gateway.secrets.sessionSecret="$(printf 's%.0s' {1..20})" --set gateway.secrets.gdprHmacKey="$(printf 'k%.0s' {1..32})" --set gateway.secrets.databaseOwnerUrl=
+refuse "migrate on a moving tag" "immutable image tag" -f "$CHART/examples/values-kind.yaml" --set global.imageTag=main
+refuse "migrate on the default appVersion" "immutable image tag" -f "$CHART/examples/values-eks-alb.yaml" --set global.imageTag=
 refuse "bad exposure" "exposure.type" -f "$CHART/examples/values-kind.yaml" --set exposure.type=nodeport
 refuse "quote in runtime config" "web.runtimeConfig" -f "$CHART/examples/values-kind.yaml" --set 'web.runtimeConfig.environment=a"b'
 refuse "path in apiBase" "apiBase" -f "$CHART/examples/values-kind.yaml" --set web.runtimeConfig.apiBase=https://x/y

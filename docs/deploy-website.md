@@ -348,7 +348,8 @@ the website only links into the app; it never talks to Stripe.
 # The app: the chart with host app.cloudtrain.com and the website origin
 # (deploy/charts/cloudtrain/examples/values-split-site.yaml).
 helm upgrade --install cloudtrain deploy/charts/cloudtrain -n cloudtrain \
-  -f deploy/charts/cloudtrain/examples/values-split-site.yaml
+  -f deploy/charts/cloudtrain/examples/values-split-site.yaml \
+  --set global.imageTag=<version>
 
 # The website: the static build, pointing at the app for sign-in and the API.
 pnpm --filter web build:site -- --app-url https://app.cloudtrain.com \

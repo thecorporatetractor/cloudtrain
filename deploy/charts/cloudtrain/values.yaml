@@ -104,8 +104,8 @@ gateway:
     host: ""
     port: 587
     from: "CloudTrain <no-reply@example.com>"
-  # Secret with the gateway's credentials. Keys: CT_DATABASE_URL,
-  # CT_DATABASE_OWNER_URL (migrations), CT_OIDC_CLIENT_SECRET, CT_SESSION_SECRET
+  # Secret with the gateway's credentials. Keys: CT_DATABASE_URL (the app role),
+  # CT_DATABASE_OWNER_URL (the migrate Job only), CT_OIDC_CLIENT_SECRET, CT_SESSION_SECRET
   # (>= 16 chars), CT_GDPR_HMAC_KEY (>= 32 chars, docs/gdpr.md), optional CT_KEYCLOAK_ADMIN_CLIENT_SECRET. Required unless
   # postgres.demo.enabled and gateway.secrets.create are used.
   existingSecret: ""
@@ -120,9 +120,25 @@ gateway:
     gdprHmacKey: ""
     databaseUrl: ""
     databaseOwnerUrl: ""
-  # Run the schema migrations (dist/db/cli.js migrate, as the owner role) in an
-  # init container before every rollout; idempotent and locked by Kysely.
+  # Run the schema migrations (dist/db/cli.js migrate, as the owner role) in a
+  # Job of their own, one per image reference and settings; idempotent and locked by Kysely.
+  # Only that Job gets CT_DATABASE_OWNER_URL: the gateway pods connect as the
+  # RLS-bound app role (and refuse to start as the owner), and their
+  # wait-for-schema init container holds a rollout until the Job is done.
+  # false: run migrations yourself (docs/deploy.md).
   migrate: true
+  # Bump to run the migrate Job again with an unchanged image and settings, e.g.
+  # after it failed for good (DB unreachable past its 30-minute deadline):
+  # the Job is named by a hash of its spec and this value, and Kubernetes never
+  # restarts a failed Job of the same name.
+  migrateRetry: 0
+  # The migrate Job is named by the image reference, not the image content, so
+  # gateway.migrate refuses the moving tags main and latest: a new build under
+  # the same tag would never be migrated, and its pods would wait for the
+  # schema until they crash-loop. true allows them (development only): bump
+  # migrateRetry after every new build. Other moving tags (kind's dev) need the
+  # same care.
+  migrateMutableTag: false
   # Read cluster-wide capacity for the admin dashboard (nodes, pods, VMIs).
   clusterCapacity: true
   extraEnv: []
