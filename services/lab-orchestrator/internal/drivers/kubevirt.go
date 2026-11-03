@@ -254,6 +254,10 @@ type cloudInit struct {
 	RunCmd     []string
 }
 
+// LoginuidImmutable makes audit loginuids immutable once set (needs auditctl
+// and CAP_AUDIT_CONTROL; a no-op where the audit tools are missing).
+const LoginuidImmutable = "command -v auditctl >/dev/null 2>&1 && auditctl --loginuid-immutable >/dev/null 2>&1 || true"
+
 // Render returns the #cloud-config document: the learner account (sudo
 // without password, learner key), root reachable with the admin key only
 // (and from the entry node whatever the host's sshd policy, see
@@ -273,7 +277,13 @@ func (c cloudInit) Render() ([]byte, error) {
 	}
 	files = append(files, graderAccessFiles(c.AdminPub, c.HostKey)...)
 	files = append(files, c.Files...)
-	runcmd := []any{[]any{"bash", "-c", "date +%s.%N > /var/log/cloudtrain-boot.ts"}}
+	runcmd := []any{
+		[]any{"bash", "-c", "date +%s.%N > /var/log/cloudtrain-boot.ts"},
+		// Freeze (revoke.go): root cannot rewrite /proc/self/loginuid to
+		// hide a process from the learner's login session. Best effort: only
+		// where the audit tools are installed.
+		[]any{"bash", "-c", LoginuidImmutable},
+	}
 	for _, r := range c.RunCmd {
 		runcmd = append(runcmd, []any{"bash", "-c", r})
 	}

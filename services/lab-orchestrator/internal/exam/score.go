@@ -3,6 +3,7 @@ package exam
 import (
 	"math"
 	"strconv"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -167,8 +168,22 @@ func Score(spec *labsv1.ExamTemplateSpec, tasks []ScoredTask, g *labsv1.ExamGrad
 	total = round1(total)
 	rep.Score = fmtNum(total)
 	rep.Passed = total >= round1(parseWeight(spec.PassMark))
+	if g != nil && len(g.RevocationUnconfirmed) > 0 {
+		// Fail closed: access that may still have been live during grading
+		// could have produced the results.
+		rep.Passed, rep.Unscored, rep.UnscoredReason = false, true, MsgUnscoredRevocation
+		rep.ReviewFlags = append(rep.ReviewFlags, "access revocation not confirmed: "+strings.Join(g.RevocationUnconfirmed, "; "))
+	}
+	if g != nil && len(g.StillRunningAfterFreeze) > 0 {
+		rep.ReviewFlags = append(rep.ReviewFlags, "units or processes started after Ready survived the freeze: "+strings.Join(g.StillRunningAfterFreeze, ", "))
+	}
 	return rep
 }
+
+// MsgUnscoredRevocation is the learner-safe reason of an attempt left
+// unscored because candidate access was not confirmed revoked. The attempt
+// still counts unless an administrator voids it after review.
+const MsgUnscoredRevocation = "the environment could not be confirmed frozen before grading, so this attempt is not scored and is held for review; it counts as an attempt unless an administrator voids it"
 
 // FormatWeight renders a task weight for status.
 func FormatWeight(w float64) string { return fmtNum(math.Round(w*100) / 100) }

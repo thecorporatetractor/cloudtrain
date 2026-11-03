@@ -66,6 +66,9 @@ export interface ExamScoreReportCR {
   objectives: { id: string; weight: string; tasks: number; score: string }[];
   tasks: { index: number; id: string; title: string; objective: string; weight: string; outcome: 'pass' | 'partial' | 'fail'; score: string; checks: ExamCheckReport[] }[];
   passes?: string[];
+  unscored?: boolean;
+  unscoredReason?: string;
+  reviewFlags?: string[];
   gradedAt: string;
 }
 

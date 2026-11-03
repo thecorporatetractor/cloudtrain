@@ -2,7 +2,7 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowRight, ChevronLeft, GraduationCap, History, Hourglass, Play, Users } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { useExams, useGrantExamRetake, useMyAttempts, useTeamExamReadiness, useVoidExamAttempt } from '@/api/exams';
-import type { ExamAttemptSummary, ExamSummary, TeamExamMember } from '@/api/types';
+import type { ExamAttemptSummary, ExamHeldAttempt, ExamSummary, TeamExamMember } from '@/api/types';
 import { can, RequireAccess } from '@/app/access';
 import { useShell } from '@/app/shell-context';
 import { alignLabel, Disclaimer, ExamDomainIcon, examDomainLabel, fmtPct, PhaseBadge, ResultBadge, RuleChips, ScoreBar } from '@/components/exams/ui';
@@ -252,6 +252,91 @@ function MemberActions({ examId, examTitle, member }: { examId: string; examTitl
   );
 }
 
+/**
+ * Completed attempts the orchestrator held for review: left unscored (the
+ * freeze was not confirmed) or flagged (something the candidate may have
+ * started survived it). Voiding one (session.control) stops it counting.
+ */
+function HeldForReview({ held }: { held: ExamHeldAttempt[] }) {
+  const { me } = useSelectedTeam(undefined);
+  const { toast } = useShell();
+  const voider = useVoidExamAttempt();
+  const [target, setTarget] = useState<ExamHeldAttempt | null>(null);
+  const [reason, setReason] = useState('');
+  if (!held.length) return null;
+  const mayVoid = can(me, 'session.control');
+  const close = () => (setTarget(null), setReason(''));
+  return (
+    <Card className="card-flush" style={{ marginBottom: 20 }}>
+      <div className="card-head">
+        <h2>Held for review</h2>
+        <span className="xs subtle">counted until voided</span>
+      </div>
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Member</th>
+            <th>Status</th>
+            <th style={{ textAlign: 'right' }}>Graded score</th>
+            <th>Why</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {held.map((h) => (
+            <tr key={h.attemptId}>
+              <td className="small">
+                {h.name}
+                <div className="xs subtle">
+                  attempt {h.number}
+                  {h.completedAt ? ` · ${relativeTime(h.completedAt)}` : ''}
+                </div>
+              </td>
+              <td>
+                <Badge tone={h.review.unscored ? 'err' : 'warn'}>{h.review.unscored ? 'Not scored' : 'Scored, flagged'}</Badge>
+              </td>
+              <td className="tnum small" style={{ textAlign: 'right' }}>
+                {fmtPct(h.review.gradedScore)}
+                <div className="xs subtle">{h.review.gradedPassed ? 'at or above the pass mark' : 'below the pass mark'}</div>
+              </td>
+              <td className="xs muted">
+                {h.review.flags.map((f) => (
+                  <div key={f}>{f}</div>
+                ))}
+              </td>
+              <td>
+                {mayVoid && (
+                  <Button size="sm" variant="ghost" onClick={() => setTarget(h)}>
+                    Void attempt
+                  </Button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <ConfirmDialog
+        open={target !== null}
+        onOpenChange={(o) => !o && close()}
+        title={target ? `Void ${target.name}'s attempt ${target.number}?` : ''}
+        description={target ? `After review: the attempt stops counting against ${target.name}'s retakes${target.review.unscored ? '' : ', and its score and pass no longer count'}. This is recorded in the audit log.` : ''}
+        confirmLabel="Void attempt"
+        danger
+        loading={voider.isPending}
+        onConfirm={() => {
+          if (!target) return;
+          const failed = (e: Error) => toast({ title: 'Not done', description: e.message, tone: 'err' });
+          voider.mutate({ attemptId: target.attemptId, reason: reason || undefined }, { onSuccess: () => (toast({ title: 'Attempt voided', tone: 'ok' }), close()), onError: failed });
+        }}
+      >
+        <Field label="Reason (audit log)">
+          {({ id }) => <Input id={id} value={reason} maxLength={500} onChange={(e) => setReason(e.target.value)} placeholder="e.g. platform fault confirmed: node lost during the freeze" />}
+        </Field>
+      </ConfirmDialog>
+    </Card>
+  );
+}
+
 export function TeamExams() {
   const search = teamExamsRoute.useSearch();
   const navigate = useNavigate({ from: '/team/exams' });
@@ -307,6 +392,7 @@ export function TeamExams() {
                 <Stat label="Not attempted" value={exam.members.filter((m) => m.readiness === 'not-attempted').length} hint={<span className="row" style={{ gap: 4 }}><Users size={11} /> of {exam.members.length} members</span>} />
               </Card>
             </div>
+            <HeldForReview held={exam.heldForReview ?? []} />
             <Card className="card-flush">
               <div className="card-head">
                 <h2>{exam.examTitle}</h2>

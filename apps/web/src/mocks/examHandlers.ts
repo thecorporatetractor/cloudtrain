@@ -1,9 +1,11 @@
 import { delay, http, HttpResponse } from 'msw';
 import type {
   ExamAttemptPhase,
+  ExamAttemptReview,
   ExamAttemptState,
   ExamAttemptSummary,
   ExamDetail,
+  ExamHeldAttempt,
   ExamReport,
   ExamSummary,
   RetakeStatus,
@@ -44,8 +46,13 @@ interface MockAttempt {
   tasks: MockTask[];
   flagged: Set<number>;
   report?: ExamReport;
+  /** Held for review (manager view only), like the gateway's stored report review. */
+  review?: ExamAttemptReview;
   voided?: { at: number; reason?: string };
 }
+
+/** Counts for the retake policy: not lost by the platform, not voided. */
+const countedMock = (a: MockAttempt) => a.phase !== 'failed' && !a.voided;
 
 const exams = new Map(fixtureExams.map((e) => [e.id, e]));
 const attempts = new Map<string, MockAttempt>();
@@ -116,9 +123,9 @@ function summary(a: MockAttempt): ExamAttemptSummary {
     ...(a.deadline ? { deadline: iso(a.deadline) } : {}),
     ...(a.submittedAt ? { submittedAt: iso(a.submittedAt) } : {}),
     ...(a.completedAt ? { completedAt: iso(a.completedAt) } : {}),
-    ...(a.report ? { score: a.report.score, passed: a.report.passed } : {}),
+    ...(a.report ? { ...(a.report.unscored ? {} : { score: a.report.score }), passed: a.report.passed } : {}),
     number: a.number,
-    counted: a.phase !== 'failed',
+    counted: countedMock(a),
     ...(a.voided ? { voided: { at: iso(a.voided.at)!, ...(a.voided.reason ? { reason: a.voided.reason } : {}) } } : {}),
   };
 }
@@ -137,7 +144,7 @@ function ownAttempt(id: unknown): MockAttempt | undefined {
 
 function retake(exam: FixtureExam): RetakeStatus {
   const list = mine(exam.id).map((a) => (tick(a), a));
-  const counted = list.filter((a) => a.phase !== 'failed');
+  const counted = list.filter(countedMock);
   const recent = counted.filter((a) => Date.now() - a.startedAt < 30 * DAY);
   const freeRetakesLeft = Math.max(0, exam.retakePolicy.freeRetakes - Math.max(0, counted.length - 1));
   const open = grants.get(`${me()?.id}:${exam.id}`) ?? 0;
@@ -236,9 +243,9 @@ function state(a: MockAttempt): ExamAttemptState {
 
 /** Readiness of one member: from their mock attempts when they have any, otherwise a stable sample. */
 function memberRow(exam: FixtureExam, m: { id: string; name: string }, i: number): TeamExamMember {
-  const real = mine(exam.id, m.id).map((a) => (tick(a), a)).filter((a) => a.phase !== 'failed');
+  const real = mine(exam.id, m.id).map((a) => (tick(a), a)).filter(countedMock);
   if (real.length) {
-    const graded = real.filter((a) => a.report);
+    const graded = real.filter((a) => a.report && !a.report.unscored);
     const best = graded.length ? Math.max(...graded.map((a) => a.report!.score)) : undefined;
     const last = graded[0]?.report;
     const weakest = last?.objectives.slice().sort((a, b) => a.score - b.score)[0];
@@ -298,6 +305,11 @@ function team(teamId: string | null): TeamExamReadiness | Response {
           members: rows,
           ...(attempted.length ? { averageScore: Math.round((attempted.reduce((a, x) => a + x.lastScore!, 0) / attempted.length) * 10) / 10 } : {}),
           passRate: rows.length ? rows.filter((x) => x.passed).length / rows.length : 0,
+          heldForReview: members.flatMap((mm) =>
+            mine(exam.id, mm.id)
+              .filter((a) => countedMock(a) && a.phase === 'completed' && a.review)
+              .map((a): ExamHeldAttempt => ({ attemptId: a.id, userId: mm.id, name: mm.name, number: a.number, ...(a.completedAt ? { completedAt: iso(a.completedAt)! } : {}), review: a.review! })),
+          ),
         };
       }),
   };
@@ -331,7 +343,9 @@ export const examHandlers = [
     const a = ownAttempt(params.id);
     if (!a) return notFound('Attempt');
     tick(a);
-    return a.report ? HttpResponse.json(a.report) : HttpResponse.json({ error: 'The report is not ready yet.' }, { status: 409 });
+    if (!a.report) return HttpResponse.json({ error: 'The report is not ready yet.' }, { status: 409 });
+    // Like the gateway: an unscored report carries no results for the candidate.
+    return HttpResponse.json(a.report.unscored ? { ...a.report, score: 0, passed: false, objectives: [], tasks: [], skills: [], recommendations: [] } : a.report);
   }),
   http.put('/api/exams/attempts/:id/tasks/:index/flag', async ({ params, request }) => {
     await delay(80);
@@ -386,11 +400,17 @@ export const examHandlers = [
     const a = attempts.get(String(params.id));
     if (!a) return notFound('Attempt');
     tick(a);
-    if (a.phase !== 'preparing' && a.phase !== 'in-progress' && a.phase !== 'grading') return HttpResponse.json({ error: 'Only a running attempt can be voided.', code: 'conflict' }, { status: 409 });
+    // Like the gateway: a completed attempt held for review (unscored or
+    // flagged) can be voided too; it keeps its phase and stops counting.
+    const held = a.phase === 'completed' && !!a.review && !a.voided;
+    if (a.phase !== 'preparing' && a.phase !== 'in-progress' && a.phase !== 'grading' && !held) return HttpResponse.json({ error: 'Only a running attempt or one held for review can be voided.', code: 'conflict' }, { status: 409 });
     const { reason } = ((await request.json().catch(() => ({}))) ?? {}) as { reason?: string };
-    a.phase = 'failed';
-    a.completedAt = Date.now();
-    a.voided = { at: a.completedAt, ...(reason ? { reason } : {}) };
+    const at = Date.now();
+    if (!held) {
+      a.phase = 'failed';
+      a.completedAt = at;
+    }
+    a.voided = { at, ...(reason ? { reason } : {}) };
     return HttpResponse.json(summary(a));
   }),
   http.post('/api/exams/:examId/retake-grants', async ({ params, request }) => {

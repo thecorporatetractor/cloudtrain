@@ -211,6 +211,14 @@ type LabSessionStatus struct {
 	ReadyAt *metav1.Time `json:"readyAt,omitempty"`
 	// +optional
 	Hibernated bool `json:"hibernated,omitempty"`
+	// StillRunningAfterRevoke lists what was started after Ready and still
+	// ran when learner access was revoked: transient systemd units ("node:
+	// unit", e.g. sudo systemd-run) and processes outside any systemd unit
+	// ("node: process comm[pid] cgroup", e.g. a loop daemonised through sudo
+	// setsid). They are left running, since they may be the graded state,
+	// and flagged for review instead.
+	// +optional
+	StillRunningAfterRevoke []string `json:"stillRunningAfterRevoke,omitempty"`
 	// Topology is the resolved topology the session's resources were
 	// provisioned from. It is recorded before anything is provisioned and
 	// drives teardown, so cleanup never depends on the live LabTemplate.

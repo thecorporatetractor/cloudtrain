@@ -509,3 +509,16 @@ func ids(ds []Drawn) string {
 	}
 	return strings.Join(out, ",")
 }
+
+func TestScoreUnscoredWhenRevocationUnconfirmed(t *testing.T) {
+	all := map[string]bool{"t1/x": true, "t1/y": true, "t2/x": true, "t3/x": true, "t3/z": true}
+	g := &labsv1.ExamGradingStatus{Passes: []labsv1.ExamGradingPass{pass(labsv1.PassInitial, all)}}
+	if rep := Score(scoreSpec(labsv1.PartialCreditPerCheck), scoreTasks(), g, metav1.Now()); !rep.Passed || rep.Unscored {
+		t.Fatalf("confirmed freeze: passed %v unscored %v", rep.Passed, rep.Unscored)
+	}
+	g.RevocationUnconfirmed = []string{"env-0"}
+	rep := Score(scoreSpec(labsv1.PartialCreditPerCheck), scoreTasks(), g, metav1.Now())
+	if rep.Passed || !rep.Unscored || rep.UnscoredReason != MsgUnscoredRevocation || rep.Score != "100" {
+		t.Errorf("unconfirmed freeze: %+v", rep)
+	}
+}
