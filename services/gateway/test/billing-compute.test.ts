@@ -292,7 +292,10 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     expect(b.error).toMatch(/€0\.01/);
     // The session that was already running is untouched.
     expect(cluster.sessions.has(running.json().id)).toBe(true);
-    expect((await start(Q.mei, TRIAL)).statusCode).toBe(201); // the trial is free, the cap is about money
+    const trial = await start(Q.mei, TRIAL);
+    expect(trial.statusCode).toBe(201); // the trial is free, the cap is about money
+    // Pro runs two labs at a time (plan limit): end the trial before the next one.
+    expect((await as(Q.mei).del(`/api/sessions/${trial.json().id}`)).statusCode).toBe(204);
     expect((await as(Q.mei).put('/api/billing/me/limits', { monthlyCap: 1, hardStop: false })).statusCode).toBe(200);
     expect((await start(Q.mei, STANDARD_VM)).statusCode).toBe(201); // warn only
     expect((await as(Q.mei).get('/api/billing/me')).json().limit).toMatchObject({ reached: true, warn: true, hardStop: false });

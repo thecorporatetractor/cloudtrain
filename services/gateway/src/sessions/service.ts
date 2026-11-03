@@ -5,7 +5,7 @@ import type { Content, ContentLab } from '../content/load.js';
 import { HttpError, notFound } from '../errors.js';
 import { ConflictError, type LabCluster } from '../kube/cluster.js';
 import type { Compiler } from '../kube/compile.js';
-import { ANNOTATION_HINTS, LABEL_LAB, LABEL_LEARNER, LABEL_MANAGED_BY, LABEL_ORG, LABS_API_VERSION, MANAGED_BY, type LabSession } from '../kube/types.js';
+import { ANNOTATION_HINTS, LABEL_CTF_EVENT, LABEL_LAB, LABEL_LEARNER, LABEL_MANAGED_BY, LABEL_ORG, LABS_API_VERSION, MANAGED_BY, type LabSession } from '../kube/types.js';
 import { labIdOf, phaseOf, revealedHints, toWebSession } from './map.js';
 import { endStateChecks } from '../content/view.js';
 
@@ -17,10 +17,26 @@ import { endStateChecks } from '../content/view.js';
 export interface SessionHooks {
   /** Throws to refuse the start (404 hidden lab, 429 quota); may set the TTL. */
   beforeStart(p: Principal, lab: ContentLab): Promise<{ ttlMinutes?: number }>;
+  /** Throws to refuse reattaching to a running session (404 hidden lab, 409 restricted processing); no quotas: it runs already. */
+  beforeResume?(p: Principal, lab: ContentLab): Promise<void>;
   started(p: Principal, lab: ContentLab, ls: LabSession): Promise<void>;
   validated(p: Principal, lab: ContentLab, ls: LabSession, res: ValidateResponse): Promise<void>;
   ended(p: Principal, sessionName: string, ls?: LabSession): Promise<void>;
   decorate(p: Principal, s: WebSession): Promise<WebSession>;
+}
+
+/**
+ * The billing gate and metering (src/billing) on every start path: lab
+ * sessions and CTF event labs alike. `gate` throws to refuse (402) and
+ * otherwise reserves the start (its usage row) under the session's name;
+ * `metered` confirms it once the session exists, `release` when the start failed.
+ */
+export interface SessionBilling<D = unknown> {
+  gate(p: Principal, labId: string, kind: 'lab' | 'event', sessionName: string): Promise<D>;
+  metered(p: Principal, decision: D, session: WebSession): Promise<void>;
+  release(p: Principal, decision: D): Promise<void>;
+  /** Reattach: confirm the session's usage row if a start lost its confirmation. */
+  confirm(p: Principal, sessionName: string): Promise<void>;
 }
 
 export interface SessionServiceOptions {
@@ -55,6 +71,7 @@ export class SessionService {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   hooks?: SessionHooks;
+  billing?: SessionBilling;
 
   constructor(
     private readonly content: Content,
@@ -110,11 +127,16 @@ export class SessionService {
   /** The caller's session, or 404 (also for someone else's session: existence is not revealed). */
   async owned(principal: Principal, id: string): Promise<{ ls: LabSession; lab: ContentLab }> {
     const ls = await this.cluster.getSession(id);
-    if (!ls || ls.spec.learner.id !== principal.sub) throw notFound('Session');
+    if (!ls || !this.mine(principal, ls)) throw notFound('Session');
     const labId = labIdOf(ls);
     const lab = labId ? this.content.labs.get(labId) : undefined;
     if (!lab) throw new HttpError(410, `Lab ${labId ?? '(unknown)'} is no longer in the catalog`);
     return { ls, lab };
+  }
+
+  /** The caller's session in the caller's current organisation (after switching orgs, the other org's sessions are not theirs here). */
+  private mine(principal: Principal, ls: LabSession): boolean {
+    return ls.spec.learner.id === principal.sub && (ls.spec.learner.org ?? '') === (principal.orgId ?? '');
   }
 
   private async ensureTemplate(lab: ContentLab): Promise<string> {
@@ -137,18 +159,41 @@ export class SessionService {
   async start(principal: Principal, labId: string, opts: { seed?: number; labels?: Record<string, string>; endsAt?: Date } = {}): Promise<WebSession> {
     const lab = this.lab(labId);
     const gate = this.hooks ? await this.hooks.beforeStart(principal, lab) : {};
+    const name = sessionName(labId);
+    const decision = await this.billing?.gate(principal, labId, opts.labels?.[LABEL_CTF_EVENT] ? 'event' : 'lab', name);
     const ttl = gate.ttlMinutes ?? this.opts.sessionTtlMinutes;
     let expiresAt: string | undefined;
     if (opts.endsAt) {
       const cap = ttl ? Math.min(this.now() + ttl * 60_000, opts.endsAt.getTime()) : opts.endsAt.getTime();
       expiresAt = new Date(cap).toISOString().replace(/\.\d{3}Z$/, 'Z');
     }
+    let created: LabSession;
+    try {
+      created = await this.create(principal, lab, labId, name, opts, expiresAt, ttl);
+    } catch (e) {
+      // The write may have committed although the call failed (a client timeout): then the
+      // session runs and is metered. Only a start that left no session releases its reservation.
+      const existing = await this.cluster.getSession(name).catch(() => null);
+      if (!existing) {
+        await this.billing?.release(principal, decision);
+        throw e;
+      }
+      created = existing;
+    }
+    const session = toWebSession(created, lab.lab);
+    // Metered before anything else can fail: the session exists from here on.
+    await this.billing?.metered(principal, decision, session);
+    await this.hooks?.started(principal, lab, created);
+    return session;
+  }
+
+  private async create(principal: Principal, lab: ContentLab, labId: string, name: string, opts: { seed?: number; labels?: Record<string, string> }, expiresAt: string | undefined, ttl: number | undefined): Promise<LabSession> {
     const templateName = await this.ensureTemplate(lab);
     const ls: LabSession = {
       apiVersion: LABS_API_VERSION,
       kind: 'LabSession',
       metadata: {
-        name: sessionName(labId),
+        name,
         labels: {
           [LABEL_LAB]: labelValue(labId),
           [LABEL_LEARNER]: labelValue(principal.sub),
@@ -164,9 +209,25 @@ export class SessionService {
         ...(expiresAt ? { expiresAt } : ttl ? { ttl: `${ttl}m` } : {}),
       },
     };
-    const created = await this.cluster.createSession(ls);
-    await this.hooks?.started(principal, lab, created);
-    return toWebSession(created, lab.lab);
+    return this.cluster.createSession(ls);
+  }
+
+  /**
+   * The caller's running session of a lab started from the lab page (not a
+   * CTF event's), newest first: starting the lab again reattaches to it
+   * instead of creating, and paying for, a second environment.
+   */
+  async live(principal: Principal, labId: string): Promise<WebSession | null> {
+    const lab = this.lab(labId);
+    const sel = [`${LABEL_LEARNER}=${labelValue(principal.sub)}`, `${LABEL_ORG}=${labelValue(principal.orgId)}`, `${LABEL_MANAGED_BY}=${MANAGED_BY}`, `${LABEL_LAB}=${labelValue(labId)}`].join(',');
+    const running = (await this.cluster.listSessions(sel))
+      .filter((ls) => this.mine(principal, ls) && labIdOf(ls) === labId && !ls.metadata.labels?.[LABEL_CTF_EVENT] && !['expired', 'failed'].includes(phaseOf(ls)))
+      .sort((a, b) => (b.metadata.creationTimestamp ?? '').localeCompare(a.metadata.creationTimestamp ?? ''));
+    if (!running[0]) return null;
+    // Reattaching is access too: a hidden lab or restricted processing refuses it like a start (no quotas: it already runs).
+    await this.hooks?.beforeResume?.(principal, lab);
+    await this.billing?.confirm(principal, running[0].metadata.name);
+    return this.view(principal, running[0], lab);
   }
 
   async get(principal: Principal, id: string): Promise<WebSession> {
@@ -176,11 +237,11 @@ export class SessionService {
 
   /** The caller's sessions (newest first), optionally for one lab. */
   async list(principal: Principal, labId?: string): Promise<WebSession[]> {
-    const sel = [`${LABEL_LEARNER}=${labelValue(principal.sub)}`, `${LABEL_MANAGED_BY}=${MANAGED_BY}`];
+    const sel = [`${LABEL_LEARNER}=${labelValue(principal.sub)}`, `${LABEL_ORG}=${labelValue(principal.orgId)}`, `${LABEL_MANAGED_BY}=${MANAGED_BY}`];
     if (labId) sel.push(`${LABEL_LAB}=${labelValue(labId)}`);
     const items = await this.cluster.listSessions(sel.join(','));
     return items
-      .filter((ls) => ls.spec.learner.id === principal.sub)
+      .filter((ls) => this.mine(principal, ls))
       .flatMap((ls) => {
         const lab = this.content.labs.get(labIdOf(ls) ?? '');
         return lab ? [toWebSession(ls, lab.lab)] : [];

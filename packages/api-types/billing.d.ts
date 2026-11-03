@@ -194,13 +194,17 @@ export interface SeatAssignRequest {
   userId: string;
 }
 
-export type BillingBlockReason = 'plan_required' | 'trial_exhausted' | 'payment_method_required' | 'payment_overdue' | 'spend_cap_reached';
+/**
+ * Why billing refuses a start. The last three are plan limits (`PlanEntitlements`): labs running at
+ * once, lab hours this month (UTC), exam simulations started this month.
+ */
+export type BillingBlockReason = 'plan_required' | 'trial_exhausted' | 'payment_method_required' | 'payment_overdue' | 'spend_cap_reached' | 'concurrent_limit' | 'lab_hours_exhausted' | 'exam_limit_reached';
 
-/** `details` of a 402 `payment_required` on a lab start. */
+/** `details` of a 402 `payment_required` on a lab, exam or CTF event lab start. */
 export interface BillingBlockDetails {
   reason: BillingBlockReason;
-  /** What fixes it. `contact_admin`: the organisation's account blocks and the caller cannot manage it. */
-  action: 'upgrade' | 'add_payment_method' | 'portal' | 'raise_cap' | 'contact_admin';
+  /** What fixes it. `contact_admin`: the organisation's account blocks and the caller cannot manage it. `end_session`: end a running lab first. */
+  action: 'upgrade' | 'add_payment_method' | 'portal' | 'raise_cap' | 'contact_admin' | 'end_session';
   /** The page where it is fixed (/account/billing or /admin/billing). */
   href: string;
   /** Whose account blocks. */
@@ -210,6 +214,9 @@ export interface BillingBlockDetails {
   cap?: number;
   spent?: number;
   graceEndedAt?: string;
+  /** Plan limits: the limit and what is used (labs running, hours this month, exam simulations this month). */
+  limit?: number;
+  used?: number;
 }
 
 /** Billing view of one lab for the signed-in person. */

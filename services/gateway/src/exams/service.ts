@@ -108,6 +108,17 @@ export class ExamService {
     return ex;
   }
 
+  /** Whether the attempt's ExamSession exists (a start whose create call failed may still have created it). */
+  async environmentExists(name: string): Promise<boolean> {
+    return !!(await this.cluster.getExamSession(name).catch(() => null));
+  }
+
+  /** What billing gates and meters an attempt by: the exam and the labs of its task pool (404 for an unknown exam). */
+  billingFacts(examId: string): { id: string; title: string; labIds: string[] } {
+    const ex = this.exam(examId);
+    return { id: examId, title: ex.def.title, labIds: Array.from(new Set([...ex.available.values()].flat())) };
+  }
+
   private duration(ex: CatalogExam): number {
     return this.opts.durationMinutes ?? ex.def.durationMinutes;
   }
@@ -225,7 +236,7 @@ export class ExamService {
    * one-running-attempt guarantee (a unique index in Postgres) also holds
    * under concurrent starts. Audited as exam.start.
    */
-  async start(p: Principal, examId: string, ip?: string): Promise<ExamAttemptState> {
+  async start(p: Principal, examId: string, ip?: string, name: string = attemptName()): Promise<ExamAttemptState> {
     const ex = this.exam(examId);
     if (ex.availability !== 'available') throw new HttpError(409, ex.availabilityNote ?? 'This exam simulation is not available yet.');
     const mine = await this.syncAll(p, examId);
@@ -235,7 +246,6 @@ export class ExamService {
     if (!status.allowed) throw new HttpError(409, status.reason ?? 'You cannot start this exam now.', { code: 'conflict', details: { ...(status.nextAllowedAt ? { nextAllowedAt: status.nextAllowedAt } : {}), ...(status.activeAttemptId ? { activeAttemptId: status.activeAttemptId } : {}) } });
 
     const avoid = policy.freshDraw ? Array.from(new Set(mine.filter(counted).flatMap((a) => a.tasks.map((t) => t.taskId)))) : [];
-    const name = attemptName();
     const seed = randomInt(1, 2 ** 31 - 1);
     const minutes = this.duration(ex);
     const rec: AttemptRecord = {

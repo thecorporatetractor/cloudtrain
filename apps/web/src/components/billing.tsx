@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router';
-import { AlertTriangle, ArrowRight, CreditCard, Gauge, Lock, Sparkles } from 'lucide-react';
+import { AlertTriangle, ArrowRight, CalendarClock, CreditCard, Gauge, Layers, Lock, Sparkles } from 'lucide-react';
 import { useBilling } from '@/api/billing';
 import type { BillingBlockDetails, BillingBlockReason, LabAccess, LabSummary } from '@/api/types';
 import { Badge } from '@/components/ui';
@@ -18,6 +18,9 @@ const ICON: Record<BillingBlockReason, typeof Lock> = {
   payment_method_required: CreditCard,
   payment_overdue: AlertTriangle,
   spend_cap_reached: Gauge,
+  concurrent_limit: Layers,
+  lab_hours_exhausted: CalendarClock,
+  exam_limit_reached: CalendarClock,
 };
 
 /** A refused lab start (402 payment_required) or a locked lab: title, the gateway's message, the fix. */
