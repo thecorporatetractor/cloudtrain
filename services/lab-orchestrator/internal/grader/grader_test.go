@@ -182,3 +182,27 @@ func TestGradeNoHostAccess(t *testing.T) {
 		}
 	}
 }
+
+// content-10: only the API server's NotFound reads as an empty result; any
+// other "not found" (context, kubeconfig, binary) is an error, so an
+// "expect empty" check cannot pass on it.
+func TestK8sQueryNotFoundIsServerOnly(t *testing.T) {
+	empty := &labsv1.Expectation{Match: "exact", Value: ""}
+	for stderr, wantPass := range map[string]bool{
+		`Error from server (NotFound): deployments.apps "x" not found`: true,
+		`error: context "qm" not found`:                                false,
+		`sh: 1: kubectl: not found`:                                    false,
+		`error: stat /root/.kube/c.conf: no such file or directory`:    false,
+		// The server's NotFound for a whole API type (missing group, deleted CRD).
+		`Error from server (NotFound): the server could not find the requested resource`: false,
+	} {
+		f := &fakeExec{reply: func(string, drivers.ExecRequest) (drivers.ExecResult, error) {
+			return drivers.ExecResult{Stderr: stderr, ExitCode: 1}, nil
+		}}
+		g := &Grader{Exec: f, Entry: "ws"}
+		_, res := g.Grade(context.Background(), []labsv1.Check{{ID: "q", Type: "k8s-query", Query: &labsv1.CheckQuery{Cluster: "c", Resource: "deployment", Name: "x", JSONPath: "{.spec}"}, Expect: empty}})
+		if res[0].Passed != wantPass {
+			t.Errorf("%q: passed=%v, want %v (%s)", stderr, res[0].Passed, wantPass, res[0].Message)
+		}
+	}
+}

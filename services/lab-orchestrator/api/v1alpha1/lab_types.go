@@ -274,7 +274,11 @@ type Check struct {
 	Port *int32 `json:"port,omitempty"`
 	// +optional
 	Expect *Expectation `json:"expect,omitempty"`
+	// TimeoutSec bounds one run of the check (0 on answer checks, which never
+	// run on a node).
 	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=300
 	TimeoutSec int32 `json:"timeoutSec,omitempty"`
 	// Answer is set on answer checks only.
 	// +optional

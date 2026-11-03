@@ -444,8 +444,16 @@ func (g *Grader) probe(ctx context.Context, c labsv1.Check) (outcome, error) {
 	return outcome{}, fmt.Errorf("check type %q: %w", c.Type, drivers.ErrUnsupported)
 }
 
+// isNotFound reports whether kubectl failed because the API server has no
+// such object. Only the server's NotFound for an object counts: other "not
+// found" errors (a missing context, kubeconfig or binary, "the server doesn't
+// have a resource type") and the server's NotFound for a whole API type ("the
+// server could not find the requested resource": a missing API group or a
+// deleted CRD) are grading errors, never an empty result an absence check
+// passes on.
 func isNotFound(stderr string) bool {
-	return strings.Contains(stderr, "NotFound") || strings.Contains(stderr, "not found")
+	return strings.Contains(stderr, "Error from server (NotFound)") &&
+		!strings.Contains(stderr, "the server could not find the requested resource")
 }
 
 // Normalize is the output a check compares: the raw output with at most one
