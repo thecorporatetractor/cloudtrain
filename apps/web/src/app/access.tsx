@@ -1,7 +1,8 @@
 import { Link } from '@tanstack/react-router';
-import { Lock } from 'lucide-react';
+import { Construction, Lock } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useMe } from '@/api/client';
+import { isRealApi } from '@/api/mode';
 import type { Me, Permission } from '@/api/types';
 import { EmptyState, PageSkeleton } from '@/components/ui';
 
@@ -16,6 +17,12 @@ export interface RouteAccess {
   when?: (me: Me) => boolean;
   /** Shown on the 403 page. */
   label: string;
+  /**
+   * The gateway does not serve this screen yet: it exists only in the in-browser demo (mock
+   * mode). With a real API it is hidden from navigation and its URL says it is not available,
+   * so nobody works on sample data that is never saved.
+   */
+  demoOnly?: true;
 }
 
 export const ROUTE_ACCESS: Record<string, RouteAccess> = {
@@ -26,7 +33,7 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   '/events/manage': { any: ['event.manage'], label: 'Manage CTF event' },
   '/team': { any: ['progress.read.team'], when: (me) => me.managedTeams.length > 0, label: 'Team dashboard' },
   '/cohorts': { any: ['cohort.manage'], label: 'Cohorts' },
-  '/studio': { any: ['studio.author'], label: 'Scenario Studio' },
+  '/studio': { any: ['studio.author'], label: 'Scenario Studio', demoOnly: true },
   '/admin': { any: ['user.manage', 'team.manage', 'sso.manage', 'content.visibility', 'quota.manage', 'audit.read', 'settings.manage', 'billing.manage'], label: 'Administration' },
   '/admin/users': { any: ['user.manage'], label: 'Users' },
   '/admin/teams': { any: ['team.manage'], label: 'Teams' },
@@ -39,6 +46,7 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   '/admin/billing': { any: ['billing.manage'], label: 'Plan & billing' },
   '/platform': { any: ['org.manage', 'capacity.read'], label: 'Platform' },
   '/platform/capacity': { any: ['capacity.read'], label: 'Capacity' },
+  '/platform/content': { any: ['org.manage'], label: 'Global content', demoOnly: true },
   '/platform/privacy': { any: ['org.manage'], label: 'Privacy requests' },
 };
 
@@ -52,10 +60,16 @@ function ruleFor(path: string): RouteAccess | undefined {
   return match ? ROUTE_ACCESS[match] : undefined;
 }
 
-export function canAccess(me: Me | undefined, path: string): boolean {
+/** The screen needs a backend this deployment does not have (see RouteAccess.demoOnly). */
+export function isUnavailable(path: string, real: boolean = isRealApi): boolean {
+  return !!(real && ruleFor(path)?.demoOnly);
+}
+
+export function canAccess(me: Me | undefined, path: string, real: boolean = isRealApi): boolean {
   const rule = ruleFor(path);
   if (!rule) return true;
   if (!me) return false;
+  if (isUnavailable(path, real)) return false;
   return rule.any.some((p) => me.permissions.includes(p)) && (rule.when ? rule.when(me) : true);
 }
 
@@ -69,6 +83,7 @@ export function RequireAccess({ path, children }: { path: string; children: Reac
       </div>
     );
   }
+  if (isUnavailable(path)) return <NotAvailable path={path} />;
   if (!canAccess(me.data, path)) return <Forbidden path={path} />;
   return <>{children}</>;
 }
@@ -82,6 +97,32 @@ export function Forbidden({ path, permission }: { path?: string; permission?: st
         icon={<Lock size={20} />}
         title={rule ? `${rule.label} is not available to you` : 'You do not have access to this page'}
         description={needs ? `It needs the ${needs} permission in this organisation. Ask your organisation admin if you think you should have it.` : 'Ask your organisation admin if you think you should have it.'}
+        action={
+          <Link to="/" className="btn btn-secondary btn-md">
+            Back to home
+          </Link>
+        }
+      />
+    </div>
+  );
+}
+
+/** A demo-only screen opened by URL in a deployment with a real API. */
+export function notAvailableCopy(path: string) {
+  return {
+    title: `${ruleFor(path)?.label ?? 'This page'} is not available yet`,
+    description: 'It is in development and only runs in the CloudTrain demo for now. Nothing here would be saved, so it is switched off in this deployment.',
+  };
+}
+
+export function NotAvailable({ path }: { path: string }) {
+  const copy = notAvailableCopy(path);
+  return (
+    <div className="page page-narrow">
+      <EmptyState
+        icon={<Construction size={20} />}
+        title={copy.title}
+        description={copy.description}
         action={
           <Link to="/" className="btn btn-secondary btn-md">
             Back to home
