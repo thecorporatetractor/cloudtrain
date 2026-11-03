@@ -22,6 +22,10 @@ export class FakeStripe {
   /** Accepted meter events, in order. */
   meterEvents: { identifier: string; event_name: string; timestamp: number; customer: string; value: number }[] = [];
   checkouts: Record<string, string>[] = [];
+  /** Checkout Sessions by id, with their status (open, complete, expired). */
+  checkoutSessions = new Map<string, Obj>();
+  /** Delay before answering Checkout Session creation (widens the window concurrent checkouts race in). */
+  checkoutCreateLatencyMs = 0;
   portals: Record<string, string>[] = [];
   subscriptionUpdates: { id: string; body: Record<string, string> }[] = [];
   idempotency = new Map<string, unknown>();
@@ -99,9 +103,26 @@ export class FakeStripe {
       return ok({ object: 'list', data: [...this.prices.values()].filter((p) => (keys.length ? keys.includes(p.lookup_key as string) : true)), has_more: false });
     }
     if (method === 'POST' && path === '/v1/checkout/sessions') {
+      if (this.checkoutCreateLatencyMs) await new Promise((r) => setTimeout(r, this.checkoutCreateLatencyMs));
       this.checkouts.push(body);
-      const s = { id: id('cs'), url: `https://checkout.stripe.test/${this.n}`, customer: body.customer, subscription: null, setup_intent: null, client_reference_id: body.client_reference_id, metadata: meta(body), mode: body.mode };
+      const s = { id: id('cs'), url: `https://checkout.stripe.test/${this.n}`, customer: body.customer, subscription: null, setup_intent: null, client_reference_id: body.client_reference_id, metadata: meta(body), mode: body.mode, status: 'open', created: Math.floor(Date.now() / 1000) };
+      this.checkoutSessions.set(s.id, s);
       return remember(s);
+    }
+    if (method === 'GET' && path === '/v1/checkout/sessions') {
+      const st = u.searchParams.get('status');
+      return ok({ object: 'list', data: [...this.checkoutSessions.values()].filter((x) => x.customer === u.searchParams.get('customer') && (!st || x.status === st)), has_more: false });
+    }
+    if (method === 'POST' && /^\/v1\/checkout\/sessions\/[^/]+\/expire$/.test(path)) {
+      const cs = this.checkoutSessions.get(path.split('/')[4]!);
+      if (!cs || cs.status !== 'open') return err(400, 'Only open sessions can be expired');
+      // A test can make a session complete just before its expiry (the payment won the race).
+      if (cs.completeOnExpire) {
+        Object.assign(cs, { status: 'complete', subscription: cs.completeOnExpire });
+        return err(400, 'Only open sessions can be expired');
+      }
+      cs.status = 'expired';
+      return ok(cs);
     }
     if (method === 'POST' && path === '/v1/billing_portal/sessions') {
       this.portals.push(body);

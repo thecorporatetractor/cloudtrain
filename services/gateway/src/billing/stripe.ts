@@ -122,6 +122,8 @@ export interface StripeCheckoutSession {
   metadata: Record<string, string>;
   mode: string;
   status?: string | null;
+  /** Unix seconds. */
+  created?: number;
 }
 export interface StripePortalSession {
   id: string;
@@ -193,6 +195,9 @@ export class StripeApi {
     sessions: {
       create: (p: Params, idempotencyKey?: string) => this.request<StripeCheckoutSession>('POST', '/v1/checkout/sessions', p, { idempotencyKey }),
       retrieve: (id: string) => this.request<StripeCheckoutSession>('GET', `/v1/checkout/sessions/${encodeURIComponent(id)}`),
+      list: (p: { customer: string; status?: 'open' | 'complete' | 'expired'; limit?: number }) => this.request<StripeList<StripeCheckoutSession>>('GET', '/v1/checkout/sessions', p),
+      /** An open session can no longer be paid. */
+      expire: (id: string) => this.request<StripeCheckoutSession>('POST', `/v1/checkout/sessions/${encodeURIComponent(id)}/expire`),
     },
   };
   billingPortal = {
