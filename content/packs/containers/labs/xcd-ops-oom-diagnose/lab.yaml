@@ -17,7 +17,7 @@ spec:
     `copperleaf/import-job:1`) and exits with code **137** before it finishes.
 
     1. Write the reason the container was stopped to `~/exam/import-reason.txt` (a short
-       phrase is enough).
+       phrase is enough). Name the one cause: a list of possible causes is not accepted.
     2. Run the import again as a container named **`import-job`** (replace the old one)
        so that it **finishes successfully**, with a **memory limit of at most 512 MiB**.
        Leave the finished container in place.
@@ -75,7 +75,40 @@ spec:
       on: cl-docker-01
       skills: [containers.operations.exit-codes]
       weight: 1.5
-      command: grep -qiE 'oom|out[ -]of[ -]memory|memory' /home/learner/exam/import-reason.txt 2>/dev/null && echo named || echo missing
+      # One short line that states the out-of-memory kill (or the memory limit being hit) as
+      # the one cause. Refused:
+      # - a hedge ("?", maybe, probably, not sure, alternatively, otherwise, either, etc.);
+      # - any list separator (" or ", "/", "&"), wherever it sits; "memory or swap" counts
+      #   as one limit;
+      # - a competing cause (crash, bug, segfault, timeout, disk, network, SIGTERM, permission,
+      #   CPU, throttling, exception, panic, healthcheck, reboot, docker stop/kill, user)
+      #   unless it is ruled out ("not a crash", "no timeout", "rather than a bug");
+      # - a negation in a clause that names the OOM terms ("not out of memory", "no OOM",
+      #   "the memory limit was not reached");
+      # - a further clause (split on , ; : . and but/and/so/because/while/then/since) that does
+      #   not name the OOM terms and holds a word outside a small context list (exit 137,
+      #   SIGKILL, kernel, killed, config, database, ...), so "OOM, exception, panic" fails.
+      # "memory" alone does not count. Every pattern is word-bounded ("debug" is not "bug").
+      # Phrasings accepted and refused are pinned in
+      # services/lab-orchestrator/internal/compile/content_checks_test.go.
+      command: |
+        f=/home/learner/exam/import-reason.txt
+        [ -f "$f" ] && [ "$(grep -c . "$f")" = 1 ] && [ "$(wc -c < "$f")" -le 200 ] || { echo missing; exit 0; }
+        say() { printf '%s\n' "$1"; }
+        line=$(tr 'A-Z' 'a-z' < "$f")
+        oom='\b(oom|oomkilled|oom[ -]?kill(s|ed|er|ing)?|out[ -]of[ -](memory|ram)|ran out of (memory|ram)|memory[ -](limit|cgroup|cap)|(exceed|hit|reach|went over)(s|ed|ing)? (its |the )?(memory|ram))\b'
+        say "$line" | grep -qE "$oom" || { echo missing; exit 0; }
+        say "$line" | grep -qE '\?|\b(maybe|possibly|perhaps|probably|unsure|guess(es|ed)?|alternatively|otherwise|either|etc|something|somehow|whatever)\b|not sure' && { echo hedged; exit 0; }
+        other='(crash(ed|es|ing)?|bugs?|buggy|segfault(s|ed)?|segmentation( fault)?|time ?outs?|timed out|disk|network|sigterm|permissions?|cpu|throttl(e|ed|es|ing)|exceptions?|panic(s|ked)?|health ?checks?|reboot(s|ed)?|docker (stop|kill)|users?|manual(ly)?)'
+        rest=$(say "$line" | sed -E "s/\b(not|no|never|wasn'?t|isn'?t|rather than|instead of)( (a|an|the|any|by|from|due to))? $other\b/ /g; s#\b(memory|ram|swap)( ?(and|or|/|\+|&) ?(memory|ram|swap))+\b#memory#g")
+        say "$rest" | grep -qE "\b$other\b" && { echo hedged; exit 0; }
+        say "$rest" | grep -qE '\b(or|nor|neither)\b|/|&' && { echo hedged; exit 0; }
+        clauses=$(say "$rest" | sed -E 's/[,;:.]+/\n/g; s/ (but|and|so|because|while|then|since) /\n/g')
+        neg="\\b(not|no|never|without|none|isnt|wasnt|didnt|doesnt|dont|wont|cant|couldnt|werent|arent|hasnt|hadnt)\\b|n't\\b"
+        say "$clauses" | grep -E "$oom" | grep -qE "$neg" && { echo hedged; exit 0; }
+        ctx='(the|a|an|it|its|was|were|is|got|been|be|has|had|by|from|with|at|in|on|of|for|to|due|this|that|which|exit(ed|s)?|code|status|sigkill|signal|kill(ed|s)?|kernel|linux|container|process|job|import|app|application|docker|inspect|shows?|showed|state|flag|true|stopped|terminated|died|limit(ed)?|memory|ram|swap|cgroups?|too|low|small|tight|set|run|config|configuration|database|catalogue|rows|data|more|than|allowed|needed|needs|uses?|used|m|mb|mib|g|gb|gib|reason|cause)'
+        say "$clauses" | grep -vE "$oom" | sed -E "s/\b$ctx\b//g; s/[^a-z]//g" | grep -q . && { echo hedged; exit 0; }
+        echo named
       expect: {match: exact, value: named}
     - id: finished
       description: import-job exited 0 after the import finished
@@ -111,6 +144,28 @@ spec:
           echo "killed by the kernel OOM killer (memory limit)" > ~/exam/import-reason.txt
           docker rm -f import-job
           docker run --name import-job copperleaf/import-job:1
+    - id: vague-reason
+      description: Writes a vague word or a list of guesses instead of the cause.
+      feedback: "Name the cause: the container went over its memory limit and the kernel's OOM killer stopped it (docker inspect: OOMKilled true)."
+      expectFail: [reason]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          echo "memory" > ~/exam/import-reason.txt
+          docker rm -f import-job
+          docker run --name import-job --memory 512m copperleaf/import-job:1
+    - id: guess-list
+      description: Lists several guesses in one line, the OOM kill among them.
+      feedback: "Pick the cause the evidence shows: docker inspect reports OOMKilled true and exit code 137, so the memory limit stopped it. A list of guesses is not a diagnosis."
+      expectFail: [reason]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          echo "OOM or CPU throttling or bad config" > ~/exam/import-reason.txt
+          docker rm -f import-job
+          docker run --name import-job --memory 512m copperleaf/import-job:1
     - id: wrong-reason
       description: Reports a crash or a bug instead of the memory limit.
       feedback: "Exit code 137 is 128 + 9 (SIGKILL); docker inspect shows OOMKilled true, so the kernel killed it at the memory limit."

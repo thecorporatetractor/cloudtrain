@@ -157,9 +157,27 @@ spec:
       description: (failover test) mv-campus-north-a's LAN interface is shut for 30 seconds
       type: shell
       on: mv-campus-north-a
+      # Records eth1's admin state and the VRRP state first (restore-master puts back exactly
+      # that), and only takes eth1 down if the learner left it up. The state is column 6 of
+      # FRR's `show vrrp summary` (Interface, VRID, Priority, IPv4, IPv6, State (v4), State
+      # (v6)), the same column a-master and b-backup read. If an earlier grading run was
+      # interrupted between this check and restore-master, its 30 s restorer is still
+      # pending and eth1 is down because of grading, not the learner: the earlier record is
+      # kept (and eth1 taken down again) instead of recording "eth1 down" as theirs.
       command: |
-        ip link set eth1 down
-        setsid sh -c 'sleep 30; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
+        f=/run/cloudtrain-vrrp-failover
+        if [ -s "$f" ] && pgrep -f 'sleep 3[0]; ip link set eth1 up' >/dev/null 2>&1 && read -r up st < "$f"; then
+          pkill -f 'sleep 3[0]; ip link set eth1 up' 2>/dev/null
+        else
+          st=$(vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}')
+          if ip -o link show eth1 | grep -q '[<,]UP[,>]'; then up=1; else up=0; fi
+          printf '%s %s\n' "$up" "${st:-none}" > "$f"
+        fi
+        if [ "$up" = 1 ]; then
+          ip link set eth1 down
+          r='ip link set eth1 up'  # via $r: this script's own text never matches the pgrep above
+          setsid sh -c "sleep 30; $r" </dev/null >/dev/null 2>&1 &
+        fi
         echo started
       expect: { match: exact, value: started }
       skills: [net.routing.vrrp]
@@ -183,6 +201,37 @@ spec:
       timeoutSec: 15
       skills: [net.routing.vrrp]
       weight: 2
+    - id: restore-master
+      description: (failover test) mv-campus-north-a's LAN interface and VRRP role are back as the learner left them before grading ends
+      type: shell
+      on: mv-campus-north-a
+      # Puts back exactly what fail-master recorded, right away (its 30 s background restore
+      # is only the fallback when grading stops early): eth1 up again only if the learner had
+      # it up, then a wait for the VRRP state it had (Master or Backup). Grading never repairs
+      # a state the learner did not create, so grading again sees the lab as they left it.
+      # The output names the state the node ended in, and says so when it is not the recorded
+      # one (for example preemption turned off, so the peer stays master and a regrade at
+      # once sees that), or when the state could not be read at all.
+      command: |
+        pkill -f 'sleep 3[0]; ip link set eth1 up' 2>/dev/null  # [0]: never matches this shell itself
+        f=/run/cloudtrain-vrrp-failover
+        msg=restored
+        if read -r up was < "$f" 2>/dev/null && [ "$up" = 1 ]; then
+          ip link set eth1 up
+          st=
+          case $was in
+            Master|Backup) for i in $(seq 20); do st=$(vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}'); [ "$st" = "$was" ] && break; sleep 1; done ;;
+            *) st=$(vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}') ;;
+          esac
+          if [ "$st" = "$was" ]; then msg="restored (VRRP $st)"
+          else msg="restored (eth1 up; VRRP ${st:-unknown}, was ${was:-unknown}: not back to the recorded state)"; fi
+        fi
+        rm -f "$f"
+        echo "$msg"
+      timeoutSec: 30
+      expect: { match: regex, value: '^restored( |$)' }
+      skills: [net.routing.vrrp]
+      weight: 0
   hints:
     - title: FRR VRRP commands
       body: "Under `interface eth1`: `vrrp {{vrid}} version 3`, `vrrp {{vrid}} ip 10.{{octet}}.10.1` and `vrrp {{vrid}} priority 200` on the master."
