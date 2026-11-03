@@ -3,6 +3,7 @@ import path from 'node:path';
 import { parse } from 'yaml';
 import { validateLab, type Lab as SourceLab } from '@cloudtrain/lab-schema';
 import type { Domain, DomainInfo, Framework, LabSummary, Path, Skill } from '@cloudtrain/api-types';
+import { answerPatternProblem } from '../answers/match.js';
 
 /** A lab.yaml from content/ (or an extra lab directory), validated against the v3 schema. */
 export interface ContentLab {
@@ -241,6 +242,15 @@ async function loadLab(file: string, pack: string | undefined, labs: Map<string,
     return;
   }
   const lab = doc as SourceLab;
+  // Answer patterns must compile for the gateway's linear-time matcher (the RE2 subset JavaScript shares).
+  for (const c of lab.spec.checks) {
+    if (c.type !== 'answer' || c.answer?.match !== 'regex' || typeof c.answer.value !== 'string') continue;
+    const problem = answerPatternProblem(c.answer.value.replace(/\{\{[^}]*\}\}/g, 'x'));
+    if (problem) {
+      issues.push({ file, message: `check ${c.id}: answer pattern: ${problem}` });
+      return;
+    }
+  }
   if (labs.has(lab.metadata.id)) {
     issues.push({ file, message: `duplicate lab id ${lab.metadata.id} (first: ${labs.get(lab.metadata.id)!.file})` });
     return;
