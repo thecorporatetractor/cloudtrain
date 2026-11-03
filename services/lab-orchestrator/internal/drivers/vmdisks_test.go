@@ -1,11 +1,16 @@
 package drivers
 
 import (
+	"context"
 	"errors"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 )
@@ -56,5 +61,34 @@ func TestBuildVMExtraDisks(t *testing.T) {
 	}
 	if v[2].(map[string]any)["dataVolume"].(map[string]any)["name"] != "vm-data1" {
 		t.Fatalf("volume %v", v[2])
+	}
+}
+
+// A reset or teardown waits for the VM's data disks too, not only the root
+// disk: a recreated VM must never adopt an old data disk still terminating.
+func TestDeleteVMsWaitsForDataDisks(t *testing.T) {
+	ctx := context.Background()
+	s := testSession()
+	data := newObj(GVKDataVolume, s.Namespace, "vm-a-"+ExtraDiskName(2))
+	data.SetLabels(SessionLabels(s))
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "vm-a-" + ExtraDiskName(2), Namespace: s.Namespace,
+		Finalizers: []string{"kubernetes.io/pvc-protection"}}}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(data, pvc).Build()
+
+	// The VM is already gone: the data disk is deleted and waited for.
+	gone, err := deleteVMs(ctx, c, c, s, []string{"vm-a"})
+	if err != nil || gone {
+		t.Fatalf("gone = %v err = %v, want not gone while the data disk exists", gone, err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(data), newObj(GVKDataVolume, s.Namespace, data.GetName())); !apierrors.IsNotFound(err) {
+		t.Errorf("data DataVolume not deleted: %v", err)
+	}
+	pvc.Finalizers = nil
+	if err := c.Update(ctx, pvc); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Delete(ctx, pvc)
+	if gone, err = deleteVMs(ctx, c, c, s, []string{"vm-a"}); err != nil || !gone {
+		t.Errorf("after the data disk is gone: gone = %v err = %v", gone, err)
 	}
 }

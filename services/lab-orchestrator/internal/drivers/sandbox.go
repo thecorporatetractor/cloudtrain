@@ -74,6 +74,15 @@ type SandboxTier struct {
 	// find in the sandbox (dummy, gre, bond, vlan, wireguard, netem, md);
 	// empty = all of them.
 	RequiredFeatures []string `json:"requiredFeatures,omitempty"`
+	// ScaleFromZero: the RuntimeClass's node pool is autoscaled and may have
+	// no node right now (AKS, GKE, Karpenter). The tier stays available when
+	// its RuntimeClass's scheduling.nodeSelector matches no node: pods are
+	// created with the RuntimeClass, stay Pending with its node selector and
+	// tolerations, and the cluster autoscaler adds a node. Without it such a
+	// tier is unavailable (fallback), and no pending pod ever asks the
+	// autoscaler for a sandbox node. Needs a RuntimeClass with a node
+	// selector.
+	ScaleFromZero bool `json:"scaleFromZero,omitempty"`
 }
 
 // FallbackMode is the effective fallback (default kubevirt).
@@ -461,6 +470,8 @@ func (s *Sandboxes) check(ctx context.Context) map[string]SandboxState {
 			switch n := schedulableMatches(nodes.Items, st.selector); {
 			case nodeErr != nil:
 				st.Available, st.Transient, st.Reason = false, true, "cannot list nodes: "+nodeErr.Error()
+			case n == 0 && cfg.ScaleFromZero && !st.selector.Empty():
+				st.Reason = fmt.Sprintf("%s, no schedulable node yet: scale from zero (pods wait for the autoscaler to add a node matching %s)", st.Reason, st.selector)
 			case n == 0:
 				st.Available, st.Reason = false, fmt.Sprintf("RuntimeClass %s (%s) matches no schedulable node", cfg.RuntimeClass, st.Reason)
 			default:
