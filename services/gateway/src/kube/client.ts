@@ -125,6 +125,8 @@ export class KubeLabCluster implements LabCluster {
           /* already closed */
         }
       },
+      pause: () => ws.pause(),
+      resume: () => ws.resume(),
     };
   }
 }

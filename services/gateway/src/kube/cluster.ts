@@ -20,6 +20,9 @@ export interface ExecHandle {
   exited: Promise<number>;
   /** Tears the stream down (closes the exec websocket). */
   close(): void;
+  /** Stops reading the process's output (backpressure towards a slow client); resume() reads again. */
+  pause?(): void;
+  resume?(): void;
 }
 
 /**

@@ -22,10 +22,38 @@ export const clampSize = (n: unknown, d: number, max: number) => {
   return Number.isFinite(v) && v > 0 ? Math.min(v, max) : d;
 };
 
+/** Output queued on the client socket above which the exec output is paused (backpressure). */
+export const OUTPUT_HIGH_WATER = 1024 * 1024;
+/** Below this the output flows again. */
+export const OUTPUT_LOW_WATER = 256 * 1024;
+/**
+ * Last resort against a client that cannot keep up: output queued for it
+ * (socket plus this stream's own buffer) above OUTPUT_MAX_QUEUED, or a
+ * backlog that makes no progress at all for OUTPUT_STALL_MS, closes the
+ * socket (with an error frame first), which ends the exec. A slow link that
+ * still drains only slows the program's output down.
+ */
+export const OUTPUT_MAX_QUEUED = 8 * 1024 * 1024;
+export const OUTPUT_STALL_MS = 30_000;
+const OUTPUT_POLL_MS = 25;
+/** A dropped socket that does not finish closing within this is terminated. */
+const CLOSE_GRACE_MS = 5_000;
+export const SLOW_CLIENT_MESSAGE = 'The terminal was closed: the connection could not keep up with the output (nothing was received for 30 seconds).';
+
+/** The exec output's source, paused while the client is backed up. */
+export interface OutputSource {
+  pause(): void;
+  resume(): void;
+}
+
 /** Output sink that is also a "resizable stream" for client-node's TTY resize channel. */
 export class TerminalOutput extends Writable {
   columns: number;
   rows: number;
+  /** The exec stream (set once attached): paused instead of buffering its output here. */
+  source: OutputSource | undefined;
+  private paused = false;
+  private dropped = false;
 
   constructor(
     private readonly ws: WebSocket,
@@ -47,9 +75,67 @@ export class TerminalOutput extends Writable {
   }
 
   override _write(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null) => void) {
-    if (this.ws.readyState === this.ws.OPEN) this.ws.send(chunk, { binary: true });
+    const ws = this.ws;
     this.tap?.(chunk);
-    cb();
+    if (ws.readyState !== ws.OPEN || this.dropped) return cb();
+    ws.send(chunk, { binary: true });
+    if (ws.bufferedAmount < OUTPUT_HIGH_WATER) return cb();
+    if (ws.bufferedAmount + this.writableLength > OUTPUT_MAX_QUEUED) {
+      this.drop();
+      return cb();
+    }
+    if (this.source) {
+      // Pause the exec stream until the socket drains: output in flight
+      // still arrives, nothing more is read meanwhile.
+      if (!this.paused) {
+        this.paused = true;
+        this.source.pause();
+        this.whenDrained(() => {
+          this.paused = false;
+          this.source?.resume();
+        });
+      }
+      return cb();
+    }
+    // No pausable source: hold the callback (client-node ignores write()'s
+    // return value, so what arrives meanwhile queues in this stream and
+    // counts towards OUTPUT_MAX_QUEUED).
+    this.whenDrained(() => cb());
+  }
+
+  /** Calls done once the socket drained below the low-water mark (or closed); drops a socket that makes no progress. */
+  private whenDrained(done: () => void) {
+    const ws = this.ws;
+    let low = ws.bufferedAmount;
+    let progress = Date.now();
+    const wait = () => {
+      if (ws.readyState !== ws.OPEN || this.dropped || ws.bufferedAmount < OUTPUT_LOW_WATER) return done();
+      if (ws.bufferedAmount + this.writableLength > OUTPUT_MAX_QUEUED) {
+        this.drop();
+        return done();
+      }
+      if (ws.bufferedAmount < low) {
+        low = ws.bufferedAmount;
+        progress = Date.now();
+      } else if (Date.now() - progress > OUTPUT_STALL_MS) {
+        this.drop();
+        return done();
+      }
+      setTimeout(wait, OUTPUT_POLL_MS);
+    };
+    setTimeout(wait, OUTPUT_POLL_MS);
+  }
+
+  /** Closes a socket that cannot keep up ('close' ends the exec, see bridge). */
+  private drop() {
+    if (this.dropped) return;
+    this.dropped = true;
+    const ws = this.ws;
+    send(ws, { t: 'error', m: SLOW_CLIENT_MESSAGE });
+    ws.close(1013, 'terminal output too slow');
+    setTimeout(() => {
+      if (ws.readyState !== ws.CLOSED) ws.terminate();
+    }, CLOSE_GRACE_MS).unref();
   }
 }
 
@@ -106,6 +192,8 @@ export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promis
     handle.close();
     return;
   }
+  const { pause, resume } = handle;
+  if (pause && resume) stdout.source = { pause, resume };
   send(ws, { t: 'ready', via: plan.via });
   const code = await handle.exited;
   send(ws, { t: 'exit', code });
