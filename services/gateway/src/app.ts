@@ -260,7 +260,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return sessions.list(req.principal, req.params.id);
   });
   app.get('/api/sessions', run, async (req) => sessions.list(req.principal));
-  app.get<{ Params: { id: string } }>('/api/sessions/:id', run, async (req) => sessions.get(req.principal, req.params.id));
+  // serverTime: the client anchors its countdown to the gateway's clock, not the browser's.
+  app.get<{ Params: { id: string } }>('/api/sessions/:id', run, async (req) => ({ ...(await sessions.get(req.principal, req.params.id)), serverTime: new Date().toISOString() }));
   app.delete<{ Params: { id: string } }>('/api/sessions/:id', run, async (req, reply) => {
     await sessions.end(req.principal, req.params.id);
     if (req.principal.orgId) await deps.billing?.meterEnd(req.principal.orgId, req.params.id).catch((e: unknown) => req.log.error({ err: e, session: req.params.id }, 'billing: could not record usage end'));

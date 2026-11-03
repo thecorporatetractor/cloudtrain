@@ -60,6 +60,10 @@ describe('HTTP API', () => {
     expect(v.grading.state).toBe('timeout');
     expect((await app.inject({ method: 'POST', url: `/api/sessions/${id}/hints/0` })).json().revealedHints).toEqual([0]);
     expect((await app.inject(`/api/labs/gateway-smoke/sessions`)).json()).toHaveLength(1);
+    // The countdown anchors to the gateway's clock.
+    const got = (await app.inject(`/api/sessions/${id}`)).json();
+    expect(got.id).toBe(id);
+    expect(Math.abs(Date.parse(got.serverTime) - Date.now())).toBeLessThan(5_000);
     expect((await app.inject({ method: 'DELETE', url: `/api/sessions/${id}` })).statusCode).toBe(204);
     expect((await app.inject(`/api/sessions/${id}`)).statusCode).toBe(404);
   });

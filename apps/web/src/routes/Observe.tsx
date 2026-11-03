@@ -112,7 +112,7 @@ function ObserveScreen() {
           <span className="ws-stat tnum" title="Checks passing">
             <span className="subtle">checks</span> {s.checksPassed}/{s.checksTotal}
           </span>
-          <Timer startedAt={s.startedAt} deadlineMinutes={s.expiresAt ? Math.round((new Date(s.expiresAt).getTime() - new Date(s.startedAt).getTime()) / 60_000) : 60} />
+          <Timer session={{ startedAt: s.startedAt, deadlineMinutes: 60, expiresAt: s.expiresAt }} />
           <span className="vdivider" style={{ height: 18, margin: '0 4px' }} />
           <Button variant="secondary" size="sm" icon={<TimerReset size={13} />} onClick={() => setPending('extend')}>
             Extend

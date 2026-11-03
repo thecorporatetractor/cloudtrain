@@ -179,6 +179,8 @@ export function Workspace() {
   );
   const onImpair = useCallback((link: TopologyLink) => toast({ title: 'Link impairment', description: `tc netem on ${link.a} ↔ ${link.b} is available once the orchestrator is wired up.`, tone: 'warn' }), [toast]);
 
+  const onExpiryWarning = useCallback((title: string) => toast({ title, description: 'The lab environment and everything in it are removed when the time is up. Validate now to record your results.', tone: 'warn' }), [toast]);
+
   const runValidate = useCallback(() => {
     if (!search.s || validate.isPending) return;
     validate.mutate(undefined, {
@@ -361,7 +363,7 @@ export function Workspace() {
                   <span className="subtle">points</span> {questions.data.earned}/{questions.data.possible}
                 </span>
               )}
-              <Timer startedAt={s.startedAt} deadlineMinutes={s.deadlineMinutes} />
+              <Timer session={s} onWarn={onExpiryWarning} />
               <span className="vdivider" style={{ height: 18, margin: '0 4px' }} />
             </>
           )}
