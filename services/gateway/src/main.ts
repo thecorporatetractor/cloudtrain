@@ -71,7 +71,9 @@ async function main() {
 
   const sessions = new SessionService(content, cluster, compiler, {
     validateTimeoutMs: config.validateTimeoutMs,
+    validatePerMinute: config.validatePerMinute,
     ...(config.sessionTtlMinutes ? { sessionTtlMinutes: config.sessionTtlMinutes } : {}),
+    log: { warn: (o, m) => log?.warn(o, m) },
   });
   let log: PlatformService['log'];
   // Instructor shadowing across gateway replicas (Postgres LISTEN/NOTIFY, src/terminal/hub.ts).

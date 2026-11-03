@@ -165,6 +165,7 @@ after an erasure for the id, address and name.
 | `cohorts` | instructor_ids, created_by | Remove from the array; set null. The cohort stays | Via membership |
 | `assignments` | target_id (kind `user`), assigned_by | Delete those targeting them; set null | `assignments` |
 | `lab_attempts`, `check_results` | user_id, results | Delete | `labAttempts`, `checkResults` |
+| `lab_hint_reveals` | user_id, hints revealed | Delete | `labHints` |
 | `skill_evidence`, `learner_skill_state`, `learner_goals` | user_id, scores | Delete | `skillEvidence`, `skillState`, `goals` |
 | `session_notices` | user_id, from_id, message | Delete theirs. In others' notices: `from_id` null, their name replaced in the message | `notices` |
 | `exam_attempts`, `exam_task_results`, `exam_retake_grants` | user_id, scores, reports, voided_by, granted_by | Delete; set null where they acted on others. **counsel**: an org may need to keep exam records | `examAttempts`, `examTaskResults`, `examRetakeGrants` (no seeds or task pools) |

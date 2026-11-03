@@ -17,6 +17,7 @@ import { TerminalArea, focusActiveTerminal, useTerminalModel } from '@/component
 import { Timer } from '@/components/workspace/Timer';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { useHotkeys } from '@/lib/hotkeys';
+import { timedOutRunFinished } from '@/lib/grading';
 import { useMediaQuery } from '@/lib/media';
 import { billingBlockOf } from '@/lib/billing';
 import { errorToast, loadView, sessionErrorPage, sessionLoadError } from '@/lib/loadState';
@@ -94,6 +95,12 @@ export function Workspace() {
   const end = useEndSession(search.s);
   const [lastResult, setLastResult] = useState<ValidateResponse | null>(null);
   const [dismissedNotices, setDismissedNotices] = useState<Set<string>>(() => new Set());
+  // A Validate that timed out keeps grading in the background; the session poll brings the
+  // result, and then the "no result yet" note gives way to the results list.
+  const timedOut = lastResult?.grading?.state === 'timeout' ? lastResult.session : undefined;
+  useEffect(() => {
+    if (timedOut && session.data && timedOutRunFinished(timedOut, session.data)) setLastResult(null);
+  }, [timedOut, session.data]);
 
   // Attach to the lab's running session when none is attached (Resume, a reload, a second tab).
   // POST /api/labs/:id/sessions is idempotent: it answers 200 with the person's running session

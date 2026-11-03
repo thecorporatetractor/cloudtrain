@@ -40,6 +40,11 @@ export interface Config {
   labctl: string;
   /** How long POST /validate waits for status.validation to answer the request. */
   validateTimeoutMs: number;
+  /**
+   * New grading runs (POST /validate that is not joining a run in flight) one person may
+   * start per minute (CT_VALIDATE_RATE_PER_MINUTE, default 6). Counted per replica.
+   */
+  validatePerMinute: number;
   /** Optional session TTL override in minutes (default: the controller's 2 x estimatedMinutes, min 30). */
   sessionTtlMinutes?: number;
   logLevel: string;
@@ -254,6 +259,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     namespace: env.CT_NAMESPACE ?? 'cloudtrain-sessions',
     labctl: fromRoot(env.CT_LABCTL ?? 'services/lab-orchestrator/bin/labctl'),
     validateTimeoutMs: num(env.CT_VALIDATE_TIMEOUT_MS, 60_000),
+    validatePerMinute: Math.max(1, num(env.CT_VALIDATE_RATE_PER_MINUTE, 6)),
     answerRatePerMinute: Math.max(1, num(env.CT_ANSWER_RATE_PER_MINUTE, 10)),
     siteConfigFile: env.CT_SITE_CONFIG ? fromRoot(env.CT_SITE_CONFIG) : path.join(contentDir, 'site.yaml'),
     publicRatePerMinute: Math.max(1, num(env.CT_PUBLIC_RATE_PER_MINUTE, 120)),

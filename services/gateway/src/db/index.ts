@@ -15,6 +15,7 @@ import * as m0011 from './migrations/0011_gdpr_lifecycle.js';
 import * as m0012 from './migrations/0012_billing_usage_kind.js';
 import * as m0013 from './migrations/0013_billing_usage_kind_validate.js';
 import * as m0014 from './migrations/0014_session_reservations.js';
+import * as m0015 from './migrations/0015_lab_hint_reveals.js';
 import type { DB } from './schema.js';
 
 export type Db = Kysely<DB>;
@@ -62,7 +63,7 @@ export function migrationProvider(appRole: string): MigrationProvider {
     up: (db) => mod.up(db, appRole),
     down: (db) => mod.down(db),
   });
-  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007), '0008_waitlist': bind(m0008), '0009_billing_compute': bind(m0009), '0010_gdpr': bind(m0010), '0011_gdpr_lifecycle': bind(m0011), '0012_billing_usage_kind': bind(m0012), '0013_billing_usage_kind_validate': bind(m0013), '0014_session_reservations': bind(m0014) }) };
+  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007), '0008_waitlist': bind(m0008), '0009_billing_compute': bind(m0009), '0010_gdpr': bind(m0010), '0011_gdpr_lifecycle': bind(m0011), '0012_billing_usage_kind': bind(m0012), '0013_billing_usage_kind_validate': bind(m0013), '0014_session_reservations': bind(m0014), '0015_lab_hint_reveals': bind(m0015) }) };
 }
 
 /**

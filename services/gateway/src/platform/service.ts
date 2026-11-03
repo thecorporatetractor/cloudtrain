@@ -36,7 +36,7 @@ import { buildHome, minutesSince, practiceSeconds, skillStates, streakDays, type
 import { endAttempt, recordRun, startAttempt } from '../learner/learning.js';
 import type { Mailer } from '../mail.js';
 import type { SessionStore } from '../oidc/sessions.js';
-import { phaseOf, revealedHints } from '../sessions/map.js';
+import { labIdOf, phaseOf, revealedHints } from '../sessions/map.js';
 import { labelValue, type SessionHooks } from '../sessions/service.js';
 import { membershipsOf } from './identity.js';
 import { assertCapacity, busy, CAPACITY_LOCK, CAPACITY_LOCK_BUDGET_MS, CLOCK_SKEW_WARN_MS, clockSkewMs, LOCK_BACKOFF_MS, MAX_LOCK_WAITERS, CONFIRMED_RETENTION_SECONDS, LIST_MAX_AGE_SECONDS, DEFAULT_CAPACITY, liveSessions, occupancy, RESERVATION_TTL_SECONDS, type CapacityConfig, type StartKind } from './capacity.js';
@@ -76,6 +76,8 @@ export const DEFAULT_QUOTAS: Quotas = { maxConcurrentSessions: 20, monthlyLabHou
 export const DEFAULT_SETTINGS = { defaultSessionMinutes: 60, allowLocalLogin: true, timezone: 'UTC' } as const;
 
 const DAY = 86_400_000;
+/** How long a hint revealed in one attempt of a lab counts against the next attempt of it. */
+const HINT_CARRY_MS = 7 * DAY;
 
 export const userRef = (u: { id: string; name: string; email: string; title?: string | null; avatar_url?: string | null }): UserRef => ({
   id: u.id,
@@ -417,10 +419,23 @@ export class PlatformService implements SessionHooks {
   async validated(p: Principal, lab: ContentLab, ls: LabSession, res: ValidateResponse): Promise<void> {
     const v = ls.status?.validation;
     if (!p.orgId || res.grading?.state !== 'complete' || !v || v.phase !== 'Complete') return;
+    const at = v.completedAt ? new Date(v.completedAt) : this.now();
     await this.tx(p, async (tx) => {
-      // Idempotent per grader answer: a validate request number is recorded once.
-      const a = await tx.selectFrom('lab_attempts').select(['validations']).where('session_name', '=', ls.metadata.name).executeTakeFirst();
-      if (a && a.validations >= v.observedRequest) return;
+      // Idempotent per grader answer (Validate and every later session read hand it in), keyed
+      // on the run's request number. The attempt row is created if started() never did, then
+      // locked, so two concurrent reads (or replicas) cannot both record the run.
+      const attemptId = await startAttempt(tx, { orgId: p.orgId!, userId: p.sub, lab: lab.lab, sessionName: ls.metadata.name, startedAt: ls.metadata.creationTimestamp ? new Date(ls.metadata.creationTimestamp) : at });
+      const a = await tx.selectFrom('lab_attempts').select(['id', 'validations', 'graded_request']).where('id', '=', attemptId).forUpdate().executeTakeFirstOrThrow();
+      if (a.graded_request !== null) {
+        if (a.graded_request >= v.observedRequest) return;
+      } else if (a.validations > 0) {
+        // Recorded before graded_request existed: the old guard, plus the run's completion time.
+        if (a.validations >= v.observedRequest) return;
+        if (v.completedAt && (v.checks ?? []).length) {
+          const seen = await tx.selectFrom('check_results').select('run').where('attempt_id', '=', a.id).where('graded_at', '=', at).limit(1).executeTakeFirst();
+          if (seen) return;
+        }
+      }
       await recordRun(tx, {
         orgId: p.orgId,
         userId: p.sub,
@@ -428,16 +443,67 @@ export class PlatformService implements SessionHooks {
         lab: lab.lab,
         score: v.score,
         checks: (v.checks ?? []).map((c) => ({ id: c.id, passed: c.passed, ...(c.weight !== undefined ? { weight: c.weight } : {}), ...(c.skills ? { skills: c.skills } : {}), ...(c.message ? { message: c.message } : {}) })),
-        hintsUsed: revealedHints(ls).length,
-        at: v.completedAt ? new Date(v.completedAt) : this.now(),
+        hintsUsed: await this.hintsUsed(tx, p, lab.lab.metadata.id, ls),
+        at,
         ...(ls.metadata.creationTimestamp ? { startedAt: new Date(ls.metadata.creationTimestamp) } : {}),
       });
+      await tx.updateTable('lab_attempts').set({ graded_request: v.observedRequest }).where('id', '=', attemptId).execute();
     });
   }
 
+  /**
+   * Records the session's revealed hints at once, per hint (lab_hint_reveals)
+   * and as the attempt's count (hints_used never goes down). Idempotent: the
+   * session calls it again for a hint already revealed, so a reveal whose
+   * first recording failed is recorded on the retry.
+   */
+  async hintRevealed(p: Principal, lab: ContentLab, ls: LabSession): Promise<void> {
+    if (!p.orgId) return;
+    const n = revealedHints(ls).length;
+    await this.tx(p, async (tx) => {
+      await this.recordReveals(tx, p, lab.lab.metadata.id, ls);
+      await tx.updateTable('lab_attempts').set({ hints_used: n }).where('session_name', '=', ls.metadata.name).where('hints_used', '<', n).execute();
+    });
+  }
+
+  private async recordReveals(tx: Tx, p: Principal, labId: string, ls: LabSession): Promise<void> {
+    const idx = revealedHints(ls);
+    if (!p.orgId || !idx.length) return;
+    await tx
+      .insertInto('lab_hint_reveals')
+      .values(idx.map((i) => ({ org_id: p.orgId!, user_id: p.sub, lab_id: labId, session_name: ls.metadata.name, hint_index: i, revealed_at: this.now() })))
+      .onConflict((oc) => oc.columns(['org_id', 'user_id', 'lab_id', 'session_name', 'hint_index']).doNothing())
+      .execute();
+  }
+
+  /**
+   * Hints used for a solve: the distinct hints this person revealed for the
+   * lab within HINT_CARRY_MS, in this session or any other. Which hints, not
+   * how many per session: revealing hint 0 in one throwaway session, hint 1
+   * in a second and solving in a third counts 2, and the penalty cannot be
+   * dodged by spreading reveals over sessions. Older reveals do not count (a
+   * later retry is fresh). This session's reveals are recorded first, in case
+   * hintRevealed did not get to.
+   */
+  private async hintsUsed(tx: Tx, p: Principal, labId: string, ls: LabSession): Promise<number> {
+    await this.recordReveals(tx, p, labId, ls);
+    const since = new Date(this.now().getTime() - HINT_CARRY_MS);
+    const rows = await tx.selectFrom('lab_hint_reveals').select('hint_index').distinct().where('user_id', '=', p.sub).where('lab_id', '=', labId).where('revealed_at', '>=', since).execute();
+    return new Set([...rows.map((r) => r.hint_index), ...revealedHints(ls)]).size;
+  }
+
+  /**
+   * Closes the attempt and records the session's revealed hints per lab as
+   * well, so a reveal whose own recording failed still counts in the learner's
+   * other sessions of the lab when this one is abandoned.
+   */
   async ended(p: Principal, sessionName: string, ls?: LabSession): Promise<void> {
     if (!p.orgId) return;
-    await this.tx(p, (tx) => endAttempt(tx, sessionName, this.now(), ls ? revealedHints(ls).length : undefined));
+    const labId = ls ? labIdOf(ls) : undefined;
+    await this.tx(p, async (tx) => {
+      if (ls && labId) await this.recordReveals(tx, p, labId, ls);
+      await endAttempt(tx, sessionName, this.now(), ls ? revealedHints(ls).length : undefined);
+    });
   }
 
   async decorate(p: Principal, s: WebSession): Promise<WebSession> {
