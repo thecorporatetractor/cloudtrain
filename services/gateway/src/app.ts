@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
 import websocket from '@fastify/websocket';
@@ -116,7 +117,8 @@ const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { content, auth, sessions, cluster, platform: ps } = deps;
   const hub = deps.hub ?? new TerminalHub();
-  const options: FastifyServerOptions = { logger: deps.logger ?? false, trustProxy: deps.trustProxy ?? '127.0.0.1' };
+  // Request ids are unique across replicas and restarts: a client quotes one from an error, the log has it.
+  const options: FastifyServerOptions = { logger: deps.logger ?? false, trustProxy: deps.trustProxy ?? '127.0.0.1', genReqId: () => randomUUID() };
   const app: FastifyInstance = Fastify(options);
   // Fail at startup, not at request time: every /api route must declare a permission or be public.
   app.addHook('onRoute', requireDeclaredPermission);
@@ -189,23 +191,32 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       if (err.status === 429 && typeof retry === 'number') reply.header('retry-after', String(retry));
       return reply.code(err.status).send(err.body());
     }
-    const e = err as { statusCode?: number; message?: string };
-    if (e.statusCode && e.statusCode < 500) return reply.code(e.statusCode).send({ error: e.message ?? 'Bad request' });
-    req.log.error({ err }, 'request failed');
-    return reply.code(502).send({ error: `Upstream error: ${e.message ?? 'unknown'}` });
+    // Only Fastify's own client errors (body too large, unsupported media type, schema
+    // validation) keep their message: it describes the request. A dependency's error that
+    // happens to carry a 4xx statusCode (an Azure RestError, say) is internal like any other.
+    const e = err as { statusCode?: number; message?: string; code?: unknown; validation?: unknown };
+    if (e.statusCode && e.statusCode < 500 && ((typeof e.code === 'string' && e.code.startsWith('FST_')) || e.validation)) return reply.code(e.statusCode).send({ error: e.message ?? 'Bad request' });
+    // Anything else is ours or a dependency's (Postgres, Kubernetes, Keycloak, labctl): its text
+    // can carry internals, so it goes to the log under the request id and the client gets the id.
+    req.log.error({ err, reqId: req.id }, 'request failed');
+    return reply.code(502).send({ error: `Something went wrong on our side. Reference: ${req.id}`, code: 'upstream', requestId: req.id });
   });
 
   app.get('/api/health', { config: { public: true } }, async () => ({ ok: true, labs: content.labs.size, contentIssues: content.issues.length, platform: !!ps }));
   // Kubernetes probes, outside /api so the Ingress/HTTPRoute (which routes /api only) never
   // exposes them. Liveness: the process answers. Readiness: content loaded and every
-  // dependency check (Postgres) passes; details are only check names and error messages.
+  // dependency check (Postgres) passes; the response names each check and says ok or failed
+  // (the error text is logged).
   app.get('/healthz', { config: { public: true }, logLevel: 'warn' }, async () => ({ ok: true }));
-  app.get('/readyz', { config: { public: true }, logLevel: 'warn' }, async (_req, reply) => {
+  app.get('/readyz', { config: { public: true }, logLevel: 'warn' }, async (req, reply) => {
     const loaded = async () => {
       if (content.labs.size === 0) throw new Error('no labs loaded');
     };
     const r = await runReadiness({ content: loaded, ...(deps.readiness ?? {}) });
-    return reply.code(r.ok ? 200 : 503).send(r);
+    if (r.ok) return reply.send(r);
+    // A dependency's error text (a Postgres address, a role name) goes to the log, not the response.
+    req.log.warn({ checks: r.checks }, 'not ready');
+    return reply.code(503).send({ ok: false, checks: Object.fromEntries(Object.entries(r.checks).map(([k, v]) => [k, v === 'ok' ? 'ok' : 'failed'])) });
   });
 
   const run = { config: { permission: 'lab.run' as const } };
@@ -316,7 +327,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         },
         (e: unknown) => {
           const err = e as HttpError;
-          send(socket, { t: 'error', m: err.status === 403 ? 'You may not observe this session.' : err.message });
+          if (!(e instanceof HttpError)) req.log.warn({ err: e }, 'observe failed');
+          send(socket, { t: 'error', m: err.status === 403 ? 'You may not observe this session.' : e instanceof HttpError ? err.message : 'The terminal could not be observed. Please try again.' });
           socket.close(1008, 'forbidden');
         },
       );

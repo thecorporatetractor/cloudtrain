@@ -1,6 +1,7 @@
 import { PassThrough, Writable } from 'node:stream';
 import type { WebSocket } from 'ws';
 import type { SessionNotice } from '@cloudtrain/api-types';
+import { HttpError } from '../errors.js';
 import type { ExecHandle, LabCluster } from '../kube/cluster.js';
 import type { TerminalPlan } from './target.js';
 
@@ -89,7 +90,9 @@ export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promis
   try {
     plan = await planned;
   } catch (e) {
-    send(ws, { t: 'error', m: (e as Error).message });
+    // HttpErrors are written for the learner; anything else (Kubernetes, Postgres) stays in the log.
+    if (!(e instanceof HttpError)) log.warn({ err: e }, 'terminal planning failed');
+    send(ws, { t: 'error', m: e instanceof HttpError ? e.message : 'The terminal could not be opened. Please try again.' });
     ws.close(1008, 'unavailable');
     return;
   }
@@ -98,7 +101,7 @@ export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promis
     handle = await cluster.exec(plan.target, plan.command, { stdout, stderr: null, stdin }, true);
   } catch (e) {
     log.warn({ err: e, target: plan.target }, 'terminal exec failed');
-    send(ws, { t: 'error', m: `Could not open a shell on ${plan.node}: ${(e as Error).message}` });
+    send(ws, { t: 'error', m: `Could not open a shell on ${plan.node}. Please try again.` });
     ws.close(1011, 'exec failed');
     return;
   }

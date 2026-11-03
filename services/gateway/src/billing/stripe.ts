@@ -253,7 +253,8 @@ export function verifyWebhook(rawBody: string | Buffer, header: string | undefin
   if (!t || !/^\d+$/.test(t) || sigs.length === 0) throw new WebhookError('malformed Stripe-Signature header');
   const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
   const expected = createHmac('sha256', secret).update(`${t}.${body}`).digest('hex');
-  const ok = sigs.some((s) => s.length === expected.length && timingSafeEqual(Buffer.from(s, 'hex'), Buffer.from(expected, 'hex')));
+  // Only well-formed hex: Buffer.from(s, 'hex') of anything else is shorter, and timingSafeEqual would throw.
+  const ok = sigs.some((s) => /^[0-9a-f]+$/i.test(s) && s.length === expected.length && timingSafeEqual(Buffer.from(s, 'hex'), Buffer.from(expected, 'hex')));
   if (!ok) throw new WebhookError('signature mismatch');
   if (Math.abs(Math.floor(now / 1000) - Number(t)) > tolerance) throw new WebhookError('timestamp outside tolerance');
   let event: StripeEvent;
