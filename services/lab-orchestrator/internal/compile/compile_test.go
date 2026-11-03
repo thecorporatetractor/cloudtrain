@@ -232,6 +232,49 @@ spec:
 	}
 }
 
+// content-10: a missing object reads as empty output, so a k8s-query on a
+// named object must not pass on "".
+func TestNamedK8sQueryMustNotPassOnEmpty(t *testing.T) {
+	lab := func(checks string) []byte {
+		return []byte(`
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata: {id: q, title: Q, domain: kubernetes, difficulty: easy, estimatedMinutes: 10}
+spec:
+  description: d
+  topology:
+    nodes:
+      - {name: ws, driver: container, image: "jumphost:1"}
+      - {name: dev, driver: k8s-cluster, cluster: {mode: virtual, context: dev}}
+  solution:
+    steps: [{on: ws, run: "true"}]
+  checks:
+` + checks)
+	}
+	bad := map[string]string{
+		"exact empty":    `{match: exact, value: ""}`,
+		"not_exact":      `{match: not_exact, value: "true"}`,
+		"not_contains":   `{match: not_contains, value: "gvisor"}`,
+		"regex optional": `{match: regex, value: '^(false)?$'}`,
+	}
+	for name, expect := range bad {
+		t.Run(name, func(t *testing.T) {
+			_, err := Compile(lab(`    - {id: c, description: c, type: k8s-query, skills: [s], query: {cluster: dev, resource: deployment, name: web, namespace: x, jsonpath: "{.spec.x}"}, expect: `+expect+`}
+`), Options{})
+			if err == nil || !strings.Contains(err.Error(), "passes on empty output") {
+				t.Fatalf("err %v", err)
+			}
+		})
+	}
+	good := `    - {id: a, description: a, type: k8s-query, skills: [s], query: {cluster: dev, resource: deployment, name: web, namespace: x, jsonpath: "{.metadata.name}:{.spec.x}"}, expect: {match: exact, value: "web:"}}
+    - {id: b, description: b, type: k8s-query, skills: [s], query: {cluster: dev, resource: node, name: n1, jsonpath: "{.metadata.name}:{.spec.unschedulable}"}, expect: {match: regex, value: '^n1:(false)?$'}}
+    - {id: c, description: c, type: k8s-query, skills: [s], query: {cluster: dev, resource: pods, namespace: x, jsonpath: "{.items[*].spec.x}"}, expect: {match: exact, value: ""}}
+`
+	if _, err := Compile(lab(good), Options{}); err != nil {
+		t.Fatalf("named checks that carry the name (and unnamed lists) are fine: %v", err)
+	}
+}
+
 func TestValidationErrorType(t *testing.T) {
 	err := Validate(mutate(minimalLab, "/tmp/{{file}}\n", "/tmp/{{nope}}\n"), Options{})
 	var ve *ValidationError

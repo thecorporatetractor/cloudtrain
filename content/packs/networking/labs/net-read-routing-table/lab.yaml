@@ -28,7 +28,8 @@ spec:
     | 10.{{octet}}.40.{{h2}} |
     | 198.51.100.{{h1}} |
 
-    Example line: `10.9.9.9 static 10.9.0.6`. Do not change any router.
+    Example line: `10.9.9.9 static 10.9.0.6`. Write one line per destination: a
+    destination with more than one line counts as wrong. Do not change any router.
   objectives:
     - Read `show ip route` codes, prefixes, distances and next hops
     - Apply longest-prefix match before administrative distance
@@ -135,7 +136,16 @@ spec:
       description: The OSPF-learned destination has the right protocol and next hop
       type: shell
       on: workstation
-      command: &line awk 'NF==3{print $1, tolower($2), $3}' /home/learner/routes.txt
+      # One answer per destination: an answer line is "<IPv4 address> <protocol> <next hop>";
+      # other lines (a header, a "# comment") are ignored. A destination answered twice fails
+      # every check (a file listing every protocol and next hop for a destination must not
+      # match every check), and the output says which one. A destination left out fails only
+      # its own check.
+      command: &line |
+        awk 'NF == 3 && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { c[$1]++; l[++n] = $1 " " tolower($2) " " $3 }
+          END { for (k in c) if (c[k] > 1) { print "destination " k " has more than one line: write one route per destination"; bad = 1 }
+                if (bad) exit
+                for (i = 1; i <= n; i++) print l[i] }' /home/learner/routes.txt
       expect: { match: regex, value: "(?m)^10\\.{{octet}}\\.20\\.{{h1}} ospf 10\\.{{octet}}\\.0\\.2$" }
       skills: [net.routing.route-selection]
     - id: static-route
@@ -204,6 +214,14 @@ spec:
           printf '%s\n' "10.{{octet}}.20.{{h1}} ospf 10.{{octet}}.0.2" "10.{{octet}}.30.{{h2}} static 10.{{octet}}.0.6" "10.{{octet}}.20.{{h3}} static 10.{{octet}}.0.6" "10.{{octet}}.40.{{h2}} static 10.{{octet}}.0.10" "198.51.100.{{h1}} static 10.{{octet}}.0.10" > /home/learner/routes.txt
       expectFail: [admin-distance]
       feedback: Static routes have distance 1 by default, but this one was given 200, so OSPF (110) is preferred while it exists.
+    - id: shotgun
+      description: Lists every candidate route for the overlapping destinations instead of choosing one
+      mutation:
+        on: workstation
+        run: |
+          printf '%s\n' "10.{{octet}}.20.{{h1}} ospf 10.{{octet}}.0.2" "10.{{octet}}.30.{{h2}} static 10.{{octet}}.0.6" "10.{{octet}}.20.{{h3}} ospf 10.{{octet}}.0.2" "10.{{octet}}.20.{{h3}} static 10.{{octet}}.0.6" "10.{{octet}}.40.{{h2}} ospf 10.{{octet}}.0.2" "10.{{octet}}.40.{{h2}} static 10.{{octet}}.0.10" "198.51.100.{{h1}} static 10.{{octet}}.0.10" > /home/learner/routes.txt
+      expectFail: [ospf-route, static-route, longest-prefix, admin-distance, default-route]
+      feedback: The router forwards with exactly one route per destination; write that one.
   solution:
     explanation: |
       Check each address with `show ip route <address>`: longest prefix first,

@@ -123,11 +123,15 @@ spec:
         [ -f $f ] || { echo no-policy; exit 0; }
         pid=$(cat /run/tr-ticket/api.pid); kill -0 $pid 2>/dev/null || { echo api-dead; exit 0; }
         before=$(cat /run/tr-ticket/reopens 2>/dev/null || echo 0)
+        # A fresh marker per grading: the rotated copy must hold what the live log held
+        # (the seed lines move on with every run, so they cannot be the proof twice).
+        m="ct-grade-marker-$(date +%s%N)"
+        echo "$m" >> $L/api.log
         logrotate -f -s /var/lib/cloudtrain/lr.state $f >/dev/null 2>&1
         sleep 3
         r=""
         [ -s $L/api.log.1.gz ] && [ -s $L/audit.log.1.gz ] && r="rotated" || r="not-rotated"
-        zcat $L/api.log.*.gz 2>/dev/null | grep -q 'seed-api' && r="$r content" || r="$r no-content"
+        zcat $L/api.log.1.gz 2>/dev/null | grep -q "$m" && r="$r content" || r="$r no-content"
         [ -s $L/api.log ] && grep -q 'GET /tickets' $L/api.log && r="$r new-api-log" || r="$r api-log-empty"
         after=$(cat /run/tr-ticket/reopens 2>/dev/null || echo 0)
         [ "$after" -gt "$before" ] && r="$r reopened" || r="$r not-signalled"
@@ -144,8 +148,16 @@ spec:
       command: |
         L={{logdir}}; f=/etc/logrotate.d/tr-ticket
         [ -f $f ] || { echo no-policy; exit 0; }
-        for i in $(seq 17); do logrotate -f -s /var/lib/cloudtrain/lr.state $f >/dev/null 2>&1; sleep 0.6; done
-        echo "$(ls $L/api.log.*.gz 2>/dev/null | wc -l) $(ls $L/audit.log.*.gz 2>/dev/null | wc -l)"
+        # Exercised on a scratch copy of the logs (same owner and mode as the real directory),
+        # so grading does not push the real logs' history out and can run again.
+        d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+        chown --reference=$L $d; chmod --reference=$L $d
+        sed "s#$L#$d#g" $f > $d/policy.conf
+        for i in $(seq 17); do
+          for n in api audit; do echo "scratch $i" >> $d/$n.log; chown --reference=$L/$n.log $d/$n.log; chmod --reference=$L/$n.log $d/$n.log; done
+          logrotate -f -s $d/state $d/policy.conf >/dev/null 2>&1
+        done
+        echo "$(ls $d/api.log.*.gz 2>/dev/null | wc -l) $(ls $d/audit.log.*.gz 2>/dev/null | wc -l)"
       expect: {match: exact, value: "14 14"}
   hints:
     - title: A stanza

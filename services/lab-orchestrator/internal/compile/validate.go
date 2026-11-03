@@ -240,6 +240,11 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 			if c.Query == nil || c.Query.Resource == "" {
 				add(path, "k8s-query check requires query.resource")
 			}
+			// A missing object reads as empty output: an expectation that
+			// passes on "" for a named object is earned by deleting it.
+			if c.Query != nil && c.Query.Name != "" && passesOnEmpty(c.Expect) {
+				add(path+"/expect", "k8s-query on %s %q passes on empty output, so deleting the object earns it; put the name in the jsonpath ('{.metadata.name}:...') and expect it", c.Query.Resource, c.Query.Name)
+			}
 		case "k8s-can-i":
 			if c.Query == nil || c.Query.Verb == "" || c.Query.Resource == "" {
 				add(path, "k8s-can-i check requires query.verb and query.resource")
@@ -480,6 +485,25 @@ func validateAnswers(s *labsv1.LabTemplateSpec, nodes map[string]*labsv1.Node) [
 }
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// passesOnEmpty reports whether an expectation is met by empty output
+// (grader.Match on ""). A regex that does not compile (placeholders) is
+// reported elsewhere.
+func passesOnEmpty(e *labsv1.Expectation) bool {
+	if e == nil {
+		return false
+	}
+	switch e.Match {
+	case "exact", "", "contains":
+		return e.Value == ""
+	case "not_exact", "not_contains":
+		return e.Value != ""
+	case "regex":
+		re, err := regexp.Compile(e.Value)
+		return err == nil && re.MatchString("")
+	}
+	return false
+}
 
 func hasClusterMember(c *labsv1.ClusterSpec, name string) bool {
 	for _, m := range c.Nodes {
