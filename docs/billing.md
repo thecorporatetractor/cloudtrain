@@ -103,7 +103,7 @@ unknown trial lab, is logged at startup and covered by `test/billing-compute.tes
 | Endpoint | Permission | |
 |---|---|---|
 | `GET /api/billing/me` | `progress.read.self` | `BillingSummary` for the signed-in person: plan and entitlements (default free plan without a subscription), subscription, whether the portal is available, the individual plans |
-| `POST /api/billing/me/checkout` | `progress.read.self` | `CheckoutRequest` `{ planId, interval }` → `201 { url, sessionId }`: a Stripe Checkout Session in subscription mode for the plan's price (found by lookup key), with the org and user in `metadata` and `subscription_data.metadata`; the browser is sent to `url`. Audit `billing.checkout` |
+| `POST /api/billing/me/checkout` | `progress.read.self` | `CheckoutRequest` `{ planId, interval }` → `201 { url, sessionId }`: a Stripe Checkout Session in subscription mode for the plan's price (found by lookup key), with the org and user in `metadata` and `subscription_data.metadata`; the browser is sent to `url`. 409 (`details.reason: plan_active`, `action: portal`) while the account already has an active plan subscription: one plan per account, changed in the portal. Checkouts of one account are serialised on the customer's advisory lock, which is taken before the customer row is written (the same order as the webhooks). Under the lock: an open plan Checkout younger than 5 minutes may be mid-payment, so the request answers 409 `checkout_in_progress`; older open ones are expired, so only the new one can be paid. A plan Checkout that completed in the last hour but whose subscription is not recorded yet answers 409 `plan_pending`. This is checked before and again after the expiries, to catch one that completed in between. The block lapses after the hour, and at once when that Checkout's webhook failed for good (`billing_events.summary.object` and `summary.customer`, read before the checkout transaction so it never takes a second pooled connection while holding the lock). Audit `billing.checkout` |
 | `POST /api/billing/me/portal` | `progress.read.self` | `{ url }` of a Customer Portal session; 409 before the first checkout. Audit `billing.portal` |
 | `POST /api/billing/me/payment-method` | `progress.read.self` | `201 { url, sessionId }`: a Checkout Session in **setup** mode (`currency` from the site) that saves a card for pay-as-you-go compute; no charge now. Audit `billing.payment_method` |
 | `PUT /api/billing/me/limits` | `progress.read.self` | `BillingLimitRequest` `{ monthlyCap, hardStop }` (minor units, 0 = no cap). Audit `billing.limit` |
@@ -246,6 +246,14 @@ simulations per month, CTF events. Shown on `/account/billing` (everyone) and
 `/admin/billing` (org admins, with seats and the event history). They are still recorded
 and displayed only; what is enforced is the model above (premium level, trial, payment
 method, dunning, spend cap).
+
+Entitlements follow **all** of a scope's active plan subscriptions (`trialing`, `active`,
+`past_due`), not just the one an event was about: the highest plan level wins, and the scope
+falls back to the free plan only when none is active. Checkout allows one plan subscription
+per account. If two still end up active (a plan bought in the portal or through the API),
+cancelling one leaves the other in force, and a warning is logged so the duplicate
+can be refunded. Summaries, seats and the org level use the same subscription (the best
+active one, else the newest).
 
 ## Products and prices
 

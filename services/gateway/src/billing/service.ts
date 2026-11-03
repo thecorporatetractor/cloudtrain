@@ -316,7 +316,14 @@ export class BillingService {
 
   /* ------------------------------------------------------- payer state */
 
-  private latestPlanSub(tx: Tx, orgId: string, userId: string | null) {
+  /** The scope's plan subscription that counts: an active one if any (the highest plan level, then the newest), else the newest. */
+  private async latestPlanSub(tx: Tx, orgId: string, userId: string | null) {
+    const subs = await this.planSubs(tx, orgId, userId);
+    return this.bestActive(subs) ?? subs[0];
+  }
+
+  /** The scope's plan subscriptions, newest first. */
+  private planSubs(tx: Tx, orgId: string, userId: string | null) {
     return tx
       .selectFrom('billing_subscriptions')
       .selectAll()
@@ -324,7 +331,14 @@ export class BillingService {
       .where(sql`coalesce(user_id, '')`, '=', userId ?? '')
       .where('kind', '=', 'plan')
       .orderBy('updated_at', 'desc')
-      .executeTakeFirst();
+      .execute();
+  }
+
+  /** Of the active subscriptions, the one with the highest plan level (newest first among equals). */
+  private bestActive<S extends { plan_id: string; status: string }>(subs: S[]): S | undefined {
+    let best: S | undefined;
+    for (const s of subs) if (ACTIVE.has(s.status) && (!best || this.pricing.level(this.plan(s.plan_id)) > this.pricing.level(this.plan(best.plan_id)))) best = s;
+    return best;
   }
 
   private customerRow(tx: Tx, orgId: string, userId: string | null): Promise<CustomerRow | undefined> {
@@ -763,9 +777,18 @@ export class BillingService {
     return price.id;
   }
 
-  private async customerFor(tx: Tx, p: Principal, userId: string | null): Promise<{ id: string; stripeCustomerId: string }> {
+  /**
+   * The scope's billing customer, created in Stripe and recorded when missing. With `lock`,
+   * the customer's advisory lock (the one the webhooks take) is taken before the row is
+   * written, in the same order as the webhooks: lock, then rows.
+   */
+  private async customerFor(tx: Tx, p: Principal, userId: string | null, lock = false): Promise<{ id: string; stripeCustomerId: string }> {
+    const lockOn = (id: string) => sql`SELECT pg_advisory_xact_lock(hashtext(${`billing-customer:${id}`}))`.execute(tx);
     const existing = await tx.selectFrom('billing_customers').select(['id', 'stripe_customer_id']).where('org_id', '=', p.orgId).where('scope_key', '=', userId ?? '').executeTakeFirst();
-    if (existing) return { id: existing.id, stripeCustomerId: existing.stripe_customer_id };
+    if (existing) {
+      if (lock) await lockOn(existing.stripe_customer_id);
+      return { id: existing.id, stripeCustomerId: existing.stripe_customer_id };
+    }
     const created = await this.stripe().customers.create(
       {
         ...(userId ? { email: p.email, name: p.name } : { name: p.orgName }),
@@ -773,6 +796,7 @@ export class BillingService {
       },
       `cus:${p.orgId}:${userId ?? 'org'}`,
     );
+    if (lock) await lockOn(created.id);
     const row = await tx
       .insertInto('billing_customers')
       .values({ org_id: p.orgId, user_id: userId, stripe_customer_id: created.id, email: userId ? p.email : null })
@@ -785,6 +809,46 @@ export class BillingService {
   private assertCheckoutOpen(): void {
     this.stripe();
     if (!this.d.site.flags.checkoutEnabled) throw new HttpError(409, 'Self-service checkout is not open yet.', { code: 'conflict' });
+  }
+
+  /**
+   * Refuses (409 plan_pending) while a plan Checkout of the customer completed in the last
+   * PLAN_PENDING_S but its subscription is not recorded yet (the webhook is on its way). The
+   * block lapses after that window, and at once when that Checkout's event failed for good
+   * (`deadCheckouts`, see deadCheckouts()); the reconciliation repairs such a plan.
+   */
+  private async assertNoPendingPlan(tx: Tx, stripeCustomerId: string, deadCheckouts: ReadonlySet<string>): Promise<void> {
+    const since = Math.floor(this.now().getTime() / 1000) - PLAN_PENDING_S;
+    const done = await this.stripe().checkout.sessions.list({ customer: stripeCustomerId, status: 'complete', limit: 100 });
+    for (const cs of done.data) {
+      if (cs.mode !== 'subscription' || !cs.subscription || (cs.created ?? 0) < since) continue;
+      const known = await tx.selectFrom('billing_subscriptions').select('id').where('stripe_subscription_id', '=', cs.subscription).executeTakeFirst();
+      if (known) continue;
+      const failedForGood = deadCheckouts.has(cs.id);
+      if (failedForGood) continue;
+      throw new HttpError(409, 'Your plan purchase is still being confirmed. Reload the billing page in a minute; change plans in the billing portal after that.', { code: 'conflict', details: { reason: 'plan_pending', action: 'portal' } });
+    }
+  }
+
+  /**
+   * Checkouts of the scope's customer whose checkout.session.completed event failed for good
+   * (billing_events summary.object and summary.customer). A failed event carries no org, so
+   * this reads platform-wide; it runs before the checkout transaction, so it never needs a
+   * second pooled connection while that transaction holds the customer lock.
+   */
+  private async deadCheckouts(p: Principal, userId: string | null): Promise<Set<string>> {
+    const cus = await this.tx(p, (tx) => tx.selectFrom('billing_customers').select('stripe_customer_id').where('org_id', '=', p.orgId).where('scope_key', '=', userId ?? '').executeTakeFirst());
+    if (!cus) return new Set();
+    const rows = await withTenant(this.d.db, { platform: true }, (tx) =>
+      tx
+        .selectFrom('billing_events')
+        .select(sql<string>`summary->>'object'`.as('object'))
+        .where('type', '=', 'checkout.session.completed')
+        .where('status', '=', 'failed')
+        .where(sql<boolean>`summary->>'customer' = ${cus.stripe_customer_id} AND summary->>'retryable' = 'false'`)
+        .execute(),
+    );
+    return new Set(rows.map((r) => r.object).filter(Boolean));
   }
 
   async checkout(p: Principal, scope: BillingScope, req: CheckoutRequest, ip?: string): Promise<CheckoutResponse> {
@@ -803,8 +867,33 @@ export class BillingService {
       if (!Number.isInteger(seats) || seats < (plan.minSeats ?? 1) || seats > (plan.maxSeats ?? 100000)) throw badRequest(`seats must be between ${plan.minSeats ?? 1} and ${plan.maxSeats ?? 100000}`, { seats: 'out of range' });
     }
     const priceId = await this.priceId(price.lookupKey);
+    const dead = await this.deadCheckouts(p, userId);
     return this.tx(p, async (tx) => {
-      const customer = await this.customerFor(tx, p, userId);
+      // One checkout per account at a time: serialised on the customer (the lock the webhooks take, taken before any row is written).
+      const customer = await this.customerFor(tx, p, userId, true);
+      // One plan subscription per account: a second would bill twice, and an upgrade is a change of the existing one (the portal prorates it).
+      const active = this.bestActive(await this.planSubs(tx, p.orgId, userId));
+      if (active) {
+        const name = this.plan(active.plan_id)?.name ?? active.plan_id;
+        throw new HttpError(409, `${scope === 'org' ? 'The organisation already has' : 'You already have'} the ${name} plan. Change or cancel it in the billing portal instead of subscribing again.`, {
+          code: 'conflict',
+          details: { reason: 'plan_active', planId: active.plan_id, action: 'portal' },
+        });
+      }
+      await this.assertNoPendingPlan(tx, customer.stripeCustomerId, dead);
+      // A plan Checkout still open (another tab) could complete as a second subscription. A
+      // young one may be mid-payment: refuse rather than kill it. An older one is expired, so
+      // only the new one can be paid.
+      const nowS = Math.floor(this.now().getTime() / 1000);
+      const open = (await this.stripe().checkout.sessions.list({ customer: customer.stripeCustomerId, status: 'open', limit: 100 })).data.filter((cs) => cs.mode === 'subscription');
+      if (open.some((cs) => nowS - (cs.created ?? 0) < CHECKOUT_IN_PROGRESS_S)) {
+        throw new HttpError(409, 'A checkout for a plan is already in progress (another tab or window). Finish or cancel it, or try again in a few minutes.', { code: 'conflict', details: { reason: 'checkout_in_progress', action: 'portal' } });
+      }
+      for (const cs of open) await this.stripe().checkout.sessions.expire(cs.id).catch((e: unknown) => {
+        if (!(e instanceof StripeError && e.status === 400)) throw e; // completed or expired meanwhile
+      });
+      // One may have completed between the first check and its expiry: check again.
+      await this.assertNoPendingPlan(tx, customer.stripeCustomerId, dead);
       const metadata = { ct_org_id: p.orgId, ct_user_id: userId ?? '', ct_scope: scope, ct_plan_id: plan.id, ct_interval: req.interval, ct_kind: 'plan' };
       const back = `${this.d.webUrl}${this.returnPath(scope)}`;
       const session = await this.stripe().checkout.sessions.create(
@@ -1577,7 +1666,30 @@ export class BillingService {
     return to.map((addr) => ({ to: addr, subject, text }));
   }
 
-  /** Writes the subscription's latest state and the entitlements that follow from it. */
+  /**
+   * Entitlements follow every active plan subscription of the scope, not the
+   * one an event was about: the highest plan level wins, and only when none is
+   * active does the scope fall back to the free plan. So cancelling one of two
+   * subscriptions (two Checkouts raced, or a plan bought in the portal) never
+   * drops a still-paying account to Free.
+   */
+  private async recomputeEntitlements(tx: Tx, orgId: string, userId: string | null): Promise<void> {
+    const subs = await this.planSubs(tx, orgId, userId);
+    const best = this.bestActive(subs);
+    const activeCount = subs.filter((s) => ACTIVE.has(s.status)).length;
+    if (activeCount > 1) this.d.log?.warn({ orgId, scope: userId ? 'user' : 'org', subscriptions: activeCount }, 'billing: more than one active plan subscription; entitlements follow the highest plan');
+    const effective = best ? this.plan(best.plan_id) : this.defaultPlan();
+    if (!effective) return;
+    const source = best ? 'subscription' : 'default';
+    const subscriptionId = best?.id ?? null;
+    await tx
+      .insertInto('billing_entitlements')
+      .values({ org_id: orgId, user_id: userId, plan_id: effective.id, entitlements: JSON.stringify(effective.entitlements), source, subscription_id: subscriptionId })
+      .onConflict((oc) => oc.columns(['org_id', 'scope_key']).doUpdateSet({ plan_id: effective.id, entitlements: JSON.stringify(effective.entitlements), source, subscription_id: subscriptionId, updated_at: this.now() }))
+      .execute();
+  }
+
+  /** Writes the subscription's latest state and the entitlements that follow from all the scope's subscriptions. */
   private async upsertSubscription(tx: Tx, sub: StripeSubscription, meta: Record<string, string>): Promise<{ orgId: string; userId: string | null; planId: string; seats: number }> {
     const item = sub.items?.data?.find((i) => !!this.planByLookupKey(i.price?.lookup_key)) ?? sub.items?.data?.[0];
     const found = this.planByLookupKey(item?.price?.lookup_key) ?? (meta.ct_plan_id ? { plan: this.plan(meta.ct_plan_id), interval: (meta.ct_interval as PlanInterval) || 'monthly' } : undefined);
@@ -1601,7 +1713,7 @@ export class BillingService {
     const status: SubscriptionStatus = STATUSES.has(sub.status) ? (sub.status as SubscriptionStatus) : 'incomplete';
     const seats = Math.max(1, item?.quantity ?? 1);
     const periodEnd = sub.current_period_end ?? item?.current_period_end;
-    const row = await tx
+    await tx
       .insertInto('billing_subscriptions')
       .values({
         org_id: orgId,
@@ -1630,17 +1742,9 @@ export class BillingService {
           updated_at: this.now(),
         }),
       )
-      .returning('id')
-      .executeTakeFirstOrThrow();
+      .execute();
     const active = ACTIVE.has(status);
-    const effective = active ? plan : this.defaultPlan();
-    if (effective) {
-      await tx
-        .insertInto('billing_entitlements')
-        .values({ org_id: orgId, user_id: userId, plan_id: effective.id, entitlements: JSON.stringify(effective.entitlements), source: active ? 'subscription' : 'default', subscription_id: active ? row.id : null })
-        .onConflict((oc) => oc.columns(['org_id', 'scope_key']).doUpdateSet({ plan_id: effective.id, entitlements: JSON.stringify(effective.entitlements), source: active ? 'subscription' : 'default', subscription_id: active ? row.id : null, updated_at: this.now() }))
-        .execute();
-    }
+    await this.recomputeEntitlements(tx, orgId, userId);
     // A plan subscription implies a payment method.
     if (active) await tx.updateTable('billing_customers').set({ has_payment_method: true, updated_at: this.now() }).where('id', '=', customerRow.id).where('has_payment_method', '=', false).execute();
     await audit(tx, { orgId, actorId: null, actorName: 'Stripe' } satisfies AuditActor, 'billing.subscription', 'subscription', sub.id, { plan: plan.id, status, seats, interval: found.interval, cancelAtPeriodEnd: !!sub.cancel_at_period_end, scope: userId ? 'user' : 'org' }, plan.name);
@@ -1662,6 +1766,10 @@ function toSubscription(r: { id: string; plan_id: string; billing_interval: 'mon
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+/** An open plan Checkout younger than this may be mid-payment: a new checkout waits instead of expiring it. */
+const CHECKOUT_IN_PROGRESS_S = 5 * 60;
+/** How long a completed plan Checkout whose subscription is not recorded blocks a new checkout. */
+const PLAN_PENDING_S = 60 * 60;
 
 /** Minor units as money, e.g. 5000 EUR -> "€50.00". */
 export function formatMoney(minor: number, currency: string): string {
