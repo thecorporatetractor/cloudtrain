@@ -60,6 +60,8 @@ func main() {
 	flag.StringVar(&watchNamespace, "watch-namespace", "", "restrict the manager to one namespace; empty = all namespaces")
 	flag.IntVar(&concurrency, "max-concurrent-reconciles", controller.DefaultMaxConcurrentReconciles, "parallel LabSession reconciles")
 	flag.DurationVar(&provisionTimeout, "provision-timeout", controller.DefaultProvisionTimeout, "fail sessions whose nodes are not ready within this time")
+	var orphanSweep time.Duration
+	flag.DurationVar(&orphanSweep, "orphan-sweep", controller.DefaultOrphanSweep, "how often cluster-scoped session objects (vcluster namespaces, Kube-OVN VPCs and subnets) whose LabSession is gone are deleted; 0 = off")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.StringVar(&registry, "image-registry", "", "registry prefix for unqualified catalog images (e.g. registry.cloudtrain.local/images); empty = the catalog's registry")
@@ -357,6 +359,10 @@ func main() {
 		Sandboxes: sandboxes, Catalog: catalog,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
+		os.Exit(1)
+	}
+	if err := mgr.Add(controller.NewOrphanSweeper(mgr.GetClient(), mgr.GetAPIReader(), orphanSweep, ctrl.Log.WithName("orphans"))); err != nil {
+		log.Error(err, "unable to set up the orphan sweeper")
 		os.Exit(1)
 	}
 	if err := (&controller.WarmPoolReconciler{

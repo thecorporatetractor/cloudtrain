@@ -281,6 +281,7 @@ kubectl label namespace cloudtrain-sessions labs.cloudtrain.dev/lab-namespace=tr
 | k8s-cluster vcluster | the chart's Role (created without `escalate`, so the manager holds all of it) | `pods/attach pods/portforward pods/exec`, `pods/status pods/ephemeralcontainers pods/resize`, `pods/log`, `endpoints`, `endpointslices`, events | session ClusterRole |
 | netdev driver | FRR pods, exec | pods, `pods/exec` | session ClusterRole |
 | Session network | per-session VPC and subnets | get list create update patch delete `vpcs subnets` (kubeovn.io) | ClusterRole (+ policy) |
+| Orphan sweeper (`--orphan-sweep`, 10m) | deletes vcluster host namespaces, VPCs and subnets (labelled with a session UID, older than 10m) whose LabSession is gone: left behind by a removed finalizer, a reinstall or an etcd restore (hibernated vclusters included; labctl preflight objects are never swept); metric `cloudtrain_orphaned_session_objects_deleted_total` | list `pods services` (label `app=vcluster`, to find host namespaces, hibernated ones through their service: it may not list namespaces), get delete `namespaces` (admission-limited as above), list delete `vpcs subnets`, list `labsessions` (uncached) | ClusterRole (+ policy) |
 | Session network | Multus attachments | `network-attachment-definitions` CRUD | session ClusterRole |
 | vlan-passthru | `ovn-nbctl` in ovn-central | list `pods`, create get `pods/exec` | Role in `kube-system` |
 
