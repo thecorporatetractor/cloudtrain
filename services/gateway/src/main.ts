@@ -83,7 +83,7 @@ async function main() {
     mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
     store,
     kc: kcAdmin,
-    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace },
+    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace, ssoEgress: config.ssoEgress },
     log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
   });
   sessions.hooks = platform;
@@ -227,7 +227,7 @@ async function main() {
   const retention = () => void sweepRetention({ db, waitlist, ledger, accounts: gdpr, config: config.retention, log: app.log }).catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'retention sweep failed'));
   const retentionSweep = config.retention.sweepMs > 0 ? setInterval(retention, config.retention.sweepMs) : undefined;
   // Tenant IdP protections (broker flow, origin stamps, foreign addresses) hold without kc:sync.
-  const stopKcRepair = kcAdmin ? scheduleTenantIdpRepair(db, kcAdmin, config.keycloak.repairMs, app.log) : undefined;
+  const stopKcRepair = kcAdmin ? scheduleTenantIdpRepair(db, kcAdmin, config.keycloak.repairMs, { ssoEgress: config.ssoEgress }, app.log) : undefined;
   if (!kcAdmin) app.log.warn({}, 'keycloak: no admin client (CT_KEYCLOAK_ADMIN_CLIENT_SECRET unset); tenant IdP protections are not re-applied and local logins are not checked for IdP origins');
   const close = async () => {
     stopKcRepair?.();

@@ -111,7 +111,7 @@ export interface SyncReport extends RepairReport {
 }
 
 export async function syncKeycloak(ps: PlatformService, kc: KeycloakAdmin, db: Db, opts: { entraFile?: string } = {}): Promise<SyncReport> {
-  const report: SyncReport = { orgs: [], linkedIdps: [], brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], failures: [], members: 0, entra: 'absent' };
+  const report: SyncReport = { orgs: [], linkedIdps: [], brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], failures: [], endpointsRefused: [], endpointsUnresolved: [], members: 0, entra: 'absent' };
   await kc.allowUnmanagedAttributes();
 
   const entra = await readEntra(opts.entraFile);
@@ -140,7 +140,7 @@ export async function syncKeycloak(ps: PlatformService, kc: KeycloakAdmin, db: D
 
   // Tenant IdPs on TENANT_BROKER_FLOW, origin-stamped, foreign addresses released (the gateway
   // also runs this on its own: main.ts, CT_KC_REPAIR_MS).
-  Object.assign(report, await repairTenantIdps(db, kc));
+  Object.assign(report, await repairTenantIdps(db, kc, { ...(ps.config.ssoEgress ? { ssoEgress: ps.config.ssoEgress } : {}) }));
   const orgs = await withTenant(db, { platform: true }, (tx) => tx.selectFrom('orgs').selectAll().orderBy('slug').execute());
   for (const o of orgs) {
     const { domains, conns, members } = await withTenant(db, { platform: true }, async (tx) => ({

@@ -159,6 +159,47 @@ per person and exam" is also a unique index, so it holds under concurrent starts
   (`cloudtrain-gateway-admin`, a service account) needs the `realm-management`
   roles `manage-realm`, `manage-identity-providers` and `manage-users`
   (docs/deploy.md).
+- **SSO URLs are untrusted:** the discovery URL, the endpoints its document names
+  and the SAML metadata URL are fetched from inside the cluster (by the gateway or
+  Keycloak). In production they must be https and resolve only to public addresses:
+  private, loopback, link-local, CGNAT, cloud metadata (169.254.169.254, the Azure
+  wireserver) and `*.svc`/`*.internal`/`*.local` names are refused. The gateway
+  dials the address it checked, so DNS rebinding doesn't get past the check.
+  Redirects aren't followed, responses are capped at 256 KiB, and errors never
+  echo what the far end answered (`src/platform/egress.ts`).
+  `CT_SSO_ALLOWED_HOSTS` (comma-separated, `idp.example.com` or `*.okta.com`)
+  narrows them to known IdP hosts (chart: `gateway.extraEnv`).
+  `CT_SSO_ALLOW_PRIVATE=true` permits http and private addresses, and is the default
+  outside production (the dev IdP is `http://localhost:8180`). The gateway fetches
+  SAML metadata itself under this policy and uploads the XML to Keycloak, so Keycloak
+  never fetches the metadata URL; the endpoints the metadata names get the same checks.
+- **The gateway's checks do not bind Keycloak's later requests.** For an OIDC
+  connection Keycloak calls the token, JWKS and userinfo endpoints on every brokered
+  login, resolving the names itself: an org admin who controls the IdP's DNS can
+  answer the gateway's one-time check with a public address and Keycloak's later
+  lookups with a private one, and Keycloak's HTTP client may follow a redirect from a
+  public host inward. Only a control where Keycloak runs closes that: restrict
+  Keycloak's egress (a NetworkPolicy, Cilium or cloud-firewall rule) to the internet
+  plus what it needs inside (its database, DNS, the gateway's back-channel logout
+  URL), denying RFC 1918, CGNAT, link-local/metadata (169.254.169.254, 168.63.129.16)
+  and the cluster's pod and service ranges. `CT_SSO_ALLOWED_HOSTS` narrows which
+  hosts can be configured at all. The chart does not deploy Keycloak, but renders
+  that rule when asked: `networkPolicy.keycloakEgress` (enabled, Keycloak's
+  `namespace` and `podSelector`, the cluster's `clusterCIDRs`, extra in-cluster
+  peers in `allowTo`) allows DNS, the listed peers and public addresses on port 443
+  only. With `gateway.keycloak.url` set (org admins can add IdPs) the chart refuses
+  to render unless that policy is enabled or `networkPolicy.keycloakEgress.unrestricted`
+  is set to say the Keycloak deployment restricts its egress some other way (another
+  CNI policy, a cloud firewall); `examples/values-nginx.yaml` shows it enabled.
+- **Existing connections are re-checked.** Connections made before these checks
+  existed were never validated. The gateway's repair run (at startup and every
+  `CT_KC_REPAIR_MS`, `keycloak/repair.ts`; `kc:sync` runs it too) re-checks the
+  endpoints Keycloak calls of every tenant IdP under the same policy and disables an
+  IdP in Keycloak whose endpoint is definitely refused: a private address, an
+  internal name, a disallowed scheme or host. A name that does not resolve right now
+  (a DNS outage) is logged as unresolved and changes nothing, so an outage cannot
+  switch off an org's SSO. Setting the connection active again re-checks its stored
+  endpoints and is refused while one still fails.
 - **Provisioning:** just-in-time on first login (user + membership + mapped
   roles/teams), re-evaluated on every login. SCIM 2.0 (`/scim/v2`) is phase 2.
   Deprovisioning: deactivated in the IdP -> blocked at next login; org_admin can

@@ -52,7 +52,7 @@ describe('tenant IdP repair: one failure does not stop the run', () => {
   it('a failing IdP is skipped and reported; the other IdPs are repaired', async () => {
     const { kc, marked } = fakeKc({ failIdp: 'b-idp' });
     const warn = vi.fn();
-    const r = await repairTenantIdps({} as never, kc, { warn });
+    const r = await repairTenantIdps({} as never, kc, {}, { warn });
     expect(marked).toEqual(['a-idp/a-idp-u1', 'a-idp/a-idp-u2', 'c-idp/c-idp-u1', 'c-idp/c-idp-u2']);
     expect(r.failures).toEqual(['b-idp: HTTP 500']);
     expect(warn).toHaveBeenCalledTimes(1);

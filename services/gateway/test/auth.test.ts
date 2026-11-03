@@ -543,7 +543,21 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
       };
       const r = await repairTenantIdps(h.t.db, kc as never);
       expect(calls).toEqual(['flow', 'idp acme-idp -> cloudtrain tenant broker login', 'mapper acme-idp', 'mark u-old acme-idp', 'drop u-foreign acme-idp']);
-      expect(r).toEqual({ brokerFlowFixed: ['acme-idp'], foreignReleased: ['acme-idp/u-foreign'], untrustedLinks: ['acme-idp/u-old'], originsMarked: ['acme-idp/u-old'], failures: [] });
+      expect(r).toEqual({ brokerFlowFixed: ['acme-idp'], foreignReleased: ['acme-idp/u-foreign'], untrustedLinks: ['acme-idp/u-old'], originsMarked: ['acme-idp/u-old'], failures: [], endpointsRefused: [], endpointsUnresolved: [] });
+
+      // Endpoints Keycloak calls: a private one disables the IdP; a name that does not resolve
+      // (a DNS outage) leaves it alone.
+      const updates: { enabled: boolean }[] = [];
+      const run = (config: Record<string, string>) =>
+        repairTenantIdps(h.t.db, { ...kc, idpUsers: async () => [], getIdp: async (alias: string) => ({ alias, providerId: 'oidc', enabled: true, firstBrokerLoginFlowAlias: 'cloudtrain tenant broker login', config }), updateIdp: async (x: { enabled: boolean }) => void updates.push(x) } as never);
+      const refused = await run({ authorizationUrl: 'https://8.8.8.8/a', tokenUrl: 'https://10.0.0.5/t' });
+      expect(refused.endpointsRefused).toEqual(['acme-idp: tokenUrl (must be a public address)']);
+      expect(updates).toEqual([expect.objectContaining({ enabled: false })]);
+      updates.length = 0;
+      const outage = await run({ tokenUrl: 'https://idp.does-not-exist.invalid/t' });
+      expect(outage.endpointsRefused).toEqual([]);
+      expect(outage.endpointsUnresolved).toEqual(['acme-idp: tokenUrl']);
+      expect(updates).toEqual([]);
     });
 
     it('a trusted login never takes an address from an account that holds it trusted', async () => {

@@ -173,6 +173,15 @@ check "aks: every container tier in kata-vm-isolation" q 'select(.kind == "Confi
 render -f "$CHART/examples/values-kind.yaml" --set web.runtimeConfig.apiBase=https://api.example.com --set 'web.csp.connectSrc=https://api.example.com wss://api.example.com' >"$OUT/web.yaml"
 check "web CT_API_BASE" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-web") | .spec.template.spec.containers[0].env[] | select(.name == "CT_API_BASE") | .value == "https://api.example.com"' "$OUT/web.yaml"
 
+# Keycloak egress (optional): DNS, the listed peers, public addresses only.
+check "keycloak egress off by default" bash -c "! yq -e 'select(.kind == \"NetworkPolicy\" and .metadata.name == \"ct-cloudtrain-keycloak-egress\")' '$OUT/values-kind.yaml'"
+render -f "$CHART/examples/values-kind.yaml" --set networkPolicy.keycloakEgress.enabled=true --set networkPolicy.keycloakEgress.namespace=keycloak --set networkPolicy.keycloakEgress.podSelector.matchLabels.app=keycloak --set 'networkPolicy.keycloakEgress.clusterCIDRs={10.244.0.0/16,fd00:10::/56}' >"$OUT/keycloak-egress.yaml"
+check "keycloak egress: in Keycloak's namespace, egress only" q 'select(.kind == "NetworkPolicy" and .metadata.name == "ct-cloudtrain-keycloak-egress") | (.metadata.namespace == "keycloak" and (.spec.policyTypes | length) == 1 and .spec.policyTypes[0] == "Egress" and .spec.podSelector.matchLabels.app == "keycloak")' "$OUT/keycloak-egress.yaml"
+KE='select(.kind == "NetworkPolicy" and .metadata.name == "ct-cloudtrain-keycloak-egress") | .spec.egress[-1]'
+check "keycloak egress: no private, metadata or cluster v4 ranges" q "$KE"' | .to[0].ipBlock.except as $e | ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "168.63.129.16/32", "10.244.0.0/16"] | all_c(. as $w | $e | any_c(. == $w))' "$OUT/keycloak-egress.yaml"
+check "keycloak egress: no private or cluster v6 ranges" q "$KE"' | .to[1].ipBlock.except as $e | ["fc00::/7", "fe80::/10", "fd00:10::/56"] | all_c(. as $w | $e | any_c(. == $w))' "$OUT/keycloak-egress.yaml"
+check "keycloak egress: public https only" q "$KE"' | .ports | (length == 1 and .[0].port == 443)' "$OUT/keycloak-egress.yaml"
+
 # Refusals: bad input fails the render with a message.
 refuse() { local name=$1 want=$2; shift 2; if out=$(render "$@" 2>&1); then fail "refuse $name (rendered)"; elif grep -q -- "$want" <<<"$out"; then pass "refuse $name"; else fail "refuse $name: $out"; fi; }
 refuse "missing issuer" "gateway.oidc.issuer is required" --set gateway.existingSecret=s
@@ -191,6 +200,10 @@ refuse "semicolon in CSP" "csp" -f "$CHART/examples/values-kind.yaml" --set 'web
 refuse "gatewayAPI without parent" "parentRefs or createGateway" -f "$CHART/examples/values-kind.yaml" --set exposure.type=gatewayAPI
 refuse "bad mirror" "mirrors" -f "$CHART/examples/values-kind.yaml" --set 'orchestrator.images.mirrors[0]=ghcr.io'
 refuse "bad ovn-central selector" "selector" -f "$CHART/examples/values-kind.yaml" --set orchestrator.rbac.ovnCentral.selector=ovn-central
+refuse "keycloak admin API with unrestricted Keycloak egress" "keycloakEgress" -f "$CHART/examples/values-kind.yaml" --set gateway.keycloak.url=https://kc.example
+check "keycloak egress: production example restricts it" q 'select(.kind == "NetworkPolicy" and .metadata.name == "ct-cloudtrain-keycloak-egress") | .metadata.namespace == "keycloak"' "$OUT/values-nginx.yaml"
+render -f "$CHART/examples/values-kind.yaml" --set gateway.keycloak.url=https://kc.example --set networkPolicy.keycloakEgress.unrestricted=true >/dev/null && pass "keycloak egress: explicit unrestricted opt-out renders" || fail "keycloak egress: explicit unrestricted opt-out renders"
+refuse "keycloak egress without namespace" "keycloakEgress.namespace" -f "$CHART/examples/values-kind.yaml" --set networkPolicy.keycloakEgress.enabled=true --set networkPolicy.keycloakEgress.podSelector.matchLabels.app=keycloak
 refuse "unknown value" "additional properties" -f "$CHART/examples/values-kind.yaml" --set gateway.typo=1
 refuse "bad sandbox fallback" "fallback" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata --set orchestrator.sandboxes.B.fallback=host
 refuse "bad sandbox tier" "invalid propertyName" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.Z.runtimeClass=kata

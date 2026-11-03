@@ -1,4 +1,6 @@
+import type { lookup as dnsLookup } from 'node:dns';
 import { withTenant, type Db } from '../db/index.js';
+import { checkResolves, checkUrl, EgressError, type EgressPolicy } from '../platform/egress.js';
 import { foreignLinks } from '../platform/kc-address.js';
 import { BROKER_ORIGIN_ATTRIBUTE, TENANT_BROKER_FLOW, type KcUser, type KeycloakAdmin } from './admin.js';
 
@@ -11,6 +13,33 @@ import { BROKER_ORIGIN_ATTRIBUTE, TENANT_BROKER_FLOW, type KcUser, type Keycloak
 
 /** The operator's Entra ID IdP: platform-trusted, keeps Keycloak's built-in first broker login. */
 export const ENTRA_ALIAS = 'azarguard-entra';
+
+/** IdP settings the browser follows (not called by Keycloak): only the URL checks, no resolve. */
+const BROWSER_URLS = new Set(['authorizationUrl', 'logoutUrl', 'singleSignOnServiceUrl']);
+
+/**
+ * The first endpoint of a tenant IdP's Keycloak settings that the SSO egress policy definitely
+ * refuses (`field (reason)`): a private address, an internal name, a disallowed scheme or host.
+ * Keycloak calls the token, JWKS, userinfo and SAML back-channel endpoints itself on every login;
+ * the gateway only checked them when the connection was made. A name that does not resolve right
+ * now (DNS outage) is not a refusal: `unresolved` lists it, and nothing is disabled for it.
+ */
+export async function refusedEndpoint(config: Record<string, string>, policy: EgressPolicy, unresolved: string[] = [], lookup?: typeof dnsLookup): Promise<string | null> {
+  for (const [k, v] of Object.entries(config)) {
+    if (!/Url$/.test(k) || typeof v !== 'string' || !v) continue;
+    try {
+      const u = checkUrl(v, policy);
+      if (!BROWSER_URLS.has(k)) await checkResolves(u, policy, lookup);
+    } catch (e) {
+      if (e instanceof EgressError && e.transient) {
+        unresolved.push(k);
+        continue;
+      }
+      return `${k} (${(e as Error).message})`;
+    }
+  }
+  return null;
+}
 
 export interface RepairReport {
   /** Tenant IdPs moved to TENANT_BROKER_FLOW (created before it existed, or changed since). */
@@ -36,6 +65,19 @@ export interface RepairReport {
    * skips only that IdP or user; the next run retries it.
    */
   failures: string[];
+  /**
+   * Tenant IdPs (`alias: field (reason)`) whose endpoints Keycloak calls fail the SSO egress policy
+   * today (private address, internal name, scheme): disabled in Keycloak until an org admin fixes
+   * them. Connections made before the gateway checked these URLs are re-validated on every run.
+   */
+  endpointsRefused: string[];
+  /** Tenant IdPs (`alias: field`) whose endpoint names did not resolve this run: left as they are. */
+  endpointsUnresolved: string[];
+}
+
+export interface RepairOptions {
+  /** The SSO egress policy (CT_SSO_EGRESS_*); empty: the strict default. */
+  ssoEgress?: EgressPolicy;
 }
 
 export interface RepairLog {
@@ -44,8 +86,8 @@ export interface RepairLog {
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-export async function repairTenantIdps(db: Db, kc: KeycloakAdmin, log?: RepairLog): Promise<RepairReport> {
-  const report: RepairReport = { brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], failures: [] };
+export async function repairTenantIdps(db: Db, kc: KeycloakAdmin, opts: RepairOptions = {}, log?: RepairLog): Promise<RepairReport> {
+  const report: RepairReport = { brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], failures: [], endpointsRefused: [], endpointsUnresolved: [] };
   const failed = (what: string, e: unknown) => {
     report.failures.push(`${what}: ${errText(e)}`);
     log?.warn({ err: e, target: what }, 'keycloak: tenant IdP repair step failed, continuing');
@@ -79,6 +121,14 @@ export async function repairTenantIdps(db: Db, kc: KeycloakAdmin, log?: RepairLo
         await kc.updateIdp({ ...idp, firstBrokerLoginFlowAlias: TENANT_BROKER_FLOW });
         report.brokerFlowFixed.push(c.kc_alias);
       }
+      // Endpoints Keycloak calls must still pass the SSO egress policy; a definite refusal disables the IdP.
+      const unresolved: string[] = [];
+      const refused = await refusedEndpoint(idp.config ?? {}, opts.ssoEgress ?? {}, unresolved);
+      for (const f of unresolved) report.endpointsUnresolved.push(`${c.kc_alias}: ${f}`);
+      if (refused) {
+        if (idp.enabled !== false) await kc.updateIdp({ ...idp, firstBrokerLoginFlowAlias: TENANT_BROKER_FLOW, enabled: false });
+        report.endpointsRefused.push(`${c.kc_alias}: ${refused}`);
+      }
       await kc.ensureBrokerOriginMapper(c.kc_alias);
       users = await kc.idpUsers(c.kc_alias, 200, true);
     } catch (e) {
@@ -110,14 +160,16 @@ export async function repairTenantIdps(db: Db, kc: KeycloakAdmin, log?: RepairLo
 }
 
 /** Runs repairTenantIdps now and every `everyMs` (0: only now). Returns a stop function. */
-export function scheduleTenantIdpRepair(db: Db, kc: KeycloakAdmin, everyMs: number, log: { info(o: object, m: string): void; warn(o: object, m: string): void }): () => void {
+export function scheduleTenantIdpRepair(db: Db, kc: KeycloakAdmin, everyMs: number, opts: RepairOptions, log: { info(o: object, m: string): void; warn(o: object, m: string): void }): () => void {
   let running = false;
   const run = () => {
     if (running) return;
     running = true;
-    void repairTenantIdps(db, kc, log)
+    void repairTenantIdps(db, kc, opts, log)
       .then((r) => {
         if (r.brokerFlowFixed.length || r.foreignReleased.length || r.originsMarked.length) log.warn({ brokerFlowFixed: r.brokerFlowFixed, foreignReleased: r.foreignReleased, originsMarked: r.originsMarked.length }, 'keycloak: repaired tenant IdPs');
+        if (r.endpointsRefused.length) log.warn({ endpointsRefused: r.endpointsRefused }, 'keycloak: tenant IdPs disabled, endpoints refused by the SSO egress policy');
+        if (r.endpointsUnresolved.length) log.warn({ endpointsUnresolved: r.endpointsUnresolved }, 'keycloak: tenant IdP endpoints did not resolve; not checked this run');
         if (r.failures.length) log.warn({ failures: r.failures.length }, 'keycloak: tenant IdP repair finished with failures (retried next run)');
         if (r.untrustedLinks.length) log.info({ untrustedLinks: r.untrustedLinks.length }, 'keycloak: brokered users with an email on a domain no org verified (not trusted for invitations)');
       })

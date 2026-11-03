@@ -9,6 +9,8 @@ import { badRequest, conflict, HttpError, notFound } from '../errors.js';
 import { TENANT_BROKER_FLOW, type KcIdentityProvider, type KeycloakAdmin } from '../keycloak/admin.js';
 import { actorOf, audit } from './audit.js';
 import { orgOf } from './admin.js';
+import { checkResolves, checkUrl, EgressError, fetchJson, fetchText } from './egress.js';
+import { refusedEndpoint } from '../keycloak/repair.js';
 import { orgForDomain } from './identity.js';
 import type { PlatformService } from './service.js';
 
@@ -76,28 +78,39 @@ async function checkMappings(tx: Tx, maps: SsoGroupMapping[] | undefined): Promi
   return list.map((m) => ({ group: m.group.trim(), roles: m.roles, teams: m.teams.map((t) => ({ teamId: t.teamId, role: t.role === 'manager' ? 'manager' : 'member' })) }));
 }
 
-async function discover(url: string): Promise<{ issuer: string; authorization_endpoint: string; token_endpoint: string; jwks_uri: string; userinfo_endpoint?: string; end_session_endpoint?: string }> {
-  // The URL comes from an org admin: allow only http(s) without credentials, refuse
-  // link-local/metadata addresses, and never follow redirects (SSRF hardening).
-  let u: URL;
+type Discovery = { issuer: string; authorization_endpoint: string; token_endpoint: string; jwks_uri: string; userinfo_endpoint?: string; end_session_endpoint?: string };
+
+/**
+ * Fetches an org admin's OIDC discovery document under the SSO egress policy
+ * (src/platform/egress.ts): https, public addresses only, optional host
+ * allowlist, no redirects. The endpoints it names are what Keycloak will call,
+ * so they get the same check. Errors say what is wrong, never what the far end
+ * answered (no probing of internal services through the messages).
+ */
+export async function discover(ps: Pick<PlatformService, 'config' | 'log'>, url: string, log?: { warn(o: object, m?: string): void }): Promise<Discovery> {
+  const policy = ps.config.ssoEgress ?? {};
+  let d: Record<string, unknown> | null;
   try {
-    u = new URL(url);
-  } catch {
-    throw badRequest('The discovery URL is not a valid URL', { discoveryUrl: 'invalid' });
-  }
-  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || u.username || u.password || /^(169\.254\.|\[?fe80:|metadata\.google\.internal$)/i.test(u.hostname)) {
-    throw badRequest('The discovery URL must be an http(s) URL without credentials, not a link-local address', { discoveryUrl: 'invalid' });
-  }
-  let r: Response;
-  try {
-    r = await fetch(u, { redirect: 'error', signal: AbortSignal.timeout(8000) });
+    d = (await fetchJson(url, policy)) as Record<string, unknown> | null;
   } catch (e) {
-    throw badRequest(`Could not reach the discovery URL: ${(e as Error).message}`, { discoveryUrl: 'unreachable' });
+    const err = e instanceof EgressError ? e : new EgressError('could not be reached', (e as Error).message);
+    (log ?? ps.log)?.warn({ url, reason: err.message, detail: err.detail }, 'SSO discovery refused or failed');
+    throw badRequest(`The discovery URL ${err.message}.`, { discoveryUrl: 'invalid' });
   }
-  if (!r.ok) throw badRequest(`Discovery URL answered HTTP ${r.status}`, { discoveryUrl: 'invalid' });
-  const d = (await r.json().catch(() => null)) as Record<string, string> | null;
-  if (!d?.issuer || !d.authorization_endpoint || !d.token_endpoint || !d.jwks_uri) throw badRequest('Not an OpenID Connect discovery document', { discoveryUrl: 'invalid' });
-  return d as never;
+  if (!d || typeof d !== 'object' || ['issuer', 'authorization_endpoint', 'token_endpoint', 'jwks_uri'].some((k) => typeof d![k] !== 'string' || !d![k])) throw badRequest('Not an OpenID Connect discovery document', { discoveryUrl: 'invalid' });
+  for (const k of ['authorization_endpoint', 'token_endpoint', 'jwks_uri', 'userinfo_endpoint', 'end_session_endpoint'] as const) {
+    if (d[k] === undefined) continue;
+    try {
+      if (typeof d[k] !== 'string') throw new EgressError('is not a URL');
+      // The browser goes to the authorization endpoint; Keycloak calls the others.
+      const u = checkUrl(d[k], policy);
+      if (k !== 'authorization_endpoint' && k !== 'end_session_endpoint') await checkResolves(u, policy);
+    } catch (e) {
+      (log ?? ps.log)?.warn({ url, field: k, reason: (e as Error).message, detail: (e as EgressError).detail }, 'SSO discovery endpoint refused');
+      throw badRequest(`The discovery document's ${k} ${e instanceof EgressError ? e.message : 'is not acceptable'}.`, { discoveryUrl: 'invalid' });
+    }
+  }
+  return d as unknown as Discovery;
 }
 
 /**
@@ -111,7 +124,46 @@ async function discover(url: string): Promise<{ issuer: string; authorization_en
  */
 export const TENANT_IDP = { enabled: true, trustEmail: true, hideOnLogin: true, firstBrokerLoginFlowAlias: TENANT_BROKER_FLOW } as const;
 
-export function oidcIdp(alias: string, displayName: string, d: Awaited<ReturnType<typeof discover>>, o: { clientId: string; clientSecret: string; scopes?: string[] }): KcIdentityProvider {
+/**
+ * Fetches SAML metadata in the gateway under the SSO egress policy (pinned
+ * lookup, no redirects, size cap) and hands Keycloak the XML, not the URL:
+ * Keycloak resolving the URL again could be answered with a private address
+ * (DNS rebinding) or follow a redirect inward. Returns the XML.
+ */
+export async function fetchSamlMetadata(ps: Pick<PlatformService, 'config' | 'log'>, url: string): Promise<string> {
+  const policy = ps.config.ssoEgress ?? {};
+  let xml: string;
+  try {
+    xml = await fetchText(url, policy, { accept: 'application/samlmetadata+xml, application/xml, text/xml', maxBytes: 1024 * 1024 });
+  } catch (e) {
+    const err = e instanceof EgressError ? e : new EgressError('could not be reached', (e as Error).message);
+    ps.log?.warn({ url, reason: err.message, detail: err.detail }, 'SAML metadata URL refused or failed');
+    throw badRequest(`The metadata URL ${err.message}.`, { saml: 'invalid' });
+  }
+  if (!/<(?:[A-Za-z0-9_-]+:)?EntityDescriptor[\s>]/.test(xml)) throw badRequest('The metadata URL did not answer with SAML metadata (an EntityDescriptor).', { saml: 'invalid' });
+  return xml;
+}
+
+/**
+ * The imported SAML settings name endpoints. Keycloak calls some of them
+ * itself (artifact resolution, back-channel logout), so they get the URL
+ * policy too; the browser-facing ones at least the scheme and name checks.
+ */
+async function checkSamlEndpoints(ps: Pick<PlatformService, 'config' | 'log'>, config: Record<string, string>): Promise<void> {
+  const policy = ps.config.ssoEgress ?? {};
+  for (const [k, v] of Object.entries(config)) {
+    if (!/Url$/.test(k) || !v) continue;
+    try {
+      const u = checkUrl(v, policy);
+      if (k !== 'singleSignOnServiceUrl') await checkResolves(u, policy);
+    } catch (e) {
+      ps.log?.warn({ field: k, url: v, reason: (e as Error).message, detail: (e as EgressError).detail }, 'SAML metadata endpoint refused');
+      throw badRequest(`The SAML metadata's ${k} ${e instanceof EgressError ? e.message : 'is not acceptable'}.`, { saml: 'invalid' });
+    }
+  }
+}
+
+export function oidcIdp(alias: string, displayName: string, d: Discovery, o: { clientId: string; clientSecret: string; scopes?: string[] }): KcIdentityProvider {
   return {
     alias,
     displayName,
@@ -165,7 +217,7 @@ export async function createConnection(ps: PlatformService, p: Principal, req: C
   if (req.type === 'oidc') {
     const o = req.oidc;
     if (!o?.discoveryUrl || !o.clientId || !o.clientSecret) throw badRequest('oidc.discoveryUrl, clientId and clientSecret are required', { oidc: 'required' });
-    const d = await discover(o.discoveryUrl);
+    const d = await discover(ps, o.discoveryUrl);
     await kc.ensureTenantBrokerFlow();
     await kc.createIdp(oidcIdp(alias, req.displayName.trim(), d, o));
     const roleClaim = o.roleClaim ?? 'roles';
@@ -175,7 +227,15 @@ export async function createConnection(ps: PlatformService, p: Principal, req: C
   } else {
     const s = req.saml;
     if (!s?.metadataUrl) throw badRequest('saml.metadataUrl is required (metadata XML upload: use the URL form for now)', { saml: 'required' });
-    const config = await kc.importIdpConfig('saml', s.metadataUrl);
+    const xml = await fetchSamlMetadata(ps, s.metadataUrl);
+    let config: Record<string, string>;
+    try {
+      config = await kc.importIdpConfigFromDocument('saml', xml);
+    } catch (e) {
+      ps.log?.warn({ err: e, url: s.metadataUrl }, 'SAML metadata import failed');
+      throw badRequest('Keycloak could not import the SAML metadata from that URL.', { saml: 'invalid' });
+    }
+    await checkSamlEndpoints(ps, config);
     await kc.ensureTenantBrokerFlow();
     await kc.createIdp({ alias, displayName: req.displayName.trim(), providerId: 'saml', ...TENANT_IDP, config: { ...config, syncMode: 'FORCE', principalType: 'SUBJECT' } });
     const groupAttribute = s.groupAttribute ?? 'groups';
@@ -223,7 +283,7 @@ export async function updateConnection(ps: PlatformService, p: Principal, id: st
     const cfg = { ...idp.config };
     if (req.oidc && row.type === 'oidc') {
       if (req.oidc.discoveryUrl) {
-        const d = await discover(req.oidc.discoveryUrl);
+        const d = await discover(ps, req.oidc.discoveryUrl);
         Object.assign(cfg, oidcIdp(row.kc_alias, row.display_name, d, { clientId: req.oidc.clientId ?? String(settings.clientId), clientSecret: req.oidc.clientSecret ?? cfg.clientSecret ?? '' }).config);
         settings.discoveryUrl = req.oidc.discoveryUrl;
         settings.issuer = d.issuer;
@@ -241,6 +301,16 @@ export async function updateConnection(ps: PlatformService, p: Principal, id: st
       await kc.ensureAttributeMapper(row.kc_alias, 'saml', 'cloudtrain groups', req.saml.groupAttribute, GROUP_ATTRIBUTE);
     }
     const enabled = req.status ? req.status === 'active' : idp.enabled;
+    // Turning an IdP (back) on re-checks every endpoint Keycloak will call, stored ones included:
+    // the repair run may have disabled it for one, and connections made before the SSO egress
+    // policy were never checked.
+    if (enabled) {
+      const refused = await refusedEndpoint(cfg, ps.config.ssoEgress ?? {});
+      if (refused) {
+        ps.log?.warn({ alias: row.kc_alias, refused }, 'SSO connection not enabled: an endpoint fails the SSO egress policy');
+        throw badRequest(`The identity provider's ${refused.replace(/ \(/, ' ').replace(/\)$/, '')}. Update the discovery URL or metadata first.`, { status: 'invalid' });
+      }
+    }
     await kc.updateIdp({ ...idp, ...(req.displayName ? { displayName: req.displayName } : {}), enabled, config: cfg });
   }
   return ps.tx(p, async (tx) => {
@@ -278,14 +348,15 @@ export async function testConnection(ps: PlatformService, p: Principal, id: stri
   const { row, org, doms } = await ps.tx(p, async (tx) => ({ row: await connRow(tx, id), org: await tx.selectFrom('orgs').select('kc_org_id').where('id', '=', p.orgId).executeTakeFirstOrThrow(), doms: await domains(tx, p.orgId) }));
   const steps: SsoTestResult['steps'] = [];
   const idp = await kc.getIdp(row.kc_alias).catch((e: unknown) => {
-    steps.push({ name: 'Keycloak reachable', ok: false, detail: (e as Error).message });
+    ps.log?.warn({ err: e }, 'SSO test: Keycloak not reachable');
+    steps.push({ name: 'Keycloak reachable', ok: false, detail: 'Keycloak did not answer; see the gateway log.' });
     return null;
   });
   steps.push({ name: 'Identity provider configured in Keycloak', ok: !!idp, ...(idp ? { detail: `${idp.providerId}, ${idp.enabled ? 'enabled' : 'disabled'}` } : {}) });
   if (row.type === 'oidc') {
     const url = String((row.settings as Record<string, unknown>).discoveryUrl ?? '');
     try {
-      const d = await discover(url);
+      const d = await discover(ps, url);
       steps.push({ name: 'Discovery document', ok: true, detail: d.issuer });
     } catch (e) {
       steps.push({ name: 'Discovery document', ok: false, detail: (e as Error).message });
