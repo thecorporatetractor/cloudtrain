@@ -332,10 +332,13 @@ describe.skipIf(!available)('billing: pay for compute (migration 0009, Stripe te
     await runFor(Q.mei, STANDARD, 1);
 
     // A past_due subscription is delinquent too, and recovers with it.
+    // (The gateway applies Stripe's current subscription, so Stripe's state changes first, as it does for real.)
     const pro = stripe.subscriptions.get('sub_mei_pro')!;
-    await hook('customer.subscription.updated', { ...pro, status: 'past_due' });
+    pro.status = 'past_due';
+    await hook('customer.subscription.updated', { ...pro });
     expect((await as(Q.mei).get('/api/billing/me')).json()).toMatchObject({ dunning: { state: 'grace' }, plan: { planId: 'pro' } });
-    await hook('customer.subscription.updated', { ...pro, status: 'active' });
+    pro.status = 'active';
+    await hook('customer.subscription.updated', { ...pro });
     expect((await as(Q.mei).get('/api/billing/me')).json().dunning.state).toBe('ok');
     const actions = await h.t.owner.selectFrom('audit_log').select('details').where('action', '=', 'billing.dunning').execute();
     expect(actions.map((a) => (a.details as { state: string }).state)).toEqual(['started', 'cleared', 'started', 'cleared']);

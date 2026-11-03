@@ -10,7 +10,7 @@ const TEST_KEY = 'sk_test_51FAKEFAKEFAKEFAKEFAKEFAKE';
 describe('billing config guard rails', () => {
   const base = { CT_PUBLIC_URL: 'http://localhost:8787' };
   it('is off by default and never accepts a live key', () => {
-    expect(billingConfig({ ...base })).toEqual({ enabled: false, mode: 'test', secretKey: '', webhookSecret: '', enforce: false, sweepMs: 60000 });
+    expect(billingConfig({ ...base })).toEqual({ enabled: false, mode: 'test', secretKey: '', webhookSecret: '', enforce: false, sweepMs: 60000, reconcileMs: 3600000 });
     expect(() => billingConfig({ ...base, STRIPE_SECRET_KEY: 'sk_live_FAKEFAKEFAKEFAKEFAKE' })).toThrow(/live key/);
     expect(() => billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: 'rk_live_FAKEFAKEFAKEFAKEFAKE', STRIPE_WEBHOOK_SECRET: SECRET })).toThrow(/live key/);
   });
@@ -21,12 +21,14 @@ describe('billing config guard rails', () => {
   it('needs a test key and a webhook secret when on', () => {
     expect(() => billingConfig({ ...base, CT_BILLING_ENABLED: '1' })).toThrow(/test-mode key/);
     expect(() => billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: TEST_KEY })).toThrow(/STRIPE_WEBHOOK_SECRET/);
-    expect(billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET })).toEqual({ enabled: true, mode: 'test', secretKey: TEST_KEY, webhookSecret: SECRET, enforce: true, sweepMs: 60000 });
+    expect(billingConfig({ ...base, CT_BILLING_ENABLED: '1', STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET })).toEqual({ enabled: true, mode: 'test', secretKey: TEST_KEY, webhookSecret: SECRET, enforce: true, sweepMs: 60000, reconcileMs: 3600000 });
     // Enforcement follows billing unless CT_BILLING_ENFORCE says otherwise; it never runs without billing.
     expect(billingConfig({ ...base, CT_BILLING_ENABLED: '1', CT_BILLING_ENFORCE: '0', STRIPE_SECRET_KEY: TEST_KEY, STRIPE_WEBHOOK_SECRET: SECRET }).enforce).toBe(false);
     expect(billingConfig({ ...base, CT_BILLING_ENFORCE: '1' }).enforce).toBe(false);
     expect(() => billingConfig({ ...base, CT_BILLING_ENFORCE: 'on' })).toThrow(/CT_BILLING_ENFORCE/);
     expect(() => billingConfig({ ...base, CT_BILLING_SWEEP_MS: '-5' })).toThrow(/CT_BILLING_SWEEP_MS/);
+    expect(() => billingConfig({ ...base, CT_BILLING_RECONCILE_MS: 'hourly' })).toThrow(/CT_BILLING_RECONCILE_MS/);
+    expect(billingConfig({ ...base, CT_BILLING_RECONCILE_MS: '0' }).reconcileMs).toBe(0);
   });
   it('key helpers', () => {
     expect(isLiveKey('sk_live_x')).toBe(true);
@@ -89,5 +91,16 @@ describe('StripeApi requests', () => {
     });
     await list.prices.list({ lookup_keys: ['ct_pro_monthly'], active: true });
     expect(calls.at(-1)!.url).toBe('https://api.stripe.com/v1/prices?lookup_keys%5B0%5D=ct_pro_monthly&active=true');
+  });
+});
+
+describe('Stripe request timeout', () => {
+  it('aborts a request Stripe does not answer and reports it as a retryable status 0', async () => {
+    const hang = (_url: string, init: { signal?: AbortSignal }) =>
+      new Promise<never>((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
+    const api = new StripeApi(TEST_KEY, hang, 'https://stripe.test', 50);
+    await expect(api.subscriptions.retrieve('sub_1')).rejects.toMatchObject({ status: 0, code: 'timeout' });
+    const down = new StripeApi(TEST_KEY, async () => Promise.reject(new Error('ECONNREFUSED')), 'https://stripe.test', 50);
+    await expect(down.customers.retrieve('cus_1')).rejects.toMatchObject({ status: 0, code: 'network' });
   });
 });

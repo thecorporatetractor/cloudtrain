@@ -75,6 +75,7 @@ and CTF event sessions start through their own services and are not metered or g
 | `STRIPE_WEBHOOK_SECRET` | | The endpoint secret (`whsec_...`) from `stripe listen` or the dashboard; required when billing is on |
 | `CT_BILLING_ENFORCE` | on with billing | `1`/`0`. Unset, it follows `CT_BILLING_ENABLED` (so dev with billing on enforces); `0` meters and shows everything but never refuses a start. Without billing nothing is enforced |
 | `CT_BILLING_SWEEP_MS` | `60000` | How often usage of sessions that ended outside the gateway (expiry, admin) is closed and the meter outbox is flushed; `0` turns the worker off |
+| `CT_BILLING_RECONCILE_MS` | `3600000` | How often billing state is re-read from Stripe (see "Webhook reliability"); `0` turns it off |
 | `flags.checkoutEnabled` (site.yaml) | `false` | Self-service payments. Off: the pricing page's paid calls to action lead to contact and `POST .../checkout` and `.../payment-method` answer 409, while summaries and the portal keep working. With enforcement on and checkout off, people can only run the trial |
 
 ### Configuration (`content/site.yaml` `plans`)
@@ -109,7 +110,7 @@ unknown trial lab, is logged at startup and covered by `test/billing-compute.tes
 | `GET /api/billing/org`, `POST /api/billing/org/checkout` (`{ planId, interval, seats }`), `POST /api/billing/org/payment-method`, `POST /api/billing/org/portal`, `PUT /api/billing/org/limits` | `billing.manage` | The same for the organisation and its per-seat plans |
 | `GET /api/billing/org/seats`, `PUT /api/billing/org/seats` (`{ seats }`), `POST /api/billing/org/seats/assign` (`{ userId }`), `DELETE /api/billing/org/seats/:userId` | `billing.manage` | Seats bought, who holds them, the active members without one. The count change updates the Stripe subscription item quantity with proration (409 below the assigned count); assignment refuses past the purchased count (409). Audit `billing.seats`, `billing.seat_assign`, `billing.seat_unassign` |
 | `GET /api/billing/org/events` | `billing.manage` | The organisation's webhook deliveries (type, status, summary) |
-| `POST /api/billing/webhook` | public (Stripe signs it) | Verifies `Stripe-Signature` (HMAC-SHA256 over the raw body, 5 minute tolerance), refuses live-mode events, records the event once by Stripe event id (a replay answers `duplicate`), applies it, audits `billing.webhook` and `billing.subscription` for the org |
+| `POST /api/billing/webhook` | public (Stripe signs it) | Verifies `Stripe-Signature` (HMAC-SHA256 over the raw body, 5 minute tolerance), refuses live-mode events, records the event by Stripe event id, applies it, audits `billing.webhook` and `billing.subscription` for the org. A redelivery of an applied or ignored event answers `duplicate`; a redelivery of a `failed` one is applied again. A failure Stripe can recover from answers 503 (see "Webhook reliability") |
 
 `BillingSummary` (both scopes) now also carries: `enforced`, `paymentMethod`, `level`,
 `payer` (who pays this person's compute) and `seat`, the compute `rates` (per tier, per hour),
@@ -133,6 +134,61 @@ Handled events:
 
 Everything else is recorded as `ignored`. Mails go out after the transaction commits; a mail
 failure is logged and never undoes billing state.
+
+### Webhook reliability
+
+- **No partial writes.** The customer lock is taken first, in its own savepoint that is
+  released at once, so the lock stays with the transaction until commit. A lock timeout rolls
+  back only that small savepoint and is recorded like any failure. `apply()` and its
+  bookkeeping (the event's outcome, the audit entry) then run under one savepoint inside the
+  event's transaction. If any of it throws, all of it is
+  rolled back and only the event row is kept, as `failed` with the error and a summary of
+  `retryable`, plus the failed Stripe `object` id and its `customer`.
+- **Stripe retries.** Retryable failures are an allowlist:
+  - Stripe 5xx, 429, a timeout or no answer;
+  - Postgres connection loss, serialization failure, deadlock, shutdown or overload, and the
+    lock, statement and idle-in-transaction timeouts of the transaction's own budget;
+  - a compute subscription whose customer row is not committed yet.
+
+  These answer **503**, so Stripe redelivers the event with backoff for up to three days.
+  Everything else is permanent (a bug, a constraint, a Stripe 4xx, a customer or price that
+  is not ours). It answers 200 with `status: failed`, so Stripe stops.
+- **Stripe reads happen before the transaction.** For each event, the gateway first reads the
+  customer row's version (`updated_at`). It then reads from Stripe: the customer's
+  subscriptions, the customer, the SetupIntent, the invoice and the metered price. Under the
+  customer lock it compares the version again. If an event or the reconciliation changed the
+  customer in between, the reads may be stale, so they are repeated (at most 3 times). Every
+  applied event bumps the version (`clock_timestamp()`). Only Stripe *writes* run inside the
+  transaction: the default payment method and creating the compute subscription.
+- **Time budget.** Every webhook or reconciliation transaction gets a budget
+  (`txBudgetMs`, default 30 s). Waiting for the lock is capped at half the budget
+  (`lock_timeout`); any one statement and any idle stretch are capped at the full budget.
+  Stripe writes check the deadline first. Every Stripe request also has a 10 second timeout
+  (`STRIPE_TIMEOUT_MS`). Running out of budget is transient (503).
+- **"Not recorded yet" ages out.** A compute-subscription event for a customer row that is
+  not committed yet is retried for one hour after Stripe created the event
+  (`TRANSIENT_MAX_AGE_MS`). After that it is permanent, and the replay no longer picks it up.
+- **Redelivery.** An event counts as done only once it is `processed` or `ignored`. A redelivery
+  of a `failed` event applies it again; concurrent deliveries of one event wait on its row.
+- **One customer at a time.** Every event takes a transaction-scoped advisory lock on its
+  Stripe customer before reading or writing, so events about the same customer apply one
+  after the other.
+- **One compute subscription.** Under that lock the customer row is read again, Stripe is asked
+  for a live compute subscription we do not know yet (it is adopted), and only then is one
+  created, with the idempotency key `computesub:<customer>:<generation>`. That key is per
+  customer, not per event, so a retry or a concurrent event gets the same subscription.
+- **Order.** Events arrive late and out of order. A subscription or `customer.updated` event
+  applies Stripe's *current* object (read as above, with the version check), not the event's
+  snapshot, so a delayed `updated`
+  cannot revive a cancelled plan and a stale `past_due` cannot restart dunning. An
+  `invoice.payment_failed` for an invoice that is `paid` or `void` by now is ignored.
+- **Reconciliation** (`BillingService.reconcile`, every `CT_BILLING_RECONCILE_MS`). One run
+  at a time across replicas: it takes a session-level `pg_try_advisory_lock`, and a replica
+  that finds it taken skips the round. It replays retryable `failed` events from the last
+  29 days (Stripe keeps events for 30). Then, for every billing customer, it re-reads the customer and all
+  its subscriptions from Stripe, takes the customer lock, checks the version (re-reading on a
+  change), and writes what differs: plans, entitlements, the payment method on file, a missing compute subscription
+  and dunning. Changes are audited as `billing.reconcile`. A second run changes nothing.
 
 `billing.manage` is held by `org_admin` (every non-platform permission). Code:
 `services/gateway/src/billing/` (`stripe.ts` REST client and signatures, `compute.ts` tiers,
@@ -268,8 +324,8 @@ Not done in this version; all of it is required before `STRIPE_MODE=live` exists
   lose `placeholder: true`); consent at checkout (`consent_collection`).
 - Licensing implications of charging: Terraform under BUSL, the Cisco evaluation licence,
   trademarks in alignment badges.
-- Webhook endpoint registered in the live dashboard with its own secret; retries and
-  dead-letter monitoring on `billing_events.status = 'failed'`.
+- Webhook endpoint registered in the live dashboard with its own secret; alerting on
+  `billing_events.status = 'failed'` rows that the reconciliation could not replay.
 - Review the remaining entitlements (lab hours, concurrent labs, exam simulations, CTF
   events) that are still display-only.
 - Dunning in the live account: Smart Retries and the customer emails in Billing settings

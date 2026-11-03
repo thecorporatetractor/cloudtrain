@@ -1012,6 +1012,7 @@ export type AuditAction =
   | 'billing.seat_unassign'
   | 'billing.limit'
   | 'billing.dunning'
+  | 'billing.reconcile'
   | (string & {});
 
 export interface AuditEvent {

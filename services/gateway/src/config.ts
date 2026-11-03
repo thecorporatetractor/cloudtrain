@@ -109,6 +109,8 @@ export interface BillingConfig {
   enforce: boolean;
   /** CT_BILLING_SWEEP_MS: how often usage is closed and the meter outbox flushed (default 60000; 0 = off). */
   sweepMs: number;
+  /** CT_BILLING_RECONCILE_MS: how often billing state is re-read from Stripe and failed events replayed (default 3600000; 0 = off). */
+  reconcileMs: number;
 }
 
 /**
@@ -135,7 +137,9 @@ export function billingConfig(env: NodeJS.ProcessEnv): BillingConfig {
   const enforce = enabled && (e === undefined || e === '' ? true : e === '1');
   const sweepMs = Number(env.CT_BILLING_SWEEP_MS ?? 60_000);
   if (!Number.isInteger(sweepMs) || sweepMs < 0) throw new Error('CT_BILLING_SWEEP_MS must be a whole number of milliseconds (0 = off)');
-  return { enabled, mode: 'test', secretKey: enabled ? secretKey : '', webhookSecret: enabled ? webhookSecret : '', enforce, sweepMs };
+  const reconcileMs = Number(env.CT_BILLING_RECONCILE_MS ?? 3_600_000);
+  if (!Number.isInteger(reconcileMs) || reconcileMs < 0) throw new Error('CT_BILLING_RECONCILE_MS must be a whole number of milliseconds (0 = off)');
+  return { enabled, mode: 'test', secretKey: enabled ? secretKey : '', webhookSecret: enabled ? webhookSecret : '', enforce, sweepMs, reconcileMs };
 }
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
