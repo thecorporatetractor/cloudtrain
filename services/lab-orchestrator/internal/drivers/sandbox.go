@@ -235,6 +235,12 @@ type SandboxPreflightTier struct {
 	Kernel  string   `json:"kernel,omitempty"`
 	Missing []string `json:"missingFeatures,omitempty"`
 	Message string   `json:"message,omitempty"`
+	// PrivilegedUnsafe, when set, says why privileged pods must not run in
+	// this RuntimeClass although unprivileged ones may: the probe saw host
+	// devices in a privileged guest, or could not show it does not (the
+	// runtime refused the privileged probe pod). The manager then keeps the
+	// tier available but not VM-trusted, whatever the handler's name.
+	PrivilegedUnsafe string `json:"privilegedUnsafe,omitempty"`
 }
 
 // ParseSandboxPreflight parses a SandboxPreflight document, or a ConfigMap
@@ -309,6 +315,9 @@ func IsSandboxRuntimeClass(rc nodev1.RuntimeClass) bool {
 func vmHandler(rc *nodev1.RuntimeClass, pf *SandboxPreflightTier) (bool, string) {
 	if hostHandlers[rc.Handler] {
 		return false, fmt.Sprintf("RuntimeClass %s has handler %q, a runtime without its own kernel: never a sandbox for privileged containers", rc.Name, rc.Handler)
+	}
+	if pf != nil && pf.RuntimeClass == rc.Name && pf.PrivilegedUnsafe != "" {
+		return false, fmt.Sprintf("RuntimeClass %s: labctl preflight found it unsafe for privileged pods (%s)", rc.Name, pf.PrivilegedUnsafe)
 	}
 	if strings.HasPrefix(rc.Handler, "kata") {
 		return true, "handler " + rc.Handler

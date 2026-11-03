@@ -37,6 +37,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,15 +53,46 @@ func (r *pfReport) addSandbox(name, status, msg, fix string) {
 	r.Checks = append(r.Checks, pfCheck{Name: "sandbox/" + name, Status: status, Message: msg, Fix: fix})
 }
 
-// sandboxProbeScript prints "kernel <release>", "memkb <MemTotal>" and
-// "feature <name> ok|missing" lines.
+// sandboxProbeScript prints "kernel <release>", "memkb <MemTotal>",
+// "blockdevs <names...>" and "feature <name> ok|missing" lines.
 func sandboxProbeScript() string {
 	var b strings.Builder
 	b.WriteString("echo kernel $(uname -r)\necho bootid $(cat /proc/sys/kernel/random/boot_id)\necho memkb $(awk '/^MemTotal:/{print $2}' /proc/meminfo)\n")
+	b.WriteString(blockDevsScript + "\n")
 	for _, f := range drivers.SandboxFeatures {
 		fmt.Fprintf(&b, "if ( %s ) >/dev/null 2>&1; then echo feature %s ok; else echo feature %s missing; fi\n", f.Script, f.Name, f.Name)
 	}
 	return b.String()
+}
+
+// blockDevsScript prints the guest's block devices ("blockdevs vda pmem0 ...").
+// /sys/block is the same for privileged and unprivileged containers of one
+// VM, so a privileged pod's VM seeing more of them than an unprivileged one's
+// had host devices passed into it.
+const blockDevsScript = "echo blockdevs $(ls /sys/block 2>/dev/null | tr '\\n' ' ')"
+
+// parseBlockDevs reads the "blockdevs" line of a probe's output.
+func parseBlockDevs(out string) []string {
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 0 && f[0] == "blockdevs" {
+			return f[1:]
+		}
+	}
+	return nil
+}
+
+// hostDeviceVerdict compares the block devices of an unprivileged and a
+// privileged pod of the same RuntimeClass. A Kata runtime without
+// privileged_without_host_devices hot-plugs the node's devices (its disks)
+// into the VM of a privileged pod: the guest then holds the host's block
+// devices, which the sandbox exists to keep away. The VMs are otherwise alike,
+// so any extra device is a failure.
+func hostDeviceVerdict(unprivileged, privileged []string) (extra int, msg string) {
+	extra = len(privileged) - len(unprivileged)
+	if extra <= 0 {
+		return 0, fmt.Sprintf("a privileged pod sees the guest's own block devices only (%s)", strings.Join(privileged, " "))
+	}
+	return extra, fmt.Sprintf("a privileged pod sees %d more block devices than an unprivileged one (%s vs %s): host devices are passed into the VM", extra, strings.Join(privileged, " "), strings.Join(unprivileged, " "))
 }
 
 // sandboxProbeLimit is the probe pod's memory limit (the guest size on runtime-rs).
@@ -76,6 +108,10 @@ type rcVerdict struct {
 	// failed are the failed probe checks (beyond the feature list, which is
 	// judged per tier).
 	failed []string
+	// privilegedUnsafe: why privileged pods must not run here, while
+	// unprivileged ones may (host devices in a privileged guest, or a
+	// privileged probe pod the runtime refused).
+	privilegedUnsafe string
 }
 
 // tierStatic is the static verdict of one tier.
@@ -340,14 +376,17 @@ func tierVerdict(cfg drivers.SandboxTier, st tierStatic, v *rcVerdict, handler s
 			fails = append(fails, "guest kernel lacks "+strings.Join(m, ", "))
 		}
 		fails = append(fails, v.failed...)
+		r.PrivilegedUnsafe = v.privilegedUnsafe
 	}
 	switch {
 	case len(fails) > 0:
 		r.Result, r.Message = drivers.PreflightFail, strings.Join(fails, "; ")
 	case v == nil || !v.probed:
 		r.Result, r.Message = drivers.PreflightUnprobed, "static checks only (no --probe)"
+	case r.PrivilegedUnsafe != "":
+		r.Result, r.Message = drivers.PreflightPass, "own kernel "+v.kernel+", lab features and link probes passed; unprivileged pods only: "+r.PrivilegedUnsafe
 	default:
-		r.Result, r.Message = drivers.PreflightPass, "own kernel "+v.kernel+", lab features, link and systemd probes passed"
+		r.Result, r.Message = drivers.PreflightPass, "own kernel "+v.kernel+", lab features, host devices, link and systemd probes passed"
 	}
 	return r
 }
@@ -392,7 +431,12 @@ func (p *sandboxProbe) run(ctx context.Context, rc string, required []string, ke
 	if !res.vm {
 		return v // never start a privileged pod outside a VM
 	}
+	p.hostDevices(pctx, ns, rc, parseBlockDevs(out), v, rep)
 	p.link(pctx, ns, rc, v, rep)
+	if v.privilegedUnsafe != "" {
+		rep.addSandbox("probe "+rc+" systemd", pfWarn, "not run: privileged pods are unsafe or unsupported here, so systemd and privileged images fall back", "")
+		return v
+	}
 	if p.systemdImage == "" {
 		rep.addSandbox("probe "+rc+" systemd", pfWarn, "not run: systemd boot and exec in a tier-B pod unchecked", "re-run with --systemd-image cloudtrain/deb-sys:24.04 (on the nodes)")
 		return v
@@ -421,6 +465,68 @@ func (p *sandboxProbe) run(ctx context.Context, rc string, required []string, ke
 		rep.addSandbox("probe "+rc+" systemd", pfPass, fmt.Sprintf("%s boots systemd to %s, kubectl exec works", p.systemdImage, state), "")
 	}
 	return v
+}
+
+// hostDevices starts a privileged pod in rc (inside the guest VM: the caller
+// has checked rc boots its own kernel) and compares its VM's block devices
+// with the unprivileged probe pod's. More of them means the runtime passes host
+// devices to privileged containers, so a privileged lab image there would
+// reach the node's disks. That makes the RuntimeClass unsafe for privileged
+// pods only (v.privilegedUnsafe, the manager's "not VM-trusted"), not a failed
+// tier: unprivileged labs keep using it. Whatever stops the comparison (a
+// refused privileged pod, an exec error, unreadable output) is treated the same
+// way: privileged pods are not trusted there unless this check proves them safe.
+func (p *sandboxProbe) hostDevices(ctx context.Context, ns, rc string, unprivileged []string, v *rcVerdict, rep *pfReport) {
+	name := "probe " + rc + " host devices"
+	unsafe := func(status, msg, fix string) {
+		rep.addSandbox(name, status, msg+": privileged and systemd images will not run in this RuntimeClass", fix)
+		v.privilegedUnsafe = msg
+	}
+	if unprivileged == nil {
+		unsafe(pfWarn, "the unprivileged probe printed no block devices", "")
+		return
+	}
+	// A runtime that admits but never runs a privileged pod must not use up
+	// the deadline of the probes after this one.
+	ctx, cancel := context.WithTimeout(ctx, hostDevicesTimeout)
+	defer cancel()
+	pod := sandboxPod(ns, "privileged", rc, p.toolsImage, true)
+	pod.Spec.Containers[0].Command = []string{"sleep", "3600"}
+	defer p.remove(pod)
+	if err := p.start(ctx, pod); err != nil {
+		unsafe(pfWarn, "privileged pods unsupported: "+err.Error(), "")
+		return
+	}
+	out, err := p.exec(ctx, pod, blockDevsScript)
+	if err != nil {
+		unsafe(pfWarn, "privileged probe exec: "+err.Error(), "")
+		return
+	}
+	privileged := parseBlockDevs(out)
+	if privileged == nil {
+		unsafe(pfWarn, "the privileged probe printed no block devices", "")
+		return
+	}
+	extra, msg := hostDeviceVerdict(unprivileged, privileged)
+	if extra > 0 {
+		unsafe(pfWarn, msg, "set privileged_without_host_devices = true for this handler in containerd's config (kata-deploy: the runtime's containerd snippet); a provider sandbox that cannot is not a sandbox for privileged images")
+		return
+	}
+	rep.addSandbox(name, pfPass, msg, "")
+}
+
+// hostDevicesTimeout bounds the privileged pod of the host-device check.
+const hostDevicesTimeout = 2 * time.Minute
+
+// remove deletes a probe pod now (best effort; the namespace goes at the end
+// of the probe anyway), so it does not hold its guest's memory through the
+// later probes.
+func (p *sandboxProbe) remove(pod *corev1.Pod) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.c.Delete(ctx, pod, client.GracePeriodSeconds(0)); err != nil && !apierrors.IsNotFound(err) {
+		p.logf("delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
 }
 
 // link wires a runc pod and a sandboxed pod into a throwaway session network
@@ -506,8 +612,8 @@ func (p *sandboxProbe) link(ctx context.Context, ns, rc string, v *rcVerdict, re
 }
 
 // sandboxPod is a probe pod, in RuntimeClass rc unless rc is empty. A systemd
-// pod is privileged (inside the guest VM only: the caller has checked the
-// sandbox is a VM).
+// (or host-device) probe pod is privileged (inside the guest VM only: the
+// caller has checked the sandbox is a VM).
 func sandboxPod(ns, name, rc, image string, systemd bool) *corev1.Pod {
 	lim := corev1.ResourceList{corev1.ResourceMemory: *resource.NewQuantity(sandboxProbeLimit, resource.BinarySI), corev1.ResourceCPU: resource.MustParse("1")}
 	pod := &corev1.Pod{
