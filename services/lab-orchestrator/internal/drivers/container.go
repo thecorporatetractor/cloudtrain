@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -457,13 +458,119 @@ func podState(pod *corev1.Pod) (NodeState, error) {
 			}
 		}
 	}
+	if failure, ok := podImageFailure(pod); ok {
+		// A missing tag or a refused pull does not heal: fail now rather
+		// than at the provision timeout.
+		return NodeState{Phase: labsv1.NodeFailed, Message: failure}, nil
+	}
 	msg := "pod " + strings.ToLower(string(pod.Status.Phase))
-	for _, cs := range pod.Status.ContainerStatuses {
+	for _, cs := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
 		if w := cs.State.Waiting; w != nil && w.Reason != "" {
 			msg = fmt.Sprintf("%s: %s", msg, w.Reason)
 		}
 	}
-	return NodeState{Phase: labsv1.NodeProvisioning, Message: msg}, nil
+	st := NodeState{Phase: labsv1.NodeProvisioning, Message: msg}
+	if podUnschedulable(pod) {
+		st.Unscheduled = true
+		st.Message = msg + ": waiting for a node (unschedulable)"
+	}
+	return st, nil
+}
+
+// podImageFailure reports a pod one of whose containers waits for an image
+// that will never pull (permanentImageError), with a message naming the
+// container and the image.
+func podImageFailure(pod *corev1.Pod) (string, bool) {
+	if pod.DeletionTimestamp != nil {
+		return "", false
+	}
+	for _, cs := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
+		if w := cs.State.Waiting; w != nil && permanentImageError(w, pullingFor(pod), containerRan(&cs)) {
+			return fmt.Sprintf("container %s image %s: %s: %s", cs.Name, cs.Image, w.Reason, w.Message), true
+		}
+	}
+	return "", false
+}
+
+// podUnschedulable reports a pending pod the scheduler could not place yet
+// (no node fits; the cluster autoscaler, if any, is adding one).
+func podUnschedulable(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodPending || pod.Spec.NodeName != "" {
+		return false
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable {
+			return true
+		}
+	}
+	return false
+}
+
+// permanentImageErrorHints are kubelet/registry messages of image pulls that
+// a retry is unlikely to fix (a missing repository or tag, refused
+// credentials). Some can be transient (credentials not yet working on a
+// node that just joined, a mirror briefly answering 404), so they fail the
+// node only once they persisted for imageErrorPersistence.
+// "requested access to the resource is denied" is the registry's refusal;
+// a bare "denied:" would also match local "permission denied:" errors.
+var permanentImageErrorHints = []string{"not found", "manifest unknown", "name unknown", "repository does not exist", "unauthorized", "authentication required", "access denied", "requested access to the resource is denied", "403 forbidden"}
+
+// imageErrorPersistence: how long a pod must have been on its node, pulling
+// an image for a container that never ran, before a permanent-looking pull
+// error fails it. The kubelet retries the
+// pull meanwhile (back-off 10s, 20s, 40s, ...), so the waiting message is the
+// latest of several attempts by then.
+const imageErrorPersistence = 2 * time.Minute
+
+// podNow is the clock of pod observations (tests replace it).
+var podNow = time.Now
+
+// pullingFor is how long pod has been on its node (the image pull started
+// then), 0 when unknown.
+func pullingFor(pod *corev1.Pod) time.Duration {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionTrue && !c.LastTransitionTime.IsZero() {
+			return podNow().Sub(c.LastTransitionTime.Time)
+		}
+	}
+	if pod.Status.StartTime != nil {
+		return podNow().Sub(pod.Status.StartTime.Time)
+	}
+	return 0
+}
+
+// containerRan reports a container that started at least once: its image
+// pulled before, so a pull error now (a restart re-pulling a :latest image
+// or one removed by image GC) is not a lab whose image can never pull.
+func containerRan(cs *corev1.ContainerStatus) bool {
+	return cs.RestartCount > 0 || cs.LastTerminationState.Terminated != nil ||
+		cs.State.Running != nil || cs.State.Terminated != nil
+}
+
+// permanentImageError reports a waiting container whose image will never
+// pull: an invalid reference or a never-pull policy without the image (at
+// once), or, for a container that never ran, a pull error naming a missing
+// image or refused access that persisted for imageErrorPersistence. A plain
+// ErrImagePull/ImagePullBackOff (registry down, network, rate limit), and
+// any pull error of a container that already ran (a credential refresh or
+// a mirror briefly failing a re-pull), stays transient: the provision
+// timeout and the session deadline bound it.
+func permanentImageError(w *corev1.ContainerStateWaiting, pulling time.Duration, ran bool) bool {
+	switch w.Reason {
+	case "InvalidImageName", "ErrImageNeverPull":
+		return true
+	case "ErrImagePull", "ImagePullBackOff":
+		if ran || pulling < imageErrorPersistence {
+			return false
+		}
+		m := strings.ToLower(w.Message)
+		for _, h := range permanentImageErrorHints {
+			if strings.Contains(m, h) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // podInstanceID changes whenever the node's filesystem was reset: a new pod

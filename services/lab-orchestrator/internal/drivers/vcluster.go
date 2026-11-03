@@ -479,8 +479,15 @@ func (d *VClusterDriver) observe(ctx context.Context, ref NodeRef, release strin
 	if pod == nil {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster pod not created"}, nil
 	}
+	if failure, ok := podImageFailure(pod); ok {
+		// A vcluster image that will never pull: fail now rather than at
+		// the provision timeout.
+		return NodeState{Phase: labsv1.NodeFailed, Message: "vcluster " + failure}, nil
+	}
 	st, _ := podState(pod)
 	if st.Phase != labsv1.NodeReady {
+		// A failed control-plane pod is replaced by its StatefulSet: keep
+		// waiting (the provision timeout bounds it).
 		st.Phase, st.Message = labsv1.NodeProvisioning, "vcluster "+st.Message
 		return st, nil
 	}

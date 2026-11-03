@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +52,37 @@ const (
 	DefaultProvisionTimeout = 15 * time.Minute
 	// DefaultMaxConcurrentReconciles bounds parallel session reconciles.
 	DefaultMaxConcurrentReconciles = 8
+
+	// DefaultProvisionDeadline bounds one provisioning attempt as a whole
+	// (topology, waiting for capacity, nodes, setup, answers): a session not
+	// ready by then fails instead of sitting in Provisioning until its TTL.
+	DefaultProvisionDeadline = 60 * time.Minute
+	// DefaultFailedRelease is how long a failed session keeps its resources
+	// (pods, VMs, disks, networks) before they are torn down; the session
+	// object stays, Failed, until it expires.
+	DefaultFailedRelease = 5 * time.Minute
+	// DefaultExpiredRetention is how long an Expired LabSession object is
+	// kept (its resources are already gone) before it is deleted.
+	DefaultExpiredRetention = 7 * 24 * time.Hour
+	// DefaultReadyRecheck is how often a Ready session is reconciled again, so
+	// a crashed or replaced VM, a restarted pod or a dead vcluster is noticed
+	// (and setup re-run) between other events.
+	DefaultReadyRecheck = 2 * time.Minute
+	// DefaultSetupSlice is how long one Reconcile keeps starting setup
+	// actions before it hands the worker back and requeues (an action that
+	// started always finishes). Deletion, hibernation and reset are checked
+	// between actions.
+	DefaultSetupSlice = 30 * time.Second
+	// requeueSetupStep: the requeue after a setup slice ended; the session
+	// goes to the back of the work queue, so other sessions get a turn.
+	requeueSetupStep = 100 * time.Millisecond
+
+	// AnnotationKeepFailed on a LabSession ("true") keeps a failed session's
+	// resources until expiry, for debugging. Sessions of labctl verify
+	// (label labs.cloudtrain.dev/verify=true) keep them too.
+	AnnotationKeepFailed = "labs.cloudtrain.dev/keep-failed"
+	// LabelVerifySession marks the LabSessions of labctl verify.
+	LabelVerifySession = "labs.cloudtrain.dev/verify"
 )
 
 // Condition reasons.
@@ -74,6 +108,15 @@ const (
 	ReasonResetRequested   = "ResetRequested"
 	ReasonResetFailed      = "ResetFailed"
 	ReasonProvisionTimeout = "ProvisionTimeout"
+	// ReasonProvisionDeadline: the session was not ready within the
+	// session-level provisioning deadline.
+	ReasonProvisionDeadline = "ProvisionDeadline"
+	ReasonInProgress        = "InProgress"
+	ReasonWaitingCapacity   = "WaitingForCapacity"
+	ReasonScheduled         = "Scheduled"
+	ReasonReleasePending    = "ReleasePending"
+	ReasonReleased          = "Released"
+	ReasonKeptForDebugging  = "KeptForDebugging"
 	// Sandboxed condition reasons.
 	ReasonSandboxed          = "Sandboxed"
 	ReasonVMFallback         = "VMFallback"
@@ -112,6 +155,37 @@ type LabSessionReconciler struct {
 	// Access, when set, grants the manager its session permissions in the
 	// session's namespace before any driver runs (internal/rbac).
 	Access SessionNamespaceAccess
+
+	// ProvisionDeadline bounds one provisioning attempt as a whole (default
+	// DefaultProvisionDeadline; negative = off).
+	ProvisionDeadline time.Duration
+	// FailedRelease: how long a failed session keeps its resources (default
+	// DefaultFailedRelease; negative = until expiry, the old behaviour).
+	FailedRelease time.Duration
+	// ExpiredRetention: how long an Expired session object is kept before it
+	// is deleted (default DefaultExpiredRetention; negative = forever).
+	ExpiredRetention time.Duration
+	// ReadyRecheck: how often a Ready session is re-observed (default
+	// DefaultReadyRecheck; negative = only at expiry and on events).
+	ReadyRecheck time.Duration
+	// SetupSlice: how long one Reconcile starts setup actions before it
+	// requeues (default DefaultSetupSlice).
+	SetupSlice time.Duration
+
+	// written: the resourceVersion of each session's last write by this
+	// reconciler (types.NamespacedName -> string), see readFresh.
+	written sync.Map
+}
+
+// durationOr returns d, def when d is 0, and 0 (off) when d is negative.
+func durationOr(d, def time.Duration) time.Duration {
+	switch {
+	case d < 0:
+		return 0
+	case d == 0:
+		return def
+	}
+	return d
 }
 
 // SessionNamespaceAccess grants the manager its session permissions in a
@@ -181,8 +255,26 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	s := &labsv1.LabSession{}
 	if err := r.Get(ctx, req.NamespacedName, s); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.written.Delete(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	s, rerr := r.readFresh(ctx, req.NamespacedName, s)
+	if rerr != nil {
+		if apierrors.IsNotFound(rerr) {
+			r.written.Delete(req.NamespacedName)
+		}
+		return ctrl.Result{}, client.IgnoreNotFound(rerr)
+	}
+	startRV := s.ResourceVersion
+	defer func() {
+		// Remember what this reconcile wrote (status patch, finalizer), so
+		// the next one does not act on a cache that has not seen it yet.
+		if s.ResourceVersion != startRV {
+			r.written.Store(req.NamespacedName, s.ResourceVersion)
+		}
+	}()
 
 	// Access first: every driver call below acts in the session namespace.
 	// Teardown tries even without it (a terminating namespace takes no new
@@ -236,12 +328,40 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	if accessErr != nil {
 		msg := fmt.Sprintf("the orchestrator works only in lab namespaces: label namespace %s with %s=true (%v)", s.Namespace, drivers.LabelLabNamespace, accessErr)
-		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonNamespaceNotLab, msg)
-		r.event(s, corev1.EventTypeWarning, ReasonNamespaceNotLab, msg)
-		if err := save(ctx); err != nil {
-			return ctrl.Result{}, err
+		// A Ready=False reason already there (a failure, expiry,
+		// provisioning) still says what the lab is doing: keep it. The
+		// event tells about the label either way.
+		if c := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionReady); c == nil || c.Status != metav1.ConditionFalse || c.Reason == ReasonNamespaceNotLab {
+			r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonNamespaceNotLab, msg)
 		}
-		return ctrl.Result{RequeueAfter: requeueNamespaceNotLab}, nil
+		r.event(s, corev1.EventTypeWarning, ReasonNamespaceNotLab, msg)
+		res := ctrl.Result{RequeueAfter: requeueNamespaceNotLab}
+		var err error
+		// Expiry still applies (the label was removed by mistake or drift):
+		// tear down with whatever access is left, so the session never runs
+		// past its expiry unnoticed. Failed sessions are still released and
+		// Expired ones still collected on this path.
+		switch {
+		case s.Status.Phase == labsv1.SessionExpired:
+			res, err = r.collectExpired(ctx, s)
+		case unclaimedPooled(s):
+		case !r.now().Before(expiry(s, nil).Time):
+			exp := expiry(s, nil)
+			s.Status.ExpiresAt = &exp
+			res, err = r.expire(ctx, s)
+		case s.Status.Phase == labsv1.SessionFailed:
+			r.rejectGrading(s, "the lab session failed; it cannot be graded")
+			res, err = r.releaseFailed(ctx, s)
+		}
+		// Check the label again soon (a collected session is simply not
+		// found then).
+		if err == nil && (res.RequeueAfter == 0 || res.RequeueAfter > requeueNamespaceNotLab) {
+			res.RequeueAfter = requeueNamespaceNotLab
+		}
+		if uerr := save(ctx); uerr != nil {
+			return ctrl.Result{}, errors.Join(err, uerr)
+		}
+		return res, err
 	}
 
 	tpl, tplErr := r.template(ctx, s)
@@ -262,6 +382,39 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		log.Error(err, "reconcile failed", "phase", s.Status.Phase)
 	}
 	return res, err
+}
+
+// readFresh returns the session to act on: the cached s, or s read
+// uncached through Reader when the cache may be behind this reconciler's
+// own last write. Setup runs in slices across reconciles (runSetup), and a
+// slice can start in the same reconcile that re-arms setup (a replaced
+// node, a reset): a requeue served from a cache that has not seen that
+// write yet would re-arm again and repeat actions. Whether to read
+// uncached therefore depends on what this reconciler wrote, not only on
+// the cached status (setupInFlight covers a write from a previous
+// manager process).
+func (r *LabSessionReconciler) readFresh(ctx context.Context, key types.NamespacedName, s *labsv1.LabSession) (*labsv1.LabSession, error) {
+	if r.Reader == nil {
+		return s, nil
+	}
+	rv, wrote := r.written.Load(key)
+	behind := wrote && rv.(string) != s.ResourceVersion
+	if !behind && !setupInFlight(s) {
+		if wrote {
+			r.written.Delete(key) // the cache has caught up
+		}
+		return s, nil
+	}
+	fresh := &labsv1.LabSession{}
+	if err := r.Reader.Get(ctx, key, fresh); err != nil {
+		return nil, err
+	}
+	if wrote && fresh.ResourceVersion == s.ResourceVersion {
+		// The cache holds the live object (a later write by someone
+		// else): it is not behind.
+		r.written.Delete(key)
+	}
+	return fresh, nil
 }
 
 // ReasonNamespaceNotLab: the session's namespace lacks the lab label.
@@ -394,7 +547,7 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	// Terminal phase: an expired session stays expired; its resources are gone
 	// (expire only sets it after teardown succeeded).
 	if st.Phase == labsv1.SessionExpired {
-		return ctrl.Result{}, nil
+		return r.collectExpired(ctx, s)
 	}
 
 	now := r.now()
@@ -412,6 +565,14 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonActive, "session has not expired")
 	}
 
+	// A failed session is released without its template (teardown uses
+	// status.topology), so a template deleted meanwhile does not keep its
+	// resources until expiry.
+	if st.Phase == labsv1.SessionFailed {
+		r.rejectGrading(s, "the lab session failed; it cannot be graded")
+		return r.releaseFailed(ctx, s)
+	}
+
 	if tplErr != nil {
 		var re *resolveError
 		switch {
@@ -419,6 +580,10 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 			r.setCondition(s, labsv1.ConditionTemplateResolved, metav1.ConditionFalse, ReasonTemplateNotFound,
 				fmt.Sprintf("LabTemplate %q not found", s.Spec.TemplateRef.Name))
 			r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonTemplateNotFound, "waiting for template")
+			// The provisioning deadline covers waiting for the template too.
+			if res, failed := r.checkProvisionDeadline(s); failed {
+				return res, nil
+			}
 			return r.requeueBeforeExpiry(s, requeueTemplateWait), nil
 		case errors.As(tplErr, &re):
 			r.setCondition(s, labsv1.ConditionTemplateResolved, metav1.ConditionFalse, ReasonResolveFailed, tplErr.Error())
@@ -427,12 +592,6 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 			return ctrl.Result{}, tplErr
 		}
 	}
-	if st.Phase == labsv1.SessionFailed {
-		// Failed sessions keep their resources for inspection until expiry or deletion.
-		r.rejectGrading(s, "the lab session failed; it cannot be graded")
-		return r.requeueBeforeExpiry(s, 0), nil
-	}
-
 	// Record what is about to be provisioned before provisioning anything,
 	// so teardown works even if the template disappears later.
 	if snap := snapshotTopology(st.Topology, &tpl.spec.Topology); !apiequality.Semantic.DeepEqual(snap, st.Topology) {
@@ -485,8 +644,16 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 			st.Nodes[i].InstanceID = ""
 		}
 		r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionFalse, ReasonAwake, "session resumed")
+		r.startProvisioning(s, true)
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "resuming nodes")
 		r.event(s, "Normal", ReasonAwake, "resuming hibernated nodes")
+	}
+
+	// One provisioning attempt (creation, reset, resume, replaced node) has
+	// a deadline across all its stages: a reset still in progress, topology,
+	// capacity, nodes, setup.
+	if res, failed := r.checkProvisionDeadline(s); failed {
+		return res, nil
 	}
 
 	// Spec-driven reset: reset every node and run setup again.
@@ -517,6 +684,7 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 	// Provision every node (idempotent).
 	nodes := make([]labsv1.NodeStatus, 0, len(tpl.spec.Topology.Nodes))
 	allReady := true
+	var unscheduled []string
 	var transient error
 	for _, n := range tpl.spec.Topology.Nodes {
 		ns := labsv1.NodeStatus{Name: n.Name, Driver: n.Driver}
@@ -554,6 +722,9 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 			if state.Phase != labsv1.NodeReady {
 				allReady = false
 			}
+			if state.Unscheduled {
+				unscheduled = append(unscheduled, n.Name)
+			}
 		}
 		// A recreated node (new pod, restarted container, replaced VM) lost
 		// whatever setup did to it: run setup again.
@@ -588,6 +759,12 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		if st.Phase != labsv1.SessionGrading {
 			st.Phase = labsv1.SessionProvisioning
 		}
+		// A session that was ready lost a node (a pod deleted by a node
+		// drain, an evicted VMI) and the driver brings it back: that is a
+		// new provisioning attempt, bounded by the session-level deadline
+		// even while the replacement waits for capacity (no-op while an
+		// attempt is already running).
+		r.startProvisioning(s, false)
 		summary := notReadySummary(nodes)
 		if wireMsg != "" && strings.HasSuffix(summary, ": ") {
 			summary = wireMsg
@@ -596,11 +773,20 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		}
 		r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionFalse, ReasonProvisioning, summary)
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "nodes are provisioning")
-		if c := meta.FindStatusCondition(st.Conditions, labsv1.ConditionNodesReady); c != nil &&
-			now.Sub(c.LastTransitionTime.Time) > r.provisionTimeout() {
-			msg := fmt.Sprintf("nodes not ready after %s: %s", r.provisionTimeout(), summary)
-			r.event(s, "Warning", ReasonProvisionTimeout, msg)
-			return r.fail(s, ReasonProvisionTimeout, msg), nil
+		// A node waiting for a cluster node (the autoscaler scaling a lab
+		// pool up from zero) does not use up the node provision timeout:
+		// it counts from when every node was scheduled. The session-level
+		// deadline still bounds the wait.
+		if len(unscheduled) > 0 {
+			r.setCondition(s, labsv1.ConditionNodesScheduled, metav1.ConditionFalse, ReasonWaitingCapacity,
+				"waiting for a cluster node to run on: "+strings.Join(unscheduled, ", "))
+		} else {
+			r.setCondition(s, labsv1.ConditionNodesScheduled, metav1.ConditionTrue, ReasonScheduled, "every node is scheduled")
+			if since, ok := r.nodeTimeoutStart(s); ok && now.Sub(since) > r.provisionTimeout() {
+				msg := fmt.Sprintf("nodes not ready after %s: %s", r.provisionTimeout(), summary)
+				r.event(s, "Warning", ReasonProvisionTimeout, msg)
+				return r.fail(s, ReasonProvisionTimeout, msg), nil
+			}
 		}
 		if transient != nil {
 			return ctrl.Result{}, transient
@@ -608,6 +794,7 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		return r.requeueBeforeExpiry(s, requeueProvisioning), nil
 	}
 	r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionTrue, ReasonNodesReady, "all nodes are ready")
+	r.setCondition(s, labsv1.ConditionNodesScheduled, metav1.ConditionTrue, ReasonScheduled, "every node is scheduled")
 
 	// Setup runs once per node incarnation; progress is persisted per action.
 	if !meta.IsStatusConditionTrue(st.Conditions, labsv1.ConditionSetupComplete) {
@@ -616,6 +803,11 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		}
 		st.Endpoints = nil
 		if err := r.runSetup(ctx, s, tpl, save); err != nil {
+			if errors.Is(err, errSetupYield) {
+				// Slice used up, or the session changed (deletion,
+				// hibernate, reset): continue on the next reconcile.
+				return ctrl.Result{RequeueAfter: requeueSetupStep}, nil
+			}
 			if drivers.IsPermanent(err) || errors.Is(err, errActionFailed) {
 				r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, ReasonSetupFailed, err.Error())
 				return r.fail(s, ReasonSetupFailed, err.Error()), nil
@@ -677,12 +869,173 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		r.event(s, "Normal", ReasonReady, "lab session is ready")
 	}
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionTrue, ReasonReady, "lab session is ready")
+	r.setCondition(s, labsv1.ConditionProvisioned, metav1.ConditionTrue, ReasonReady, "lab session is ready")
 	if gradingRequested(s) && r.gradingStillRequested(ctx, s) {
 		if err := r.grade(ctx, s, tpl, save); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
+	// Re-observe a Ready session periodically: VMIs, vcluster workloads and
+	// nodes of other drivers are not watched, so a crashed VM or a dead
+	// control plane would otherwise go unnoticed until expiry.
+	return r.requeueBeforeExpiry(s, jitter(durationOr(r.ReadyRecheck, DefaultReadyRecheck), s.UID)), nil
+}
+
+// jitter spreads d over [0.8d, 1.2d] by the session UID, so the Ready
+// rechecks of a class that became ready together do not run in lockstep
+// (and do not burst the API server through the uncached driver reads).
+// The offset is stable per session; d = 0 stays 0.
+func jitter(d time.Duration, uid types.UID) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(uid))
+	frac := float64(h.Sum32()%1001)/1000*0.4 - 0.2 // [-0.2, 0.2]
+	return d + time.Duration(frac*float64(d))
+}
+
+// checkProvisionDeadline starts the provisioning clock of a session that
+// has none and fails a session whose current provisioning attempt
+// (Provisioned False) is older than the provisioning deadline.
+func (r *LabSessionReconciler) checkProvisionDeadline(s *labsv1.LabSession) (ctrl.Result, bool) {
+	st := &s.Status
+	c := meta.FindStatusCondition(st.Conditions, labsv1.ConditionProvisioned)
+	if c == nil {
+		r.setCondition(s, labsv1.ConditionProvisioned, metav1.ConditionFalse, ReasonInProgress, "provisioning")
+		return ctrl.Result{}, false
+	}
+	d := durationOr(r.ProvisionDeadline, DefaultProvisionDeadline)
+	if d <= 0 || c.Status != metav1.ConditionFalse || r.now().Sub(c.LastTransitionTime.Time) <= d {
+		return ctrl.Result{}, false
+	}
+	msg := fmt.Sprintf("the lab was not ready within %s", d)
+	for _, typ := range []string{labsv1.ConditionNodesReady, labsv1.ConditionSetupComplete, labsv1.ConditionReady} {
+		if cc := meta.FindStatusCondition(st.Conditions, typ); cc != nil && cc.Status == metav1.ConditionFalse && cc.Message != "" {
+			msg += ": " + cc.Message
+			break
+		}
+	}
+	r.event(s, corev1.EventTypeWarning, ReasonProvisionDeadline, msg)
+	return r.fail(s, ReasonProvisionDeadline, msg), true
+}
+
+// nodeTimeoutStart is when the node provision timeout started: when the
+// nodes stopped being ready, or later, when the last unscheduled node got
+// a cluster node.
+func (r *LabSessionReconciler) nodeTimeoutStart(s *labsv1.LabSession) (time.Time, bool) {
+	c := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionNodesReady)
+	if c == nil {
+		return time.Time{}, false
+	}
+	since := c.LastTransitionTime.Time
+	if sc := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionNodesScheduled); sc != nil &&
+		sc.Status == metav1.ConditionTrue && sc.LastTransitionTime.After(since) {
+		since = sc.LastTransitionTime.Time
+	}
+	return since, true
+}
+
+// startProvisioning starts a new provisioning attempt: the session-level
+// deadline counts from now. A session that is already provisioning keeps
+// its attempt (a reset in progress does not extend the deadline) unless
+// force is set (a resume).
+func (r *LabSessionReconciler) startProvisioning(s *labsv1.LabSession, force bool) {
+	c := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionProvisioned)
+	if c != nil && c.Status == metav1.ConditionFalse && !force {
+		return
+	}
+	meta.RemoveStatusCondition(&s.Status.Conditions, labsv1.ConditionProvisioned)
+	r.setCondition(s, labsv1.ConditionProvisioned, metav1.ConditionFalse, ReasonInProgress, "provisioning")
+}
+
+// setupInFlight reports a session whose setup may be running in slices:
+// setup is not complete and the session is still live. The first slice runs
+// in the reconcile that flips NodesReady to True, so the cache can still
+// show NodesReady False (or no conditions at all) and progress 0 after that
+// slice was written: neither NodesReady nor SetupProgress tells, so every
+// session that has not completed setup is read uncached.
+func setupInFlight(s *labsv1.LabSession) bool {
+	return s.DeletionTimestamp.IsZero() && s.Status.Phase != labsv1.SessionFailed && s.Status.Phase != labsv1.SessionExpired &&
+		!meta.IsStatusConditionTrue(s.Status.Conditions, labsv1.ConditionSetupComplete)
+}
+
+// keepFailed reports a failed session that keeps its resources until expiry.
+func keepFailed(s *labsv1.LabSession) bool {
+	// labctl verify labels its sessions with any value (true, batch,
+	// networking, platform4, ...): the key marks a verify session.
+	_, verify := s.Labels[LabelVerifySession]
+	return s.Annotations[AnnotationKeepFailed] == "true" || verify
+}
+
+// releaseFailed tears a failed session's resources down once the grace
+// period after the failure is over; the session stays Failed until it
+// expires.
+func (r *LabSessionReconciler) releaseFailed(ctx context.Context, s *labsv1.LabSession) (ctrl.Result, error) {
+	grace := durationOr(r.FailedRelease, DefaultFailedRelease)
+	c := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionResourcesReleased)
+	switch {
+	case c != nil && c.Status == metav1.ConditionTrue:
+		return r.requeueBeforeExpiry(s, 0), nil
+	case grace <= 0 || keepFailed(s):
+		r.setCondition(s, labsv1.ConditionResourcesReleased, metav1.ConditionFalse, ReasonKeptForDebugging,
+			"the failed session keeps its resources until it expires")
+		return r.requeueBeforeExpiry(s, 0), nil
+	case c == nil:
+		// A session that failed before this condition existed: start now.
+		r.markFailed(s)
+		c = meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionResourcesReleased)
+	}
+	if left := grace - r.now().Sub(c.LastTransitionTime.Time); left > 0 {
+		return r.requeueBeforeExpiry(s, left), nil
+	}
+	if err := r.teardown(ctx, s); err != nil {
+		if errors.Is(err, drivers.ErrInProgress) {
+			return r.requeueBeforeExpiry(s, requeueTeardown), nil
+		}
+		return ctrl.Result{}, err
+	}
+	for i := range s.Status.Nodes {
+		s.Status.Nodes[i].Phase = labsv1.NodeDestroyed
+		s.Status.Nodes[i].Details = nil
+	}
+	s.Status.Endpoints = nil
+	r.setCondition(s, labsv1.ConditionResourcesReleased, metav1.ConditionTrue, ReasonReleased, "the failed session's resources were released")
+	r.event(s, corev1.EventTypeNormal, ReasonReleased, "failed lab session: resources released")
 	return r.requeueBeforeExpiry(s, 0), nil
+}
+
+// markFailed records when the session failed (ResourcesReleased False).
+func (r *LabSessionReconciler) markFailed(s *labsv1.LabSession) {
+	if meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionResourcesReleased) != nil {
+		return
+	}
+	r.setCondition(s, labsv1.ConditionResourcesReleased, metav1.ConditionFalse, ReasonReleasePending,
+		"the failed session's resources are released after a grace period")
+}
+
+// collectExpired deletes an Expired session object once the retention is
+// over (its resources are already gone; the finalizer's teardown is a no-op).
+// The orphan sweep cannot race it: a session being deleted is still listed
+// until its finalizer is released, and only after that are any leftover
+// cluster-scoped objects (vcluster namespaces, VPCs) orphans.
+func (r *LabSessionReconciler) collectExpired(ctx context.Context, s *labsv1.LabSession) (ctrl.Result, error) {
+	keep := durationOr(r.ExpiredRetention, DefaultExpiredRetention)
+	if keep <= 0 {
+		return ctrl.Result{}, nil
+	}
+	since := s.CreationTimestamp.Time
+	if c := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionExpired); c != nil && c.Status == metav1.ConditionTrue {
+		since = c.LastTransitionTime.Time
+	}
+	if left := keep - r.now().Sub(since); left > 0 {
+		return ctrl.Result{RequeueAfter: left}, nil
+	}
+	if err := r.Delete(ctx, s); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	logf.FromContext(ctx).Info("expired lab session deleted after its retention", "retention", keep.String())
+	return ctrl.Result{}, nil
 }
 
 func (r *LabSessionReconciler) provisionTimeout() time.Duration {
@@ -702,6 +1055,7 @@ func (r *LabSessionReconciler) rearmSetup(s *labsv1.LabSession, reason, msg stri
 	s.Status.SetupProgress = 0
 	s.Status.Endpoints = nil
 	s.Status.ComputedAnswers = nil
+	r.startProvisioning(s, false)
 	r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, reason, msg)
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, reason, msg)
 	if s.Status.Phase != labsv1.SessionGrading {
@@ -796,6 +1150,13 @@ func (r *LabSessionReconciler) expire(ctx context.Context, s *labsv1.LabSession)
 	s.Status.Endpoints = nil
 	r.rejectGrading(s, "the lab session expired; it cannot be graded")
 	r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionTrue, ReasonExpired, "session passed its expiry; resources released")
+	// Usage metering (gateway sessions/usage.ts) ends a lab that went
+	// Ready=False before it expired at that transition. NamespaceNotLab
+	// sets Ready False while the lab keeps running: the lab stopped only
+	// now, so the transition is stamped now.
+	if c := meta.FindStatusCondition(s.Status.Conditions, labsv1.ConditionReady); c != nil && c.Reason == ReasonNamespaceNotLab {
+		meta.RemoveStatusCondition(&s.Status.Conditions, labsv1.ConditionReady)
+	}
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonExpired, "session expired")
 	r.event(s, "Normal", ReasonExpired, "lab session expired")
 	return ctrl.Result{}, nil
@@ -935,9 +1296,21 @@ func findNodeStatus(nodes []labsv1.NodeStatus, name string) (labsv1.NodeStatus, 
 // completed action. Setup actions must still be idempotent: an action whose
 // result could not be persisted, or every action after a node was recreated
 // or reset, runs again.
+//
+// Setup runs in slices: once SetupSlice is used up, or when the session was
+// deleted, asked to hibernate or reset meanwhile, it returns errSetupYield
+// before the next action and the caller requeues. A class burst of long
+// setups then does not keep teardown, expiry and grading of other sessions
+// waiting for a worker, and ending a lab during setup waits for one action
+// at most.
 func (r *LabSessionReconciler) runSetup(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, save saveFunc) error {
 	total := len(tpl.spec.Setup)
-	for i := int(s.Status.SetupProgress); i < total; i++ {
+	first, start := int(s.Status.SetupProgress), r.now()
+	slice := durationOr(r.SetupSlice, DefaultSetupSlice)
+	for i := first; i < total; i++ {
+		if i > first && (r.now().Sub(start) >= slice || r.sessionChanged(ctx, s)) {
+			return errSetupYield
+		}
 		if err := r.runAction(ctx, s, tpl, i, tpl.spec.Setup[i]); err != nil {
 			return err
 		}
@@ -952,6 +1325,25 @@ func (r *LabSessionReconciler) runSetup(ctx context.Context, s *labsv1.LabSessio
 }
 
 var errActionFailed = errors.New("action failed")
+
+// errSetupYield: setup stopped between two actions and continues on the
+// next reconcile.
+var errSetupYield = errors.New("setup yields to the next reconcile")
+
+// sessionChanged reports, from the API server (r.Reader), a session that was
+// deleted, asked to hibernate or reset since this reconcile read it: setup
+// stops before the next action instead of running to the end.
+func (r *LabSessionReconciler) sessionChanged(ctx context.Context, s *labsv1.LabSession) bool {
+	if r.Reader == nil {
+		return false
+	}
+	fresh := &labsv1.LabSession{}
+	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(s), fresh); err != nil {
+		return apierrors.IsNotFound(err)
+	}
+	return !fresh.DeletionTimestamp.IsZero() || fresh.Spec.Hibernate != s.Spec.Hibernate ||
+		fresh.Spec.ResetGeneration != s.Spec.ResetGeneration
+}
 
 // runAction executes one action through the owning node's driver.
 func (r *LabSessionReconciler) runAction(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, i int, a labsv1.Action) error {
@@ -1004,9 +1396,15 @@ func (r *LabSessionReconciler) ref(s *labsv1.LabSession, tpl *resolvedTemplate, 
 func (r *LabSessionReconciler) fail(s *labsv1.LabSession, reason, msg string) ctrl.Result {
 	s.Status.Phase = labsv1.SessionFailed
 	s.Status.Endpoints = nil
+	r.markFailed(s)
 	r.rejectGrading(s, "the lab session failed; it cannot be graded")
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, reason, msg)
-	return r.requeueBeforeExpiry(s, 0)
+	// Come back when the failed session's resources are to be released.
+	var d time.Duration
+	if g := durationOr(r.FailedRelease, DefaultFailedRelease); g > 0 && !keepFailed(s) {
+		d = g
+	}
+	return r.requeueBeforeExpiry(s, d)
 }
 
 // requeueBeforeExpiry requeues after d (0 = no periodic requeue), but never

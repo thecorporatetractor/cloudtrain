@@ -64,6 +64,17 @@ func TestOrphanSweeperDeletesObjectsOfMissingSessions(t *testing.T) {
 		// probe runs longer than the minimum age.
 		clusterObj(drivers.GVKVpc, "vpc-preflight", "preflight-ab12cd", old),
 		clusterObj(drivers.GVKSubnet, "lab-preflight", "preflight-sb-ab12cd", old),
+		// Kept: an Expired session being collected after its retention
+		// (deleted, its finalizer still running teardown) still counts as
+		// live, so the sweep never races the finalizer over its objects.
+		session(func(s *labsv1.LabSession) {
+			s.Name, s.UID = "s-collect", "collect-uid"
+			s.Finalizers = []string{Finalizer}
+			s.DeletionTimestamp = &metav1.Time{Time: now.Add(-time.Minute)}
+			s.Status.Phase = labsv1.SessionExpired
+		}),
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ct-vc-collect", Labels: sessionObjLabels("collect-uid"), CreationTimestamp: metav1.NewTime(old)}},
+		clusterObj(drivers.GVKVpc, "vpc-collect", "collect-uid", old),
 	}
 	sch := scheme(t)
 	for _, gvk := range []schema.GroupVersionKind{drivers.GVKSubnet, drivers.GVKVpc} {
@@ -80,7 +91,7 @@ func TestOrphanSweeperDeletesObjectsOfMissingSessions(t *testing.T) {
 	// vcluster host namespaces are found through their control-plane pods
 	// and services.
 	var pods []client.Object
-	for _, ns := range []string{"ct-vc-gone", "ct-vc-live", "team-x"} {
+	for _, ns := range []string{"ct-vc-gone", "ct-vc-live", "team-x", "ct-vc-collect"} {
 		pods = append(pods, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "vc-0", Namespace: ns, Labels: map[string]string{"app": "vcluster"}}})
 	}
 	for _, ns := range []string{"ct-vc-gone", "ct-vc-hibernated", "ct-vc-live"} {

@@ -59,7 +59,17 @@ func main() {
 	flag.BoolVar(&metricsSecure, "metrics-secure", true, "serve metrics over HTTPS with Kubernetes authn/authz")
 	flag.StringVar(&watchNamespace, "watch-namespace", "", "restrict the manager to one namespace; empty = all namespaces")
 	flag.IntVar(&concurrency, "max-concurrent-reconciles", controller.DefaultMaxConcurrentReconciles, "parallel LabSession reconciles")
-	flag.DurationVar(&provisionTimeout, "provision-timeout", controller.DefaultProvisionTimeout, "fail sessions whose nodes are not ready within this time")
+	flag.DurationVar(&provisionTimeout, "provision-timeout", controller.DefaultProvisionTimeout, "fail sessions whose nodes are not ready within this time (counted from when every node was scheduled: waiting for the node autoscaler does not count)")
+	var provisionDeadline, failedRelease, expiredRetention, readyRecheck, setupSlice time.Duration
+	flag.DurationVar(&provisionDeadline, "provision-deadline", controller.DefaultProvisionDeadline, "fail a session not ready within this time of its creation, reset or resume (topology, waiting for capacity, nodes and setup together); negative = off")
+	flag.DurationVar(&failedRelease, "failed-session-release", controller.DefaultFailedRelease, "tear a failed session's resources down this long after it failed (sessions annotated "+controller.AnnotationKeepFailed+"=true and labctl verify sessions keep them until expiry); negative = keep until expiry")
+	flag.DurationVar(&expiredRetention, "expired-session-retention", controller.DefaultExpiredRetention, "delete Expired LabSession objects this long after they expired (keep it well above any billing close lag: the gateway bills an open usage row whose session is gone up to the time it notices); negative = keep them")
+	flag.DurationVar(&readyRecheck, "ready-recheck", controller.DefaultReadyRecheck, "re-observe Ready sessions this often (a crashed VM or vcluster is noticed and setup re-run); negative = off")
+	var apiQPS float64
+	var apiBurst int
+	flag.Float64Var(&apiQPS, "kube-api-qps", 50, "client-side rate limit of API requests (the drivers read pods, VMs and vcluster workloads uncached, and every Ready session is re-observed every --ready-recheck)")
+	flag.IntVar(&apiBurst, "kube-api-burst", 100, "client-side burst of API requests")
+	flag.DurationVar(&setupSlice, "setup-slice", controller.DefaultSetupSlice, "one reconcile starts setup actions for at most this long, then requeues the session so others get a worker")
 	var orphanSweep time.Duration
 	flag.DurationVar(&orphanSweep, "orphan-sweep", controller.DefaultOrphanSweep, "how often cluster-scoped session objects (vcluster namespaces, Kube-OVN VPCs and subnets) whose LabSession is gone are deleted; 0 = off")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
@@ -142,6 +152,12 @@ func main() {
 	}
 
 	cfg := ctrl.GetConfigOrDie()
+	if apiQPS > 0 {
+		cfg.QPS = float32(apiQPS)
+	}
+	if apiBurst > 0 {
+		cfg.Burst = apiBurst
+	}
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
 		Cache:  cacheOpts,
@@ -355,6 +371,8 @@ func main() {
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
 		Recorder:         mgr.GetEventRecorder("lab-orchestrator"),
 		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
+		ProvisionDeadline: provisionDeadline, FailedRelease: failedRelease, ExpiredRetention: expiredRetention,
+		ReadyRecheck: readyRecheck, SetupSlice: setupSlice,
 		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics, Access: sessionAccess,
 		Sandboxes: sandboxes, Catalog: catalog,
 	}).SetupWithManager(mgr); err != nil {

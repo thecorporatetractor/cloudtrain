@@ -74,7 +74,10 @@ func (r *LabSessionReconciler) reconcileClaim(ctx context.Context, s *labsv1.Lab
 		return ctrl.Result{}, false, nil
 	}
 	if st.Phase == labsv1.SessionExpired {
-		return ctrl.Result{}, true, nil
+		// The claimant never reaches reconcileSession: collect it here once
+		// its retention is over (the pooled session is collected on its own).
+		res, err := r.collectExpired(ctx, s)
+		return res, true, err
 	}
 	p, err := r.claimedSession(ctx, s)
 	if err != nil {
@@ -88,7 +91,8 @@ func (r *LabSessionReconciler) reconcileClaim(ctx context.Context, s *labsv1.Lab
 			st.Phase, st.Endpoints = labsv1.SessionExpired, nil
 			r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionTrue, ReasonExpired, "session passed its expiry; resources released")
 			r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonExpired, "session expired")
-			return ctrl.Result{}, true, nil
+			res, err := r.collectExpired(ctx, s)
+			return res, true, err
 		}
 		r.event(s, "Warning", ReasonPooledSessionLost, msg)
 		return r.fail(s, ReasonPooledSessionLost, msg), true, nil
@@ -275,7 +279,7 @@ func (r *LabSessionReconciler) mirror(ctx context.Context, s, p *labsv1.LabSessi
 		r.event(s, "Normal", ReasonReady, "lab session is ready (pooled session "+p.Name+")")
 	}
 	if st.Phase == labsv1.SessionExpired {
-		return ctrl.Result{}, nil
+		return r.collectExpired(ctx, s)
 	}
 	// The pooled session's changes arrive through the watch; requeue at
 	// expiry in case it is gone by then.

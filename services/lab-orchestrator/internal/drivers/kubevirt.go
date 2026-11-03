@@ -13,6 +13,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -333,6 +334,21 @@ type vmiStatus struct {
 	// instance hashes the VMI UIDs (changes when any VM was recreated).
 	instance string
 	waiting  []string
+	// unscheduled counts VMs waiting for a cluster node (launcher pod
+	// unschedulable, e.g. while the autoscaler scales a KVM pool from zero).
+	unscheduled int
+	// failed: VMs that will never boot (a containerDisk or a registry
+	// import whose image does not exist or is refused), with why.
+	failed []string
+}
+
+// failure is the message of a set of VMs that will never all run, "" when
+// none failed.
+func (st vmiStatus) failure() string {
+	if len(st.failed) == 0 {
+		return ""
+	}
+	return "VM image will not pull: " + strings.Join(st.failed, "; ")
 }
 
 // observeVMIs reads the VMI of each VM name.
@@ -344,10 +360,28 @@ func observeVMIs(ctx context.Context, r client.Reader, ns string, names []string
 		err := r.Get(ctx, client.ObjectKeyFromObject(vmi), vmi)
 		switch {
 		case apierrors.IsNotFound(err):
-			st.waiting = append(st.waiting, n+" (no instance yet)")
+			// No instance yet: the VM's printableStatus says why
+			// (ErrorUnschedulable, Provisioning, DataVolumeError, ...).
+			why := "no instance yet"
+			vm := newObj(GVKVirtualMachine, ns, n)
+			if r.Get(ctx, client.ObjectKeyFromObject(vm), vm) == nil {
+				if ps, _, _ := unstructured.NestedString(vm.Object, "status", "printableStatus"); ps != "" {
+					why = "no instance yet: " + ps
+					if ps == "ErrorUnschedulable" {
+						st.unscheduled++
+					}
+				}
+			}
+			if msg, ok := rootDiskFailure(ctx, r, ns, n); ok {
+				st.failed = append(st.failed, n+": "+msg)
+			}
+			st.waiting = append(st.waiting, n+" ("+why+")")
 			continue
 		case err != nil:
 			return st, err
+		}
+		if vmiUnschedulable(vmi) {
+			st.unscheduled++
 		}
 		phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase")
 		if phase == "Running" && vmi.GetDeletionTimestamp() == nil {
@@ -357,6 +391,11 @@ func observeVMIs(ctx context.Context, r client.Reader, ns string, names []string
 			if phase == "" {
 				phase = "Pending"
 			}
+			if msg, ok := launcherImageFailure(ctx, r, ns, vmi); ok {
+				st.failed = append(st.failed, n+": "+msg)
+			} else if msg, ok := rootDiskFailure(ctx, r, ns, n); ok {
+				st.failed = append(st.failed, n+": "+msg)
+			}
 			st.waiting = append(st.waiting, n+" ("+phase+")")
 		}
 	}
@@ -364,6 +403,107 @@ func observeVMIs(ctx context.Context, r client.Reader, ns string, names []string
 	sum := sha256.Sum256([]byte(strings.Join(uids, ",")))
 	st.instance = hex.EncodeToString(sum[:])[:16]
 	return st, nil
+}
+
+// launcherImageFailure reports a VMI whose virt-launcher pod waits for an
+// image that will never pull (an ephemeral VM's containerDisk with a missing
+// tag or refused credentials: the VMI exists, so the VM's printableStatus
+// only says ErrImagePull/ImagePullBackOff). Best effort: a read error is no
+// failure.
+func launcherImageFailure(ctx context.Context, r client.Reader, ns string, vmi *unstructured.Unstructured) (string, bool) {
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{"kubevirt.io/created-by": string(vmi.GetUID())}); err != nil {
+		return "", false
+	}
+	for i := range pods.Items {
+		if msg, ok := podImageFailure(&pods.Items[i]); ok {
+			return msg, true
+		}
+	}
+	return "", false
+}
+
+// dataVolumeFailedPhase: CDI gave up on the import.
+const dataVolumeFailedPhase = "Failed"
+
+// rootDiskFailure reports a persistent VM whose root DataVolume import from
+// the registry will never succeed: CDI marked it Failed, or its Running
+// condition names a missing image or refused credentials (the same hints as
+// a pod's pull, persisting for imageErrorPersistence since that condition
+// last changed, and never counted from before the DataVolume was created). Best effort: a missing DataVolume (ephemeral VMs) or a read
+// error is no failure.
+func rootDiskFailure(ctx context.Context, r client.Reader, ns, vm string) (string, bool) {
+	dv := newObj(GVKDataVolume, ns, RootDiskName(vm))
+	if err := r.Get(ctx, client.ObjectKeyFromObject(dv), dv); err != nil || dv.GetDeletionTimestamp() != nil {
+		return "", false
+	}
+	phase, _, _ := unstructured.NestedString(dv.Object, "status", "phase")
+	var msg string
+	// since: when the condition carrying msg entered its state (the error's
+	// persistence), never before the DataVolume was created.
+	since := dv.GetCreationTimestamp().Time
+	var msgSince time.Time
+	conds, _, _ := unstructured.NestedSlice(dv.Object, "status", "conditions")
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if !ok || m["status"] != "False" {
+			continue
+		}
+		if t, _ := m["type"].(string); t == "Running" || (t == "Ready" && msg == "") {
+			msg, _ = m["message"].(string)
+			if reason, _ := m["reason"].(string); reason != "" {
+				msg = strings.TrimSuffix(reason+": "+msg, ": ")
+			}
+			msgSince = time.Time{}
+			if ltt, _ := m["lastTransitionTime"].(string); ltt != "" {
+				if ts, err := time.Parse(time.RFC3339, ltt); err == nil {
+					msgSince = ts
+				}
+			}
+		}
+	}
+	if msgSince.After(since) {
+		since = msgSince
+	}
+	describe := func() string {
+		out := "root disk " + dv.GetName() + " import " + strings.ToLower(phase)
+		if phase == "" {
+			out = "root disk " + dv.GetName() + " import"
+		}
+		if msg != "" {
+			out += ": " + msg
+		}
+		return out
+	}
+	if phase == dataVolumeFailedPhase {
+		return describe(), true
+	}
+	if podNow().Sub(since) < imageErrorPersistence {
+		return "", false
+	}
+	lower := strings.ToLower(msg)
+	for _, h := range permanentImageErrorHints {
+		if strings.Contains(lower, h) {
+			return describe(), true
+		}
+	}
+	return "", false
+}
+
+// vmiUnschedulable reports a VMI whose launcher pod the scheduler could not
+// place yet (KubeVirt mirrors the pod's PodScheduled condition).
+func vmiUnschedulable(vmi *unstructured.Unstructured) bool {
+	if phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase"); phase == "Running" {
+		return false
+	}
+	conds, _, _ := unstructured.NestedSlice(vmi.Object, "status", "conditions")
+	for _, c := range conds {
+		m, ok := c.(map[string]any)
+		if ok && m["type"] == "PodScheduled" && m["status"] == "False" && m["reason"] == "Unschedulable" {
+			return true
+		}
+	}
+	return false
 }
 
 // deleteVMs deletes the session's VMs and reports whether VMs, VMIs and

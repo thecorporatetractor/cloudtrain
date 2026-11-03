@@ -54,4 +54,21 @@ describe('metered window of a lab session', () => {
     const resetting = session({ phase: 'Provisioning', readyAt: at(5).toISOString(), conditions: [{ type: 'Ready', status: 'False', reason: 'ResetRequested', lastTransitionTime: at(20).toISOString() }] });
     expect(usageEnd(resetting, at(30).getTime()).end).toEqual(at(30));
   });
+
+  it('a lab whose namespace lost its lab label keeps running and is billed to its expiry', () => {
+    // Before expiry: Ready False NamespaceNotLab is no failure.
+    const unlabelled = session({ phase: 'Ready', readyAt: at(5).toISOString(), expiresAt: at(60).toISOString(), conditions: [{ type: 'Ready', status: 'False', reason: 'NamespaceNotLab', lastTransitionTime: at(20).toISOString() }] });
+    expect(usageEnd(unlabelled, at(40).getTime()).end).toEqual(at(40));
+    // Expired on that path: the orchestrator stamps the Ready transition with the expiry.
+    const expired = session({
+      phase: 'Expired',
+      readyAt: at(5).toISOString(),
+      expiresAt: at(60).toISOString(),
+      conditions: [
+        { type: 'Ready', status: 'False', reason: 'Expired', lastTransitionTime: at(60).toISOString() },
+        { type: 'Expired', status: 'True', reason: 'Expired', lastTransitionTime: at(60).toISOString() },
+      ],
+    });
+    expect(usageEnd(expired, at(90).getTime()).end).toEqual(at(60));
+  });
 });
