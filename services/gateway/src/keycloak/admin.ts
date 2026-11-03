@@ -54,6 +54,28 @@ export interface KcUser {
   attributes?: Record<string, string[]>;
 }
 
+/**
+ * First-broker-login flow of tenant IdPs (org self-service SSO). It only ever
+ * creates a new Keycloak user: "Create User If Unique" is REQUIRED, so a
+ * brokered identity whose email or username already belongs to a Keycloak user
+ * fails the login instead of being linked to that user. The built-in "first
+ * broker login" flow may link it ("Verify Existing Account By Email" trusts an
+ * IdP with trustEmail), and an org admin controls what its IdP asserts: an IdP
+ * asserting another org's user's email would then sign in as that user.
+ */
+export const TENANT_BROKER_FLOW = 'cloudtrain tenant broker login';
+
+/**
+ * User attribute a tenant IdP stamps on every Keycloak user it brokers (a hardcoded-attribute
+ * mapper, value = the IdP alias). It outlives the IdP link: a brokered user who sets a password in
+ * the account console and unlinks the IdP still carries it, and users cannot edit it (unmanaged
+ * attributes are admin-edit only). The gateway treats a local login of such a user like a login
+ * through that IdP when deciding whether to trust its email (platform/identity.ts).
+ */
+export const BROKER_ORIGIN_ATTRIBUTE = 'ct_broker_origin';
+const BROKER_ORIGIN_MAPPER = 'cloudtrain broker origin';
+const CREATE_IF_UNIQUE = 'idp-create-user-if-unique';
+
 export class KeycloakAdmin {
   private token?: { value: string; until: number };
   private readonly f: typeof fetch;
@@ -99,6 +121,39 @@ export class KeycloakAdmin {
   }
 
   /* --------------------------------------------------------------- realm */
+
+  /**
+   * Creates or repairs TENANT_BROKER_FLOW: Create User If Unique, REQUIRED,
+   * and nothing else enabled. Idempotent.
+   */
+  async ensureTenantBrokerFlow(): Promise<void> {
+    const flows = (await this.request<{ alias: string }[]>('GET', '/authentication/flows')).data;
+    if (!flows.some((f) => f.alias === TENANT_BROKER_FLOW)) {
+      try {
+        await this.request('POST', '/authentication/flows', {
+          alias: TENANT_BROKER_FLOW,
+          description: 'CloudTrain tenant IdPs: create a new user, never link to an existing account',
+          providerId: 'basic-flow',
+          topLevel: true,
+          builtIn: false,
+        });
+      } catch (e) {
+        // A concurrent call created it first: repair it below like any existing flow.
+        if (!(e instanceof KeycloakError && e.status === 409)) throw e;
+      }
+    }
+    const path = `/authentication/flows/${encodeURIComponent(TENANT_BROKER_FLOW)}/executions`;
+    type Exec = { id: string; providerId?: string; requirement: string; level?: number; index?: number };
+    let execs = (await this.request<Exec[]>('GET', path)).data;
+    if (!execs.some((e) => e.providerId === CREATE_IF_UNIQUE)) {
+      await this.request('POST', `${path}/execution`, { provider: CREATE_IF_UNIQUE });
+      execs = (await this.request<Exec[]>('GET', path)).data;
+    }
+    for (const e of execs) {
+      const want = e.providerId === CREATE_IF_UNIQUE ? 'REQUIRED' : 'DISABLED';
+      if (e.requirement !== want) await this.request('PUT', path, { ...e, requirement: want });
+    }
+  }
 
   async userProfile(): Promise<Record<string, unknown>> {
     return (await this.request<Record<string, unknown>>('GET', '/users/profile')).data;
@@ -211,11 +266,56 @@ export class KeycloakAdmin {
     else await this.request('POST', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`, mapper);
   }
 
+  /** Stamps BROKER_ORIGIN_ATTRIBUTE = `alias` on every user the IdP brokers (each login). Idempotent. */
+  async ensureBrokerOriginMapper(alias: string): Promise<void> {
+    const existing = (await this.idpMappers(alias)).find((m) => m.name === BROKER_ORIGIN_MAPPER);
+    const mapper = { name: BROKER_ORIGIN_MAPPER, identityProviderAlias: alias, identityProviderMapper: 'hardcoded-attribute-idp-mapper', config: { syncMode: 'FORCE', attribute: BROKER_ORIGIN_ATTRIBUTE, 'attribute.value': alias } };
+    if (existing) await this.request('PUT', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers/${existing.id}`, { ...mapper, id: existing.id });
+    else await this.request('POST', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`, mapper);
+  }
+
   /* ---------------------------------------------------------------- users */
 
   async findUserByEmail(email: string): Promise<KcUser | null> {
     const list = (await this.request<KcUser[]>('GET', `/users?email=${encodeURIComponent(email)}&exact=true`)).data;
     return list[0] ?? null;
+  }
+
+  async findUserByUsername(username: string): Promise<KcUser | null> {
+    const list = (await this.request<KcUser[]>('GET', `/users?username=${encodeURIComponent(username)}&exact=true`)).data;
+    return list[0] ?? null;
+  }
+
+  /** Users brokered from (linked to) the IdP `alias`; `full` includes their attributes. */
+  async idpUsers(alias: string, page = 200, full = false): Promise<KcUser[]> {
+    const out: KcUser[] = [];
+    for (let first = 0; ; first += page) {
+      const list = (await this.request<KcUser[]>('GET', `/users?idpAlias=${encodeURIComponent(alias)}&briefRepresentation=${full ? 'false' : 'true'}&first=${first}&max=${page}`)).data;
+      out.push(...list);
+      if (list.length < page) return out;
+    }
+  }
+
+  async federatedIdentities(id: string): Promise<{ identityProvider: string; userId?: string; userName?: string }[]> {
+    return (await this.request<{ identityProvider: string }[]>('GET', `/users/${encodeURIComponent(id)}/federated-identity`)).data;
+  }
+
+  /**
+   * Takes the IdP links `aliases` away from user `id`. A user with nothing else (no other link,
+   * no credential such as a password) only existed through them and is deleted, which frees its
+   * email and username in Keycloak.
+   */
+  async dropBrokeredLinks(id: string, aliases: string[]): Promise<'deleted' | 'unlinked' | 'none'> {
+    const links = await this.federatedIdentities(id);
+    const drop = links.filter((l) => aliases.includes(l.identityProvider));
+    if (!drop.length) return 'none';
+    const creds = (await this.request<unknown[]>('GET', `/users/${encodeURIComponent(id)}/credentials`)).data;
+    if (drop.length === links.length && creds.length === 0) {
+      await this.deleteUser(id);
+      return 'deleted';
+    }
+    for (const l of drop) await this.request('DELETE', `/users/${encodeURIComponent(id)}/federated-identity/${encodeURIComponent(l.identityProvider)}`);
+    return 'unlinked';
   }
 
   async createUser(u: { email: string; firstName?: string; lastName?: string; attributes?: Record<string, string[]> }): Promise<string> {
@@ -225,6 +325,14 @@ export class KeycloakAdmin {
     const found = await this.findUserByEmail(u.email);
     if (!found) throw new KeycloakError('user not found after create', 500);
     return found.id;
+  }
+
+  /** Adds `value` to the user's attribute `name` (kept when already there). */
+  async addUserAttribute(id: string, name: string, value: string): Promise<void> {
+    const u = (await this.request<KcUser>('GET', `/users/${encodeURIComponent(id)}`)).data;
+    const values = u.attributes?.[name] ?? [];
+    if (values.includes(value)) return;
+    await this.request('PUT', `/users/${encodeURIComponent(id)}`, { ...u, attributes: { ...(u.attributes ?? {}), [name]: [...values, value] } });
   }
 
   async setUserEnabled(id: string, enabled: boolean): Promise<void> {

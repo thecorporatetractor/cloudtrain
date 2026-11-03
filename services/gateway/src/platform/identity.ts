@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { sql } from 'kysely';
 import type { OrgRole, Role, TeamRole } from '@cloudtrain/api-types';
 import type { Principal } from '../auth.js';
@@ -29,10 +30,18 @@ export function normalizeRoles(roles: Iterable<string>): OrgRole[] {
 export interface IdentityClaims {
   sub: string;
   email: string;
+  /** The provider asserts that the user proved control of `email` (OIDC `email_verified`). */
+  emailVerified: boolean;
   name: string;
   title?: string;
   /** Keycloak IdP alias the user came through (user session note), absent for local login. */
   identityProvider?: string;
+  /**
+   * Local login only: IdPs the Keycloak user was brokered from or is linked to
+   * (kc-address.ts, brokerOrigins). null: Keycloak could not be asked, so the
+   * email is not trusted. Absent: not checked (no Keycloak admin client).
+   */
+  brokerOrigins?: string[] | null;
   /** IdP app roles (`roles` claim of the IdP, mapped to the `idp_roles` attribute). */
   idpRoles: string[];
   /** IdP groups (`groups` claim, mapped to `idp_groups`). */
@@ -44,7 +53,45 @@ export interface ProvisionOptions {
   platformIdps: string[];
   /** Org the login started for (identity-first). */
   preferredOrgId?: string | null;
+  /**
+   * Invitation the login was started from (its link, sent to the invited
+   * mailbox). Holding the link proves control of that mailbox for that one
+   * invitation, so it may be accepted even when the email is otherwise untrusted.
+   */
+  invitation?: { orgId: string; email: string } | null;
   ip?: string;
+}
+
+/**
+ * Whether the login's email may be matched to identities and invitations that
+ * other orgs created for it. The email must be verified, and a brokered login
+ * (a tenant IdP, whose org admin controls what it asserts) is only believed for
+ * a verified domain of the IdP's own org: otherwise any org admin could add an
+ * IdP that asserts someone else's address and take over their invitations.
+ * Platform IdPs (CT_PLATFORM_IDPS, the operator's Entra) follow the same rule:
+ * trusted for their own org's verified domains only. A platform IdP with no
+ * org, or an address outside those domains, accepts invitations only through
+ * the invitation link (docs/platform-identity.md).
+ */
+export function emailTrusted(c: Pick<IdentityClaims, 'emailVerified' | 'identityProvider'>, ssoOrgId: string | null, domainOrg: Pick<OrgForDomain, 'org_id' | 'verified'> | null): boolean {
+  if (!c.emailVerified) return false;
+  if (!c.identityProvider) return true;
+  return !!(ssoOrgId && domainOrg?.verified && domainOrg.org_id === ssoOrgId);
+}
+
+/**
+ * A local login's email is trusted only as far as the account's origin allows: an account a
+ * tenant IdP brokered (or one linked to an IdP) stays as trusted as that IdP when it signs in with
+ * a password it added later. `origins` null (unknown) is untrusted. Returns the origin that decides
+ * (the first untrusted one, else the first), for last_idp.
+ */
+async function originsTrust(db: Db, origins: string[] | null, domainOrg: Pick<OrgForDomain, 'org_id' | 'verified'> | null): Promise<{ trusted: boolean; origin?: string }> {
+  if (origins === null) return { trusted: false };
+  for (const alias of origins) {
+    const o = await orgForIdp(db, alias);
+    if (!emailTrusted({ emailVerified: true, identityProvider: alias }, o?.org_id ?? null, domainOrg)) return { trusted: false, origin: alias };
+  }
+  return { trusted: true, ...(origins[0] ? { origin: origins[0] } : {}) };
 }
 
 export type ProvisionResult =
@@ -127,19 +174,56 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
     return { ok: false, reason: 'sso_required', message: `${domainOrg.name} requires single sign-on for ${domain}.`, orgId: domainOrg.org_id };
   }
   if (ssoOrg && ssoOrg.status === 'suspended') return { ok: false, reason: 'org_suspended', message: 'This organization is suspended.', orgId: ssoOrg.org_id };
+  // A brokered login may not assert an address in a domain that another org verified: that org's
+  // own IdP signs those people in. (The gateway then drops the Keycloak user's link to this IdP,
+  // routes/auth.ts, so the address is free in Keycloak for its owner's first login.)
+  if (c.identityProvider && domainOrg?.verified && domainOrg.org_id !== ssoOrg?.org_id) {
+    return { ok: false, reason: 'email_conflict', message: `This identity provider may not sign in addresses of ${domain}: ${domainOrg.name} has verified that domain.`, orgId: domainOrg.org_id };
+  }
+
+  // A local login of an account that came from an IdP (Keycloak says so, or an earlier login came
+  // through one: last_idp) is judged by that IdP: otherwise a tenant IdP could broker an address,
+  // add a password in Keycloak's account console and sign in "locally" with a trusted email.
+  let localOrigin: string | undefined;
+  let trusted = emailTrusted(c, ssoOrg?.org_id ?? null, domainOrg);
+  if (!c.identityProvider) {
+    const prev = await withTenant(db, { userId: c.sub }, (tx) => tx.selectFrom('users').select('last_idp').where('id', '=', c.sub).executeTakeFirst());
+    const sticky = prev?.last_idp && prev.last_idp !== 'local' ? [prev.last_idp] : [];
+    const origins = c.brokerOrigins === null ? null : [...new Set([...(c.brokerOrigins ?? []), ...sticky])];
+    const o = await originsTrust(db, origins, domainOrg);
+    localOrigin = o.origin;
+    if (!o.trusted) trusted = false;
+  }
+  const invitedOrg = opts.invitation && opts.invitation.email.toLowerCase() === email ? opts.invitation.orgId : null;
+  // Orgs whose pending invitations this login may accept: any (a trusted email), else only
+  // the IdP's own org and the org whose invitation link started the login.
+  const acceptable = trusted ? null : [ssoOrg?.org_id, invitedOrg].filter((o): o is string => !!o);
 
   // A pre-provisioned identity ('pending-…', from the seed or an invitation) with this email becomes this sub.
   const existing = (await sql<{ id: string; platform_roles: string[] }>`SELECT * FROM auth_user_by_email(${email})`.execute(db)).rows[0];
-  if (existing && existing.id !== c.sub) {
-    if (!existing.id.startsWith('pending-')) {
+  if (existing && existing.id !== c.sub && !existing.id.startsWith('pending-')) {
+    // A real account holds the address. A login that proves it (a trusted email, or the invitation
+    // link for it) takes it over from an account that only had it from an untrusted login; otherwise
+    // the first untrusted login for an address would lock its owner out (account squatting).
+    const proven = trusted || !!invitedOrg;
+    if (!proven || !(await releaseUntrustedAddress(db, existing.id, email, domainOrg, c, opts.ip))) {
       return { ok: false, reason: 'email_conflict', message: 'Another account already uses this email address.' };
     }
+  } else if (existing && existing.id !== c.sub) {
     const pendingOrgs = await membershipsOf(db, existing.id);
-    const claimOrg = ssoOrg?.org_id ?? domainOrg?.org_id ?? pendingOrgs[0]?.org_id ?? null;
-    // Only claim inside an org that owns this login (its IdP or its domain) or invited the email.
-    if (claimOrg && pendingOrgs.some((m) => m.org_id === claimOrg)) {
+    // Claiming moves every membership of the pending identity: an untrusted email may only
+    // claim one whose memberships all lie in orgs it may accept.
+    if (!trusted && !pendingOrgs.every((m) => acceptable!.includes(m.org_id))) {
+      return { ok: false, reason: 'email_conflict', message: 'This sign-in cannot be matched to the account for this email address. Use the invitation link, or sign in with a verified email address.' };
+    }
+    const claimOrg = ssoOrg?.org_id ?? domainOrg?.org_id ?? invitedOrg ?? pendingOrgs[0]?.org_id ?? null;
+    const inClaimOrg = !!claimOrg && pendingOrgs.some((m) => m.org_id === claimOrg);
+    // Claim inside an org that owns this login (its IdP or its domain) or invited the email. A trusted
+    // email claims the identity wherever it was invited (another org invited an SSO user of this IdP).
+    const tenantOrg = inClaimOrg ? claimOrg : trusted ? (pendingOrgs[0]?.org_id ?? null) : null;
+    if (tenantOrg) {
       await db.transaction().execute(async (tx) => {
-        await setTenant(tx, claimOrg, c.sub);
+        await setTenant(tx, tenantOrg, c.sub);
         await tx.updateTable('users').set({ id: c.sub }).where('id', '=', existing.id).execute();
       });
     }
@@ -158,7 +242,7 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
     if (platformClaim === true && !platformRoles.includes('platform_admin')) platformRoles = [...platformRoles, 'platform_admin'];
     if (platformClaim === false) platformRoles = platformRoles.filter((r) => r !== 'platform_admin');
     // Signing in answers an inactivity warning.
-    const values = { email, name: c.name || email, last_login_at: new Date(), last_idp: c.identityProvider ?? 'local', platform_roles: platformRoles, inactivity_warned_at: null, ...(c.title ? { title: c.title } : {}) };
+    const values = { email, name: c.name || email, last_login_at: new Date(), last_idp: c.identityProvider ?? localOrigin ?? 'local', platform_roles: platformRoles, inactivity_warned_at: null, ...(c.title ? { title: c.title } : {}) };
     await tx
       .insertInto('users')
       .values({ id: c.sub, ...values })
@@ -203,8 +287,8 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
     }
   }
 
-  // Pending invitations for this email (any org that invited it).
-  await acceptInvitations(db, c.sub, email);
+  // Pending invitations for this email: any org that invited it when the email is trusted.
+  await acceptInvitations(db, c.sub, email, acceptable ?? undefined);
 
   const memberships = await membershipsOf(db, c.sub);
   const active = memberships.filter((m) => m.status === 'active' && m.org_status === 'active');
@@ -223,12 +307,57 @@ export async function provision(db: Db, c: IdentityClaims, opts: ProvisionOption
   return { ok: true, userId: c.sub, orgId: pick?.org_id ?? null, platformAdmin: user.platformAdmin };
 }
 
-/** Turns open invitations for `email` into active memberships (with their roles and teams). */
-export async function acceptInvitations(db: Db, userId: string, email: string): Promise<number> {
+/**
+ * Takes `email` away from the account `holderId` when that account only holds it from an
+ * untrusted login (emailTrusted: a tenant IdP asserting an address outside its own org's
+ * verified domains) and gives it to the login `c`, which proved it. The holder keeps its account
+ * under a placeholder address; its open invitations for the address (other orgs invited the
+ * address, not the holder) move to `c`. A local account, or one whose IdP's org owns the domain,
+ * keeps the address: false.
+ */
+export async function releaseUntrustedAddress(db: Db, holderId: string, email: string, domainOrg: OrgForDomain | null, c: IdentityClaims, ip?: string): Promise<boolean> {
+  const holder = await withTenant(db, { platform: true }, (tx) => tx.selectFrom('users').select(['id', 'last_idp']).where('id', '=', holderId).executeTakeFirst());
+  if (!holder?.last_idp || holder.last_idp === 'local') return false;
+  const holderOrg = await orgForIdp(db, holder.last_idp);
+  if (emailTrusted({ emailVerified: true, identityProvider: holder.last_idp }, holderOrg?.org_id ?? null, domainOrg)) return false;
+  await withTenant(db, { platform: true }, async (tx) => {
+    await tx.updateTable('users').set({ email: `unverified-${randomUUID()}@invalid` }).where('id', '=', holderId).execute();
+    await tx
+      .insertInto('users')
+      .values({ id: c.sub, email, name: c.name || email })
+      .onConflict((oc) => oc.column('id').doNothing())
+      .execute();
+    // Open invitations of other orgs were made out to the address; the holder's own IdP org keeps its.
+    const moved = await tx
+      .updateTable('memberships')
+      .set({ user_id: c.sub, updated_at: new Date() })
+      .where('user_id', '=', holderId)
+      .where('status', '=', 'invited')
+      .$if(!!holderOrg, (q) => q.where('org_id', '<>', holderOrg!.org_id))
+      .where('org_id', 'not in', (eb) => eb.selectFrom('memberships').select('org_id').where('user_id', '=', c.sub))
+      .returning('org_id')
+      .execute();
+    const orgs = moved.map((m) => m.org_id);
+    if (orgs.length) {
+      await tx.updateTable('invitations').set({ user_id: c.sub }).where('user_id', '=', holderId).where('accepted_at', 'is', null).where('org_id', 'in', orgs).execute();
+    }
+    for (const orgId of new Set([...(holderOrg ? [holderOrg.org_id] : []), ...orgs])) {
+      await audit(tx, { orgId, actorId: c.sub, actorName: c.name, ip }, 'auth.email_reclaimed', 'user', holderId, { idp: c.identityProvider ?? 'local', from: holderId, invitationsMoved: orgs }, email);
+    }
+  });
+  return true;
+}
+
+/**
+ * Turns open invitations for `email` into active memberships (with their roles
+ * and teams). `onlyOrgs` limits acceptance to those orgs (an untrusted email).
+ */
+export async function acceptInvitations(db: Db, userId: string, email: string, onlyOrgs?: string[]): Promise<number> {
   let accepted = 0;
   // The invited user already has a membership row (status 'invited') in each inviting org.
   for (const m of await membershipsOf(db, userId)) {
     if (m.status !== 'invited') continue;
+    if (onlyOrgs && !onlyOrgs.includes(m.org_id)) continue;
     await withTenant(db, { orgId: m.org_id, userId }, async (tx) => {
       const inv = await tx
         .selectFrom('invitations')

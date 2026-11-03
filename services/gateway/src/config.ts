@@ -53,7 +53,8 @@ export interface Config {
   /** Where the web app lives (post-login and post-logout redirects). */
   webUrl: string;
   oidc: { issuer: string; clientId: string; clientSecret: string };
-  keycloak: { baseUrl: string; realm: string; adminClientId: string; adminClientSecret: string };
+  /** repairMs: how often the gateway re-applies the tenant IdP protections (keycloak/repair.ts); 0 = only at startup. */
+  keycloak: { baseUrl: string; realm: string; adminClientId: string; adminClientSecret: string; repairMs: number };
   /** Seals refresh tokens at rest; at least 16 characters. */
   sessionSecret: string;
   sessionMaxAgeSeconds: number;
@@ -268,6 +269,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       realm,
       adminClientId: env.CT_KEYCLOAK_ADMIN_CLIENT_ID ?? 'cloudtrain-gateway-admin',
       adminClientSecret: env.CT_KEYCLOAK_ADMIN_CLIENT_SECRET ?? (prod ? '' : 'gateway-admin-dev-only-secret'),
+      repairMs: num(env.CT_KC_REPAIR_MS, 15 * 60_000),
     },
     sessionSecret: env.CT_SESSION_SECRET ?? (prod ? '' : 'dev-only-session-secret-not-for-production'),
     sessionMaxAgeSeconds: num(env.CT_SESSION_MAX_AGE_SECONDS, 12 * 3600),

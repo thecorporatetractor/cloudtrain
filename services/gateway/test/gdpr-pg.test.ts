@@ -779,7 +779,7 @@ describe.skipIf(!available)('GDPR rights in Postgres', () => {
 
     it('a closed account cannot sign in, even with a live identity-provider session', async () => {
       const { provision } = await import('../src/platform/identity.js');
-      const res = await provision(h.t.db, { sub: id, email, name: 'Clo Sing', idpRoles: [], idpGroups: [] }, { platformIdps: [] });
+      const res = await provision(h.t.db, { sub: id, email, emailVerified: true, name: 'Clo Sing', idpRoles: [], idpGroups: [] }, { platformIdps: [] });
       expect(res).toMatchObject({ ok: false, reason: 'deactivated' });
       expect((res as { message: string }).message).toContain('closed');
     });

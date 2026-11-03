@@ -199,7 +199,7 @@ describe.skipIf(!available)('retention sweeps', () => {
       await clean();
       await user('ret-back', 'came.back@example.org', { last_login_at: just(inactive, -60), created_at: just(inactive, -400), inactivity_warned_at: just(NOW, -31) });
       const { provision } = await import('../src/platform/identity.js');
-      await provision(h.t.db, { sub: 'ret-back', email: 'came.back@example.org', name: 'Came Back', idpRoles: [], idpGroups: [] }, { platformIdps: [] });
+      await provision(h.t.db, { sub: 'ret-back', email: 'came.back@example.org', emailVerified: true, name: 'Came Back', idpRoles: [], idpGroups: [] }, { platformIdps: [] });
       expect((await h.t.owner.selectFrom('users').select('inactivity_warned_at').where('id', '=', 'ret-back').executeTakeFirstOrThrow()).inactivity_warned_at).toBeNull();
       await h.gdpr.sweepAccounts({ ...cfg, closedDays: 0 });
       expect(await exists('ret-back')).toBe(true);

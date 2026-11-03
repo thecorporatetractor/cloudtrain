@@ -7,6 +7,7 @@ import { syncKeycloakOrg } from '../platform/platform.js';
 import type { PlatformService } from '../platform/service.js';
 import { GROUP_ATTRIBUTE, linkToOrganization, ROLE_ATTRIBUTE } from '../platform/sso.js';
 import type { KeycloakAdmin } from './admin.js';
+import { ENTRA_ALIAS, repairTenantIdps, type RepairReport } from './repair.js';
 
 /*
  * Makes Keycloak match the database: every org is a Keycloak organization
@@ -18,7 +19,7 @@ import type { KeycloakAdmin } from './admin.js';
  * ~/.config/cloudtrain/entra-dev.env (never committed, never printed).
  */
 
-export const ENTRA_ALIAS = 'azarguard-entra';
+export { ENTRA_ALIAS };
 export const ENTRA_ENV_FILE = path.join(os.homedir(), '.config/cloudtrain/entra-dev.env');
 
 /** KEY=VALUE lines (optional `export`, quotes); comments and blanks ignored. */
@@ -101,7 +102,8 @@ export async function ensureEntraIdp(kc: KeycloakAdmin, e: EntraSettings): Promi
   await kc.ensureAttributeMapper(ENTRA_ALIAS, 'oidc', 'cloudtrain groups', 'groups', GROUP_ATTRIBUTE);
 }
 
-export interface SyncReport {
+/** What kc:sync did; the tenant IdP repair (repair.ts) is part of it. */
+export interface SyncReport extends RepairReport {
   orgs: string[];
   linkedIdps: string[];
   members: number;
@@ -109,7 +111,7 @@ export interface SyncReport {
 }
 
 export async function syncKeycloak(ps: PlatformService, kc: KeycloakAdmin, db: Db, opts: { entraFile?: string } = {}): Promise<SyncReport> {
-  const report: SyncReport = { orgs: [], linkedIdps: [], members: 0, entra: 'absent' };
+  const report: SyncReport = { orgs: [], linkedIdps: [], brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], members: 0, entra: 'absent' };
   await kc.allowUnmanagedAttributes();
 
   const entra = await readEntra(opts.entraFile);
@@ -136,6 +138,9 @@ export async function syncKeycloak(ps: PlatformService, kc: KeycloakAdmin, db: D
     });
   }
 
+  // Tenant IdPs on TENANT_BROKER_FLOW, origin-stamped, foreign addresses released (the gateway
+  // also runs this on its own: main.ts, CT_KC_REPAIR_MS).
+  Object.assign(report, await repairTenantIdps(db, kc));
   const orgs = await withTenant(db, { platform: true }, (tx) => tx.selectFrom('orgs').selectAll().orderBy('slug').execute());
   for (const o of orgs) {
     const { domains, conns, members } = await withTenant(db, { platform: true }, async (tx) => ({
@@ -152,7 +157,9 @@ export async function syncKeycloak(ps: PlatformService, kc: KeycloakAdmin, db: D
       await linkToOrganization(kc, kcId, c.kc_alias, domains);
       report.linkedIdps.push(c.kc_alias);
     }
-    // Local accounts of the org become Keycloak organization members (brokered ones join on first login).
+    // Members of the org become Keycloak organization members. Brokered users of tenant IdPs do
+    // not join on first login (TENANT_BROKER_FLOW has no organization onboarding step), so they
+    // join here, on the next kc:sync after their first login.
     for (const m of members) {
       try {
         await kc.addOrgMember(kcId, m.user_id);

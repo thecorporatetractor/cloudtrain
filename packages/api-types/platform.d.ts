@@ -949,6 +949,7 @@ export type AuditAction =
   | 'auth.login'
   | 'auth.logout'
   | 'auth.login_denied'
+  | 'auth.email_reclaimed'
   | 'auth.dev_impersonate'
   | 'org.switch'
   | 'user.invite'
