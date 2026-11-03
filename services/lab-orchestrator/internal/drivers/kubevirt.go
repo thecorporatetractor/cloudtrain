@@ -378,23 +378,37 @@ func deleteVMs(ctx context.Context, c client.Client, r client.Reader, s *labsv1.
 		if !g {
 			continue // KubeVirt recreates a template DataVolume while its VM exists
 		}
-		// Root disks: owned by the VM (garbage-collected with it); deleted
-		// explicitly too so a reset does not wait for the collector.
-		g, err = deleteIfOwned(ctx, c, r, s, newObj(GVKDataVolume, s.Namespace, RootDiskName(n)))
-		if err != nil && !meta.IsNoMatchError(err) {
-			return false, err
-		}
-		if !g {
-			gone = false
-		}
-		pvc := &corev1.PersistentVolumeClaim{}
-		if err := r.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: RootDiskName(n)}, pvc); err == nil {
-			gone = false
-		} else if !apierrors.IsNotFound(err) {
-			return false, err
+		// Root and data disks: owned by the VM (garbage-collected with it);
+		// deleted explicitly too so a reset does not wait for the collector,
+		// and waited for, so a recreated VM never adopts an old disk that is
+		// still terminating (topology resources.disks: <vm>-data1..N).
+		for _, disk := range vmDiskNames(n) {
+			g, err = deleteIfOwned(ctx, c, r, s, newObj(GVKDataVolume, s.Namespace, disk))
+			if err != nil && !meta.IsNoMatchError(err) {
+				return false, err
+			}
+			if !g {
+				gone = false
+			}
+			pvc := &corev1.PersistentVolumeClaim{}
+			if err := r.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: disk}, pvc); err == nil {
+				gone = false
+			} else if !apierrors.IsNotFound(err) {
+				return false, err
+			}
 		}
 	}
 	return gone, nil
+}
+
+// vmDiskNames are the DataVolume (and PVC) names a VM's persistent disks can
+// have: the root disk and every possible data disk.
+func vmDiskNames(vm string) []string {
+	out := []string{RootDiskName(vm)}
+	for i := 1; i <= MaxExtraDisks; i++ {
+		out = append(out, vm+"-"+ExtraDiskName(i))
+	}
+	return out
 }
 
 // annotateVM sets AnnotationBootstrapped on a VM.

@@ -462,8 +462,7 @@ func (d *VClusterDriver) install(ctx context.Context, ref NodeRef, release strin
 		args = append(args, "-f", d.ValuesFile)
 	}
 	args = append(args, "-f", overlay)
-	_, err = d.Helm.Helm(ctx, args...)
-	return err
+	return helmInstall(ctx, d.Helm, release, d.hostNS(ref), args)
 }
 
 func (d *VClusterDriver) observe(ctx context.Context, ref NodeRef, release string, publish bool) (NodeState, error) {

@@ -51,6 +51,10 @@ func sandboxesB(fallback string) map[string]SandboxTier {
 	return map[string]SandboxTier{"B": {RuntimeClass: "kata-clh-runtime-rs", Fallback: fallback}}
 }
 
+func scaleFromZeroB() map[string]SandboxTier {
+	return map[string]SandboxTier{"B": {RuntimeClass: "kata-clh-runtime-rs", Fallback: SandboxFallbackFail, ScaleFromZero: true}}
+}
+
 func TestParseSandboxFlag(t *testing.T) {
 	m, err := ParseSandboxFlag(" B=kata-clh-runtime-rs , A=gvisor:fail")
 	if err != nil || len(m) != 2 || m["B"].RuntimeClass != "kata-clh-runtime-rs" || m["B"].FallbackMode() != SandboxFallbackKubeVirt ||
@@ -154,6 +158,12 @@ func TestApplySandbox(t *testing.T) {
 		{"RuntimeClass missing: systemd refused", "deb-sys:24.04", sandboxesB(""), nil, []client.Object{kataNode()}, "", false, false, true},
 		{"RuntimeClass missing: plain image on the default runtime", "deb-tools:1", sandboxesB(""), nil, []client.Object{kataNode()}, "kata", false, false, false},
 		{"no Kata node: systemd refused", "deb-sys:24.04", sandboxesB(""), nil, []client.Object{katart}, "", false, false, true},
+		// Scale from zero: no Kata node yet, the pod carries the RuntimeClass
+		// (its node selector) so the autoscaler adds one; never runc.
+		{"scale from zero, no Kata node: systemd image waits for a sandbox node", "deb-sys:24.04", scaleFromZeroB(), nil, []client.Object{katart}, "kata-clh-runtime-rs", true, true, false},
+		{"scale from zero, no Kata node: plain image waits for a sandbox node", "deb-tools:1", scaleFromZeroB(), nil, []client.Object{katart}, "kata-clh-runtime-rs", false, false, false},
+		{"scale from zero without a RuntimeClass node selector: refused", "deb-sys:24.04", scaleFromZeroB(), nil,
+			[]client.Object{&nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "kata-clh-runtime-rs"}, Handler: "kata-clh-runtime-rs"}}, "", false, false, true},
 		{"kata-named RuntimeClass with handler runc: refused", "deb-sys:24.04", sandboxesB(""), nil, []client.Object{impostor, kataNode()}, "", false, false, true},
 		{"non-Kata handler, unproven: refused", "deb-sys:24.04", sandboxesB(""), nil, []client.Object{microvm, kataNode()}, "", false, false, true},
 		{"non-Kata handler, unproven: unprivileged pods use it", "deb-tools:1", sandboxesB(""), nil, []client.Object{microvm, kataNode()}, "kata-clh-runtime-rs", false, false, false},
