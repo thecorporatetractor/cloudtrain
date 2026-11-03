@@ -1,11 +1,13 @@
 import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Lab, TopologyLink, TopologyNode, AccessKind } from '@/api/types';
 import { FakeCapture, FakeShell } from '@/lib/fakeShell';
-import { RemoteShell } from '@/lib/remoteShell';
+import { RemoteShell, type ShellStatus } from '@/lib/remoteShell';
+import { isFocusEscape, moveFocusOutOf, useTerminalScreenReader } from '@/lib/terminalA11y';
 import { useTheme } from '@/lib/theme';
+import { TerminalStatusBar } from './TerminalStatus';
 
 export type TerminalSource = { kind: 'console'; node: TopologyNode; access: AccessKind } | { kind: 'capture'; link: TopologyLink };
 
@@ -51,6 +53,18 @@ export function readTerminalTheme(): ITheme {
 }
 
 /**
+ * What runs behind a terminal tab. A real session never gets simulated output: the gateway
+ * has no packet capture yet, so a capture tab in a real lab says so instead of inventing traffic.
+ */
+export type TerminalBackend = 'remote' | 'fake-shell' | 'fake-capture' | 'capture-unavailable';
+export function terminalBackend(source: TerminalSource, sessionId: string | undefined): TerminalBackend {
+  if (source.kind === 'console') return sessionId ? 'remote' : 'fake-shell';
+  return sessionId ? 'capture-unavailable' : 'fake-capture';
+}
+
+export const CAPTURE_UNAVAILABLE = 'Packet capture is not available in live labs yet. Run tcpdump in a console on one of the link\'s nodes instead.';
+
+/**
  * One xterm instance. Stays mounted while its tab is hidden so scrollback and the fake shell survive.
  */
 export function TerminalView({ lab, source, active, onOpenNode, ownsKey, sessionId }: Props) {
@@ -62,6 +76,10 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
   openNodeRef.current = onOpenNode;
   const ownsKeyRef = useRef(ownsKey);
   ownsKeyRef.current = ownsKey;
+  const shellRef = useRef<RemoteShell | null>(null);
+  const [status, setStatus] = useState<ShellStatus | null>(null);
+  const [screenReader] = useTerminalScreenReader();
+  const backend = terminalBackend(source, sessionId);
 
   useEffect(() => {
     const el = ref.current;
@@ -76,24 +94,37 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
       scrollback: 4000,
       allowProposedApi: true,
       theme: readTerminalTheme(),
+      screenReaderMode: screenReader,
       // A real PTY already sends CRLF; the fake shell writes bare LF.
-      convertEol: !(sessionId && source.kind === 'console'),
+      convertEol: backend !== 'remote',
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
-    term.attachCustomKeyEventHandler((e) => !(ownsKeyRef.current?.(e) ?? false));
+    term.attachCustomKeyEventHandler((e) => {
+      if (isFocusEscape(e)) {
+        e.preventDefault();
+        moveFocusOutOf(el, e.shiftKey ? -1 : 1);
+        return false;
+      }
+      return !(ownsKeyRef.current?.(e) ?? false);
+    });
     termRef.current = term;
     fitRef.current = fit;
 
     let session: { start(): void; dispose(): void };
-    if (source.kind === 'console' && sessionId) {
+    if (backend === 'remote' && source.kind === 'console' && sessionId) {
       const entry = lab.spec.topology.entry ?? lab.spec.topology.nodes[0]?.name;
-      session = new RemoteShell(term, { sessionId, node: source.node.name, entry: source.node.name === entry });
+      const remote = new RemoteShell(term, { sessionId, node: source.node.name, entry: source.node.name === entry, onStatus: setStatus });
+      shellRef.current = remote;
+      session = remote;
     } else if (source.kind === 'console') {
       session = new FakeShell(term, { lab, node: source.node, access: source.access, onOpenNode: (n) => openNodeRef.current?.(n) });
-    } else {
+    } else if (backend === 'fake-capture') {
       session = new FakeCapture(term, source.link);
+    } else {
+      session = { start: () => term.write(`\x1b[2m${CAPTURE_UNAVAILABLE}\x1b[0m\r\n`), dispose: () => undefined };
+      term.options.disableStdin = true;
     }
     session.start();
 
@@ -118,6 +149,7 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
     return () => {
       ro.disconnect();
       session.dispose();
+      shellRef.current = null;
       term.dispose();
       termRef.current = null;
     };
@@ -136,6 +168,10 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
   }, [theme]);
 
   useEffect(() => {
+    if (termRef.current) termRef.current.options.screenReaderMode = screenReader;
+  }, [screenReader]);
+
+  useEffect(() => {
     if (active) {
       const id = requestAnimationFrame(() => {
         try {
@@ -150,5 +186,11 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
     }
   }, [active]);
 
-  return <div ref={ref} className="term" style={{ display: active ? 'block' : 'none' }} aria-label={source.kind === 'console' ? `${source.node.name} ${source.access} console` : `Capture on ${source.link.a} ↔ ${source.link.b}`} />;
+  const label = source.kind === 'console' ? `${source.node.name} ${source.access} console` : `Capture on ${source.link.a} ↔ ${source.link.b}`;
+  return (
+    <div className="term-wrap" style={{ display: active ? 'flex' : 'none' }}>
+      <div ref={ref} className="term" aria-label={`${label}. Press F6 to move focus out of the terminal.`} />
+      {status && source.kind === 'console' && <TerminalStatusBar status={status} node={source.node.name} onReconnect={() => shellRef.current?.reconnect()} />}
+    </div>
+  );
 }

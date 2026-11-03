@@ -25,7 +25,7 @@ import type { BillingService, StartDecision } from './billing/service.js';
 import type { WaitlistStore } from './waitlist/store.js';
 import { registerWaitlistRoutes } from './waitlist/routes.js';
 import type { SessionService } from './sessions/service.js';
-import { bridge, clampSize, send } from './terminal/bridge.js';
+import { bridge, clampSize, observeFailure, send } from './terminal/bridge.js';
 import { TerminalHub } from './terminal/hub.js';
 import { planTerminal } from './terminal/target.js';
 import { registerExamRoutes } from './exams/routes.js';
@@ -363,10 +363,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
           });
         },
         (e: unknown) => {
-          const err = e as HttpError;
           if (!(e instanceof HttpError)) req.log.warn({ err: e }, 'observe failed');
-          send(socket, { t: 'error', m: err.status === 403 ? 'You may not observe this session.' : e instanceof HttpError ? err.message : 'The terminal could not be observed. Please try again.' });
-          socket.close(1008, 'forbidden');
+          const f = observeFailure(e);
+          send(socket, { t: 'error', m: f.m });
+          socket.close(f.code, f.reason);
         },
       );
       return;

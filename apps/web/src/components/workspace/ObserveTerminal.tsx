@@ -4,6 +4,7 @@ import '@xterm/xterm/css/xterm.css';
 import { useEffect, useRef } from 'react';
 import { isRealApi } from '@/api/mode';
 import { FakeObserve, ObserveShell } from '@/lib/observeShell';
+import { readOnlyTerminalKeys, useTerminalScreenReader } from '@/lib/terminalA11y';
 import { useTheme } from '@/lib/theme';
 import { readTerminalTheme } from './TerminalView';
 
@@ -18,6 +19,7 @@ export function ObserveTerminal({ sessionId, learner, node, onState }: { session
   const termRef = useRef<Terminal | null>(null);
   const { theme } = useTheme();
   const onStateRef = useRef(onState);
+  const [screenReader] = useTerminalScreenReader();
   onStateRef.current = onState;
 
   useEffect(() => {
@@ -33,11 +35,13 @@ export function ObserveTerminal({ sessionId, learner, node, onState }: { session
       scrollback: 4000,
       allowProposedApi: true,
       theme: readTerminalTheme(),
+      screenReaderMode: screenReader,
       convertEol: !isRealApi,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    term.attachCustomKeyEventHandler(readOnlyTerminalKeys(el));
     termRef.current = term;
     const session = isRealApi ? new ObserveShell(term, { sessionId, onState: (s, d) => onStateRef.current(s, d) }) : new FakeObserve(term, { learner, node, onState: (s) => onStateRef.current(s) });
     session.start();
@@ -76,5 +80,9 @@ export function ObserveTerminal({ sessionId, learner, node, onState }: { session
     return () => cancelAnimationFrame(id);
   }, [theme]);
 
-  return <div ref={ref} className="term term-observe" aria-label={`Read-only view of ${learner}'s terminal on ${node}`} aria-readonly />;
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.screenReaderMode = screenReader;
+  }, [screenReader]);
+
+  return <div ref={ref} className="term term-observe" aria-label={`Read-only view of ${learner}'s terminal on ${node}. Press Tab or F6 to move focus out of the terminal.`} aria-readonly />;
 }

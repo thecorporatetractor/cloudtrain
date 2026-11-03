@@ -6,6 +6,7 @@ import { DriverIcon } from '@/components/domain';
 import { Dropdown, Tooltip } from '@/components/ui';
 import { clusterMembers, findConsoleNode } from '@/lib/personalize';
 import { cn } from '@/lib/utils';
+import { ScreenReaderToggle } from './TerminalStatus';
 import { TerminalView, type TerminalSource } from './TerminalView';
 
 export interface TermTab {
@@ -269,6 +270,7 @@ export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCa
                   </Dropdown.Content>
                 </Dropdown.Root>
                 <div className="grow" />
+                {i === model.panes.length - 1 && <ScreenReaderToggle />}
                 {i === model.panes.length - 1 && model.panes.length < 3 && (
                   <Tooltip content="Split pane" shortcut="mod+shift+d">
                     <button className="tab-action" aria-label="Split pane" onClick={onSplit}>

@@ -1,5 +1,8 @@
-import type { IDisposable, Terminal } from '@xterm/xterm';
+import type { Terminal } from '@xterm/xterm';
+import { CLOSE_REFUSED, KEEPALIVE_MS, RECONNECT_DELAYS_MS, type RemoteShellDeps, type SocketLike, STABLE_MS } from './remoteShell';
 import { wsUrl } from './runtimeConfig';
+
+type ObserveState = 'connecting' | 'live' | 'ended' | 'error';
 
 /**
  * Read-only mirror of a learner's terminal for instructors:
@@ -7,16 +10,36 @@ import { wsUrl } from './runtimeConfig';
  * The gateway drops any input on an observe connection; the client never sends
  * keystrokes either (xterm runs with stdin disabled). Resize is not sent: the
  * observer sees the learner's geometry.
+ *
+ * Like RemoteShell it sends a keepalive frame every KEEPALIVE_MS (the gateway ignores it; the
+ * Azure LB drops flows idle for about 4 minutes, and a quiet learner sends nothing), and a
+ * dropped connection reconnects with the same backoff. A refusal (close 1008) is not retried;
+ * an error frame followed by 1011 (the gateway hit a transient failure) is. The gateway replays the learner's recent output on every connection, so the
+ * terminal is cleared when a reconnected socket first answers (not before: the old output
+ * stays readable while disconnected), and the replay does not show twice.
  */
 export class ObserveShell {
-  private ws: WebSocket | null = null;
-  private subs: IDisposable[] = [];
+  private ws: SocketLike | null = null;
   private disposed = false;
+  private attempts = 0;
+  private retryTimer: unknown = null;
+  private stableTimer: unknown = null;
+  private keepalive: unknown = null;
+  private readonly deps: RemoteShellDeps;
 
   constructor(
-    private readonly term: Terminal,
-    private readonly opts: { sessionId: string; onState?: (s: 'connecting' | 'live' | 'ended' | 'error', detail?: string) => void },
-  ) {}
+    private readonly term: Pick<Terminal, 'write' | 'reset' | 'cols' | 'rows'>,
+    private readonly opts: { sessionId: string; onState?: (s: ObserveState, detail?: string) => void; deps?: Partial<RemoteShellDeps> },
+  ) {
+    this.deps = {
+      socket: (url) => new WebSocket(url) as unknown as SocketLike,
+      setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+      clearTimeout: (id) => window.clearTimeout(id as number),
+      setInterval: (fn, ms) => window.setInterval(fn, ms),
+      clearInterval: (id) => window.clearInterval(id as number),
+      ...opts.deps,
+    };
+  }
 
   start() {
     this.connect();
@@ -28,14 +51,34 @@ export class ObserveShell {
 
   private connect() {
     if (this.disposed) return;
+    this.retryTimer = null;
     const { sessionId, onState } = this.opts;
     onState?.('connecting');
     const q = new URLSearchParams({ observe: '1', cols: String(this.term.cols), rows: String(this.term.rows) });
-    const ws = new WebSocket(wsUrl(`/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`, location));
+    const ws = this.deps.socket(wsUrl(`/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`, location));
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     let ended = false;
-    ws.onmessage = (ev: MessageEvent<ArrayBuffer | string>) => {
+    // A reconnect: the old output is replaced by the gateway's replay on this socket's first frame.
+    let stale = this.attempts > 0;
+    let errorMessage: string | undefined;
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      this.stopTimers();
+      this.keepalive = this.deps.setInterval(() => {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'p' }));
+      }, KEEPALIVE_MS);
+      this.stableTimer = this.deps.setTimeout(() => {
+        this.stableTimer = null;
+        this.attempts = 0;
+      }, STABLE_MS);
+    };
+    ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
+      if (stale) {
+        stale = false;
+        this.term.reset();
+      }
       if (typeof ev.data !== 'string') {
         this.term.write(new Uint8Array(ev.data));
         return;
@@ -46,32 +89,54 @@ export class ObserveShell {
       } catch {
         return;
       }
-      if (f.t === 'ready') onState?.('live');
+      if (f.t === 'ready' || f.t === 'observe') onState?.('live');
       else if (f.t === 'exit') {
         ended = true;
         this.note(`[learner's shell ended${f.code ? ` with code ${f.code}` : ''}]`);
         onState?.('ended');
       } else if (f.t === 'error') {
-        ended = true;
-        this.note(f.m ?? 'observe unavailable', 'err');
-        onState?.('error', f.m);
+        // Final only if the close that follows is a refusal (1008); 1011 is retried.
+        errorMessage = f.m ?? 'observe unavailable';
+        this.note(errorMessage, 'err');
       }
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (this.ws !== ws) return;
-      if (!ended && !this.disposed) {
-        this.note('[connection closed; retrying in 3 s]');
-        onState?.('connecting');
-        window.setTimeout(() => this.connect(), 3000);
+      this.ws = null;
+      this.stopTimers();
+      if (ended || this.disposed) return;
+      if (ev?.code === CLOSE_REFUSED) {
+        onState?.('error', errorMessage);
+        return;
       }
+      const delay = RECONNECT_DELAYS_MS[this.attempts];
+      if (delay === undefined) {
+        this.note('[connection closed. Reload the page to watch again]');
+        onState?.('error', 'connection closed');
+        return;
+      }
+      this.attempts += 1;
+      this.note(`[connection closed; retrying in ${Math.round(delay / 1000)} s]`);
+      onState?.('connecting');
+      this.retryTimer = this.deps.setTimeout(() => this.connect(), delay);
     };
+  }
+
+  private stopTimers() {
+    if (this.keepalive !== null) this.deps.clearInterval(this.keepalive);
+    if (this.stableTimer !== null) this.deps.clearTimeout(this.stableTimer);
+    this.keepalive = null;
+    this.stableTimer = null;
   }
 
   dispose() {
     this.disposed = true;
-    this.subs.forEach((s) => s.dispose());
-    this.ws?.close();
+    if (this.retryTimer !== null) this.deps.clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.stopTimers();
+    const ws = this.ws;
     this.ws = null;
+    ws?.close();
   }
 }
 

@@ -7,6 +7,7 @@ import { useAttempt, useFlagTask, useSubmitExam } from '@/api/exams';
 import type { ExamAttemptState, ExamTaskView, ExamTerminalTarget } from '@/api/types';
 import { ExamTerminal } from '@/components/exams/ExamTerminal';
 import { AutoSubmitFailed, SubmitFailed } from '@/components/exams/SubmitErrors';
+import { ScreenReaderToggle } from '@/components/workspace/TerminalStatus';
 import { Disclaimer, ExamTimer, PhaseBadge, useServerClock } from '@/components/exams/ui';
 import { Prose } from '@/components/prose';
 import { Badge, Button, Dialog, ErrorState, Meter, Skeleton, Tooltip } from '@/components/ui';
@@ -145,6 +146,7 @@ function Terminals({ attempt, closed }: { attempt: ExamAttemptState; closed: boo
             </Tooltip>
           ))}
         <span className="grow" />
+        <ScreenReaderToggle className="exam-terms-a11y" />
         {entry && <span className="xs subtle" style={{ alignSelf: 'center', paddingRight: 6 }}>{entry.label}</span>}
       </div>
       <div className="exam-terms-body">

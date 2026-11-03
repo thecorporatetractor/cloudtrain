@@ -72,6 +72,8 @@ const WORKSPACE_SHORTCUTS = [
       { keys: 'alt+]', description: 'Next tab' },
       { keys: 'alt+[', description: 'Previous tab' },
       { keys: 'alt+1', description: 'Tab 1 … 9' },
+      { keys: 'F6', description: 'Move focus out of the terminal' },
+      { keys: 'shift+F6', description: 'Move focus out of the terminal, backwards' },
     ],
   },
 ];
@@ -181,6 +183,9 @@ export function Workspace() {
     [terminals, toast],
   );
   const onImpair = useCallback((link: TopologyLink) => toast({ title: 'Link impairment', description: `tc netem on ${link.a} ↔ ${link.b} is available once the orchestrator is wired up.`, tone: 'warn' }), [toast]);
+  // Live labs: the gateway has no packet capture or link impairment yet, and a live lab never
+  // shows simulated output, so both are offered only in the in-browser demo.
+  const linkTools: { onCapture?: (l: TopologyLink) => void; onImpair?: (l: TopologyLink) => void } = isRealApi ? {} : { onCapture, onImpair };
 
   const onExpiryWarning = useCallback((title: string) => toast({ title, description: 'The lab environment and everything in it are removed when the time is up. Validate now to record your results.', tone: 'warn' }), [toast]);
 
@@ -501,7 +506,7 @@ export function Workspace() {
               <Panel id="topo" panelRef={topoRef} collapsible collapsedSize="0%" minSize="15%" defaultSize="30%" maxSize="60%" className="ws-topo-panel">
                 <div className="ws-topo">
                   <div className="ws-topo-head">
-                    <span className="xs subtle">Topology · click a node to open its console · right-click a link (or Tab to it and press Enter) to capture</span>
+                    <span className="xs subtle">{isRealApi ? 'Topology · click a node to open its console' : 'Topology · click a node to open its console · right-click a link (or Tab to it and press Enter) to capture'}</span>
                     <span className="row" style={{ gap: 8 }}>
                       {s?.nodes.map((n) => (
                         <span key={n.name} className="row xs mono muted" style={{ gap: 4 }} title={`${n.name}: ${n.status}${n.ip ? ` · ${n.ip}` : ''}`}>
@@ -510,7 +515,7 @@ export function Workspace() {
                       ))}
                     </span>
                   </div>
-                  {!layout.topoCollapsed && <TopologyCanvas topology={l.spec.topology} nodeStates={s?.nodes} onOpenNode={(name, access) => terminals.openConsole(name, access)} onCapture={onCapture} onImpair={onImpair} />}
+                  {!layout.topoCollapsed && <TopologyCanvas topology={l.spec.topology} nodeStates={s?.nodes} onOpenNode={(name, access) => terminals.openConsole(name, access)} {...linkTools} />}
                 </div>
               </Panel>
               <Separator className="splitter splitter-h" />
@@ -518,7 +523,7 @@ export function Workspace() {
                 {isRealApi && !envReady ? (
                   <EnvironmentState session={s} onRestart={() => void navigate({ search: {}, replace: true })} />
                 ) : (
-                  <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onCapture={onCapture} onSplit={terminals.split} ownsKey={ownsKey} sessionId={isRealApi ? s?.id : undefined} />
+                  <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onCapture={linkTools.onCapture} onSplit={terminals.split} ownsKey={ownsKey} sessionId={isRealApi ? s?.id : undefined} />
                 )}
               </Panel>
             </PersistedGroup>

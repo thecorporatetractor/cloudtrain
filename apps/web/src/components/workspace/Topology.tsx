@@ -311,32 +311,52 @@ export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpen
           <div className="menu-label mono" style={{ textTransform: 'none', letterSpacing: 0 }}>
             {menu.link.a} ↔ {menu.link.b}
           </div>
-          <button
-            className="menu-item"
-            role="menuitem"
-            autoFocus
-            onClick={() => {
-              onCapture?.(menu.link);
+          <LinkMenuItems
+            onCapture={onCapture}
+            onImpair={onImpair}
+            onPick={(fn) => {
+              fn(menu.link);
               setMenu(null);
               menu.returnTo?.focus();
             }}
-          >
-            <Activity size={14} /> Capture on this link
-          </button>
-          <button
-            className="menu-item"
-            role="menuitem"
-            onClick={() => {
-              onImpair?.(menu.link);
-              setMenu(null);
-              menu.returnTo?.focus();
-            }}
-          >
-            <Gauge size={14} /> Impair (latency, loss)…
-          </button>
+          />
           {menu.link.subnet && <div className="menu-label xs">{menu.link.subnet}</div>}
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The link menu's actions. Live labs pass neither handler (the gateway has no capture or
+ * impairment yet): the menu then says so instead of offering simulated output.
+ */
+export function LinkMenuItems({ onCapture, onImpair, onPick }: { onCapture?: (l: TopologyLink) => void; onImpair?: (l: TopologyLink) => void; onPick: (fn: (l: TopologyLink) => void) => void }) {
+  const note = useRef<HTMLDivElement>(null);
+  const none = !onCapture && !onImpair;
+  // Keyboard users opened the menu from a link: put focus on the explanation so it is read out.
+  useEffect(() => {
+    if (none) note.current?.focus();
+  }, [none]);
+  if (none) {
+    return (
+      <div ref={note} className="menu-label xs" role="menuitem" aria-disabled="true" tabIndex={-1} style={{ textTransform: 'none', letterSpacing: 0, maxWidth: 240, whiteSpace: 'normal' }}>
+        Packet capture and link impairment are not available in live labs yet. Use tcpdump or tc in a node console.
+      </div>
+    );
+  }
+  return (
+    <>
+      {onCapture && (
+        <button className="menu-item" role="menuitem" autoFocus onClick={() => onPick(onCapture)}>
+          <Activity size={14} /> Capture on this link
+        </button>
+      )}
+      {onImpair && (
+        <button className="menu-item" role="menuitem" autoFocus={!onCapture} onClick={() => onPick(onImpair)}>
+          <Gauge size={14} /> Impair (latency, loss)…
+        </button>
+      )}
+    </>
   );
 }

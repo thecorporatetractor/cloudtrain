@@ -1,12 +1,14 @@
 import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ExamTerminalTarget, Lab, TopologyNode } from '@/api/types';
 import { isRealApi } from '@/api/mode';
 import { FakeShell } from '@/lib/fakeShell';
-import { RemoteShell } from '@/lib/remoteShell';
+import { RemoteShell, type ShellStatus } from '@/lib/remoteShell';
+import { isFocusEscape, moveFocusOutOf, useTerminalScreenReader } from '@/lib/terminalA11y';
 import { useTheme } from '@/lib/theme';
+import { TerminalStatusBar } from '@/components/workspace/TerminalStatus';
 
 function readTheme(): ITheme {
   const cs = getComputedStyle(document.documentElement);
@@ -59,6 +61,9 @@ export function ExamTerminal({ attemptId, target, active, contexts, hosts, close
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const disposeRef = useRef<(() => void) | null>(null);
+  const shellRef = useRef<RemoteShell | null>(null);
+  const [status, setStatus] = useState<ShellStatus | null>(null);
+  const [screenReader] = useTerminalScreenReader();
   const { theme } = useTheme();
 
   useEffect(() => {
@@ -72,16 +77,23 @@ export function ExamTerminal({ attemptId, target, active, contexts, hosts, close
       cursorStyle: 'bar',
       scrollback: 4000,
       theme: readTheme(),
+      screenReaderMode: screenReader,
       convertEol: !isRealApi,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(el);
+    term.attachCustomKeyEventHandler((e) => {
+      if (!isFocusEscape(e)) return true;
+      e.preventDefault();
+      moveFocusOutOf(el, e.shiftKey ? -1 : 1);
+      return false;
+    });
     termRef.current = term;
     fitRef.current = fit;
     let session: { start(): void; dispose(): void };
     if (isRealApi) {
-      session = new RemoteShell(term, {
+      const remote = new RemoteShell(term, {
         sessionId: attemptId,
         node: target.node,
         entry: target.entry,
@@ -89,13 +101,20 @@ export function ExamTerminal({ attemptId, target, active, contexts, hosts, close
           q.set('target', target.id);
           return `/api/exams/attempts/${encodeURIComponent(attemptId)}/terminal?${q}`;
         },
+        onStatus: setStatus,
       });
+      shellRef.current = remote;
+      session = remote;
     } else {
       const lab = fakeLab(target, contexts, hosts);
       session = new FakeShell(term, { lab, node: lab.spec.topology.nodes[0]!, access: contexts.length ? 'shell' : 'ssh' });
     }
     session.start();
-    disposeRef.current = () => session.dispose();
+    disposeRef.current = () => {
+      session.dispose();
+      shellRef.current = null;
+      setStatus(null);
+    };
     const ro = new ResizeObserver(() => {
       if (el.clientWidth > 0 && el.clientHeight > 0) {
         try {
@@ -124,6 +143,10 @@ export function ExamTerminal({ attemptId, target, active, contexts, hosts, close
   }, [theme]);
 
   useEffect(() => {
+    if (termRef.current) termRef.current.options.screenReaderMode = screenReader;
+  }, [screenReader]);
+
+  useEffect(() => {
     if (!active) return;
     const id = requestAnimationFrame(() => {
       try {
@@ -144,5 +167,10 @@ export function ExamTerminal({ attemptId, target, active, contexts, hosts, close
     termRef.current.options.disableStdin = true;
   }, [closed]);
 
-  return <div ref={ref} className="term" style={{ display: active ? 'block' : 'none' }} aria-label={`Terminal on ${target.node}`} />;
+  return (
+    <div className="term-wrap" style={{ display: active ? 'flex' : 'none' }}>
+      <div ref={ref} className="term" aria-label={`Terminal on ${target.node}. Press F6 to move focus out of the terminal.`} />
+      {status && !closed && <TerminalStatusBar status={status} node={target.node} onReconnect={() => shellRef.current?.reconnect()} />}
+    </div>
+  );
 }
