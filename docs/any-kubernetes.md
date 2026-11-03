@@ -90,7 +90,7 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 |---|---|---|
 | `services/lab-orchestrator/internal/drivers/userns.go:67-95`, `cmd/manager/main.go:60,144-160` | `hostUsers: false` when every node's runtime handler reports `features.userNamespaces` (auto-detected, good) | portable |
 | `services/lab-orchestrator/internal/network/pod.go:122-131` | wired pods: `hostUsers: false` plus `procMount: Unmasked` (needs the `ProcMountType` feature, beta; off on some managed versions) or else a **privileged** `net-init` | P |
-| `services/lab-orchestrator/internal/drivers/netdev.go:66-69` | FRR containers add `SYS_ADMIN` | P |
+| `services/lab-orchestrator/internal/drivers/netdev.go` (FRR `Capabilities`) | FRR containers add `SYS_ADMIN` (FRR's privs model requires it: every daemon exits at start without it). The pod is held in by seccomp RuntimeDefault, every other capability dropped, `allowPrivilegeEscalation: false`, and `hostUsers: false` or the tier N sandbox. `learnerSudo` on a device lifts no_new_privs, and root then keeps SYS_ADMIN (not the default capabilities), so the manager allows it only with `hostUsers: false` or a verified sandbox RuntimeClass and refuses the node otherwise. The router console runs `vtysh` (which has no `start-shell`), never a shell | P |
 | session namespace `cloudtrain-sessions` (`Taskfile.yml:198`, `services/gateway/src/config.ts:130`) created without Pod Security labels; kind enforces nothing | privileged init containers are rejected where a cluster enforces `baseline` by default (AKS deployment safeguards, GKE Autopilot, policy add-ons) | P |
 | `services/lab-orchestrator/internal/drivers/container.go:68-69,203-205` | `--runtime-class` for Kata is a free string; no check that the RuntimeClass exists or that its handler supports userns. The per-tier `--sandboxes` (`internal/drivers/sandbox.go`, section 11) do check: RuntimeClass, VM handler, schedulable nodes, preflight verdict | P |
 
@@ -556,7 +556,9 @@ for either mode, using the orchestrator's own wiring code for the probe.
   Unmasked` for writable network sysctls in user-namespaced pods; a privileged
   `net-init` for router nodes without user namespaces (`ip_forward` and
   per-interface `rp_filter` are unsafe sysctls, and the per-interface ones do
-  not exist yet when the sandbox is created); SYS_ADMIN for FRR; KubeVirt's
+  not exist yet when the sandbox is created); SYS_ADMIN for FRR (FRR's
+  privs_init exits without it; contained by seccomp RuntimeDefault, no
+  privilege escalation and a user namespace or the tier N sandbox); KubeVirt's
   virt-launcher. So session namespaces stay `privileged`, and baseline is
   audited only.
 

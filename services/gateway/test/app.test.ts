@@ -5,7 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { DevAuthenticator, type Authenticator } from '../src/auth.js';
 import { SessionService } from '../src/sessions/service.js';
-import { loginShellCommand, planTerminal, sshCommand } from '../src/terminal/target.js';
+import { consoleCommand, loginShellCommand, planTerminal, sshCommand } from '../src/terminal/target.js';
 import { alice, FakeCluster, FakeCompiler, realContent } from './fakes.js';
 
 let app: FastifyInstance | undefined;
@@ -88,6 +88,41 @@ describe('terminal planning', () => {
     expect(() => planTerminal(ls, lab, 'elsewhere')).toThrow(/not part of this lab/);
     expect(() => sshCommand("x';rm -rf /")).toThrow(/invalid node name/);
     expect(() => planTerminal({ ...ls, status: { phase: 'Provisioning' as const } }, lab)).toThrow(/not ready/);
+  });
+
+  it('opens the router console (never a shell) on a netdev node', async () => {
+    const content = await realContent();
+    const lab = content.labs.get('net-arp-neighbour-tables')!.lab;
+    const router = lab.spec.topology.nodes.find((n) => n.driver === 'netdev')!.name;
+    const ls = (command?: string) => ({
+      apiVersion: 'labs.cloudtrain.dev/v1alpha1' as const,
+      kind: 'LabSession' as const,
+      metadata: { name: 's1' },
+      spec: { templateRef: { name: 't' }, learner: { id: 'alice' }, seed: 1 },
+      status: {
+        phase: 'Ready' as const,
+        entryNode: 'workstation',
+        endpoints: [
+          { node: 'workstation', access: 'shell', protocol: 'k8s-exec', target: 'ns/pod-a/node' },
+          { node: router, access: 'console', protocol: 'k8s-exec', target: 'ns/pod-r/node', ...(command ? { command } : {}) },
+        ],
+      },
+    });
+    const plan = planTerminal(ls('vtysh'), lab, router);
+    expect(plan.command).toEqual(consoleCommand(['vtysh']));
+    expect(plan.command).toEqual(['/bin/sh', '-c', 'export TERM=xterm-256color; exec "$0" "$@"', 'vtysh']);
+    expect(plan.via).toBe(`console on ${router}`);
+    expect(plan.target.pod).toBe('pod-r');
+    // No console command: refused, never the login shell (root in the router pod).
+    expect(() => planTerminal(ls(), lab, router)).toThrow(/no console command/);
+    // The entry node still gets its login shell.
+    expect(planTerminal(ls('vtysh'), lab).command).toEqual(loginShellCommand());
+  });
+
+  it('passes console arguments as argv, never into the script', () => {
+    const cmd = consoleCommand(['vtysh', '$(id)', ';sh']);
+    expect(cmd.slice(0, 3)).toEqual(['/bin/sh', '-c', 'export TERM=xterm-256color; exec "$0" "$@"']);
+    expect(cmd.slice(3)).toEqual(['vtysh', '$(id)', ';sh']);
   });
 
   it('only su-s to the learner when running as root', () => {

@@ -57,6 +57,11 @@ export interface Endpoint {
   /** For k8s-exec: "namespace/pod/container". */
   target?: string;
   url?: string;
+  /**
+   * For k8s-exec: the program to start instead of a login shell, e.g. "vtysh"
+   * for a router console (whitespace-separated argv; written by the orchestrator).
+   */
+  command?: string;
 }
 
 export interface CheckResult {
