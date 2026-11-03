@@ -73,6 +73,16 @@ export interface NewSession {
   authenticatedAt?: Date;
 }
 
+/** refreshOnce: 'fresh' (another request already refreshed), 'refreshed', 'none' (no refresh token), 'gone' (session ended). */
+export type RefreshOutcome = 'fresh' | 'refreshed' | 'none' | 'gone';
+
+/**
+ * How long a replica's claim on a refresh lasts. Longer than the token-endpoint
+ * timeout (OidcClient TOKEN_TIMEOUT_MS), so a claim never lapses while its
+ * refresh is still running.
+ */
+export const REFRESH_LEASE_MS = 30_000;
+
 export class SessionStore {
   private readonly now: () => number;
   constructor(
@@ -139,6 +149,80 @@ export class SessionStore {
       .execute();
   }
 
+  private readonly refreshing = new Map<string, Promise<RefreshOutcome>>();
+
+  /**
+   * Refreshes an expired access token once per session. Requests of this
+   * process that arrive meanwhile share the same refresh. Across replicas the
+   * refresh is claimed with a compare-and-set on access_expires_at (a short
+   * lease): the replica whose UPDATE matches the expired value refreshes, the
+   * others find the lease and treat the session as fresh. Without this,
+   * parallel requests each spend the same refresh token, and with
+   * refresh-token rotation all but the first are refused and end the session.
+   *
+   * No transaction or row lock is held across the token-endpoint call: a slow
+   * or hung IdP must not pin pool connections (they are shared by every route).
+   * If the refresh fails for a reason other than a refusal, the lease is given
+   * back so the next request retries. Errors of `refresh` propagate (the
+   * caller decides whether to revoke).
+   */
+  refreshOnce(idHash: string, refresh: (refreshToken: string) => Promise<TokenSet>): Promise<RefreshOutcome> {
+    const running = this.refreshing.get(idHash);
+    if (running) return running;
+    const p = this.refreshClaimed(idHash, refresh).finally(() => this.refreshing.delete(idHash));
+    this.refreshing.set(idHash, p);
+    return p;
+  }
+
+  private async refreshClaimed(idHash: string, refresh: (refreshToken: string) => Promise<TokenSet>): Promise<RefreshOutcome> {
+    const row = await this.db.selectFrom('auth_sessions').select(['refresh_token', 'access_expires_at']).where('id_hash', '=', idHash).executeTakeFirst();
+    if (!row) return 'gone';
+    const expired = row.access_expires_at;
+    if (!expired || expired.getTime() >= this.now()) return 'fresh';
+    const rt = row.refresh_token ? this.sealer.open(row.refresh_token) : null;
+    if (!rt) return 'none';
+    const lease = new Date(this.now() + REFRESH_LEASE_MS);
+    const claimed = await this.db
+      .updateTable('auth_sessions')
+      .set({ access_expires_at: lease })
+      .where('id_hash', '=', idHash)
+      .where('access_expires_at', '=', expired)
+      .where('refresh_token', '=', row.refresh_token!)
+      .executeTakeFirst();
+    // Another replica claimed it (or refreshed it) between our read and our update.
+    if (Number(claimed.numUpdatedRows) === 0) return 'fresh';
+    let t: TokenSet;
+    try {
+      t = await refresh(rt);
+    } catch (e) {
+      // Give the lease back so the next request retries (a refusal revokes anyway).
+      await this.db
+        .updateTable('auth_sessions')
+        .set({ access_expires_at: expired })
+        .where('id_hash', '=', idHash)
+        .where('access_expires_at', '=', lease)
+        .execute()
+        .catch(() => undefined);
+      throw e;
+    }
+    const done = await this.db
+      .updateTable('auth_sessions')
+      .set({
+        access_expires_at: new Date(this.now() + (t.expires_in ?? 300) * 1000),
+        ...(t.refresh_token ? { refresh_token: this.sealer.seal(t.refresh_token) } : {}),
+        ...(t.id_token ? { id_token: t.id_token } : {}),
+      })
+      .where('id_hash', '=', idHash)
+      .where('access_expires_at', '=', lease)
+      .executeTakeFirst();
+    if (Number(done.numUpdatedRows) > 0) return 'refreshed';
+    // 0 rows: the session was revoked (logout) while the refresh ran, or another writer (a
+    // re-auth storing fresh tokens) moved the lease. Only a missing row is 'gone'; a row someone
+    // else updated is current, so it is used as it is.
+    const still = await this.db.selectFrom('auth_sessions').select('id_hash').where('id_hash', '=', idHash).executeTakeFirst();
+    return still ? 'fresh' : 'gone';
+  }
+
   refreshTokenOf(row: AuthSessionRow): string | null {
     return row.refresh_token ? this.sealer.open(row.refresh_token) : null;
   }
@@ -203,13 +287,12 @@ export class OidcAuthenticator implements Authenticator {
     const row = await this.store.get(token);
     if (!row) return null;
     if (row.access_expires_at && row.access_expires_at.getTime() < Date.now()) {
-      const rt = this.store.refreshTokenOf(row);
-      if (!rt) {
-        await this.store.revoke(row.id_hash);
-        return null;
-      }
       try {
-        await this.store.storeRefresh(row.id_hash, await this.oidc.refresh(rt));
+        const outcome = await this.store.refreshOnce(row.id_hash, (rt) => this.oidc.refresh(rt));
+        if (outcome === 'none' || outcome === 'gone') {
+          await this.store.revoke(row.id_hash);
+          return null;
+        }
       } catch (e) {
         if (e instanceof OidcError && e.status && e.status >= 400 && e.status < 500) {
           await this.store.revoke(row.id_hash);

@@ -20,6 +20,8 @@ export class FakeOidcProvider {
   private refresh = new Map<string, { claims: Record<string, unknown>; sid: string }>();
   tokenCalls = 0;
   accessTtl = 300;
+  /** Refresh-token rotation (Keycloak "Revoke Refresh Token"): a refresh token works once. */
+  rotateRefreshTokens = false;
 
   async start(): Promise<this> {
     const { privateKey, publicKey } = await generateKeyPair('RS256');
@@ -85,6 +87,7 @@ export class FakeOidcProvider {
       } else if (f.get('grant_type') === 'refresh_token') {
         const r = this.refresh.get(f.get('refresh_token') ?? '');
         if (!r) return json(400, { error: 'invalid_grant' });
+        if (this.rotateRefreshTokens) this.refresh.delete(f.get('refresh_token') ?? '');
         ({ claims, sid } = r);
       } else return json(400, { error: 'unsupported_grant_type' });
       const refresh = randomUUID();

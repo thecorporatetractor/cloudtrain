@@ -36,6 +36,9 @@ export interface TokenSet {
   token_type?: string;
 }
 
+/** Upper bound of a call to the IdP (discovery, token endpoint): a hung IdP fails the request instead of hanging it. */
+export const TOKEN_TIMEOUT_MS = 10_000;
+
 export class OidcError extends Error {
   constructor(
     message: string,
@@ -71,7 +74,7 @@ export class OidcClient {
 
   async meta(): Promise<Discovery> {
     this.discovery ??= (async () => {
-      const r = await this.f(`${this.cfg.issuer.replace(/\/$/, '')}/.well-known/openid-configuration`);
+      const r = await this.f(`${this.cfg.issuer.replace(/\/$/, '')}/.well-known/openid-configuration`, { signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS) });
       if (!r.ok) throw new OidcError(`OIDC discovery failed: HTTP ${r.status}`, r.status);
       return (await r.json()) as Discovery;
     })();
@@ -112,6 +115,7 @@ export class OidcClient {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
       body: new URLSearchParams({ ...body, client_id: this.cfg.clientId, client_secret: this.cfg.clientSecret }).toString(),
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
     });
     const json = (await r.json().catch(() => ({}))) as TokenSet & { error?: string; error_description?: string };
     if (!r.ok) throw new OidcError(`token endpoint: ${json.error ?? r.status}${json.error_description ? ` (${json.error_description})` : ''}`, r.status);

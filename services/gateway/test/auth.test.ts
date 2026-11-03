@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FakeOidcProvider } from './fake-oidc.js';
 import { harness, Q, type Harness } from './harness.js';
 import { pgAvailable } from './pg.js';
+import { Sealer, SessionStore } from '../src/oidc/sessions.js';
+import { createDb } from '../src/db/index.js';
 
 const available = await pgAvailable();
 
@@ -132,6 +134,93 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
     op.revokeRefreshTokens();
     expect((await h.app.inject({ url: '/api/me', headers: { cookie } })).statusCode).toBe(401);
     op.accessTtl = 300;
+  });
+
+  it('parallel requests after expiry refresh once, so refresh-token rotation does not end the session', async () => {
+    op.accessTtl = -10;
+    const { cb } = await signIn('lucas.ferreira@quillmoor.example', { sub: Q.lucas, email: 'lucas.ferreira@quillmoor.example', name: 'Lucas Ferreira' });
+    const cookie = cookieOf(cb)!;
+    op.accessTtl = 300;
+    op.rotateRefreshTokens = true;
+    try {
+      const calls = op.tokenCalls;
+      const all = await Promise.all(Array.from({ length: 6 }, () => h.app.inject({ url: '/api/me', headers: { cookie } })));
+      expect(all.map((r) => r.statusCode)).toEqual([200, 200, 200, 200, 200, 200]);
+      expect(op.tokenCalls).toBe(calls + 1);
+      expect((await h.app.inject({ url: '/api/me', headers: { cookie } })).statusCode).toBe(200);
+    } finally {
+      op.rotateRefreshTokens = false;
+    }
+  });
+
+  it('two gateway replicas refresh one session once (claimed lease), the second finds it fresh', async () => {
+    op.accessTtl = -10;
+    const { cb } = await signIn('lucas.ferreira@quillmoor.example', { sub: Q.lucas, email: 'lucas.ferreira@quillmoor.example', name: 'Lucas Ferreira' });
+    op.accessTtl = 300;
+    const idHash = (await h.t.owner.selectFrom('auth_sessions').select('id_hash').where('user_id', '=', Q.lucas).orderBy('created_at', 'desc').limit(1).executeTakeFirstOrThrow()).id_hash;
+    expect(cookieOf(cb)).toBeTruthy();
+    const replica = () => new SessionStore(h.t.db, new Sealer('test-session-secret-0123456789'), { maxAgeSeconds: 3600, idleSeconds: 1800, secureCookie: false });
+    let refreshes = 0;
+    const slow = async () => {
+      refreshes++;
+      await new Promise((r) => setTimeout(r, 200));
+      return { access_token: 'a', refresh_token: 'r2', expires_in: 300 };
+    };
+    const outcomes = await Promise.all([replica().refreshOnce(idHash, slow), replica().refreshOnce(idHash, slow)]);
+    expect(outcomes.sort()).toEqual(['fresh', 'refreshed']);
+    expect(refreshes).toBe(1);
+    expect(await replica().refreshOnce('no-such-session', slow)).toBe('gone');
+  });
+
+  it('a refresh whose lease another writer moved keeps the session (fresh), one revoked meanwhile is gone', async () => {
+    op.accessTtl = -10;
+    await signIn('lucas.ferreira@quillmoor.example', { sub: Q.lucas, email: 'lucas.ferreira@quillmoor.example', name: 'Lucas Ferreira' });
+    op.accessTtl = 300;
+    const idHash = (await h.t.owner.selectFrom('auth_sessions').select('id_hash').where('user_id', '=', Q.lucas).orderBy('created_at', 'desc').limit(1).executeTakeFirstOrThrow()).id_hash;
+    const store = new SessionStore(h.t.db, new Sealer('test-session-secret-0123456789'), { maxAgeSeconds: 3600, idleSeconds: 1800, secureCookie: false });
+    // A re-auth stores fresh tokens (a new expiry) while the IdP call runs.
+    const reauth = async () => {
+      await h.t.owner.updateTable('auth_sessions').set({ access_expires_at: new Date(Date.now() + 600_000) }).where('id_hash', '=', idHash).execute();
+      return { access_token: 'a', refresh_token: 'r-moved', expires_in: 300 };
+    };
+    expect(await store.refreshOnce(idHash, reauth)).toBe('fresh');
+    expect(await h.t.owner.selectFrom('auth_sessions').select('id_hash').where('id_hash', '=', idHash).executeTakeFirst()).toBeTruthy();
+    // Expired again, and logged out while the IdP call runs.
+    await h.t.owner.updateTable('auth_sessions').set({ access_expires_at: new Date(Date.now() - 10_000) }).where('id_hash', '=', idHash).execute();
+    const logout = async () => {
+      await h.t.owner.deleteFrom('auth_sessions').where('id_hash', '=', idHash).execute();
+      return { access_token: 'a', expires_in: 300 };
+    };
+    expect(await store.refreshOnce(idHash, logout)).toBe('gone');
+  });
+
+  it('a hung token endpoint holds no database connection, and a failed refresh is retried', async () => {
+    op.accessTtl = -10;
+    await signIn('lucas.ferreira@quillmoor.example', { sub: Q.lucas, email: 'lucas.ferreira@quillmoor.example', name: 'Lucas Ferreira' });
+    op.accessTtl = 300;
+    const idHash = (await h.t.owner.selectFrom('auth_sessions').select('id_hash').where('user_id', '=', Q.lucas).orderBy('created_at', 'desc').limit(1).executeTakeFirstOrThrow()).id_hash;
+    // A pool of ONE connection: if the refresh kept it while the IdP stalls, the query below would hang.
+    const one = createDb(h.t.appUrl, 1);
+    try {
+      const store = new SessionStore(one, new Sealer('test-session-secret-0123456789'), { maxAgeSeconds: 3600, idleSeconds: 1800, secureCookie: false });
+      let release!: (e: Error) => void;
+      const stalled = store.refreshOnce(idHash, () => new Promise<never>((_, rej) => (release = rej)));
+      await new Promise((r) => setTimeout(r, 100));
+      const probe = await Promise.race([
+        one.selectFrom('auth_sessions').select('id_hash').where('id_hash', '=', idHash).executeTakeFirst().then(() => 'db ok'),
+        new Promise((r) => setTimeout(() => r('db blocked'), 2000)),
+      ]);
+      expect(probe).toBe('db ok');
+      // While the claim is held, another replica treats the session as fresh rather than spending the same refresh token.
+      const other = new SessionStore(h.t.db, new Sealer('test-session-secret-0123456789'), { maxAgeSeconds: 3600, idleSeconds: 1800, secureCookie: false });
+      expect(await other.refreshOnce(idHash, async () => ({ access_token: 'x', expires_in: 300 }))).toBe('fresh');
+      release(new Error('IdP timed out'));
+      await expect(stalled).rejects.toThrow('IdP timed out');
+      // The lease was given back: the next request refreshes.
+      expect(await other.refreshOnce(idHash, async () => ({ access_token: 'x', refresh_token: 'r3', expires_in: 300 }))).toBe('refreshed');
+    } finally {
+      await one.destroy();
+    }
   });
 
   it('logs out (RP-initiated) and honours back-channel logout tokens', async () => {
