@@ -2,10 +2,12 @@ package drivers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 )
@@ -64,9 +66,25 @@ func (FRR) ReadyCommand() []string    { return []string{"vtysh", "-c", "show ver
 func (FRR) ConsoleCommand() []string  { return []string{"vtysh"} }
 func (FRR) Capabilities() []corev1.Capability {
 	// zebra programs routes and addresses; ospfd/isisd use raw sockets;
-	// watchfrr manages the daemons.
+	// watchfrr manages the daemons. SYS_ADMIN is not optional: FRR's privs
+	// model (lib/privs.c) puts it in every daemon's permitted set for netns
+	// VRFs, and without it mgmtd, zebra, bgpd, ospfd, ospf6d, bfdd and
+	// staticd all exit at start ("privs_init: initial cap_set_proc failed:
+	// Operation not permitted", checked on cloudtrain/frr:10, FRR 10.7.1).
+	// It is contained by the pod's isolation instead: seccomp RuntimeDefault,
+	// no privilege escalation, and a user namespace or a sandbox runtime.
 	return []corev1.Capability{"NET_ADMIN", "NET_RAW", "NET_BIND_SERVICE", "SYS_ADMIN"}
 }
+
+// netdevBaseCapabilities is the explicit allowlist from the container
+// runtime's default set that device images use (every capability is dropped
+// first, so a runtime with a wider default adds nothing): the FRR entrypoint
+// installs config files and pid locks as root (CHOWN, DAC_OVERRIDE, FOWNER,
+// FSETID), the daemons drop to the frr user (SETUID, SETGID), watchfrr
+// signals them (KILL), and sshd's privilege separation (network-automation
+// labs) chroots (SYS_CHROOT). Not granted: MKNOD, SETPCAP, SETFCAP,
+// AUDIT_WRITE.
+var netdevBaseCapabilities = []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID", "SYS_CHROOT"}
 
 // ConfigCommand writes stdin to a file and loads it with `vtysh -f`, which
 // applies it to the running daemons in config mode and exits non-zero on
@@ -136,12 +154,30 @@ func (d *NetdevDriver) podFamily(n labsv1.Node) (DeviceFamily, error) {
 	return f, nil
 }
 
-// BuildPod renders the device pod (before network wiring).
+// BuildPod renders the device pod (before network wiring). The device
+// container runs as root with the family's capabilities, so the pod is locked
+// down around it: seccomp RuntimeDefault for every container, every other
+// capability dropped, and no privilege escalation (setuid sudo inside the
+// device) unless the lab opts in with learnerSudo on the node (the
+// network-automation labs, whose automation account uses sudo).
 func (d *NetdevDriver) BuildPod(ref NodeRef, f DeviceFamily) *corev1.Pod {
 	pod := d.ContainerDriver.BuildPod(ref)
 	c := &pod.Spec.Containers[0]
 	c.Ports = nil
-	c.SecurityContext = &corev1.SecurityContext{Capabilities: &corev1.Capabilities{Add: f.Capabilities()}}
+	c.SecurityContext = &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(ref.Node.LearnerSudo),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+			Add:  appendCapabilities(append([]corev1.Capability{}, netdevBaseCapabilities...), f.Capabilities()...),
+		},
+	}
+	if pod.Spec.SecurityContext == nil {
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	pod.Spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	if ref.Node.LearnerSudo {
+		setAnnotation(pod, AnnotationLearnerSudo, "true")
+	}
 	c.StartupProbe = &corev1.Probe{
 		ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: f.ReadyCommand()}},
 		PeriodSeconds:    2,
@@ -164,11 +200,36 @@ func (d *NetdevDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, e
 	if d.Network == nil {
 		return fail(fmt.Errorf("netdev node %q needs a lab network: %w", ref.Node.Name, ErrUnsupported))
 	}
+	if ref.Node.LearnerSudo && d.DenyLearnerSudo {
+		return fail(fmt.Errorf("node %q requests learnerSudo, which this platform does not allow (--allow-learner-sudo=false): %w", ref.Node.Name, ErrUnsupported))
+	}
 	pod := d.BuildPod(ref, f)
 	if err := d.Network.DecoratePod(ref, pod, ContainerName, true); err != nil {
 		return fail(err)
 	}
-	if err := d.createIfAbsent(ctx, ref, pod); err != nil {
+	// Like container nodes, the device pod gets its tier's sandbox
+	// RuntimeClass (catalog tier N) when one is configured and available; the
+	// decision is made once, right before the pod is created.
+	prepare := func() error {
+		if _, err := d.applySandbox(ctx, ref, pod); err != nil {
+			return err
+		}
+		// learnerSudo lifts no_new_privs in a container that keeps SYS_ADMIN
+		// (FRR): sudo there is root with SYS_ADMIN, which on the host kernel
+		// reaches bpf() and perf_event_open. Only inside a user namespace or a
+		// VM sandbox; never with host users.
+		if ref.Node.LearnerSudo {
+			if ok, why := podIsolated(pod); !ok {
+				return fmt.Errorf("node %q sets learnerSudo on a device that keeps SYS_ADMIN; that runs only in a user namespace or a sandbox RuntimeClass, and this pod has %s: %w",
+					ref.Node.Name, why, ErrUnsupported)
+			}
+		}
+		return nil
+	}
+	if err := d.createPodIfAbsent(ctx, ref, pod, prepare); err != nil {
+		if IsPermanent(err) && !errors.Is(err, ErrConflict) {
+			return fail(err)
+		}
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("pod: %w", err)
 	}
 	st, err := d.Status(ctx, ref)
@@ -231,4 +292,18 @@ func (d *NetdevDriver) Connect(_ context.Context, ref NodeRef, access labsv1.Acc
 		}, nil
 	}
 	return labsv1.Endpoint{}, fmt.Errorf("netdev driver: %s access: %w", access, ErrUnsupported)
+}
+
+// appendCapabilities appends the capabilities have does not contain yet.
+func appendCapabilities(have []corev1.Capability, add ...corev1.Capability) []corev1.Capability {
+	for _, a := range add {
+		dup := false
+		for _, h := range have {
+			dup = dup || h == a
+		}
+		if !dup {
+			have = append(have, a)
+		}
+	}
+	return have
 }

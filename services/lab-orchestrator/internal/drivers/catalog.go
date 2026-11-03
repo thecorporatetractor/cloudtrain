@@ -116,6 +116,10 @@ func ParseCatalog(data []byte) (*ImageCatalog, error) {
 		if img.VMFallback != "" && img.Kind != ImageKindContainer {
 			return nil, fmt.Errorf("image catalog: %s: vmFallback applies to container images only", ref)
 		}
+		if img.Tier != "" && !sandboxTiers[img.Tier] {
+			// e.g. a bare `tier: N`, which YAML 1.1 reads as false
+			return nil, fmt.Errorf("image catalog: %s has unknown tier %q (quote one-letter tiers)", ref, img.Tier)
+		}
 		if img.DiskSize != "" {
 			q, err := resource.ParseQuantity(img.DiskSize)
 			if err != nil || q.Sign() <= 0 {

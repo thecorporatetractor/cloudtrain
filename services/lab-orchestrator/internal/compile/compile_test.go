@@ -319,6 +319,17 @@ func TestLearnerSudoOptIn(t *testing.T) {
 	}
 }
 
+func TestLearnerSudoOnNetdevNode(t *testing.T) {
+	// Network-automation labs: the router's automation account uses sudo.
+	lt, err := Compile(mutate(minimalLab, "access: [shell]}", "access: [shell]}\n      - {name: r1, driver: netdev, image: \"frr:10\", access: [console], learnerSudo: true}"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lt.Spec.Topology.Nodes[1].LearnerSudo {
+		t.Fatal("learnerSudo on the netdev node not compiled")
+	}
+}
+
 func TestShellCheckDefaultTimeout(t *testing.T) {
 	lt, err := Compile([]byte(minimalLab), Options{})
 	if err != nil {

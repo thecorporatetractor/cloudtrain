@@ -6,6 +6,7 @@ import { DevAuthenticator, type Principal } from '../src/auth.js';
 import { MemoryEvidenceSink, skillEvidence } from '../src/exams/evidence.js';
 import { retakeStatus } from '../src/exams/policy.js';
 import { planExamTerminal } from '../src/exams/routes.js';
+import { templateDriver } from '../src/terminal/target.js';
 import { ExamService, type TeamDirectory } from '../src/exams/service.js';
 import { can } from '../src/authz.js';
 import { MemoryExamStore, type AttemptRecord } from '../src/exams/store.js';
@@ -374,13 +375,46 @@ describe('exam terminal planning', () => {
     },
   });
   it('opens a shell on the entry node and ssh to VMs, and refuses after the freeze', () => {
-    expect(planExamTerminal(ls(), 'workstation')).toMatchObject({ target: { namespace: 'ns', pod: 'pod-ws', container: 'node' }, via: 'shell on workstation' });
+    expect(planExamTerminal(ls(), 'workstation', 'container')).toMatchObject({ target: { namespace: 'ns', pod: 'pod-ws', container: 'node' }, via: 'shell on workstation' });
     expect(planExamTerminal(ls(), 'db').via).toBe('ssh db from workstation');
     expect(() => planExamTerminal(ls(), 'nope')).toThrow(/No terminal/);
-    expect(() => planExamTerminal(ls({}, ), 'workstation')).not.toThrow();
+    expect(() => planExamTerminal(ls({}, ), 'workstation', 'container')).not.toThrow();
     expect(() => planExamTerminal(ls({}, true), 'workstation')).toThrow(/closed/);
     expect(() => planExamTerminal(ls({ conditions: [{ type: 'AccessRevoked', status: 'True' }] }), 'workstation')).toThrow(/closed/);
     expect(() => planExamTerminal(ls({ phase: 'Provisioning' }), 'workstation')).toThrow(/not ready/);
+  });
+  it('opens the router console on a netdev node and refuses a shell there', () => {
+    const router = (command?: string) =>
+      ls({
+        nodes: [
+          { name: 'workstation', driver: 'container', phase: 'Ready' },
+          { name: 'r1', driver: 'netdev', phase: 'Ready' },
+        ],
+        endpoints: [
+          { node: 'workstation', access: 'shell', protocol: 'k8s-exec', target: 'ns/pod-ws/node' },
+          { node: 'r1', access: 'console', protocol: 'k8s-exec', target: 'ns/pod-r1/node', ...(command ? { command } : {}) },
+        ],
+      });
+    const plan = planExamTerminal(router('vtysh'), 'r1');
+    expect(plan.command).toEqual(['/bin/sh', '-c', 'export TERM=xterm-256color; exec "$0" "$@"', 'vtysh']);
+    expect(plan.via).toBe('console on r1');
+    expect(() => planExamTerminal(router(), 'r1')).toThrow(/no console command/);
+    expect(planExamTerminal(router('vtysh'), 'workstation').via).toBe('shell on workstation');
+    // The template names r1 a device: refused even when the status does not list it.
+    const noStatus = ls({ endpoints: [{ node: 'r1', access: 'console', protocol: 'k8s-exec', target: 'ns/pod-r1/node' }] });
+    expect(() => planExamTerminal(noStatus, 'r1', 'netdev')).toThrow(/no console command/);
+    // Neither the template nor the status names the driver: no shell.
+    expect(() => planExamTerminal(noStatus, 'r1')).toThrow(/not ready for a terminal/);
+    // A known container node still gets its shell.
+    expect(planExamTerminal(noStatus, 'r1', 'container').via).toBe('shell on r1');
+  });
+  it('reads the node driver from the compiled template', () => {
+    const tpl = { apiVersion: 'labs.cloudtrain.dev/v1alpha1' as const, kind: 'LabTemplate' as const, metadata: { name: 't' },
+      spec: { source: { id: 'x', version: 1 }, topology: { nodes: [{ name: 'r1', driver: 'netdev' }, { name: 'ws', driver: 'container' }] } } };
+    expect(templateDriver(tpl, 'r1')).toBe('netdev');
+    expect(templateDriver(tpl, 'ws')).toBe('container');
+    expect(templateDriver(tpl, 'nope')).toBeUndefined();
+    expect(templateDriver(null, 'r1')).toBeUndefined();
   });
 });
 

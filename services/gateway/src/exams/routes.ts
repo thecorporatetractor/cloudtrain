@@ -6,23 +6,28 @@ import { HttpError } from '../errors.js';
 import type { LabCluster } from '../kube/cluster.js';
 import type { LabSession } from '../kube/types.js';
 import { bridge, clampSize } from '../terminal/bridge.js';
-import { loginShellCommand, parseExecTarget, sshCommand, type TerminalPlan } from '../terminal/target.js';
+import { nodeCommand, parseExecTarget, sshCommand, templateDriver, type TerminalPlan } from '../terminal/target.js';
 import { attemptName, type ExamService } from './service.js';
 
 /**
  * Where an exam terminal runs: like a lab terminal (own k8s-exec endpoint ->
- * login shell, otherwise `ssh <node>` from the entry node), but only while
+ * its console command or a login shell, otherwise `ssh <node>` from the entry
+ * node), but only while
  * the environment session is not frozen.
  */
-export function planExamTerminal(ls: LabSession, node: string): TerminalPlan {
+export function planExamTerminal(ls: LabSession, node: string, sourceDriver?: string): TerminalPlan {
   const phase = ls.status?.phase;
   const revoked = ls.spec.accessRevoked || (ls.status?.conditions ?? []).some((c) => c.type === 'AccessRevoked' && c.status === 'True');
   if (revoked) throw new HttpError(409, 'Time is up: the exam environment is closed.');
   if (phase !== 'Ready' && phase !== 'Grading') throw new HttpError(409, 'The exam environment is not ready.');
   const eps = ls.status?.endpoints ?? [];
-  const exec = (name: string) => parseExecTarget(eps.find((e) => e.node === name && e.protocol === 'k8s-exec')?.target);
+  const execEndpoint = (name: string) => eps.find((e) => e.node === name && e.protocol === 'k8s-exec');
+  const exec = (name: string) => parseExecTarget(execEndpoint(name)?.target);
   const own = exec(node);
-  if (own) return { node, target: own, command: loginShellCommand(), via: `shell on ${node}` };
+  if (own) {
+    const ep = execEndpoint(node);
+    return { node, target: own, command: nodeCommand(ls, node, ep, sourceDriver), via: ep?.command ? `console on ${node}` : `shell on ${node}` };
+  }
   const entry = ls.status?.entryNode ?? '';
   const entryTarget = exec(entry);
   if (!entryTarget || !eps.some((e) => e.node === node)) throw new HttpError(404, `No terminal for ${node}`);
@@ -90,7 +95,10 @@ export function registerExamRoutes(app: FastifyInstance, exams: ExamService, lab
       const planned = exams.terminalTarget(req.principal, req.params.attemptId, req.query.target ?? '').then(async ({ environment, node }) => {
         const ls = await labs.getSession(environment);
         if (!ls) throw new HttpError(409, 'The exam environment is closed.');
-        return planExamTerminal(ls, node);
+        // The node's driver from the compiled template, so a device is never
+        // given a shell because the session status does not list it yet.
+        const tpl = await labs.getTemplate(ls.spec.templateRef.name);
+        return planExamTerminal(ls, node, templateDriver(tpl, node));
       });
       planned.catch(() => undefined); // reported to the client by bridge()
       void bridge(socket, labs, planned, { cols: clampSize(req.query.cols, 120, 1000), rows: clampSize(req.query.rows, 32, 500) }, req.log);

@@ -126,9 +126,12 @@ type Node struct {
 	Resources *NodeResources `json:"resources,omitempty"`
 	// +optional
 	Access []AccessType `json:"access,omitempty"`
-	// LearnerSudo (entry container node only, opt-in security trade-off)
-	// allows privilege escalation in the node container so setuid/setgid
-	// programs (sudo, crontab, passwd) work for the learner. Default false:
+	// LearnerSudo (entry container node or netdev node, opt-in security
+	// trade-off) allows privilege escalation in the node container so
+	// setuid/setgid programs (sudo, crontab, passwd) work for the learner (on
+	// a netdev node: the device's automation account; root there keeps the
+	// device's capabilities, so it runs only in a user namespace or a sandbox
+	// RuntimeClass). Default false:
 	// allowPrivilegeEscalation is false and the learner cannot become root.
 	// +optional
 	LearnerSudo bool `json:"learnerSudo,omitempty"`

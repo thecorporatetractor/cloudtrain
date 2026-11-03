@@ -70,9 +70,7 @@ func TestNetdevProvisionPod(t *testing.T) {
 		strings.Join(main.StartupProbe.Exec.Command, " ") != "vtysh -c show version" {
 		t.Errorf("main container = %+v", main)
 	}
-	if caps := main.SecurityContext.Capabilities.Add; len(caps) != 4 {
-		t.Errorf("caps = %v", caps)
-	}
+	assertNetdevLockedDown(t, pod, false)
 	if pod.Annotations[network.AnnotationNetworks] == "" || pod.Annotations[network.AnnotationLogicalSwitch] == "" {
 		t.Errorf("annotations = %v", pod.Annotations)
 	}
@@ -234,5 +232,168 @@ func TestLinkNetworkTopology(t *testing.T) {
 	list.SetGroupVersionKind(network.SubnetGVK.GroupVersion().WithKind("SubnetList"))
 	if err := c.List(ctx, list); err != nil || len(list.Items) != 0 {
 		t.Errorf("subnets left: %d %v", len(list.Items), err)
+	}
+}
+
+// assertNetdevLockedDown checks the device pod's isolation: seccomp
+// RuntimeDefault for the pod, every capability dropped and only the
+// allowlist added back, and privilege escalation only with learnerSudo.
+func assertNetdevLockedDown(t *testing.T, pod *corev1.Pod, sudo bool) {
+	t.Helper()
+	if sc := pod.Spec.SecurityContext; sc == nil || sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("pod seccomp = %+v, want RuntimeDefault", pod.Spec.SecurityContext)
+	}
+	main := pod.Spec.Containers[0]
+	sc := main.SecurityContext
+	if sc == nil || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation != sudo {
+		t.Errorf("allowPrivilegeEscalation = %v, want %v", sc.AllowPrivilegeEscalation, sudo)
+	}
+	if sc.Privileged != nil && *sc.Privileged {
+		t.Error("device container must not be privileged")
+	}
+	if got := sc.Capabilities.Drop; len(got) != 1 || got[0] != "ALL" {
+		t.Errorf("drop = %v, want [ALL]", got)
+	}
+	allowed := map[corev1.Capability]bool{}
+	for _, c := range append(append([]corev1.Capability{}, netdevBaseCapabilities...), FRR{}.Capabilities()...) {
+		allowed[c] = true
+	}
+	for _, c := range sc.Capabilities.Add {
+		if !allowed[c] {
+			t.Errorf("capability %s is not in the netdev allowlist", c)
+		}
+		delete(allowed, c)
+	}
+	if len(allowed) != 0 {
+		t.Errorf("missing capabilities %v", allowed)
+	}
+	for _, c := range []corev1.Capability{"MKNOD", "SETFCAP", "SETPCAP", "SYS_MODULE", "SYS_PTRACE", "BPF", "PERFMON"} {
+		for _, a := range sc.Capabilities.Add {
+			if a == c {
+				t.Errorf("capability %s must not be added", c)
+			}
+		}
+	}
+	if got := pod.Annotations[AnnotationLearnerSudo] == "true"; got != sudo {
+		t.Errorf("learner-sudo annotation = %v, want %v", got, sudo)
+	}
+}
+
+func TestNetdevLearnerSudoException(t *testing.T) {
+	ctx := context.Background()
+	ref := netRef("edge-1")
+	ref.Node.LearnerSudo = true
+
+	// Host users and no sandbox: sudo would be root with SYS_ADMIN on the host
+	// kernel, so the device is refused.
+	d0, c0, _ := newNetdev(t)
+	st, err := d0.Provision(ctx, ref)
+	if !errors.Is(err, ErrUnsupported) || st.Phase != labsv1.NodeFailed || !strings.Contains(err.Error(), "user namespace or a sandbox") {
+		t.Fatalf("learnerSudo with host users: state %+v err %v", st, err)
+	}
+	if err := c0.Get(ctx, client.ObjectKey{Namespace: "labs", Name: ref.ResourceName()}, &corev1.Pod{}); err == nil {
+		t.Error("refused device must not get a pod")
+	}
+
+	// In a user namespace (the lab network runs wired pods with hostUsers: false).
+	d, c, _ := newNetdev(t)
+	d.Network.(*LinkNetwork).UserNamespaces = true
+	if _, err := d.Provision(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: ref.ResourceName()}, pod); err != nil {
+		t.Fatal(err)
+	}
+	assertNetdevLockedDown(t, pod, true)
+
+	if p := mustPod(t, c, ref); p.Spec.HostUsers == nil || *p.Spec.HostUsers {
+		t.Error("learnerSudo device must run with hostUsers: false")
+	}
+
+	// The operator can refuse it.
+	d2, c2, _ := newNetdev(t)
+	d2.Network.(*LinkNetwork).UserNamespaces = true
+	d2.DenyLearnerSudo = true
+	st, err = d2.Provision(ctx, ref)
+	if !errors.Is(err, ErrUnsupported) || st.Phase != labsv1.NodeFailed {
+		t.Fatalf("deny learner sudo: state %+v err %v", st, err)
+	}
+	if err := c2.Get(ctx, client.ObjectKey{Namespace: "labs", Name: ref.ResourceName()}, &corev1.Pod{}); err == nil {
+		t.Error("refused node must not get a pod")
+	}
+}
+
+func TestNetdevSandboxTier(t *testing.T) {
+	ctx := context.Background()
+	cat, err := ParseCatalog([]byte(`
+images:
+  frr:10: { kind: container, image: cloudtrain/frr:10, netdev: frr, tier: "N" }
+  nettools:1: { kind: container, image: cloudtrain/nettools:1 }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(kataRC("kata-vm-isolation", "kata"), kataNode()).Build()
+	base := &ContainerDriver{Client: c, Scheme: s, ImageRegistry: "cloudtrain", Executor: &recordingExecutor{}, Catalog: cat}
+	base.Sandboxes = &Sandboxes{Tiers: map[string]SandboxTier{"N": {RuntimeClass: "kata-vm-isolation", Fallback: SandboxFallbackFail}}, Reader: c}
+	base.Network = &LinkNetwork{Manager: &network.Manager{Client: c}, ToolsImage: base.ImageFor("nettools:1"), DestroyWait: time.Millisecond}
+	d := NewNetdev(base)
+	ref := netRef("edge-1")
+	if _, err := d.Provision(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: ref.ResourceName()}, pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "kata-vm-isolation" {
+		t.Errorf("runtimeClassName = %v, want the tier N sandbox", pod.Spec.RuntimeClassName)
+	}
+	if pod.Annotations[AnnotationSandbox] != "kata-vm-isolation" {
+		t.Errorf("sandbox annotation = %q", pod.Annotations[AnnotationSandbox])
+	}
+	assertNetdevLockedDown(t, pod, false)
+}
+
+func TestCatalogRejectsUnknownTier(t *testing.T) {
+	// A bare `tier: N` is YAML 1.1 false and would silently disable the tier N sandbox.
+	if _, err := ParseCatalog([]byte("images:\n  frr:10: { kind: container, image: cloudtrain/frr:10, tier: N }\n")); err == nil {
+		t.Fatal("bare tier N must be rejected")
+	}
+	if _, err := ParseCatalog([]byte("images:\n  frr:10: { kind: container, image: cloudtrain/frr:10, tier: \"N\" }\n")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustPod(t *testing.T, c client.Client, ref NodeRef) *corev1.Pod {
+	t.Helper()
+	p := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: ref.Namespace(), Name: ref.ResourceName()}, p); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// learnerSudo in the tier N sandbox (a VM per pod) is allowed without user namespaces.
+func TestNetdevLearnerSudoInSandbox(t *testing.T) {
+	ctx := context.Background()
+	cat, err := ParseCatalog([]byte("images:\n  frr:10: { kind: container, image: cloudtrain/frr:10, netdev: frr, tier: \"N\" }\n  nettools:1: { kind: container, image: cloudtrain/nettools:1 }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(kataRC("kata-vm-isolation", "kata"), kataNode()).Build()
+	base := &ContainerDriver{Client: c, Scheme: s, ImageRegistry: "cloudtrain", Executor: &recordingExecutor{}, Catalog: cat}
+	base.Sandboxes = &Sandboxes{Tiers: map[string]SandboxTier{"N": {RuntimeClass: "kata-vm-isolation", Fallback: SandboxFallbackFail}}, Reader: c}
+	base.Network = &LinkNetwork{Manager: &network.Manager{Client: c}, ToolsImage: base.ImageFor("nettools:1"), DestroyWait: time.Millisecond}
+	ref := netRef("edge-1")
+	ref.Node.LearnerSudo = true
+	if _, err := NewNetdev(base).Provision(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if p := mustPod(t, c, ref); p.Spec.RuntimeClassName == nil || *p.Spec.RuntimeClassName != "kata-vm-isolation" {
+		t.Errorf("runtimeClassName = %v", p.Spec.RuntimeClassName)
 	}
 }
