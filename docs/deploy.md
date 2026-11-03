@@ -477,8 +477,17 @@ The chart renders it into the `<release>-orchestrator-sandboxes` ConfigMap
   The probe boots a pod per RuntimeClass and checks its own kernel, the lab kernel
   features, guest sizing, a lab link (Multus/Kube-OVN, MTU and 1400-byte frames with DF
   both ways between a runc pod and a sandboxed pod) and systemd boot with `kubectl exec`.
+  It also starts a privileged pod and compares its VM's block devices with the
+  unprivileged pod's. A Kata handler without `privileged_without_host_devices = true`
+  hot-plugs the node's disks into privileged guests, and the `kata*` name alone can't
+  show that. More devices, or a privileged pod the runtime refuses, marks the tier
+  `privilegedUnsafe` in the verdict: it stays available for unprivileged labs, but the
+  manager no longer trusts it for systemd and privileged images (they fall back), even
+  with a `kata*` handler. Without a mounted verdict the manager still trusts any `kata*`
+  handler by name.
   A tier it fails is unavailable to the manager (its labs fall back); a non-Kata handler it
-  proves (e.g. GKE `microvm`) becomes trusted.
+  proves (e.g. GKE `microvm`) becomes trusted. Run the probe, and mount its verdict,
+  before relying on a sandbox for privileged images (`deb-sys`, `el-sys`).
 - **Capacity.** The gateway's capacity view (`GET /api/platform/capacity`) marks Kata nodes
   (`sandbox`), counts sandboxed lab pods per node (`sandboxes`) apart from KubeVirt VMs, and
   includes the RuntimeClass overhead in requested CPU and memory.

@@ -108,6 +108,10 @@ tiers:
 	if err != nil || !pf.Tiers["B"].VM {
 		t.Fatalf("preflight: %+v, %v", pf, err)
 	}
+	pf, err = ParseSandboxPreflight([]byte("tiers: {B: {runtimeClass: kata, result: pass, vm: true, privilegedUnsafe: host devices}}"))
+	if err != nil || pf.Tiers["B"].PrivilegedUnsafe != "host devices" {
+		t.Fatalf("preflight with privilegedUnsafe: %+v, %v", pf, err)
+	}
 	if _, err := ParseSandboxPreflight([]byte("tiers: {B: {runtimeClass: x, result: maybe}}")); err == nil {
 		t.Fatal("preflight with an unknown result: want error")
 	}
@@ -138,6 +142,9 @@ func TestApplySandbox(t *testing.T) {
 	microvm := kataRC("kata-clh-runtime-rs", "microvm")
 	proven := &SandboxPreflight{Tiers: map[string]SandboxPreflightTier{"B": {RuntimeClass: "kata-clh-runtime-rs", Handler: "microvm", Result: PreflightPass, VM: true}}}
 	failed := &SandboxPreflight{Tiers: map[string]SandboxPreflightTier{"B": {RuntimeClass: "kata-clh-runtime-rs", Handler: "kata-clh-runtime-rs", Result: PreflightFail, Message: "guest kernel lacks gre"}}}
+	// The probe saw host devices in a privileged guest: unprivileged only.
+	hostDevs := &SandboxPreflight{Tiers: map[string]SandboxPreflightTier{"B": {RuntimeClass: "kata-clh-runtime-rs", Handler: "kata-clh-runtime-rs", Result: PreflightPass, VM: true,
+		PrivilegedUnsafe: "a privileged pod sees 1 more block devices than an unprivileged one (vda sda vs vda): host devices are passed into the VM"}}}
 	cases := []struct {
 		name, image string
 		tiers       map[string]SandboxTier
@@ -172,6 +179,9 @@ func TestApplySandbox(t *testing.T) {
 			[]client.Object{impostor, kataNode()}, "", false, false, true},
 		{"non-Kata handler proven by preflight", "deb-sys:24.04", sandboxesB(""), proven, []client.Object{microvm, kataNode()}, "kata-clh-runtime-rs", true, true, false},
 		{"preflight failed the tier: refused", "deb-sys:24.04", sandboxesB(""), failed, []client.Object{katart, kataNode()}, "", false, false, true},
+		{"kata handler with host devices in privileged guests: systemd refused", "deb-sys:24.04", sandboxesB(""), hostDevs, []client.Object{katart, kataNode()}, "", false, false, true},
+		{"kata handler with host devices in privileged guests: privileged refused", "dind:28", sandboxesB(""), hostDevs, []client.Object{katart, kataNode()}, "", false, false, true},
+		{"kata handler with host devices in privileged guests: unprivileged pods use it", "deb-tools:1", sandboxesB(""), hostDevs, []client.Object{katart, kataNode()}, "kata-clh-runtime-rs", false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
