@@ -18,6 +18,7 @@ import { PlatformService } from './platform/service.js';
 import { SessionService } from './sessions/service.js';
 import { phaseOf } from './sessions/map.js';
 import { TerminalHub } from './terminal/hub.js';
+import { PgTerminalBus } from './terminal/pgbus.js';
 import { loadExamCatalog } from './exams/catalog.js';
 import { LabctlExamCompiler } from './exams/compile.js';
 import { KubeExamCluster } from './exams/kube.js';
@@ -66,6 +67,8 @@ async function main() {
     ...(config.sessionTtlMinutes ? { sessionTtlMinutes: config.sessionTtlMinutes } : {}),
   });
   let log: PlatformService['log'];
+  // Instructor shadowing across gateway replicas (Postgres LISTEN/NOTIFY, src/terminal/hub.ts).
+  const terminalBus = await PgTerminalBus.start(config.databaseUrl, { secret: config.sessionSecret, log: { warn: (o, m) => log?.warn(o, m) } });
   const platform = new PlatformService({
     db,
     content,
@@ -167,7 +170,7 @@ async function main() {
     platform,
     oidc: { client: oidc, store },
     clusterInfo: new KubeClusterInfo(kc),
-    hub: new TerminalHub(),
+    hub: new TerminalHub(terminalBus),
     exams,
     answers,
     events,
@@ -220,6 +223,7 @@ async function main() {
     if (billingReconcile) clearInterval(billingReconcile);
     await billing.settle();
     await app.close();
+    await terminalBus.close();
     await db.destroy();
     process.exit(0);
   };

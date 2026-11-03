@@ -362,6 +362,11 @@ no longer be matched, which is safe while dumps live 14 days.
 - **Terminal observation**: confirmed still in place. Starting an observation writes a learner-visible notice, pushes it to their terminal,
   shows the banner in the workspace ("An instructor is observing this session") and writes `session.observe` to the audit log. The gateway test covers the notice and the audit row.
   It appears **when observing starts, not before**: there is no advance warning or a way to refuse. The first-sign-in notice now says this can happen.
+  Across gateway replicas the observed terminal output (which can hold secrets the learner types or prints) passes through Postgres
+  `pg_notify` on channel `ct_terminal`, only while someone observes. It is not stored, and it is encrypted with a key derived from
+  `CT_SESSION_SECRET`, so other database roles that LISTEN, and server logs that capture query parameters, see only ciphertext.
+  Messages carry their send time and are accepted once within 30 s, so a captured "observation stopped" notice cannot be replayed
+  to mislead the learner while an instructor is still watching.
 
 ## Retention
 
