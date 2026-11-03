@@ -26,6 +26,13 @@ export class FakeStripe {
   subscriptionUpdates: { id: string; body: Record<string, string> }[] = [];
   idempotency = new Map<string, unknown>();
   requests: { method: string; url: string; body: Record<string, string> }[] = [];
+  invoices = new Map<string, Obj>();
+  /** Events as Stripe keeps them (GET /v1/events/:id, for replays). */
+  events = new Map<string, Obj>();
+  /** Fail the next `count` requests whose `METHOD path` matches (e.g. a Stripe outage during a webhook). */
+  failRequests: { match: RegExp; count: number; status: number; message: string } = { match: /$^/, count: 0, status: 500, message: 'Stripe is having a moment' };
+  /** Delay before answering subscription creation: widens the window two concurrent webhooks race in. */
+  subscriptionCreateLatencyMs = 0;
   /** The next N meter event calls answer this status (500: retryable, 400: permanent). */
   failMeterEvents: { count: number; status: number; message: string } = { count: 0, status: 500, message: 'Stripe is having a moment' };
   private n = 1;
@@ -56,6 +63,10 @@ export class FakeStripe {
     const u = new URL(url);
     const body = Object.fromEntries(new URLSearchParams(init.body ?? ''));
     this.requests.push({ method: init.method, url: u.pathname + u.search, body });
+    if (this.failRequests.count > 0 && this.failRequests.match.test(`${init.method} ${u.pathname}`)) {
+      this.failRequests.count--;
+      return err(this.failRequests.status, this.failRequests.message);
+    }
     const idem = init.headers['idempotency-key'];
     if (idem && this.idempotency.has(idem)) return ok(this.idempotency.get(idem));
     const remember = (v: unknown) => (idem && this.idempotency.set(idem, v), ok(v));
@@ -72,6 +83,10 @@ export class FakeStripe {
     if (method === 'DELETE' && path.startsWith('/v1/customers/')) {
       if (!this.customers.delete(last())) return err(404, 'No such customer');
       return ok({ id: last(), deleted: true });
+    }
+    if (method === 'GET' && path.startsWith('/v1/customers/')) {
+      const c = this.customers.get(last());
+      return c ? ok(c) : err(404, 'No such customer');
     }
     if (method === 'POST' && path.startsWith('/v1/customers/')) {
       const c = this.customers.get(last());
@@ -96,7 +111,21 @@ export class FakeStripe {
       const s = this.subscriptions.get(last());
       return s ? ok(s) : err(404, 'No such subscription');
     }
+    if (method === 'GET' && path === '/v1/subscriptions') {
+      const status = u.searchParams.get('status');
+      const data = [...this.subscriptions.values()].filter((x) => x.customer === u.searchParams.get('customer') && (status === 'all' ? true : status ? x.status === status : x.status !== 'canceled'));
+      return ok({ object: 'list', data, has_more: false });
+    }
+    if (method === 'GET' && path.startsWith('/v1/invoices/')) {
+      const i = this.invoices.get(last());
+      return i ? ok(i) : err(404, 'No such invoice');
+    }
+    if (method === 'GET' && path.startsWith('/v1/events/')) {
+      const e = this.events.get(last());
+      return e ? ok(e) : err(404, 'No such event');
+    }
     if (method === 'POST' && path === '/v1/subscriptions') {
+      if (this.subscriptionCreateLatencyMs) await new Promise((r) => setTimeout(r, this.subscriptionCreateLatencyMs));
       const price = this.prices.get(body['items[0][price]']!);
       if (!price) return err(400, 'No such price');
       const s = this.subscription(id('sub'), body.customer!, price.lookup_key as string, { metadata: meta(body) });
@@ -196,7 +225,9 @@ export class FakeStripe {
 
   /** An invoice object as Stripe sends it in `invoice.paid` / `invoice.payment_failed`. */
   invoice(customer: string, over: Obj = {}): Obj {
-    return { id: `in_${this.n++}`, object: 'invoice', customer, amount_due: 1234, amount_paid: 0, currency: 'eur', attempt_count: 1, status: 'open', ...over };
+    const i = { id: `in_${this.n++}`, object: 'invoice', customer, amount_due: 1234, amount_paid: 0, currency: 'eur', attempt_count: 1, status: 'open', ...over };
+    this.invoices.set(i.id, i);
+    return i;
   }
 }
 

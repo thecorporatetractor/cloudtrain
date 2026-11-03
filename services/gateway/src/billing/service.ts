@@ -37,7 +37,7 @@ import { HttpError, badRequest, conflict, notFound } from '../errors.js';
 import type { Mail, Mailer } from '../mail.js';
 import { actorOf, audit, type AuditActor } from '../platform/audit.js';
 import { computeTierOf, monthOf, PricingModel, type LabFacts } from './compute.js';
-import { StripeApi, StripeError, verifyWebhook, WebhookError, type StripeEvent, type StripeSubscription } from './stripe.js';
+import { StripeApi, StripeError, verifyWebhook, WebhookError, type StripeCustomer, type StripeEvent, type StripeInvoice, type StripeSetupIntent, type StripeSubscription } from './stripe.js';
 
 /*
  * Billing: plans come from the site configuration, money moves through Stripe
@@ -81,6 +81,8 @@ export interface BillingDeps {
   webUrl: string;
   now?: () => Date;
   log?: { info: (o: object, m: string) => void; warn: (o: object, m: string) => void };
+  /** Time budget of one webhook or reconciliation transaction (default 30 s): lock wait, statements, idle time and Stripe writes. */
+  txBudgetMs?: number;
 }
 
 const ACTIVE: ReadonlySet<string> = new Set<SubscriptionStatus>(['trialing', 'active', 'past_due']);
@@ -137,6 +139,21 @@ interface PayerState {
   spent: number;
 }
 
+/** Stripe objects read before the event's transaction (see prefetch). */
+interface Prefetched {
+  setupIntent?: StripeSetupIntent;
+  invoice?: StripeInvoice;
+  /** The Stripe customer the event is about, and its row's version (updated_at) when Stripe was read. */
+  customerId?: string;
+  version?: string | null;
+  /** All of the customer's subscriptions, read before the transaction (absent: not needed, or the customer is gone). */
+  subs?: StripeSubscription[];
+  /** The customer as Stripe has it now (customer.updated); null when deleted. */
+  customer?: StripeCustomer | null;
+  /** A prefetch failure, raised inside the savepoint so it is recorded like any other. */
+  error?: unknown;
+}
+
 interface ApplyResult {
   status: 'processed' | 'ignored';
   orgId?: string;
@@ -153,6 +170,7 @@ export class BillingService {
   private readonly priceIds = new Map<string, string>();
   private readonly facts = new Map<string, LabFacts & { title: string }>();
   private flushing: Promise<unknown> | undefined;
+  private readonly deadlines = new WeakMap<Tx, number>();
 
   constructor(private readonly d: BillingDeps) {
     this.enabled = !!d.stripe;
@@ -962,7 +980,15 @@ export class BillingService {
 
   /* ------------------------------------------------------------ webhook */
 
-  /** Verifies, records (once) and applies a Stripe event. Returns what happened; never throws for a known-bad event body. */
+  /**
+   * Verifies, records and applies a Stripe event. An event counts as handled
+   * (`duplicate` on a redelivery) only once it was applied or ignored. apply()
+   * runs under a savepoint, so a failure leaves none of its writes behind: the
+   * event is recorded `failed` and, when a retry can succeed (Stripe or the
+   * database had a moment), the route answers 503 so Stripe redelivers it and
+   * the redelivery applies it again. A failure no retry can fix answers 200
+   * (`failed`); `reconcile()` repairs the state either way.
+   */
   async webhook(rawBody: Buffer | string, signature: string | undefined): Promise<WebhookOutcome> {
     if (!this.d.webhookSecret) throw new HttpError(409, 'Billing is not enabled on this deployment.', { code: 'conflict' });
     let event: StripeEvent;
@@ -973,30 +999,338 @@ export class BillingService {
       throw e;
     }
     if (event.livemode) throw new HttpError(400, 'Webhook rejected: live-mode events are not accepted in test mode');
-    const mails: Mail[] = [];
-    const outcome = await withTenant(this.d.db, { platform: true }, async (tx): Promise<WebhookOutcome> => {
-      const inserted = await tx.insertInto('billing_events').values({ stripe_event_id: event.id, type: event.type, org_id: null, user_id: null, livemode: event.livemode }).onConflict((oc) => oc.column('stripe_event_id').doNothing()).returning('id').executeTakeFirst();
-      if (!inserted) return { eventId: event.id, type: event.type, status: 'duplicate' };
+    let r: { outcome: WebhookOutcome; retry: boolean };
+    try {
+      r = await this.process(event);
+    } catch (e) {
+      // Outside the savepoint (the database itself): Stripe retries a transient failure.
+      if (isRetryableBillingError(e)) throw new HttpError(503, 'The event could not be applied yet; Stripe retries it.', { code: 'upstream' });
+      throw e;
+    }
+    if (r.retry) throw new HttpError(503, 'The event could not be applied yet; Stripe retries it.', { code: 'upstream' });
+    return r.outcome;
+  }
+
+  /**
+   * Records and applies one (verified) event; shared by the webhook and the replay of failed
+   * events. Stripe is read before the transaction (see prefetch). Under the customer lock the
+   * customer row's version is compared with the one seen before reading Stripe: if another
+   * event or the reconciliation changed the customer meanwhile, the reads may be stale, so they
+   * are done again (at most STALE_RETRIES times).
+   */
+  private async process(event: StripeEvent): Promise<{ outcome: WebhookOutcome; retry: boolean }> {
+    for (let attempt = 1; ; attempt++) {
       try {
-        const r = await this.apply(tx, event);
+        return await this.processOnce(event, attempt >= STALE_RETRIES);
+      } catch (e) {
+        if (!(e instanceof StaleReadError) || attempt >= STALE_RETRIES) throw e;
+      }
+    }
+  }
+
+  private async processOnce(event: StripeEvent, lastTry: boolean): Promise<{ outcome: WebhookOutcome; retry: boolean }> {
+    const mails: Mail[] = [];
+    let retry = false;
+    let pre: Prefetched;
+    try {
+      pre = await this.prefetch(event);
+    } catch (e) {
+      pre = { error: e };
+    }
+    const outcome = await withTenant(this.d.db, { platform: true }, async (tx): Promise<WebhookOutcome> => {
+      await this.budget(tx);
+      await tx.insertInto('billing_events').values({ stripe_event_id: event.id, type: event.type, org_id: null, user_id: null, livemode: event.livemode }).onConflict((oc) => oc.column('stripe_event_id').doNothing()).execute();
+      // One delivery of an event at a time: a concurrent one waits here until the first commits.
+      const row = await tx.selectFrom('billing_events').select(['id', 'status']).where('stripe_event_id', '=', event.id).forUpdate().executeTakeFirstOrThrow();
+      if (row.status === 'processed' || row.status === 'ignored') return { eventId: event.id, type: event.type, status: 'duplicate' };
+      // The customer lock is taken before the apply savepoint, so rolling that savepoint back
+      // keeps it until commit. Its own savepoint, released at once (the lock stays with the
+      // transaction), lets a lock timeout be recorded below instead of aborting the transaction.
+      let lockFailure: unknown;
+      if (pre.customerId && !pre.error) {
+        await sql`SAVEPOINT billing_lock`.execute(tx);
+        try {
+          await this.lockCustomer(tx, pre.customerId);
+          await sql`RELEASE SAVEPOINT billing_lock`.execute(tx);
+        } catch (e) {
+          await sql`ROLLBACK TO SAVEPOINT billing_lock`.execute(tx);
+          lockFailure = e;
+        }
+        if (!lockFailure && (await this.customerVersion(tx, pre.customerId)) !== pre.version) {
+          if (!lastTry) throw new StaleReadError();
+          lockFailure = new TransientEventError('the customer kept changing while Stripe was read');
+        }
+      }
+      // The savepoint covers apply() and its bookkeeping (outcome, audit): any failure in
+      // between undoes all of it, and only the record of the failure is written below.
+      await sql`SAVEPOINT billing_apply`.execute(tx);
+      try {
+        if (pre.error) throw pre.error;
+        if (lockFailure) throw lockFailure;
+        const r = await this.apply(tx, event, pre);
+        await this.bumpCustomer(tx, pre.customerId);
         await tx
           .updateTable('billing_events')
-          .set({ status: r.status, processed_at: this.now(), org_id: r.orgId ?? null, user_id: r.userId ?? null, summary: JSON.stringify(r.summary) })
-          .where('id', '=', inserted.id)
+          .set({ status: r.status, processed_at: this.now(), error: null, org_id: r.orgId ?? null, user_id: r.userId ?? null, summary: JSON.stringify(r.summary) })
+          .where('id', '=', row.id)
           .execute();
         if (r.orgId) await audit(tx, { orgId: r.orgId, actorId: null, actorName: 'Stripe' }, 'billing.webhook', 'event', event.id, { type: event.type, status: r.status, ...r.summary });
+        await sql`RELEASE SAVEPOINT billing_apply`.execute(tx);
         if (r.mails) mails.push(...r.mails);
         return { eventId: event.id, type: event.type, status: r.status };
       } catch (e) {
+        if (e instanceof StaleReadError) throw e; // the whole transaction rolls back; process() reads again
+        await sql`ROLLBACK TO SAVEPOINT billing_apply`.execute(tx);
         const message = e instanceof Error ? e.message : String(e);
-        await tx.updateTable('billing_events').set({ status: 'failed', processed_at: this.now(), error: message.slice(0, 500) }).where('id', '=', inserted.id).execute();
-        this.d.log?.warn({ eventId: event.id, type: event.type, err: message }, 'billing webhook failed');
+        // A "not yet" that has lasted TRANSIENT_MAX_AGE_MS since Stripe created the event will not resolve: permanent.
+        const expired = e instanceof TransientEventError && this.now().getTime() - event.created * 1000 > TRANSIENT_MAX_AGE_MS;
+        retry = isRetryableBillingError(e) && !expired;
+        // summary.retryable: the reconciliation replays only failures a retry can fix; object and
+        // customer: which Stripe object failed (checkout looks up a Checkout whose event failed for good).
+        await tx.updateTable('billing_events').set({ status: 'failed', processed_at: this.now(), error: message.slice(0, 500), summary: JSON.stringify({ retryable: retry, ...(typeof event.data.object.id === 'string' ? { object: event.data.object.id } : {}), ...(this.customerOf(event) ? { customer: this.customerOf(event) } : {}) }) }).where('id', '=', row.id).execute();
+        this.d.log?.warn({ eventId: event.id, type: event.type, err: message, retry }, 'billing webhook failed');
         return { eventId: event.id, type: event.type, status: 'failed' };
       }
     });
     // Mail after commit: a mail server hiccup never rolls back billing state.
+    await this.sendMails(mails);
+    return { outcome, retry };
+  }
+
+  /** The customer the event is about (all handled event types concern one), else undefined. */
+  private customerOf(event: StripeEvent): string | undefined {
+    const obj = event.data.object;
+    if (event.type === 'customer.updated') return typeof obj.id === 'string' ? obj.id : undefined;
+    return typeof obj.customer === 'string' ? obj.customer : undefined;
+  }
+
+  /**
+   * Stripe reads the event needs, before its transaction, so no read runs while the
+   * transaction, its pooled connection and the customer lock are held. The customer row's
+   * version is read first; processOnce() compares it under the lock (optimistic concurrency).
+   */
+  private async prefetch(event: StripeEvent): Promise<Prefetched> {
+    const stripe = this.d.stripe;
+    if (!stripe) return {};
+    const obj = event.data.object;
+    const pre: Prefetched = {};
+    const handled = ['checkout.session.completed', 'customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted', 'invoice.paid', 'invoice.payment_failed', 'customer.updated'];
+    if (!handled.includes(event.type)) return pre;
+    const cus = this.customerOf(event);
+    if (cus) {
+      pre.customerId = cus;
+      pre.version = await withTenant(this.d.db, { platform: true }, (tx) => this.customerVersion(tx, cus));
+    }
+    if (event.type === 'checkout.session.completed' && obj.mode === 'setup' && typeof obj.setup_intent === 'string') pre.setupIntent = await stripe.setupIntents.retrieve(obj.setup_intent);
+    if (event.type === 'invoice.payment_failed' && typeof obj.id === 'string') pre.invoice = await stripe.invoices.retrieve(obj.id);
+    if (cus && !event.type.startsWith('invoice.')) {
+      pre.subs = await this.remoteSubscriptions(cus);
+      await this.priceId(this.pricing.compute.lookupKey).catch(() => undefined);
+    }
+    if (cus && event.type === 'customer.updated') pre.customer = await this.remoteCustomer(cus);
+    return pre;
+  }
+
+  /** All of a customer's subscriptions in Stripe (undefined when the customer is gone). */
+  private async remoteSubscriptions(customer: string): Promise<StripeSubscription[] | undefined> {
+    const subs: StripeSubscription[] = [];
+    try {
+      for (let after: string | undefined; ; ) {
+        const page = await this.stripe().subscriptions.list({ customer, status: 'all', limit: 100, ...(after ? { starting_after: after } : {}) });
+        subs.push(...page.data);
+        if (!page.has_more || page.data.length === 0) break;
+        after = page.data.at(-1)!.id;
+      }
+    } catch (e) {
+      if (e instanceof StripeError && e.status === 404) return undefined;
+      throw e;
+    }
+    return subs;
+  }
+
+  private async remoteCustomer(customer: string): Promise<StripeCustomer | null> {
+    try {
+      const c = await this.stripe().customers.retrieve(customer);
+      return c.deleted ? null : c;
+    } catch (e) {
+      if (e instanceof StripeError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  /** The billing customer row's version: its updated_at, exactly (text keeps microseconds). */
+  private async customerVersion(tx: Tx, stripeCustomerId: string): Promise<string | null> {
+    const r = await tx.selectFrom('billing_customers').select(sql<string>`updated_at::text`.as('v')).where('stripe_customer_id', '=', stripeCustomerId).executeTakeFirst();
+    return r?.v ?? null;
+  }
+
+  /** Marks the customer changed (a new version) at the end of every locked write. */
+  private async bumpCustomer(tx: Tx, stripeCustomerId: string | undefined): Promise<void> {
+    if (stripeCustomerId) await tx.updateTable('billing_customers').set({ updated_at: sql`clock_timestamp()` }).where('stripe_customer_id', '=', stripeCustomerId).execute();
+  }
+
+  /**
+   * The time budget of a billing transaction: waiting for a lock, any one statement and any
+   * idle stretch (a Stripe write) are each bounded, so one event cannot hold the customer lock
+   * and a pooled connection for minutes; Stripe writes check the overall deadline first.
+   */
+  private async budget(tx: Tx): Promise<void> {
+    const ms = this.d.txBudgetMs ?? 30_000;
+    this.deadlines.set(tx, Date.now() + ms);
+    await sql`SELECT set_config('lock_timeout', ${`${Math.max(1, Math.floor(ms / 2))}ms`}, true), set_config('statement_timeout', ${`${ms}ms`}, true), set_config('idle_in_transaction_session_timeout', ${`${ms}ms`}, true)`.execute(tx);
+  }
+
+  /** Before a Stripe write inside a transaction: out of budget is a transient failure (retried later), not a hung lock. */
+  private checkBudget(tx: Tx): void {
+    const deadline = this.deadlines.get(tx);
+    if (deadline !== undefined && Date.now() > deadline) throw new TransientEventError('the billing transaction ran out of time');
+  }
+
+  private async sendMails(mails: Mail[]): Promise<void> {
     for (const m of mails) await this.d.mailer?.send(m).catch((e: unknown) => this.d.log?.warn({ err: e instanceof Error ? e.message : String(e), subject: m.subject }, 'billing mail failed'));
-    return outcome;
+  }
+
+  /**
+   * Serialises everything that changes one billing customer (webhooks, the
+   * reconciliation) until the transaction ends, so two events about the same
+   * customer cannot both see "no compute subscription" or interleave writes.
+   */
+  private async lockCustomer(tx: Tx, stripeCustomerId: string | undefined): Promise<void> {
+    if (stripeCustomerId) await sql`SELECT pg_advisory_xact_lock(hashtext(${`billing-customer:${stripeCustomerId}`}))`.execute(tx);
+  }
+
+  /**
+   * Stripe's current state of a subscription, read before the transaction (and checked for
+   * staleness under the lock). Events arrive late and out of order, so the event's own
+   * snapshot may be older than what was applied; the live object never is. A subscription
+   * Stripe no longer returns (its customer was deleted) falls back to the snapshot.
+   */
+  private currentSubscription(sent: StripeSubscription, pre: Prefetched): StripeSubscription {
+    return pre.subs?.find((x) => x.id === sent.id) ?? sent;
+  }
+
+  /* ------------------------------------------------------- reconciliation */
+
+  /**
+   * Repairs billing state from Stripe, for whatever a webhook missed: replays
+   * events that failed to apply (Stripe keeps events 30 days), then, per
+   * billing customer, re-reads the customer and all its subscriptions and
+   * writes what changed (plans, entitlements, the compute subscription,
+   * payment method, dunning). Idempotent; runs every CT_BILLING_RECONCILE_MS.
+   */
+  async reconcile(): Promise<{ replayed: number; customers: number; changed: number; errors: number; skipped?: boolean }> {
+    this.stripe();
+    // One run at a time across all gateway replicas: a session-level advisory lock held on one
+    // connection for the whole run; another replica that finds it taken skips this round.
+    return this.d.db.connection().execute(async (conn) => {
+      const got = await sql<{ ok: boolean }>`SELECT pg_try_advisory_lock(hashtext('billing-reconcile')) AS ok`.execute(conn);
+      if (!got.rows[0]?.ok) return { replayed: 0, customers: 0, changed: 0, errors: 0, skipped: true };
+      try {
+        return await this.reconcileRun();
+      } finally {
+        await sql`SELECT pg_advisory_unlock(hashtext('billing-reconcile'))`.execute(conn);
+      }
+    });
+  }
+
+  private async reconcileRun(): Promise<{ replayed: number; customers: number; changed: number; errors: number }> {
+    const stripe = this.stripe();
+    const out = { replayed: 0, customers: 0, changed: 0, errors: 0 };
+    const since = new Date(this.now().getTime() - 29 * DAY);
+    // Only failures a retry can fix (a permanent one would fail again and fill every page).
+    const failed = await withTenant(this.d.db, { platform: true }, (tx) =>
+      tx.selectFrom('billing_events').select('stripe_event_id').where('status', '=', 'failed').where('received_at', '>=', since).where(sql<boolean>`coalesce((summary->>'retryable')::boolean, true)`).orderBy('received_at').limit(200).execute(),
+    );
+    for (const f of failed) {
+      try {
+        const event = await stripe.events.retrieve(f.stripe_event_id);
+        if (event.livemode) continue;
+        const r = await this.process(event);
+        if (r.outcome.status === 'processed' || r.outcome.status === 'ignored') out.replayed++;
+        else out.errors++;
+      } catch (e) {
+        out.errors++;
+        this.d.log?.warn({ eventId: f.stripe_event_id, err: e instanceof Error ? e.message : String(e) }, 'billing reconcile: event replay failed');
+      }
+    }
+    const customers = await withTenant(this.d.db, { platform: true }, (tx) => tx.selectFrom('billing_customers').select('stripe_customer_id').orderBy('created_at').execute());
+    for (const c of customers) {
+      try {
+        out.changed += await this.reconcileCustomer(c.stripe_customer_id);
+        out.customers++;
+      } catch (e) {
+        out.errors++;
+        this.d.log?.warn({ customer: c.stripe_customer_id, err: e instanceof Error ? e.message : String(e) }, 'billing reconcile: customer failed');
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Brings one customer in line with Stripe; returns how many records changed. Stripe is read
+   * before the transaction; under the customer lock the row's version must be the one seen
+   * before reading, else a webhook applied newer state meanwhile and the reads are repeated.
+   */
+  private async reconcileCustomer(stripeCustomerId: string): Promise<number> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.reconcileCustomerOnce(stripeCustomerId);
+      } catch (e) {
+        if (!(e instanceof StaleReadError) || attempt >= STALE_RETRIES) throw e;
+      }
+    }
+  }
+
+  private async reconcileCustomerOnce(stripeCustomerId: string): Promise<number> {
+    const version = await withTenant(this.d.db, { platform: true }, (tx) => this.customerVersion(tx, stripeCustomerId));
+    const remote = await this.remoteCustomer(stripeCustomerId);
+    if (!remote) return 0;
+    const subs = (await this.remoteSubscriptions(stripeCustomerId)) ?? [];
+    await this.priceId(this.pricing.compute.lookupKey).catch(() => undefined);
+    const mails: Mail[] = [];
+    const changed = await withTenant(this.d.db, { platform: true }, async (tx) => {
+      await this.budget(tx);
+      await this.lockCustomer(tx, stripeCustomerId);
+      if ((await this.customerVersion(tx, stripeCustomerId)) !== version) throw new StaleReadError();
+      let n = 0;
+      for (const sub of subs) {
+        const known = await tx.selectFrom('billing_subscriptions').select(['status', 'seats', 'cancel_at_period_end', 'current_period_end', 'price_lookup_key']).where('stripe_subscription_id', '=', sub.id).executeTakeFirst();
+        if (known && !subscriptionDiffers(known, sub)) continue;
+        if (!known && !ACTIVE.has(sub.status) && sub.status !== 'incomplete') continue; // ended before we ever saw it
+        if (this.isComputeSub(sub)) await this.upsertComputeSubscription(tx, sub);
+        else {
+          try {
+            await this.upsertSubscription(tx, sub, sub.metadata ?? {});
+          } catch (e) {
+            if (e instanceof PermanentEventError) continue; // not one of our plans
+            throw e;
+          }
+        }
+        n++;
+      }
+      let cus = await this.customerByStripeId(tx, stripeCustomerId);
+      if (!cus) return n;
+      const pm = remote.invoice_settings?.default_payment_method;
+      if (pm && !cus.has_payment_method) {
+        await tx.updateTable('billing_customers').set({ has_payment_method: true, updated_at: this.now() }).where('id', '=', cus.id).execute();
+        n++;
+      }
+      cus = (await this.customerByStripeId(tx, stripeCustomerId))!;
+      const plan = await this.latestPlanSub(tx, cus.org_id, cus.user_id);
+      if ((cus.has_payment_method || (plan && ACTIVE.has(plan.status))) && !cus.compute_subscription_id) {
+        if (await this.ensureComputeSubscription(tx, cus, subs)) n++;
+      }
+      const d = await this.recomputeDunning(tx, cus);
+      if (d.transition) n++;
+      mails.push(...d.mails);
+      if (n > 0) {
+        await this.bumpCustomer(tx, stripeCustomerId);
+        await audit(tx, { orgId: cus.org_id, actorId: null, actorName: 'Stripe' }, 'billing.reconcile', 'customer', stripeCustomerId, { changes: n });
+      }
+      return n;
+    });
+    await this.sendMails(mails);
+    return changed;
   }
 
   private isComputeSub(sub: StripeSubscription): boolean {
@@ -1004,33 +1338,36 @@ export class BillingService {
     return !!sub.items?.data?.some((i) => i.price?.lookup_key === this.pricing.compute.lookupKey);
   }
 
-  private async apply(tx: Tx, event: StripeEvent): Promise<ApplyResult> {
+  private async apply(tx: Tx, event: StripeEvent, pre: Prefetched = {}): Promise<ApplyResult> {
     const obj = event.data.object;
     switch (event.type) {
       case 'checkout.session.completed': {
         const meta = (obj.metadata ?? {}) as Record<string, string>;
         const cusId = typeof obj.customer === 'string' ? obj.customer : undefined;
+        await this.lockCustomer(tx, cusId);
         if (obj.mode === 'setup') {
           const si = typeof obj.setup_intent === 'string' ? obj.setup_intent : undefined;
           const cus = cusId ? await this.customerByStripeId(tx, cusId) : undefined;
           if (!si || !cus) return { status: 'ignored', ...(meta.ct_org_id ? { orgId: meta.ct_org_id } : {}), summary: { reason: !si ? 'no setup intent on session' : 'unknown customer', session: obj.id } };
-          const intent = await this.stripe().setupIntents.retrieve(si);
+          const intent = pre.setupIntent ?? (await this.stripe().setupIntents.retrieve(si));
           if (!intent.payment_method) return { status: 'ignored', orgId: cus.org_id, userId: cus.user_id, summary: { reason: 'setup intent has no payment method', session: obj.id } };
+          this.checkBudget(tx);
           await this.stripe().customers.update(cus.stripe_customer_id, { invoice_settings: { default_payment_method: intent.payment_method } });
-          const mails = await this.paymentMethodSaved(tx, cus, event.id);
+          const mails = await this.paymentMethodSaved(tx, cus, pre.subs);
           return { status: 'processed', orgId: cus.org_id, userId: cus.user_id, summary: { session: obj.id, setupIntent: si, paymentMethod: 'saved', computeSubscription: mails.computeSub ?? null }, mails: mails.mails };
         }
         const subId = typeof obj.subscription === 'string' ? obj.subscription : undefined;
         if (!subId) return { status: 'ignored', ...(meta.ct_org_id ? { orgId: meta.ct_org_id } : {}), summary: { reason: 'no subscription on session', session: obj.id } };
-        const sub = await this.stripe().subscriptions.retrieve(subId);
+        const sub = pre.subs?.find((x) => x.id === subId) ?? (await this.stripe().subscriptions.retrieve(subId));
         const r = await this.upsertSubscription(tx, sub, meta);
         // The plan's payment method also pays for compute: make it the customer default and open the metered subscription.
         const cus = await this.customerByStripeId(tx, sub.customer);
         let computeSub: string | undefined;
         let mails: Mail[] = [];
         if (cus) {
+          this.checkBudget(tx);
           if (sub.default_payment_method) await this.stripe().customers.update(cus.stripe_customer_id, { invoice_settings: { default_payment_method: sub.default_payment_method } });
-          const saved = await this.paymentMethodSaved(tx, cus, event.id);
+          const saved = await this.paymentMethodSaved(tx, cus, pre.subs);
           computeSub = saved.computeSub;
           mails = saved.mails;
         }
@@ -1039,7 +1376,8 @@ export class BillingService {
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
-        const sub = obj as unknown as StripeSubscription;
+        const sent = obj as unknown as StripeSubscription;
+        const sub = this.currentSubscription(sent, pre);
         // The person was erased (docs/gdpr.md): the closing events of the deleted Stripe customer have nothing left to update.
         const erasedUser = sub.metadata?.ct_user_id;
         if (erasedUser && !(await this.customerByStripeId(tx, sub.customer)) && !(await tx.selectFrom('users').select('id').where('id', '=', erasedUser).executeTakeFirst())) {
@@ -1055,8 +1393,9 @@ export class BillingService {
         // A plan bought outside Checkout (portal, API) still needs the metered compute subscription.
         let computeSub: string | undefined;
         if (cus && ACTIVE.has(sub.status) && !cus.compute_subscription_id && event.type !== 'customer.subscription.deleted') {
+          this.checkBudget(tx);
           if (sub.default_payment_method) await this.stripe().customers.update(cus.stripe_customer_id, { invoice_settings: { default_payment_method: sub.default_payment_method } });
-          computeSub = await this.ensureComputeSubscription(tx, cus, event.id);
+          computeSub = await this.ensureComputeSubscription(tx, cus, pre.subs);
         }
         const d = cus ? await this.recomputeDunning(tx, cus) : { mails: [] as Mail[], transition: undefined };
         return { status: 'processed', orgId: r.orgId, userId: r.userId, summary: { subscription: sub.id, plan: r.planId, status: sub.status, seats: r.seats, cancelAtPeriodEnd: sub.cancel_at_period_end, dunning: d.transition ?? 'unchanged', ...(computeSub ? { computeSubscription: computeSub } : {}) }, mails: d.mails };
@@ -1064,10 +1403,16 @@ export class BillingService {
       case 'invoice.paid':
       case 'invoice.payment_failed': {
         const cusId = typeof obj.customer === 'string' ? obj.customer : undefined;
+        await this.lockCustomer(tx, cusId);
         const cus = cusId ? await this.customerByStripeId(tx, cusId) : undefined;
         const summary = { invoice: obj.id, amountPaid: obj.amount_paid, amountDue: obj.amount_due, currency: obj.currency, customer: cusId, attempt: obj.attempt_count };
         if (!cus) return { status: 'processed', summary };
         const failed = event.type === 'invoice.payment_failed';
+        if (failed && typeof obj.id === 'string') {
+          // A late failure for an invoice that has been paid (or voided) since must not restart dunning.
+          const now = pre.invoice ?? (await this.stripe().invoices.retrieve(obj.id));
+          if (now.status === 'paid' || now.status === 'void') return { status: 'ignored', orgId: cus.org_id, userId: cus.user_id, summary: { ...summary, reason: `invoice is ${now.status} now` } };
+        }
         await tx
           .updateTable('billing_customers')
           .set({ invoice_failed_at: failed ? (cus.invoice_failed_at ?? this.now()) : null, ...(failed ? {} : { has_payment_method: true }), updated_at: this.now() })
@@ -1077,11 +1422,14 @@ export class BillingService {
         return { status: 'processed', orgId: cus.org_id, userId: cus.user_id, summary: { ...summary, dunning: d.transition ?? 'unchanged' }, mails: d.mails };
       }
       case 'customer.updated': {
+        await this.lockCustomer(tx, typeof obj.id === 'string' ? obj.id : undefined);
         const cus = typeof obj.id === 'string' ? await this.customerByStripeId(tx, obj.id) : undefined;
         if (!cus) return { status: 'ignored', summary: { reason: 'unknown customer', customer: obj.id } };
-        const pm = (obj.invoice_settings as { default_payment_method?: string | null } | undefined)?.default_payment_method ?? null;
+        // Stripe's current customer, read under the lock: the event's snapshot may be older than what was applied.
+        const current: { invoice_settings?: { default_payment_method?: string | null } } = pre.customer ?? (obj as { invoice_settings?: { default_payment_method?: string | null } });
+        const pm = current.invoice_settings?.default_payment_method ?? null;
         if (pm && !cus.has_payment_method) {
-          const saved = await this.paymentMethodSaved(tx, cus, event.id);
+          const saved = await this.paymentMethodSaved(tx, cus, pre.subs);
           return { status: 'processed', orgId: cus.org_id, userId: cus.user_id, summary: { customer: cus.stripe_customer_id, paymentMethod: 'saved' }, mails: saved.mails };
         }
         if (!pm && cus.has_payment_method) {
@@ -1105,18 +1453,25 @@ export class BillingService {
   }
 
   /** A payment method is on file: record it and open the compute (metered) subscription if there is none. */
-  private async paymentMethodSaved(tx: Tx, cus: CustomerRow, eventId: string): Promise<{ computeSub?: string; mails: Mail[] }> {
+  private async paymentMethodSaved(tx: Tx, cus: CustomerRow, subs?: StripeSubscription[]): Promise<{ computeSub?: string; mails: Mail[] }> {
     await tx.updateTable('billing_customers').set({ has_payment_method: true, updated_at: this.now() }).where('id', '=', cus.id).execute();
-    const computeSub = await this.ensureComputeSubscription(tx, cus, eventId);
+    const computeSub = await this.ensureComputeSubscription(tx, cus, subs);
     return { ...(computeSub ? { computeSub } : {}), mails: [] };
   }
 
   /**
    * One metered compute subscription per billing customer (the metered price
    * only, no fixed fee): meter events for the customer are billed through it.
-   * Exactly one, or usage would be billed twice.
+   * Exactly one, or usage would be billed twice. Under the customer lock the
+   * row is read again (a concurrent webhook may have just opened one), Stripe
+   * is asked for a live compute subscription we do not know yet (a delivery
+   * whose commit failed after Stripe created it), and the create carries an
+   * idempotency key per customer and generation, not per event, so a retry or
+   * a second event in the same generation gets the same subscription back.
    */
-  private async ensureComputeSubscription(tx: Tx, cus: CustomerRow, eventId: string): Promise<string | undefined> {
+  private async ensureComputeSubscription(tx: Tx, known: CustomerRow, remoteSubs?: StripeSubscription[]): Promise<string | undefined> {
+    await this.lockCustomer(tx, known.stripe_customer_id);
+    const cus = (await this.customerByStripeId(tx, known.stripe_customer_id)) ?? known;
     if (cus.compute_subscription_id) {
       const row = await tx.selectFrom('billing_subscriptions').select('status').where('stripe_subscription_id', '=', cus.compute_subscription_id).executeTakeFirst();
       if (!row || ACTIVE.has(row.status) || row.status === 'incomplete') return cus.compute_subscription_id;
@@ -1128,9 +1483,18 @@ export class BillingService {
       this.d.log?.warn({ lookupKey: this.pricing.compute.lookupKey, err: e instanceof Error ? e.message : String(e) }, 'billing: no metered compute price (run stripe:sync); compute subscription not created');
       return undefined;
     }
+    // Read before the transaction by the caller (and checked for staleness under the lock).
+    const remote = remoteSubs ?? (await this.remoteSubscriptions(cus.stripe_customer_id)) ?? [];
+    const live = remote.find((x) => this.isComputeSub(x) && (ACTIVE.has(x.status) || x.status === 'incomplete'));
+    if (live) {
+      await this.upsertComputeSubscription(tx, live, cus);
+      return live.id;
+    }
+    this.checkBudget(tx);
+    const generation = Number((await tx.selectFrom('billing_subscriptions').select(sql<number>`count(*)::int`.as('n')).where('customer_id', '=', cus.id).where('kind', '=', 'compute').executeTakeFirstOrThrow()).n);
     const sub = await this.stripe().subscriptions.create(
       { customer: cus.stripe_customer_id, items: [{ price }], metadata: { ct_kind: 'compute', ct_org_id: cus.org_id, ct_user_id: cus.user_id ?? '', ct_scope: cus.user_id ? 'user' : 'org' } },
-      `computesub:${cus.stripe_customer_id}:${eventId}`,
+      `computesub:${cus.stripe_customer_id}:${generation}`,
     );
     await this.upsertComputeSubscription(tx, sub, cus);
     return sub.id;
@@ -1138,7 +1502,8 @@ export class BillingService {
 
   private async upsertComputeSubscription(tx: Tx, sub: StripeSubscription, known?: CustomerRow): Promise<{ customer: CustomerRow }> {
     const customer = known ?? (await this.customerByStripeId(tx, sub.customer));
-    if (!customer) throw new Error(`compute subscription ${sub.id}: unknown customer ${sub.customer}`);
+    // We create the customer row before any compute subscription: it may not be committed yet. Retry.
+    if (!customer) throw new TransientEventError(`compute subscription ${sub.id}: customer ${sub.customer} not recorded yet`);
     const status: SubscriptionStatus = STATUSES.has(sub.status) ? (sub.status as SubscriptionStatus) : 'incomplete';
     const periodEnd = sub.current_period_end ?? sub.items?.data?.[0]?.current_period_end;
     await tx
@@ -1216,14 +1581,14 @@ export class BillingService {
   private async upsertSubscription(tx: Tx, sub: StripeSubscription, meta: Record<string, string>): Promise<{ orgId: string; userId: string | null; planId: string; seats: number }> {
     const item = sub.items?.data?.find((i) => !!this.planByLookupKey(i.price?.lookup_key)) ?? sub.items?.data?.[0];
     const found = this.planByLookupKey(item?.price?.lookup_key) ?? (meta.ct_plan_id ? { plan: this.plan(meta.ct_plan_id), interval: (meta.ct_interval as PlanInterval) || 'monthly' } : undefined);
-    if (!found?.plan) throw new Error(`subscription ${sub.id}: no plan for lookup key ${item?.price?.lookup_key ?? '(none)'}`);
+    if (!found?.plan) throw new PermanentEventError(`subscription ${sub.id}: no plan for lookup key ${item?.price?.lookup_key ?? '(none)'}`);
     const plan = found.plan;
     // The org comes from the metadata we set at checkout, else from the customer we created.
     let orgId = meta.ct_org_id;
     let userId: string | null = meta.ct_user_id || null;
     let customerRow = await tx.selectFrom('billing_customers').select(['id', 'org_id', 'user_id']).where('stripe_customer_id', '=', sub.customer).executeTakeFirst();
     if (!customerRow) {
-      if (!orgId) throw new Error(`subscription ${sub.id}: unknown customer ${sub.customer} and no ct_org_id metadata`);
+      if (!orgId) throw new PermanentEventError(`subscription ${sub.id}: unknown customer ${sub.customer} and no ct_org_id metadata`);
       customerRow = await tx
         .insertInto('billing_customers')
         .values({ org_id: orgId, user_id: userId, stripe_customer_id: sub.customer, email: null })
@@ -1305,6 +1670,46 @@ export function formatMoney(minor: number, currency: string): string {
   } catch {
     return `${(minor / 100).toFixed(2)} ${currency}`;
   }
+}
+
+/** An event no retry can apply (not one of our customers or plans): recorded `failed`, answered 200. */
+export class PermanentEventError extends Error {}
+
+/** An event that cannot be applied yet but will be (a row another transaction is about to commit). */
+export class TransientEventError extends Error {}
+
+/** The customer changed between reading Stripe and taking its lock: read again. */
+class StaleReadError extends Error {}
+const STALE_RETRIES = 3;
+/** How long a "not yet" (TransientEventError) is retried, counted from the event's creation in Stripe; then it is permanent. */
+export const TRANSIENT_MAX_AGE_MS = 3_600_000;
+
+/** Postgres SQLSTATEs a retry can get past: connection loss, serialization failures, deadlocks, lock/statement/idle timeouts (the transaction's own budget), shutdown, overload. */
+const TRANSIENT_PG = /^(08...|25P03|40001|40P01|53300|55P03|57014|57P01|57P02|57P03)$/;
+const TRANSIENT_NET = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN']);
+
+/**
+ * Whether Stripe should redeliver an event that failed. An allowlist: Stripe
+ * 5xx, 429, timeouts and network errors; Postgres connection, serialization,
+ * deadlock and overload errors; TransientEventError. Everything else (a bug,
+ * a constraint, a refusal) is permanent: retrying would fail the same way.
+ */
+export function isRetryableBillingError(e: unknown): boolean {
+  if (e instanceof TransientEventError) return true;
+  if (e instanceof StripeError) return e.status === 0 || e.status === 429 || e.status >= 500;
+  const code = (e as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && (TRANSIENT_PG.test(code) || TRANSIENT_NET.has(code))) return true;
+  return e instanceof Error && /Connection terminated|timeout exceeded when trying to connect/i.test(e.message);
+}
+
+/** Whether Stripe's subscription differs from the stored row in anything we record. */
+function subscriptionDiffers(row: { status: string; seats: number; cancel_at_period_end: boolean; current_period_end: Date | null; price_lookup_key: string | null }, sub: StripeSubscription): boolean {
+  const item = sub.items?.data?.[0];
+  const end = sub.current_period_end ?? item?.current_period_end;
+  if (row.status !== sub.status || row.cancel_at_period_end !== !!sub.cancel_at_period_end) return true;
+  if ((row.current_period_end?.getTime() ?? null) !== (end ? end * 1000 : null)) return true;
+  if (row.price_lookup_key !== null && !sub.items?.data?.some((i) => i.price?.lookup_key === row.price_lookup_key)) return true;
+  return sub.items?.data?.some((i) => i.price?.lookup_key === row.price_lookup_key && i.quantity !== undefined && Math.max(1, i.quantity) !== row.seats) ?? false;
 }
 
 /** Stripe refuses a meter event whose identifier it has already accepted: it was reported. */

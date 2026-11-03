@@ -12,7 +12,10 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 export const STRIPE_API = 'https://api.stripe.com';
 const API_VERSION = '2025-09-30.clover';
 
-export type FetchLike = (input: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{ status: number; json(): Promise<unknown>; text(): Promise<string> }>;
+export type FetchLike = (input: string, init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{ status: number; json(): Promise<unknown>; text(): Promise<string> }>;
+
+/** Per-request timeout: billing holds a database transaction (and a customer lock) around some calls. */
+export const STRIPE_TIMEOUT_MS = 10_000;
 
 export const isLiveKey = (key: string | undefined): boolean => /^[sr]k_live_/.test(key ?? '');
 export const isTestKey = (key: string | undefined): boolean => /^[sr]k_test_[A-Za-z0-9]{8,}/.test(key ?? '');
@@ -71,6 +74,8 @@ export interface StripePrice {
 }
 export interface StripeCustomer {
   id: string;
+  /** Set on a customer that was deleted (retrieve still answers, with nothing else). */
+  deleted?: boolean;
   email?: string | null;
   metadata: Record<string, string>;
   invoice_settings?: { default_payment_method?: string | null };
@@ -84,6 +89,11 @@ export interface StripeSubscription {
   default_payment_method?: string | null;
   metadata: Record<string, string>;
   items: StripeList<{ id: string; quantity?: number; price: StripePrice; current_period_end?: number }>;
+}
+export interface StripeInvoice {
+  id: string;
+  customer: string | null;
+  status: 'draft' | 'open' | 'paid' | 'uncollectible' | 'void' | null;
 }
 export interface StripeSetupIntent {
   id: string;
@@ -130,6 +140,7 @@ export class StripeApi {
     private readonly secretKey: string,
     private readonly fetchImpl: FetchLike = (url, init) => fetch(url, init),
     private readonly base: string = STRIPE_API,
+    private readonly timeoutMs: number = STRIPE_TIMEOUT_MS,
   ) {
     if (isLiveKey(secretKey)) throw new Error('StripeApi: live keys are not accepted in this version');
   }
@@ -143,7 +154,15 @@ export class StripeApi {
       'content-type': 'application/x-www-form-urlencoded',
     };
     if (opts.idempotencyKey) headers['idempotency-key'] = opts.idempotencyKey;
-    const res = await this.fetchImpl(url, { method, headers, ...(body !== undefined ? { body } : {}) });
+    let res: Awaited<ReturnType<FetchLike>>;
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    try {
+      res = await this.fetchImpl(url, { method, headers, signal, ...(body !== undefined ? { body } : {}) });
+    } catch (e) {
+      // status 0: no answer (timed out or unreachable); retryable, like a 5xx.
+      if (signal.aborted) throw new StripeError(0, `Stripe did not answer within ${this.timeoutMs} ms`, 'timeout');
+      throw new StripeError(0, `Stripe unreachable: ${e instanceof Error ? e.message : String(e)}`, 'network');
+    }
     const data = (await res.json().catch(() => ({}))) as { error?: { message?: string; code?: string; type?: string; param?: string } };
     if (res.status >= 400) throw new StripeError(res.status, data.error?.message ?? `Stripe ${res.status}`, data.error?.code, data.error?.type, data.error?.param);
     return data as T;
@@ -181,11 +200,20 @@ export class StripeApi {
   };
   subscriptions = {
     retrieve: (id: string) => this.request<StripeSubscription>('GET', `/v1/subscriptions/${encodeURIComponent(id)}`),
+    /** A customer's subscriptions; `status: 'all'` includes canceled ones. */
+    list: (p: { customer: string; status?: 'all' | 'active' | 'canceled' | 'past_due' | 'trialing' | 'unpaid' | 'incomplete'; limit?: number; starting_after?: string }) => this.request<StripeList<StripeSubscription>>('GET', '/v1/subscriptions', p),
     create: (p: { customer: string; items: { price: string; quantity?: number }[]; metadata?: Record<string, string>; default_payment_method?: string }, idempotencyKey?: string) =>
       this.request<StripeSubscription>('POST', '/v1/subscriptions', p, { idempotencyKey }),
     /** Seat changes: `items[0][id]` + `quantity`, prorated (`proration_behavior: create_prorations`). */
     update: (id: string, p: { items?: { id: string; quantity: number }[]; proration_behavior?: 'create_prorations' | 'none' | 'always_invoice'; metadata?: Record<string, string> }, idempotencyKey?: string) =>
       this.request<StripeSubscription>('POST', `/v1/subscriptions/${encodeURIComponent(id)}`, p, { idempotencyKey }),
+  };
+  invoices = {
+    retrieve: (id: string) => this.request<StripeInvoice>('GET', `/v1/invoices/${encodeURIComponent(id)}`),
+  };
+  /** Events are kept for 30 days: replaying one that failed to apply. */
+  events = {
+    retrieve: (id: string) => this.request<StripeEvent>('GET', `/v1/events/${encodeURIComponent(id)}`),
   };
   setupIntents = {
     retrieve: (id: string) => this.request<StripeSetupIntent>('GET', `/v1/setup_intents/${encodeURIComponent(id)}`),

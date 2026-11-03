@@ -183,6 +183,18 @@ async function main() {
     return new Date(Number.isNaN(exp) ? Date.now() : Math.min(exp, Date.now()));
   };
   const billingSweep = config.billing.sweepMs > 0 ? setInterval(() => void billing.sweep(sessionEnd).catch((e: unknown) => app.log.warn({ err: e }, 'billing sweep failed')), config.billing.sweepMs) : undefined;
+  // Webhooks can be missed or fail for good: re-read subscriptions from Stripe and replay failed events.
+  const billingReconcile =
+    config.billing.enabled && config.billing.reconcileMs > 0
+      ? setInterval(
+          () =>
+            void billing
+              .reconcile()
+              .then((r) => (r.changed || r.replayed || r.errors ? app.log.info(r, 'billing reconciled with Stripe') : undefined))
+              .catch((e: unknown) => app.log.warn({ err: e }, 'billing reconcile failed')),
+          config.billing.reconcileMs,
+        )
+      : undefined;
   const gdprSweep = config.gdpr.sweepMs > 0 ? setInterval(() => void gdpr.sweep().catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'gdpr sweep failed')), config.gdpr.sweepMs) : undefined;
   const retention = () => void sweepRetention({ db, waitlist, ledger, accounts: gdpr, config: config.retention, log: app.log }).catch((e: unknown) => app.log.warn({ code: (e as { code?: string }).code }, 'retention sweep failed'));
   const retentionSweep = config.retention.sweepMs > 0 ? setInterval(retention, config.retention.sweepMs) : undefined;
@@ -192,6 +204,7 @@ async function main() {
     await gdpr.settled();
     if (sweep) clearInterval(sweep);
     if (billingSweep) clearInterval(billingSweep);
+    if (billingReconcile) clearInterval(billingReconcile);
     await billing.settle();
     await app.close();
     await db.destroy();
