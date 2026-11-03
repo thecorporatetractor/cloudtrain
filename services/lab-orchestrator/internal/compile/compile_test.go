@@ -308,3 +308,18 @@ func TestK8sCheckDefaultTimeout(t *testing.T) {
 		t.Errorf("file default timeout = %d", c.TimeoutSec)
 	}
 }
+
+// content-9: a check timeout above what the grader waits (300 s) or below 1 s
+// is rejected instead of silently cut.
+func TestCheckTimeoutBounds(t *testing.T) {
+	for _, v := range []string{"0", "301", "600"} {
+		doc := mutate(minimalLab, `command: "test -f /tmp/{{file}}", skills`, `command: "test -f /tmp/{{file}}", timeoutSec: `+v+`, skills`)
+		if _, err := Compile(doc, Options{}); err == nil || !strings.Contains(err.Error(), "timeoutSec") {
+			t.Errorf("timeoutSec %s: error %v", v, err)
+		}
+	}
+	doc := mutate(minimalLab, `command: "test -f /tmp/{{file}}", skills`, `command: "test -f /tmp/{{file}}", timeoutSec: 300, skills`)
+	if _, err := Compile(doc, Options{}); err != nil {
+		t.Errorf("timeoutSec 300: %v", err)
+	}
+}

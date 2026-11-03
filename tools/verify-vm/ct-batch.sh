@@ -36,6 +36,7 @@ RECONCILES=${RECONCILES:-64}
 PAR_VM=${PAR_VM:-2} PAR_POD=${PAR_POD:-3}
 READY_TIMEOUT=${READY_TIMEOUT:-45m}
 GRADE_TIMEOUT=${GRADE_TIMEOUT:-15m}   # labctl verify --grade-timeout: max time for one grading round (default 5m)
+MAX_PREPASS=${MAX_PREPASS:-0.5}       # labctl verify --max-prepass: largest check-weight share passing before the solution (1 disables)
 CYCLE_SLEEP=${CYCLE_SLEEP:-900}
 EXAM_SEEDS=${EXAM_SEEDS:-"1 2"}   # auto-solve with the first, no-solve with the second
 mkdir -p "$RES"/{labs,logs,reports,exams,state}
@@ -315,7 +316,7 @@ run_lab() { # run_lab <id> <dir> <slot>
   rm -f "$rep"
   { echo "# $id ($slot) rev $(git -C "$REPO" rev-parse --short HEAD) started $(date -u +%FT%TZ)"
     cd "$REPO/services/lab-orchestrator" && "$REPO/tools/slots/run.sh" "$slot" -- timeout -k 2m 4h bin/labctl verify --context "$CTX" \
-      --repo-root "$REPO" --session-label "$SESSION_LABEL" --parallel "$par" --ready-timeout "$READY_TIMEOUT" --grade-timeout "$GRADE_TIMEOUT" "$dir"; } >"$log" 2>&1
+      --repo-root "$REPO" --session-label "$SESSION_LABEL" --parallel "$par" --ready-timeout "$READY_TIMEOUT" --grade-timeout "$GRADE_TIMEOUT" --max-prepass "$MAX_PREPASS" "$dir"; } >"$log" 2>&1
   rc=$?
   [[ -f $rep ]] && cp "$rep" "$RES/reports/$id.json"
   local status=fail step=""

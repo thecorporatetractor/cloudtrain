@@ -66,6 +66,12 @@ type verifyOpts struct {
 	readyTimeout            time.Duration
 	gradeTimeout            time.Duration
 	teardownTimeout         time.Duration
+	// maxPrepass is the largest share of the check weight that may pass
+	// before the solution (content-8).
+	maxPrepass float64
+	// gradeBudget is how long the workspace waits for a grading; a slower
+	// one is reported (content-1).
+	gradeBudget time.Duration
 	// sessionLabels are set on every LabSession (managers can select them
 	// with --session-selector).
 	sessionLabels map[string]string
@@ -86,29 +92,38 @@ type RunReport struct {
 	Namespace string `json:"namespace"`
 	OK        bool   `json:"ok"`
 	// Params are the resolved param values.
-	Params      map[string]string `json:"params,omitempty"`
-	ReadySec    float64           `json:"readySeconds,omitempty"`
-	Before      *GradeReport      `json:"gradeBefore,omitempty"`
-	After       *GradeReport      `json:"gradeAfter,omitempty"`
-	ExpectFail  []string          `json:"expectFail,omitempty"`
+	Params   map[string]string `json:"params,omitempty"`
+	ReadySec float64           `json:"readySeconds,omitempty"`
+	Before   *GradeReport      `json:"gradeBefore,omitempty"`
+	After    *GradeReport      `json:"gradeAfter,omitempty"`
+	// Again is a second grading right after After: it must agree with it.
+	Again *GradeReport `json:"gradeAgain,omitempty"`
+	// PrePassed are the checks that pass before the solution (base runs).
+	PrePassed []string `json:"prePassed,omitempty"`
+	// PrePassShare is their share of the check weight (base runs), recorded
+	// so batch reports show how close each lab is to --max-prepass.
+	PrePassShare float64 `json:"prePassShare,omitempty"`
+	// Warnings do not fail the run.
+	Warnings   []string `json:"warnings,omitempty"`
+	ExpectFail []string `json:"expectFail,omitempty"`
 	// Answers are the answers submitted to answer checks (base runs).
-	Answers     []AnswerReport    `json:"answers,omitempty"`
-	Teardown    string            `json:"teardown"` // clean, leftovers, skipped (--keep), failed
-	Leftovers   []string          `json:"leftovers,omitempty"`
-	Errors      []string          `json:"errors,omitempty"`
-	DurationSec float64           `json:"durationSeconds"`
+	Answers     []AnswerReport `json:"answers,omitempty"`
+	Teardown    string         `json:"teardown"` // clean, leftovers, skipped (--keep), failed
+	Leftovers   []string       `json:"leftovers,omitempty"`
+	Errors      []string       `json:"errors,omitempty"`
+	DurationSec float64        `json:"durationSeconds"`
 	// answerDigests: per answer check, a digest of its expected values.
 	answerDigests map[string]string
 }
 
 // LabReport is written to <out>/<lab>.json.
 type LabReport struct {
-	Lab         string      `json:"lab"`
-	Path        string      `json:"path"`
-	OK          bool        `json:"ok"`
-	StartedAt   time.Time   `json:"startedAt"`
-	DurationSec float64     `json:"durationSeconds"`
-	Errors      []string    `json:"errors,omitempty"`
+	Lab         string    `json:"lab"`
+	Path        string    `json:"path"`
+	OK          bool      `json:"ok"`
+	StartedAt   time.Time `json:"startedAt"`
+	DurationSec float64   `json:"durationSeconds"`
+	Errors      []string  `json:"errors,omitempty"`
 	// Warnings do not fail the lab (e.g. an answer the same for two seeds).
 	Warnings []string    `json:"warnings,omitempty"`
 	Runs     []RunReport `json:"runs"`
@@ -145,6 +160,13 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	fl.DurationVar(&o.gradeTimeout, "grade-timeout", 5*time.Minute, "max time for one grading round")
 	sessionLabel := fl.String("session-label", verifyLabel+"=true", "label key=value put on every verifier LabSession (match it with the manager's --session-selector)")
 	fl.DurationVar(&o.teardownTimeout, "teardown-timeout", 10*time.Minute, "max time for session teardown")
+	// 0.5 was checked against the latest local verify reports (32 labs,
+	// 2026-11): the highest share before the solution was 43%, none above
+	// 50%. Batch runs record prePassShare per lab and take MAX_PREPASS
+	// (tools/verify-vm/ct-batch.sh), so the threshold can be relaxed for a
+	// batch without a rebuild if a wider run shows guard-heavy labs above it.
+	fl.Float64Var(&o.maxPrepass, "max-prepass", 0.5, "largest share of the check weight that may pass before the solution (0-1; 1 disables the rule)")
+	fl.DurationVar(&o.gradeBudget, "grade-budget", 60*time.Second, "grading time the workspace waits for (CT_VALIDATE_TIMEOUT_MS); slower gradings are reported")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
@@ -452,6 +474,13 @@ func (v *verifier) verifyAll(ctx context.Context, labs []*labUnderTest) []LabRep
 		for _, rr := range r.Runs {
 			r.OK = r.OK && rr.OK
 		}
+		for _, rr := range r.Runs {
+			for _, w := range rr.Warnings {
+				msg := fmt.Sprintf("%s run: %s", rr.Kind, w)
+				r.Warnings = append(r.Warnings, msg)
+				v.logf("%s: WARN %s", r.Lab, msg)
+			}
+		}
 		for _, id := range sameAnswersAcrossSeeds(r.Runs) {
 			msg := fmt.Sprintf("answer check %s expects the same answer for both seeds; learners could share it", id)
 			r.Warnings = append(r.Warnings, msg)
@@ -514,8 +543,16 @@ func (v *verifier) run(ctx context.Context, r runSpec) (rep RunReport) {
 		fail("grade before: %v", err)
 		return rep
 	}
-	if r.kind == runBase && allPassed(before) {
-		fail("every check passes before the solution (lab is already solved)")
+	if r.kind == runBase {
+		pre := checkPrepass(&r.lab.tpl.Spec, before)
+		rep.PrePassed, rep.PrePassShare = pre.ids, pre.share
+		switch {
+		case pre.solved:
+			fail("every check passes before the solution (lab is already solved)")
+		case pre.share > v.o.maxPrepass:
+			fail("%.0f%% of the check weight passes before the solution (%s); at most %.0f%% may", 100*pre.share, strings.Join(pre.ids, ", "), 100*v.o.maxPrepass)
+		}
+		rep.Warnings = append(rep.Warnings, pre.warnings...)
 	}
 
 	// 3/4/5. Apply the steps.
@@ -547,6 +584,19 @@ func (v *verifier) run(ctx context.Context, r runSpec) (rep RunReport) {
 			if !c.Passed {
 				fail("check %s fails after the %s (%s): %s", c.ID, r.kind, c.Message, tail(c.Output, 300))
 			}
+		}
+		if d := gradeDuration(after); v.o.gradeBudget > 0 && d > v.o.gradeBudget {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf("grading took %s, longer than the %s the workspace waits for a result", d.Round(time.Second), v.o.gradeBudget))
+		}
+		// Grading must not change what it grades: a second grading right away agrees.
+		again, err := v.grade(ctx, sess, 3)
+		rep.Again = again
+		if err != nil {
+			fail("grade again: %v", err)
+			return rep
+		}
+		for _, d := range regradeDiffs(after, again) {
+			fail("grading is not repeatable: %s", d)
 		}
 	}
 	if r.kind == runBase {
@@ -607,15 +657,6 @@ func tail(s string, n int) string {
 		return "…" + s[len(s)-n:]
 	}
 	return s
-}
-
-func allPassed(g *GradeReport) bool {
-	for _, c := range g.Checks {
-		if !c.Passed {
-			return false
-		}
-	}
-	return len(g.Checks) > 0
 }
 
 // sessionNamespaceLabels adds the Pod Security labels of a session
