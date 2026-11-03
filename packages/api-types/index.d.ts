@@ -378,6 +378,8 @@ export interface LabSession {
   hints?: Record<number, LabHint>;
   /** Observer banners and cohort broadcasts for this session (platform API). */
   notices?: SessionNotice[];
+  /** The gateway's clock when it answered (GET /api/sessions/:id): countdowns use it, not the browser's clock. */
+  serverTime?: string;
 }
 
 export interface ValidateResponse {
