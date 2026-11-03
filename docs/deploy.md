@@ -525,6 +525,32 @@ The chart renders it into the `<release>-orchestrator-sandboxes` ConfigMap
   prototype) still works as sandboxes with `fallback: fail`; it cannot be combined with
   `orchestrator.sandboxes`.
 
+### Production isolation profile
+
+`orchestrator.isolation.profile: production` (`--isolation-profile=production`) fails closed:
+
+- The chart refuses to render without `orchestrator.sandboxes`, and the manager refuses to
+  start without tier sandboxes.
+- Every lab pod must run in a sandbox RuntimeClass the manager verified (a VM per pod) or
+  with `hostUsers: false`. A pod that would run with host users on the host kernel is
+  refused (the node fails with the reason) instead of created. Learner sudo
+  (`learnerSudo`) therefore only runs inside a VM sandbox or a user namespace.
+- A tier `V` sandbox is required too: pods learners create inside virtual clusters run
+  in it (the chart and the manager refuse production without it).
+- At startup the manager logs every catalog container tier without a sandbox, and it
+  refuses to start while lab node pods created before the profile applied run without
+  isolation (pods are immutable). `--isolation-evict` deletes them instead; their
+  sessions recreate them under the profile. Unavailable user namespaces are logged as
+  an error in every profile, not silently.
+
+Both profiles set seccomp `RuntimeDefault` on every lab node pod (container and netdev
+drivers; pods inside vclusters get it from the lab pool's kubelet `seccompDefault`) and give node containers an
+explicit capability allowlist (`drop: [ALL]` plus the runtime's default set; drivers add
+NET_ADMIN and the device capabilities on top). On AKS, map every container tier to Pod
+Sandboxing (`kata-vm-isolation`) with `fallback: fail`; see
+`examples/values-aks-app-routing.yaml`. Catalog tiers of one letter that YAML 1.1 reads
+as booleans (`N`, `Y`) must be quoted.
+
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.

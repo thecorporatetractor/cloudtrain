@@ -16,6 +16,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
@@ -52,6 +53,8 @@ func main() {
 		linkRateMbps                                                                                              int
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence                                           bool
 		allowLearnerSudo                                                                                          bool
+		isolationProfile                                                                                          string
+		isolationEvict                                                                                            bool
 		concurrency                                                                                               int
 		provisionTimeout                                                                                          time.Duration
 	)
@@ -99,6 +102,8 @@ func main() {
 	flag.StringVar(&ovnCentral, "ovn-central", "kube-system/app=ovn-central", "Kube-OVN central pods (<namespace>/<label>=<value>) to set vlan-passthru on lab link switches with ovn-nbctl; empty = links drop 802.1Q-tagged frames")
 	flag.BoolVar(&linkSysctls, "link-sysctls", true, "run wired lab pods (topology links) in a user namespace with writable network sysctls (ip_forward, rp_filter, accept_ra, proxy_arp, ping_group_range) when user namespaces are available (--user-namespaces); false = privileged net-init and read-only /proc/sys")
 	flag.IntVar(&linkRateMbps, "link-rate-mbps", 10, "rate limit of every lab link attachment in Mbit/s, each direction (Kube-OVN ingress_rate/egress_rate: OVS policing and an HTB queue on the host side of the port, out of the learner's reach), so a bridging loop cannot saturate the host; 0 = none")
+	flag.StringVar(&isolationProfile, "isolation-profile", drivers.IsolationDev, "dev or production. production fails closed: the manager exits without tier sandboxes, and every lab pod must run in a sandbox RuntimeClass or with hostUsers: false (a pod that would run with host users on the host kernel is refused); see internal/drivers/isolation.go")
+	flag.BoolVar(&isolationEvict, "isolation-evict", false, "production profile: delete lab node pods that run neither in a sandbox nor in a user namespace (created before the profile applied) instead of refusing to start; their sessions recreate them under the profile")
 	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
 	flag.StringVar(&networkModeFlag, "network-mode", string(network.ModePrimary), "how wired lab pods and lab VMs reach the session network (docs/any-kubernetes.md): primary (Kube-OVN is the cluster's primary CNI; eth0 placed with ovn.kubernetes.io/logical_switch) or secondary (another CNI owns eth0, Kube-OVN runs non-primary behind Multus; eth0 = a session segment as the Multus default network, VMs with multus.default)")
 	flag.IntVar(&labMTU, "lab-mtu", network.DefaultLinkMTU, "MTU of every session segment (Kube-OVN Subnet spec.mtu): lab links, management, lab and access subnets; lab content assumes 1400. 0 = Kube-OVN default (node MTU minus tunnel overhead)")
@@ -250,7 +255,13 @@ func main() {
 		}
 		var why string
 		useUserNS, why = drivers.DetectUserNamespaces(context.Background(), direct, runtimeClass)
-		log.Info("user namespaces for tier-A container nodes", "enabled", useUserNS, "reason", why)
+		if useUserNS {
+			log.Info("user namespaces for tier-A container nodes", "enabled", true, "reason", why)
+		} else {
+			// Not silent: without user namespaces, lab pods outside a sandbox
+			// run with host users (the production profile refuses them).
+			log.Error(nil, "user namespaces unavailable: lab pods outside a sandbox RuntimeClass run with host users on the host kernel", "reason", why, "isolationProfile", isolationProfile)
+		}
 	default:
 		log.Error(nil, "--user-namespaces must be auto, true or false", "value", userNamespaces)
 		os.Exit(1)
@@ -260,6 +271,47 @@ func main() {
 		log.Error(err, "invalid sandbox configuration")
 		os.Exit(1)
 	}
+	profile, err := drivers.ParseIsolationProfile(isolationProfile)
+	if err != nil {
+		log.Error(err, "invalid --isolation-profile")
+		os.Exit(1)
+	}
+	if profile == drivers.IsolationProduction {
+		warnings, err := drivers.CheckProductionProfile(sandboxes, catalog)
+		if err != nil {
+			log.Error(err, "refusing to start")
+			os.Exit(1)
+		}
+		for _, w := range warnings {
+			log.Info("isolation profile production: " + w)
+		}
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for the isolation check")
+			os.Exit(1)
+		}
+		ictx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		keys, bad, err := drivers.UnisolatedLabPods(ictx, direct, sandboxes.Tiers[drivers.SandboxTierVCluster].RuntimeClass)
+		if err != nil {
+			cancel()
+			log.Error(err, "cannot list lab pods for the isolation check")
+			os.Exit(1)
+		}
+		for i, k := range keys {
+			log.Error(nil, "lab pod without isolation (host users, no sandbox)", "pod", bad[i])
+			if isolationEvict {
+				if err := direct.Delete(ictx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: k.Namespace, Name: k.Name}}); client.IgnoreNotFound(err) != nil {
+					log.Error(err, "cannot delete unisolated lab pod", "pod", k.String())
+				}
+			}
+		}
+		cancel()
+		if len(keys) > 0 && !isolationEvict {
+			log.Error(nil, "refusing to start: lab pods run without isolation under the production profile; recreate them or start with --isolation-evict", "pods", len(keys))
+			os.Exit(1)
+		}
+	}
+	log.Info("isolation profile", "profile", profile, "userNamespaces", useUserNS, "sandboxes", sandboxes.Enabled())
 	if sandboxes.Enabled() {
 		direct, err := client.New(cfg, client.Options{Scheme: scheme})
 		if err != nil {
@@ -330,7 +382,8 @@ func main() {
 		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent", StorageClass: vmDiskStorageClass,
 			VolumeMode: vmDiskVolumeMode, AccessModes: drivers.SplitList(vmDiskAccessModes)},
 		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
-		Network: netOpts, NamespaceAccess: nsAccess,
+		RequireIsolation: profile == drivers.IsolationProduction,
+		Network:          netOpts, NamespaceAccess: nsAccess,
 	})
 	if err != nil {
 		log.Error(err, "unable to build drivers")

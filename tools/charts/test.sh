@@ -146,6 +146,11 @@ check "sandboxes ConfigMap" q 'select(.kind == "ConfigMap" and .metadata.name ==
 check "sandboxes manager flags" q '[select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--sandboxes-config=/etc/cloudtrain/sandboxes/sandboxes.yaml" or . == "--sandbox-preflight=/etc/cloudtrain/sandbox-preflight/preflight.yaml")] | length == 2' "$OUT/sandboxes.yaml"
 check "sandbox preflight ConfigMap optional" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.volumes[] | select(.name == "sandbox-preflight") | (.configMap.name == "lab-sandbox-preflight" and .configMap.optional == true)' "$OUT/sandboxes.yaml"
 
+# Isolation profile: dev by default; production (the AKS example) pins it with Kata sandboxes.
+check "isolation profile dev by default" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--isolation-profile=dev")' "$OUT/values-kind.yaml"
+check "aks: isolation profile production" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--isolation-profile=production")' "$OUT/values-aks-app-routing.yaml"
+check "aks: every container tier in kata-vm-isolation" q 'select(.kind == "ConfigMap" and .metadata.name == "ct-cloudtrain-orchestrator-sandboxes") | .data["sandboxes.yaml"] | from_yaml | .tiers as $t | (["A", "B", "C", "N", "V"] | all_c($t[.].runtimeClass == "kata-vm-isolation" and $t[.].fallback == "fail"))' "$OUT/values-aks-app-routing.yaml"
+
 # Web runtime config and CSP sources go in as environment variables.
 render -f "$CHART/examples/values-kind.yaml" --set web.runtimeConfig.apiBase=https://api.example.com --set 'web.csp.connectSrc=https://api.example.com wss://api.example.com' >"$OUT/web.yaml"
 check "web CT_API_BASE" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-web") | .spec.template.spec.containers[0].env[] | select(.name == "CT_API_BASE") | .value == "https://api.example.com"' "$OUT/web.yaml"
@@ -171,6 +176,9 @@ refuse "bad ovn-central selector" "selector" -f "$CHART/examples/values-kind.yam
 refuse "unknown value" "additional properties" -f "$CHART/examples/values-kind.yaml" --set gateway.typo=1
 refuse "bad sandbox fallback" "fallback" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata --set orchestrator.sandboxes.B.fallback=host
 refuse "bad sandbox tier" "invalid propertyName" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.Z.runtimeClass=kata
+refuse "production profile without sandboxes" "production needs orchestrator.sandboxes" -f "$CHART/examples/values-kind.yaml" --set orchestrator.isolation.profile=production
+refuse "production profile without a tier V sandbox" "orchestrator.sandboxes.V" -f "$CHART/examples/values-kind.yaml" --set orchestrator.isolation.profile=production --set orchestrator.sandboxes.B.runtimeClass=kata
+refuse "unknown isolation profile" "isolation" -f "$CHART/examples/values-kind.yaml" --set orchestrator.isolation.profile=strict
 refuse "sandboxes and tierRuntimeClasses" "exclusive" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata --set orchestrator.tierRuntimeClasses.B=kata
 
 # Dev sign-in-as is never set by the chart.
