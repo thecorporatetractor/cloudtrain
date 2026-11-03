@@ -1,7 +1,7 @@
 import type { Lab as SourceLab } from '@cloudtrain/lab-schema';
 import type { CheckResult, LabHint, LabSession as WebSession, NodeStatus as WebNodeStatus, SessionNodeState, SessionPhase } from '@cloudtrain/api-types';
 import { endStateChecks, learnerParams, revealedHint } from '../content/view.js';
-import { ANNOTATION_HINTS, LABEL_LAB, type LabSession, type NodePhase } from '../kube/types.js';
+import { ANNOTATION_HINTS, LABEL_CTF_EVENT, LABEL_LAB, type LabSession, type NodePhase } from '../kube/types.js';
 
 const NODE_STATUS: Record<NodePhase, WebNodeStatus> = {
   Pending: 'provisioning',
@@ -124,5 +124,6 @@ export function toWebSession(ls: LabSession, lab: SourceLab): WebSession {
     entryNode: ls.status?.entryNode || lab.spec.topology.entry || lab.spec.topology.nodes[0].name,
     ...(params ? { params: { ...params } } : {}),
     ...(revealed.length ? { hints } : {}),
+    ...(ls.metadata.labels?.[LABEL_CTF_EVENT] ? { eventId: ls.metadata.labels[LABEL_CTF_EVENT] } : {}),
   };
 }

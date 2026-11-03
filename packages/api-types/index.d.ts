@@ -380,6 +380,8 @@ export interface LabSession {
   notices?: SessionNotice[];
   /** The gateway's clock when it answered (GET /api/sessions/:id): countdowns use it, not the browser's clock. */
   serverTime?: string;
+  /** Set on a CTF event's session: it belongs to the event, the lab page does not resume it. */
+  eventId?: string;
 }
 
 export interface ValidateResponse {

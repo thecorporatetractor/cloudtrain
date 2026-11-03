@@ -1,13 +1,14 @@
 import { Link } from '@tanstack/react-router';
 import { ChevronLeft, Clock, Lightbulb, Play, Tag } from 'lucide-react';
 import { useBilling } from '@/api/billing';
-import { useCatalog, useLab, useSkills } from '@/api/client';
+import { useCatalog, useLab, useLabSessions, useSkills } from '@/api/client';
 import { BillingBlocked, ComputeRate, LabAccessChip } from '@/components/billing';
 import { DifficultyBadge, DomainIcon, DriverIcon, SkillTags, domainLabel, driverLabel } from '@/components/domain';
 import { Prose } from '@/components/prose';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { labRoute } from '@/router';
+import { liveSession } from '@/lib/liveSession';
 import { personalize } from '@/lib/personalize';
 import { frameworkDomainLabel } from '@/lib/readiness';
 import { formatMinutes, titleCase } from '@/lib/utils';
@@ -18,6 +19,7 @@ export function LabOverview() {
   const catalog = useCatalog();
   const skills = useSkills();
   const billing = useBilling('user');
+  const sessions = useLabSessions(labId);
 
   if (lab.isPending) {
     return (
@@ -36,7 +38,8 @@ export function LabOverview() {
   // Params are drawn per attempt; until then they read as ‹name›.
   const { metadata, spec } = personalize(lab.data);
   const summary = catalog.data?.labs.find((l) => l.id === metadata.id);
-  const resume = summary?.completion === 'in-progress';
+  // Resume reattaches to the running environment; without one, a start is a new session.
+  const live = liveSession(sessions.data);
   // Billing: compute tier and rate, premium plan, trial, and a lock with its fix (docs/billing.md).
   const access = lab.data.access ?? summary?.access;
   const hintCost = (spec.hints ?? []).reduce((a, h) => a + (h.cost ?? 1), 0);
@@ -81,8 +84,8 @@ export function LabOverview() {
             {summary?.completion === 'completed' && <Badge tone="ok">Best {summary.bestScore} / 100</Badge>}
             <LabAccessChip access={access} />
             {access?.locked ? null : (
-              <Link to="/labs/$labId/work" params={{ labId: metadata.id }} search={{}} className="btn btn-primary btn-lg">
-                <Play size={14} /> {resume ? 'Resume lab' : 'Start lab'}
+              <Link to="/labs/$labId/work" params={{ labId: metadata.id }} search={live ? { s: live.id } : {}} className="btn btn-primary btn-lg">
+                <Play size={14} /> {live ? 'Resume lab' : 'Start lab'}
               </Link>
             )}
           </div>

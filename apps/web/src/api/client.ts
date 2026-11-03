@@ -115,6 +115,8 @@ export const queries = {
   home: () => queryOptions({ queryKey: ['home'], queryFn: () => request<HomeData>('/api/home') }),
   catalog: () => queryOptions({ queryKey: ['catalog'], queryFn: () => request<CatalogData>('/api/catalog'), staleTime: 60_000 }),
   lab: (id: string) => queryOptions({ queryKey: ['lab', id], queryFn: () => request<Lab>(`/api/labs/${id}`), staleTime: 60_000 }),
+  /** The caller's sessions of a lab, newest first (GET /api/labs/:id/sessions): what "Resume" attaches to. */
+  labSessions: (labId: string) => queryOptions({ queryKey: ['lab-sessions', labId], queryFn: () => request<LabSession[]>(`/api/labs/${labId}/sessions`), staleTime: 0 }),
   session: (id: string | undefined) =>
     queryOptions({
       queryKey: ['session', id],
@@ -162,6 +164,7 @@ export const useHome = () => useQuery(queries.home());
 export const useCatalog = () => useQuery(queries.catalog());
 export const useLab = (id: string) => useQuery(queries.lab(id));
 export const useSession = (id: string | undefined) => useQuery(queries.session(id));
+export const useLabSessions = (labId: string) => useQuery(queries.labSessions(labId));
 export const useSkills = (member?: string) => useQuery(queries.skills(member));
 export const useQuestions = (sessionId: string | undefined, enabled = true) => useQuery(queries.questions(sessionId, enabled));
 
@@ -187,7 +190,10 @@ export function useStartSession(labId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => post<LabSession>(`/api/labs/${labId}/sessions`),
-    onSuccess: (s) => qc.setQueryData(['session', s.id], s),
+    onSuccess: (s) => {
+      qc.setQueryData(['session', s.id], s);
+      void qc.invalidateQueries({ queryKey: ['lab-sessions', labId] });
+    },
   });
 }
 
@@ -210,7 +216,10 @@ export function useEndSession(sessionId: string | undefined) {
         if (!(err instanceof ApiError && err.status === 404)) throw err;
       }
     },
-    onSuccess: () => qc.removeQueries({ queryKey: ['session', sessionId] }),
+    onSuccess: () => {
+      qc.removeQueries({ queryKey: ['session', sessionId] });
+      void qc.invalidateQueries({ queryKey: ['lab-sessions'] });
+    },
   });
 }
 

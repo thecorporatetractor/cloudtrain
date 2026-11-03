@@ -95,7 +95,12 @@ export function Workspace() {
   const [lastResult, setLastResult] = useState<ValidateResponse | null>(null);
   const [dismissedNotices, setDismissedNotices] = useState<Set<string>>(() => new Set());
 
-  // Start (or restart) a session when none is attached or it is gone.
+  // Attach to the lab's running session when none is attached (Resume, a reload, a second tab).
+  // POST /api/labs/:id/sessions is idempotent: it answers 200 with the person's running session
+  // (after the same visibility, processing and billing checks as a start) and creates one, 201,
+  // only when none runs, so a second, separately billed environment is never started by accident.
+  // A mutate() callback does not run once the workspace is unmounted, so leaving mid-request
+  // never navigates the page the learner went to.
   const startingRef = useRef(false);
   useEffect(() => {
     const missing = !search.s || (session.isError && session.error instanceof ApiError && session.error.status === 404);
