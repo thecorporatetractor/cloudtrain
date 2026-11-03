@@ -189,6 +189,7 @@ async function main() {
     site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute, waitlist: { store: waitlist, perHour: config.waitlistRatePerHour } },
     trustProxy: config.trustProxy,
     corsOrigins: config.corsOrigins,
+    appUrls: [config.webUrl, config.publicUrl],
     readiness: { postgres: () => sql`SELECT 1`.execute(db) },
     billing,
     gdpr: { service: gdpr, perHour: config.gdpr.perHour },

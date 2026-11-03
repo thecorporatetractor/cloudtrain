@@ -247,6 +247,12 @@ Both hosts must be same-site, because the session cookie is `SameSite=Lax`. The 
 routes one host only, so the second route is yours to add. The default (one host,
 path routing) needs none of this.
 
+The terminal WebSockets accept an `Origin` only from the request's own host, the
+public and web URLs, or `gateway.corsOrigins`. CORS does not cover WebSockets, so
+without that check a page on any other same-site origin could open a learner's shell
+with their cookie. A web app on another origin must therefore be listed in
+`gateway.corsOrigins`.
+
 
 ## Local and the verify VM
 

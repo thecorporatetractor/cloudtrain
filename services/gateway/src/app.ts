@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyRequest, type FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
 import websocket from '@fastify/websocket';
 import type { Lab, SiteConfig } from '@cloudtrain/api-types';
@@ -66,6 +66,12 @@ export interface AppDeps {
    * web app served from another same-site origin. Empty (default) = same-origin only.
    */
   corsOrigins?: string[];
+  /**
+   * The app's own URLs (CT_WEB_URL, CT_PUBLIC_URL): their origins may open terminal WebSockets.
+   * Given apart from `platform`, so a gateway without the platform database (labs-only dev,
+   * the web app on Vite's :5173 behind a proxy that rewrites Host) still accepts its own app.
+   */
+  appUrls?: string[];
   /** Readiness checks for GET /readyz (e.g. Postgres); each resolves or throws. */
   readiness?: Record<string, () => Promise<unknown>>;
   /**
@@ -110,6 +116,13 @@ export function requireDeclaredPermission(r: { url: string; method: string | str
 const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 /**
+ * Whether the request matched an /api route. Decided on the matched route pattern, never the raw
+ * URL: the router decodes percent-escapes, so `/%61pi/me` reaches the `/api/me` route while
+ * `req.url` does not start with `/api/`.
+ */
+const isApiRoute = (req: FastifyRequest): boolean => (req.routeOptions.url ?? '').startsWith('/api/');
+
+/**
  * The gateway's HTTP surface: the paths and shapes apps/web uses (see
  * packages/api-types and docs/api/platform.md). Every /api route declares
  * the permission it needs (`config.permission`) or is explicitly public;
@@ -141,7 +154,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const allowed = (origin: string | undefined) => [...cors].find((o) => o === origin);
     app.addHook('onRequest', async (req, reply) => {
       const origin = allowed(req.headers.origin);
-      if (!origin || !req.url.startsWith('/api/')) return;
+      if (!origin || !isApiRoute(req)) return;
       reply.header('access-control-allow-origin', origin);
       reply.header('access-control-allow-credentials', 'true');
       reply.header('vary', 'Origin');
@@ -156,6 +169,21 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   }
   await app.register(cookie);
   await app.register(websocket, { options: { maxPayload: 1 << 20 } });
+  // Cross-site WebSocket hijacking: a browser sends the cookie with a WebSocket upgrade from any
+  // page of the same site (a sibling subdomain included), and CORS does not apply to WebSockets.
+  // Only the app's own origins may open one: the request's own host, the web and public URLs and
+  // CT_CORS_ORIGINS. A client without an Origin header is not a browser page.
+  const wsOrigins = new Set([...cors, ...[...(deps.appUrls ?? []), ps?.config.webUrl, ps?.config.publicUrl].flatMap((u) => (u ? [originOf(u)] : []))]);
+  // After the websocket plugin: its own onRequest hook must have run for a refused upgrade's socket to be closed.
+  // Every upgrade is checked whatever its path: the router decodes percent-escapes (`/%61pi/...`
+  // matches `/api/...`), so a test on the raw URL would let a disguised path through.
+  app.addHook('onRequest', async (req, reply) => {
+    if (req.headers.upgrade?.toLowerCase() !== 'websocket') return;
+    const origin = req.headers.origin;
+    if (origin === undefined || wsOriginAllowed(origin, req.headers.host, wsOrigins)) return;
+    req.log.warn({ origin, url: req.url }, 'WebSocket from a foreign origin refused');
+    return reply.code(403).send({ error: 'Origin not allowed', code: 'forbidden' });
+  });
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => done(null, Object.fromEntries(new URLSearchParams(body as string))));
 
   // The web client sends content-type: application/json on body-less POSTs; treat an empty body as none.
@@ -173,7 +201,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.decorateRequest('principal', null as never);
   app.addHook('onRequest', async (req, reply) => {
-    if (!req.url.startsWith('/api/') || !req.routeOptions.url) return; // unknown routes: 404 below
+    if (!isApiRoute(req)) return; // unknown routes: 404 below
     const cfg = req.routeOptions.config ?? {};
     if (cfg.public) return;
     const p = await auth.authenticate(req);
@@ -343,10 +371,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       );
       return;
     }
-    const planned = sessions.owned(req.principal, id).then(({ ls, lab }) => planTerminal(ls, lab.lab, req.query.node));
+    // The socket joins the session's learners (observer notices, the observers' copy of the
+    // output) only once the caller is known to own the session and the terminal is planned.
+    let tap: ((chunk: Buffer) => void) | undefined;
+    const planned = sessions.owned(req.principal, id).then(({ ls, lab }) => {
+      const plan = planTerminal(ls, lab.lab, req.query.node);
+      if (socket.readyState === socket.OPEN) tap = hub.addLearner(id, socket);
+      return plan;
+    });
     planned.catch(() => undefined); // reported to the client by bridge()
-    const tap = hub.addLearner(id, socket);
-    void bridge(socket, cluster, planned, { cols: clampSize(req.query.cols, 120, 1000), rows: clampSize(req.query.rows, 32, 500) }, req.log, tap);
+    void bridge(socket, cluster, planned, { cols: clampSize(req.query.cols, 120, 1000), rows: clampSize(req.query.rows, 32, 500) }, req.log, (chunk) => tap?.(chunk));
   });
 
   if (deps.answers) registerAnswerRoutes(app, deps.answers);
@@ -367,4 +401,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (deps.exams) registerExamRoutes(app, deps.exams, cluster, ps ? (p) => ps.ensureNotRestricted(p) : undefined, deps.billing);
 
   return app;
+}
+
+const originOf = (u: string): string => {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return '';
+  }
+};
+
+/** A WebSocket Origin is allowed when it is the request's own host or one of the app's origins. */
+export function wsOriginAllowed(origin: string, host: string | undefined, allowed: Set<string>): boolean {
+  const o = originOf(origin);
+  if (!o || o === 'null') return false;
+  if (allowed.has(o)) return true;
+  return !!host && new URL(o).host === host.toLowerCase();
 }
