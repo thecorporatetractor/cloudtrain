@@ -231,6 +231,7 @@ outside lab namespaces, no writes to namespaced objects anywhere else. Sources, 
 | `leader_election_role.yaml` | Role | the manager's namespace | static |
 | `ovn_central_role.yaml` | Role | `kube-system` (Kube-OVN's ovn-central) | static |
 | `admission_policy.yaml` | ValidatingAdmissionPolicy + binding | requests of the manager's ServiceAccount | static |
+| `vcluster_pod_network_policy.yaml` | ValidatingAdmissionPolicy + binding | pods a vcluster syncer (a `ct-vc-*` ServiceAccount) writes in `ct-vc-*`, also through `pods/status`: no Multus or Kube-OVN network annotations, so a learner's pod can't join another session's segment or VPC. Kube-OVN's own annotations are kept | static |
 
 ### Lab namespaces
 

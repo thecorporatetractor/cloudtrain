@@ -7,6 +7,7 @@
 #   deploy/charts/cloudtrain/files/orchestrator-session-role.txt -> .../config/rbac/session_role.yaml
 #   deploy/charts/cloudtrain/files/orchestrator-admission-policy.txt -> .../config/rbac/admission_policy.yaml
 #     (.txt so scanners do not report the accepted roles a second time)
+#   deploy/charts/cloudtrain/files/vcluster-pod-network-policy.txt -> .../config/rbac/vcluster_pod_network_policy.yaml
 #   deploy/charts/cloudtrain/files/catalog.yaml       -> deploy/images/catalog.yaml
 #   deploy/charts/cloudtrain/files/catalog-iac-opentofu.yaml -> deploy/images/overlays/iac-opentofu.yaml
 # This script (re)creates the links, e.g. after a CRD is added or removed.
@@ -19,6 +20,7 @@ links=(
   "deploy/charts/cloudtrain/files/orchestrator-role.txt|../../../../services/lab-orchestrator/config/rbac/role.yaml"
   "deploy/charts/cloudtrain/files/orchestrator-session-role.txt|../../../../services/lab-orchestrator/config/rbac/session_role.yaml"
   "deploy/charts/cloudtrain/files/orchestrator-admission-policy.txt|../../../../services/lab-orchestrator/config/rbac/admission_policy.yaml"
+  "deploy/charts/cloudtrain/files/vcluster-pod-network-policy.txt|../../../../services/lab-orchestrator/config/rbac/vcluster_pod_network_policy.yaml"
   "deploy/charts/cloudtrain/files/catalog.yaml|../../../images/catalog.yaml"
   "deploy/charts/cloudtrain/files/catalog-iac-opentofu.yaml|../../../images/overlays/iac-opentofu.yaml"
 )

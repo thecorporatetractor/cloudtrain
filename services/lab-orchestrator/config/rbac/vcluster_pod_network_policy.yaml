@@ -1,0 +1,56 @@
+# Pods a vcluster syncs into its host namespace (ct-vc-*) must not choose their
+# own network (security review network-3). A learner is cluster-admin inside
+# the virtual cluster; if the syncer copies a pod's annotations to the host
+# pod, a Multus or Kube-OVN annotation could attach it to another session's
+# segment or VPC (sniffing, ARP spoofing, tampering with graded state), or pin
+# its address. The syncer (the vcluster's ServiceAccount in its own ct-vc-*
+# namespace) may therefore neither set nor change any network-request
+# annotation; values that Kube-OVN or Multus wrote themselves stay untouched,
+# since those controllers are not matched. Enforced for every vcluster, not
+# only the lab-orchestrator's requests. Needs Kubernetes 1.30+.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: lab-vcluster-pod-network
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        # pods/status too: a status update can change metadata.annotations (the
+        # status strategy resets only spec, deletionTimestamp and ownerReferences),
+        # and the vcluster Role grants the syncer update/patch on pods/status.
+        resources: [pods, pods/status]
+  matchConditions:
+    - name: vcluster-syncer
+      expression: >-
+        request.namespace.startsWith('ct-vc-') &&
+        request.userInfo.username.startsWith('system:serviceaccount:ct-vc-')
+  variables:
+    - name: ann
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: old
+      expression: "request.operation == 'UPDATE' && has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    # Multus (k8s.v1.cni.cncf.io/networks, v1.multus-cni.io/default-network) and
+    # every Kube-OVN annotation, also the per-attachment form
+    # <nad>.<namespace>.ovn.kubernetes.io/<key>.
+    - name: changed
+      expression: >-
+        variables.ann.filter(k,
+          (k.startsWith('k8s.v1.cni.cncf.io/') || k.startsWith('v1.multus-cni.io/') || k.contains('ovn.kubernetes.io/')) &&
+          !(k in variables.old && variables.old[k] == variables.ann[k]))
+  validations:
+    - expression: "size(variables.changed) == 0"
+      messageExpression: >-
+        'pods synced from a virtual cluster may not set network annotations (' + variables.changed.join(', ') + ')'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: lab-vcluster-pod-network
+spec:
+  policyName: lab-vcluster-pod-network
+  validationActions: [Deny]
