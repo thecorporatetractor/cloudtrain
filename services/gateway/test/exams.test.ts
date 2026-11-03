@@ -203,6 +203,75 @@ describe('exam service', () => {
     expect((await svc.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ allowed: true, attemptsTotal: 0 });
   });
 
+  it('keeps an unscored attempt (freeze not confirmed) out of scores, evidence and readiness, but counts it until an admin voids it', async () => {
+    const { svc, cluster, evidence } = await make();
+    const { id } = await svc.start(alice, EXAM);
+    cluster.inProgress(id, '2026-10-14T10:05:00Z');
+    cluster.completed(id, '80', false);
+    const rep = cluster.sessions.get(id)!.status!.report!;
+    rep.unscored = true;
+    rep.unscoredReason = 'not frozen in time';
+    rep.reviewFlags = ['access revocation not confirmed: env-1 (vm1 unreachable)'];
+    now = new Date('2026-10-14T10:20:00Z');
+    const st = await svc.attempt(alice, id);
+    expect(st).toMatchObject({ phase: 'completed', passed: false, reportReady: true });
+    expect(st.score).toBeUndefined();
+    // The candidate learns nothing about the results: they would show whether
+    // making a node unreachable paid off.
+    const mine = await svc.report(alice, id);
+    expect(mine).toMatchObject({ unscored: true, unscoredReason: 'not frozen in time', passed: false, score: 0, objectives: [], tasks: [], skills: [], recommendations: [] });
+    expect(mine).not.toHaveProperty('review');
+    expect(evidence.recorded).toHaveLength(0);
+    // Not a free retake: the candidate may have made a node unreachable on purpose.
+    expect((await svc.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ attemptsTotal: 1 });
+    const ex = (await svc.teamReadiness(manager)).exams.find((e) => e.examId === EXAM)!;
+    expect(ex.members.find((m) => m.userId === 'alice')).toMatchObject({ readiness: 'not-attempted', passed: false });
+    // Managers see it held for review, with the graded score and why.
+    expect(ex.heldForReview).toEqual([
+      expect.objectContaining({ attemptId: id, userId: 'alice', number: 1, review: { unscored: true, flags: ['access revocation not confirmed: env-1 (vm1 unreachable)'], gradedScore: 80, gradedPassed: true } }),
+    ]);
+    // After review an admin voids it; the environment is kept and it stops counting.
+    await expect(svc.void(bob, id, 'x')).rejects.toMatchObject({ status: 403 });
+    const out = await svc.void(admin, id, 'platform fault: node lost', '10.9.9.9');
+    expect(out).toMatchObject({ phase: 'completed', counted: false, voided: { reason: 'platform fault: node lost' } });
+    expect(cluster.sessions.has(id)).toBe(true);
+    expect((await svc.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ allowed: true, attemptsTotal: 0 });
+    expect((await svc.teamReadiness(manager)).exams.find((e) => e.examId === EXAM)!.heldForReview).toEqual([]);
+    await expect(svc.void(admin, id, undefined)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('holds a scored attempt flagged by the freeze for review: listed for managers, voidable, hidden from the candidate', async () => {
+    const { svc, cluster } = await make();
+    const { id } = await svc.start(alice, EXAM);
+    cluster.inProgress(id, '2026-10-14T10:05:00Z');
+    cluster.completed(id, '80', true);
+    cluster.sessions.get(id)!.status!.report!.reviewFlags = ['units or processes started after Ready survived the freeze: env-1/workstation: process sh[40] /'];
+    now = new Date('2026-10-14T10:20:00Z');
+    expect(await svc.attempt(alice, id)).toMatchObject({ score: 80, passed: true });
+    const mine = await svc.report(alice, id);
+    expect(mine).toMatchObject({ score: 80, passed: true });
+    expect(mine).not.toHaveProperty('review');
+    expect(mine.tasks.length).toBeGreaterThan(0);
+    const ex = (await svc.teamReadiness(manager)).exams.find((e) => e.examId === EXAM)!;
+    expect(ex.heldForReview).toEqual([expect.objectContaining({ attemptId: id, review: expect.objectContaining({ unscored: false, gradedScore: 80, gradedPassed: true }) })]);
+    expect(ex.members.find((m) => m.userId === 'alice')).toMatchObject({ passed: true });
+    // A reviewer who finds the run tampered with withdraws it: no longer counted or passed.
+    expect(await svc.void(admin, id, 'background loop rewrote the answer')).toMatchObject({ phase: 'completed', counted: false });
+    const after = (await svc.teamReadiness(manager)).exams.find((e) => e.examId === EXAM)!;
+    expect(after.heldForReview).toEqual([]);
+    expect(after.members.find((m) => m.userId === 'alice')).toMatchObject({ passed: false, attempts: 0 });
+  });
+
+  it('refuses to void a scored, completed attempt', async () => {
+    const { svc, cluster } = await make();
+    const { id } = await svc.start(alice, EXAM);
+    cluster.inProgress(id, '2026-10-14T10:05:00Z');
+    cluster.completed(id, '80', true);
+    now = new Date('2026-10-14T10:20:00Z');
+    await svc.attempt(alice, id);
+    await expect(svc.void(admin, id, 'x')).rejects.toMatchObject({ status: 409 });
+  });
+
   it('gives managers team readiness and refuses learners', async () => {
     const { svc, cluster } = await make();
     const { id } = await svc.start(alice, EXAM);
@@ -257,7 +326,7 @@ describe('exam interventions and audit', () => {
     const st = await svc.attempt(alice, id);
     expect(st.message).toMatch(/ended by an administrator/);
     expect(store.audits.at(-1)).toMatchObject({ action: 'exam.void', targetId: id, actorId: 'olga', details: { candidate: 'alice', reason: 'Proctoring incident' } });
-    await expect(svc.void(admin, id, undefined)).rejects.toThrow(/Only a running attempt/);
+    await expect(svc.void(admin, id, undefined)).rejects.toThrow(/Only a running attempt or one held for review/);
     expect((await svc.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ allowed: true, attemptsTotal: 0 });
   });
 

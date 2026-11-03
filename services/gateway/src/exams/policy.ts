@@ -4,7 +4,13 @@ import type { AttemptRecord } from './store.js';
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
-/** Attempts that count for the retake policy: everything except attempts the platform could not run or an admin voided. */
+/**
+ * Attempts that count for the retake policy: everything except attempts the
+ * platform could not run or an admin voided. An unscored attempt (the freeze
+ * was not confirmed) still counts until an admin voids it after review: the
+ * candidate may have made a node unreachable on purpose, and a free retake
+ * would reward that.
+ */
 export function counted(a: AttemptRecord): boolean {
   return a.phase !== 'failed' && !a.voided;
 }

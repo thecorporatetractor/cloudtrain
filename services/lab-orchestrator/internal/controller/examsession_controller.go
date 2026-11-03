@@ -709,9 +709,42 @@ func (r *ExamSessionReconciler) freeze(ctx context.Context, run *examRun, envs m
 		return false, nil
 	}
 	msg := "candidate access revoked on every environment"
+	if es.Status.Grading == nil {
+		es.Status.Grading = &labsv1.ExamGradingStatus{}
+	}
+	var running []string
+	for name, ls := range envs {
+		for _, u := range ls.Status.StillRunningAfterRevoke {
+			running = append(running, name+"/"+u)
+		}
+	}
+	sort.Strings(running)
+	es.Status.Grading.StillRunningAfterFreeze = running
+	if len(running) > 0 {
+		r.event(es, "Warning", "StillRunningAfterFreeze", "units or processes started after Ready survived the freeze (attempt held for review): "+strings.Join(running, ", "))
+	}
 	if !done {
-		msg = "access revocation not confirmed in time; grading continues"
-		r.event(es, "Warning", "FreezeTimeout", msg)
+		// Fail closed: grading still runs (the report shows the results),
+		// but the attempt is left unscored and held for review. It still
+		// counts as an attempt unless an administrator voids it: the
+		// candidate may have made a node unreachable on purpose.
+		var unconfirmed, names []string
+		for name, ls := range envs {
+			if envBroken(ls) || meta.IsStatusConditionTrue(ls.Status.Conditions, labsv1.ConditionAccessRevoked) {
+				continue
+			}
+			names = append(names, name)
+			entry := name
+			if c := meta.FindStatusCondition(ls.Status.Conditions, labsv1.ConditionAccessRevoked); c != nil && c.Message != "" {
+				entry += " (" + c.Message + ")"
+			}
+			unconfirmed = append(unconfirmed, entry)
+		}
+		sort.Strings(unconfirmed)
+		sort.Strings(names)
+		es.Status.Grading.RevocationUnconfirmed = unconfirmed
+		msg = "access revocation not confirmed in time on " + strings.Join(names, ", ") + "; grading continues but the attempt is unscored and held for review"
+		r.event(es, "Warning", "FreezeTimeout", "access revocation not confirmed in time: "+strings.Join(unconfirmed, "; "))
 	}
 	r.setCondition(es, labsv1.ExamConditionFrozen, metav1.ConditionTrue, "Frozen", msg)
 	return true, nil

@@ -4,6 +4,7 @@ import type {
   ExamAttemptState,
   ExamAttemptSummary,
   ExamDetail,
+  ExamHeldAttempt,
   ExamReport,
   ExamSummary,
   ExamTaskView,
@@ -24,7 +25,7 @@ import type { ExamCompiler } from './compile.js';
 import { skillEvidence, type ExamEvidenceSink } from './evidence.js';
 import type { ExamCluster, ExamSession } from './kube.js';
 import { counted, isActive, retakeStatus } from './policy.js';
-import { RunningAttemptExists, type AttemptRecord, type ExamAuditEntry, type ExamStore } from './store.js';
+import { RunningAttemptExists, type AttemptRecord, type ExamAuditEntry, type ExamStore, type StoredExamReport } from './store.js';
 
 export const LABEL_EXAM_ID = 'labs.cloudtrain.dev/exam-id';
 
@@ -344,7 +345,7 @@ export class ExamService {
     const st = es.status ?? {};
     const phase = PHASES[st.phase ?? 'Pending'] ?? 'preparing';
     const ex = this.catalog.exams.get(rec.examId);
-    let report: ExamReport | undefined = rec.report;
+    let report: StoredExamReport | undefined = rec.report;
     if (phase === 'completed' && !report && st.report) report = this.toReport(rec, es, ex);
     const tasks =
       rec.tasks.length || !st.tasks?.length
@@ -358,12 +359,13 @@ export class ExamService {
       ...(st.deadline ? { deadline: st.deadline } : {}),
       ...(st.submittedAt ? { submittedAt: st.submittedAt } : {}),
       ...(st.completedAt ? { completedAt: st.completedAt } : {}),
-      ...(report ? { report, score: report.score, passed: report.passed } : {}),
+      // An unscored report keeps its results visible but records no score.
+      ...(report ? { report, ...(report.unscored ? {} : { score: report.score }), passed: report.passed } : {}),
     };
     if (JSON.stringify(next) !== JSON.stringify(rec)) {
       rec = await this.store.update(rec.orgId, rec.id, () => next);
     }
-    if (rec.report && !rec.evidenceRecorded) {
+    if (rec.report && !rec.report.unscored && !rec.evidenceRecorded) {
       await this.recordEvidence(rec);
       rec = await this.store.update(rec.orgId, rec.id, (r) => ({ ...r, evidenceRecorded: true }));
     }
@@ -389,7 +391,7 @@ export class ExamService {
     });
   }
 
-  private toReport(rec: AttemptRecord, es: ExamSession, ex: CatalogExam | undefined): ExamReport {
+  private toReport(rec: AttemptRecord, es: ExamSession, ex: CatalogExam | undefined): StoredExamReport {
     const st = es.status!;
     const r = st.report!;
     const names = this.catalog.objectiveNames;
@@ -421,7 +423,8 @@ export class ExamService {
       .filter((x) => x.labIds.length > 0);
     const started = st.startedAt ? Date.parse(st.startedAt) : undefined;
     const ended = st.frozenAt ? Date.parse(st.frozenAt) : undefined;
-    const report: ExamReport = {
+    const flags = r.reviewFlags ?? [];
+    const report: StoredExamReport = {
       attemptId: rec.id,
       examId: rec.examId,
       examTitle: rec.examTitle,
@@ -440,6 +443,10 @@ export class ExamService {
       tasks,
       skills: [],
       recommendations,
+      ...(r.unscored ? { unscored: true, unscoredReason: r.unscoredReason ?? 'This attempt is not scored.' } : {}),
+      ...(r.unscored || flags.length
+        ? { review: { unscored: !!r.unscored, flags: r.unscored && !flags.length ? ['left unscored by the orchestrator'] : flags, gradedScore: num(r.score), gradedPassed: num(r.score) >= num(r.passMark) } }
+        : {}),
     };
     report.skills = skillEvidence(report);
     return report;
@@ -545,6 +552,9 @@ export class ExamService {
    * Ends someone's running attempt (session.control on the candidate: an
    * instructor of their cohort, an org admin). The ExamSession and its
    * environments are deleted; the attempt is not scored and never counts.
+   * A completed attempt held for review (unscored, or flagged because
+   * something the candidate may have started survived the freeze) can be
+   * voided too; its environment is kept and it stops counting.
    * Audited as exam.void.
    */
   async void(p: Principal, id: string, reason: string | undefined, ip?: string): Promise<ExamAttemptSummary> {
@@ -554,14 +564,17 @@ export class ExamService {
     if (!subject) throw notFound('Attempt');
     authorize(p, 'session.control', subject);
     const { rec } = await this.sync(found);
-    if (!isActive(rec)) throw new HttpError(409, 'Only a running attempt can be voided.', { code: 'conflict' });
-    await this.cluster.deleteExamSession(rec.id);
+    // A completed attempt held for review (unscored, or flagged by the
+    // freeze): voiding it after review is how an admin stops it counting.
+    const held = heldForReview(rec);
+    if (!isActive(rec) && !held) throw new HttpError(409, 'Only a running attempt or one held for review can be voided.', { code: 'conflict' });
+    if (!held) await this.cluster.deleteExamSession(rec.id);
     const at = this.now().toISOString();
     const why = reason?.trim().slice(0, 500) || undefined;
     const next = await this.store.update(
       rec.orgId,
       rec.id,
-      (r) => ({ ...r, phase: 'failed', completedAt: at, voided: { at, by: p.sub, ...(why ? { reason: why } : {}) } }),
+      (r) => (held ? { ...r, voided: { at, by: p.sub, ...(why ? { reason: why } : {}) } } : { ...r, phase: 'failed', completedAt: at, voided: { at, by: p.sub, ...(why ? { reason: why } : {}) } }),
       auditOf(p, 'exam.void', 'exam_attempt', rec.id, { examId: rec.examId, candidate: rec.userId, phase: rec.phase, ...(why ? { reason: why } : {}) }, ip, `${rec.examTitle} · ${rec.userName}`),
     );
     return this.attemptSummary(next);
@@ -589,7 +602,7 @@ export class ExamService {
   async report(p: Principal, id: string): Promise<ExamReport> {
     const { rec } = await this.sync(await this.owned(p, id));
     if (!rec.report) throw new HttpError(409, rec.phase === 'failed' ? 'This attempt was not scored.' : 'The report is not ready yet.');
-    return rec.report;
+    return candidateReport(rec.report);
   }
 
   /* ---------------------------------------------------------- manager */
@@ -624,6 +637,10 @@ export class ExamService {
             ...(mine.find(isActive) ? { activeAttemptId: mine.find(isActive)!.id } : {}),
           };
         });
+        const names = new Map(team.members.map((m) => [m.userId, m.name]));
+        const heldList: ExamHeldAttempt[] = rows
+          .filter((r) => r.examId === ex.def.id && names.has(r.userId) && counted(r) && heldForReview(r))
+          .map((r) => ({ attemptId: r.id, userId: r.userId, name: names.get(r.userId)!, number: r.number, ...(r.completedAt ? { completedAt: r.completedAt } : {}), review: r.report!.review! }));
         const attempted = members.filter((m) => m.lastScore !== undefined);
         return {
           examId: ex.def.id,
@@ -632,8 +649,25 @@ export class ExamService {
           members,
           ...(attempted.length ? { averageScore: Math.round((attempted.reduce((a, m) => a + m.lastScore!, 0) / attempted.length) * 10) / 10 } : {}),
           passRate: members.length ? members.filter((m) => m.passed).length / members.length : 0,
+          heldForReview: heldList,
         };
       }),
     };
   }
+}
+
+/** A completed, not voided attempt the orchestrator held for review (unscored or flagged). */
+function heldForReview(rec: AttemptRecord): boolean {
+  return rec.phase === 'completed' && !rec.voided && !!rec.report?.review;
+}
+
+/**
+ * The report as the candidate sees it: never the review, and for an unscored
+ * attempt no results at all (they would show whether a deliberate disruption
+ * of the freeze paid off).
+ */
+export function candidateReport(rep: StoredExamReport): ExamReport {
+  const { review: _review, ...out } = rep;
+  if (!out.unscored) return out;
+  return { ...out, score: 0, passed: false, objectives: [], tasks: [], skills: [], recommendations: [] };
 }

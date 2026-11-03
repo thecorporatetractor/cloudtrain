@@ -1,4 +1,11 @@
-import type { ExamAttemptPhase, ExamReport } from '@cloudtrain/api-types';
+import type { ExamAttemptPhase, ExamAttemptReview, ExamReport } from '@cloudtrain/api-types';
+
+/**
+ * The report as persisted: the full results plus, for an attempt held for
+ * review, why (manager and admin views only; ExamService.report strips it,
+ * and for an unscored attempt the results too, before the candidate sees it).
+ */
+export type StoredExamReport = ExamReport & { review?: ExamAttemptReview };
 
 /** One drawn task as persisted with the attempt. */
 export interface AttemptTask {
@@ -39,7 +46,7 @@ export interface AttemptRecord {
   score?: number;
   passed?: boolean;
   /** Final report (per task, per objective, per check). */
-  report?: ExamReport;
+  report?: StoredExamReport;
   /** Skill evidence was fed to the learner model (exactly once). */
   evidenceRecorded: boolean;
   /** Ended by an admin/instructor (not scored, does not count); the ExamSession is deleted. */

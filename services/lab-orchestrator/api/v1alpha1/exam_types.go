@@ -343,6 +343,19 @@ type ExamGradingStatus struct {
 	StageStartedAt *metav1.Time `json:"stageStartedAt,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
+	// RevocationUnconfirmed lists the environments whose candidate access
+	// was not confirmed revoked before grading, each with the last revoke
+	// error (the node that could not be reached and why) for review. Any
+	// entry leaves the attempt unscored: the candidate (or something they
+	// started) may still have been acting while the checks ran.
+	// +optional
+	RevocationUnconfirmed []string `json:"revocationUnconfirmed,omitempty"`
+	// StillRunningAfterFreeze lists, as "environment/node: ...", transient
+	// units and processes started after Ready that survived the freeze (see
+	// LabSession status.stillRunningAfterRevoke). The attempt is scored but
+	// held for review (score report reviewFlags).
+	// +optional
+	StillRunningAfterFreeze []string `json:"stillRunningAfterFreeze,omitempty"`
 }
 
 // TaskOutcome of a scored task.
@@ -414,8 +427,19 @@ type ExamScoreReport struct {
 	Tasks         []ExamTaskReport      `json:"tasks"`
 	// Passes lists the grading passes that ran (initial, rerun, reboot).
 	// +optional
-	Passes   []string    `json:"passes,omitempty"`
-	GradedAt metav1.Time `json:"gradedAt"`
+	Passes []string `json:"passes,omitempty"`
+	// Unscored: the grading cannot be trusted, so the attempt neither passes
+	// nor counts (Passed is false); UnscoredReason says why (learner-safe).
+	// +optional
+	Unscored bool `json:"unscored,omitempty"`
+	// +optional
+	UnscoredReason string `json:"unscoredReason,omitempty"`
+	// ReviewFlags are reasons an administrator should review the attempt
+	// before trusting the result (e.g. units the candidate may have started
+	// that kept running after the freeze). Not shown to the candidate.
+	// +optional
+	ReviewFlags []string    `json:"reviewFlags,omitempty"`
+	GradedAt    metav1.Time `json:"gradedAt"`
 }
 
 // ExamSessionStatus is the observed state of an attempt.

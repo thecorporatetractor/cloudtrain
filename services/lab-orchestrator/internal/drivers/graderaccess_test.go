@@ -79,3 +79,28 @@ func TestHostAccessFailed(t *testing.T) {
 		}
 	}
 }
+
+// grading-3: a VM makes loginuids immutable at boot, so root cannot move a
+// process out of the learner's login session by rewriting its loginuid.
+func TestCloudInitLoginuidImmutable(t *testing.T) {
+	kp, _ := NewSSHKeyPair("k")
+	ud, err := cloudInit{Hostname: "h", LearnerPub: kp.Public, AdminPub: kp.Public, HostKey: kp}.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		RunCmd [][]string `json:"runcmd"`
+	}
+	if err := yaml.Unmarshal(ud, &doc); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range doc.RunCmd {
+		if len(c) == 3 && c[2] == LoginuidImmutable {
+			found = true
+		}
+	}
+	if !found || !strings.Contains(LoginuidImmutable, "auditctl --loginuid-immutable") || !strings.HasSuffix(LoginuidImmutable, "|| true") {
+		t.Errorf("runcmd must make loginuid immutable (best effort): %v", doc.RunCmd)
+	}
+}

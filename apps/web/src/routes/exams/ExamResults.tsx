@@ -141,137 +141,155 @@ function ExamResultsScreen() {
         </div>
       </header>
 
-      <Card className="exam-hero" style={{ marginBottom: 20 }}>
-        <Ring value={r.score / 100} size={104} stroke={8} tone={r.passed ? 'ok' : 'err'} label={`Score ${fmtPct(r.score)}`}>
-          <span className="tnum" style={{ fontSize: 22, fontWeight: 700 }}>
-            {fmtPct(r.score)}
-          </span>
-        </Ring>
-        <div className="stack" style={{ gap: 6 }}>
-          <div className={r.passed ? 'exam-verdict exam-verdict-pass' : 'exam-verdict exam-verdict-fail'}>{r.passed ? 'Passed' : 'Not passed'}</div>
-          <div className="small muted">
-            {fmtPct(r.score)} against a pass mark of {r.passMark}% · {passTasks} of {r.tasks.length} tasks fully solved · {r.partialCredit === 'per-check' ? 'partial credit per check' : 'all-or-nothing per task'}
+      {r.unscored ? (
+        <Card className="exam-hero" style={{ marginBottom: 20 }}>
+          <Ring value={0} size={104} stroke={8} tone="neutral" label="Not scored">
+            <span style={{ fontSize: 22, fontWeight: 700 }}>-</span>
+          </Ring>
+          <div className="stack" style={{ gap: 6 }}>
+            <div className="exam-verdict exam-verdict-fail">Not scored</div>
+            {r.unscoredReason ? <div className="small muted">{r.unscoredReason}</div> : null}
+            <div className="small muted">Results are not shown for an attempt held for review. Pass mark {r.passMark}%.</div>
           </div>
-          <div style={{ maxWidth: 520, marginTop: 6 }}>
-            <ScoreBar value={r.score} passMark={r.passMark} />
+          <div className="grid-2" style={{ gap: 18 }}>
+            <Stat label="Time used" value={r.minutesUsed !== undefined ? `${r.minutesUsed} min` : '-'} hint={`of ${r.durationMinutes} min`} />
           </div>
-        </div>
-        <div className="grid-2" style={{ gap: 18 }}>
-          <Stat label="Time used" value={r.minutesUsed !== undefined ? `${r.minutesUsed} min` : '-'} hint={`of ${r.durationMinutes} min`} />
-          <Stat label="Grading" value={r.passes.length} hint={r.passes.join(' · ')} />
-        </div>
-      </Card>
-
-      <div className="split split-7-5">
-        <div className="stack" style={{ gap: 20 }}>
-          <Card className="card-flush">
-            <div className="card-head">
-              <h2>By objective</h2>
-              <span className="xs subtle">line = pass mark</span>
+        </Card>
+      ) : (
+        <Card className="exam-hero" style={{ marginBottom: 20 }}>
+          <Ring value={r.score / 100} size={104} stroke={8} tone={r.passed ? 'ok' : 'err'} label={`Score ${fmtPct(r.score)}`}>
+            <span className="tnum" style={{ fontSize: 22, fontWeight: 700 }}>
+              {fmtPct(r.score)}
+            </span>
+          </Ring>
+          <div className="stack" style={{ gap: 6 }}>
+            <div className={r.passed ? 'exam-verdict exam-verdict-pass' : 'exam-verdict exam-verdict-fail'}>{r.passed ? 'Passed' : 'Not passed'}</div>
+            <div className="small muted">
+              {fmtPct(r.score)} against a pass mark of {r.passMark}% · {passTasks} of {r.tasks.length} tasks fully solved · {r.partialCredit === 'per-check' ? 'partial credit per check' : 'all-or-nothing per task'}
             </div>
-            <div className="card-body stack" style={{ gap: 14 }}>
-              {r.objectives.map((o) => (
-                <div key={o.id} className="exam-objective-row">
-                  <div style={{ minWidth: 0 }}>
-                    <div className="small truncate">{o.name ?? o.id}</div>
-                    <div className="xs subtle">
-                      {o.weight}% of the score · {o.tasks} task{o.tasks === 1 ? '' : 's'}
+            <div style={{ maxWidth: 520, marginTop: 6 }}>
+              <ScoreBar value={r.score} passMark={r.passMark} />
+            </div>
+          </div>
+          <div className="grid-2" style={{ gap: 18 }}>
+            <Stat label="Time used" value={r.minutesUsed !== undefined ? `${r.minutesUsed} min` : '-'} hint={`of ${r.durationMinutes} min`} />
+            <Stat label="Grading" value={r.passes.length} hint={r.passes.join(' · ')} />
+          </div>
+        </Card>
+      )}
+
+      {!r.unscored && (
+        <div className="split split-7-5">
+          <div className="stack" style={{ gap: 20 }}>
+            <Card className="card-flush">
+              <div className="card-head">
+                <h2>By objective</h2>
+                <span className="xs subtle">line = pass mark</span>
+              </div>
+              <div className="card-body stack" style={{ gap: 14 }}>
+                {r.objectives.map((o) => (
+                  <div key={o.id} className="exam-objective-row">
+                    <div style={{ minWidth: 0 }}>
+                      <div className="small truncate">{o.name ?? o.id}</div>
+                      <div className="xs subtle">
+                        {o.weight}% of the score · {o.tasks} task{o.tasks === 1 ? '' : 's'}
+                      </div>
                     </div>
+                    <ScoreBar value={o.score} passMark={r.passMark} />
+                    <span className="tnum small" style={{ textAlign: 'right' }}>
+                      {fmtPct(o.score)}
+                    </span>
                   </div>
-                  <ScoreBar value={o.score} passMark={r.passMark} />
-                  <span className="tnum small" style={{ textAlign: 'right' }}>
-                    {fmtPct(o.score)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </Card>
-
-          <Card className="card-flush">
-            <div className="card-head">
-              <h2>By task</h2>
-              <span className="xs subtle">messages never reveal expected values</span>
-            </div>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Task</th>
-                  <th>Objective</th>
-                  <th style={{ textAlign: 'right' }}>Weight</th>
-                  <th>Outcome</th>
-                  <th style={{ textAlign: 'right' }}>Score</th>
-                  <th style={{ textAlign: 'right' }}>Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {r.tasks.map((t) => (
-                  <TaskRow key={t.index} t={t} />
                 ))}
-              </tbody>
-            </table>
-          </Card>
-        </div>
-
-        <div className="stack" style={{ gap: 20 }}>
-          {r.recommendations.length > 0 && (
-            <Card>
-              <h2 style={{ marginBottom: 10 }}>Practise next</h2>
-              <div className="stack" style={{ gap: 12 }}>
-                {r.recommendations.map((rec) => {
-                  const o = r.objectives.find((x) => x.id === rec.objective);
-                  return (
-                    <div key={rec.objective}>
-                      <div className="small">
-                        {o?.name ?? rec.objective} <span className="tnum subtle">· {o ? fmtPct(o.score) : ''}</span>
-                      </div>
-                      <div className="row" style={{ gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-                        {rec.labIds.map((id) => (
-                          <Link key={id} to="/labs/$labId" params={{ labId: id }} className="btn btn-secondary btn-sm" title={id}>
-                            {labTitle(id)}
-                          </Link>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
               </div>
             </Card>
-          )}
 
-          <Card>
-            <h2 style={{ marginBottom: 4 }}>Skill evidence</h2>
-            <p className="xs subtle" style={{ marginBottom: 12 }}>
-              Every graded check updated your skill model, exactly like lab checks.
-            </p>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Skill</th>
-                  <th style={{ textAlign: 'right' }}>Passed</th>
-                  <th style={{ textAlign: 'right' }}>Failed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {r.skills.map((s) => (
-                  <tr key={s.skillId}>
-                    <td>
-                      <SkillTags ids={[s.skillId]} size="xs" />
-                    </td>
-                    <td className="tnum small text-ok" style={{ textAlign: 'right' }}>
-                      {s.passed}
-                    </td>
-                    <td className="tnum small" style={{ textAlign: 'right', color: s.failed ? 'var(--err)' : undefined }}>
-                      {s.failed}
-                    </td>
+            <Card className="card-flush">
+              <div className="card-head">
+                <h2>By task</h2>
+                <span className="xs subtle">messages never reveal expected values</span>
+              </div>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Task</th>
+                    <th>Objective</th>
+                    <th style={{ textAlign: 'right' }}>Weight</th>
+                    <th>Outcome</th>
+                    <th style={{ textAlign: 'right' }}>Score</th>
+                    <th style={{ textAlign: 'right' }}>Time</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </Card>
+                </thead>
+                <tbody>
+                  {r.tasks.map((t) => (
+                    <TaskRow key={t.index} t={t} />
+                  ))}
+                </tbody>
+              </table>
+            </Card>
+          </div>
 
-          <Disclaimer text={r.disclaimer} />
+          <div className="stack" style={{ gap: 20 }}>
+            {r.recommendations.length > 0 && (
+              <Card>
+                <h2 style={{ marginBottom: 10 }}>Practise next</h2>
+                <div className="stack" style={{ gap: 12 }}>
+                  {r.recommendations.map((rec) => {
+                    const o = r.objectives.find((x) => x.id === rec.objective);
+                    return (
+                      <div key={rec.objective}>
+                        <div className="small">
+                          {o?.name ?? rec.objective} <span className="tnum subtle">· {o ? fmtPct(o.score) : ''}</span>
+                        </div>
+                        <div className="row" style={{ gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                          {rec.labIds.map((id) => (
+                            <Link key={id} to="/labs/$labId" params={{ labId: id }} className="btn btn-secondary btn-sm" title={id}>
+                              {labTitle(id)}
+                            </Link>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Card>
+            )}
+
+            <Card>
+              <h2 style={{ marginBottom: 4 }}>Skill evidence</h2>
+              <p className="xs subtle" style={{ marginBottom: 12 }}>
+                Every graded check updated your skill model, exactly like lab checks.
+              </p>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Skill</th>
+                    <th style={{ textAlign: 'right' }}>Passed</th>
+                    <th style={{ textAlign: 'right' }}>Failed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {r.skills.map((s) => (
+                    <tr key={s.skillId}>
+                      <td>
+                        <SkillTags ids={[s.skillId]} size="xs" />
+                      </td>
+                      <td className="tnum small text-ok" style={{ textAlign: 'right' }}>
+                        {s.passed}
+                      </td>
+                      <td className="tnum small" style={{ textAlign: 'right', color: s.failed ? 'var(--err)' : undefined }}>
+                        {s.failed}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Card>
+
+            <Disclaimer text={r.disclaimer} />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -246,6 +246,43 @@ export interface ExamReport {
   skills: ExamSkillEvidence[];
   /** Labs recommended for the weakest objectives. */
   recommendations: { objective: string; labIds: string[] }[];
+  /**
+   * Grading could not be trusted (the environment was not confirmed frozen
+   * before the checks ran): the attempt does not pass and records no score,
+   * but it is held for review and counts against the retake policy until an
+   * administrator voids it. `unscoredReason` says why. The candidate's report
+   * then carries no results (score 0, no objectives, tasks, skills or
+   * recommendations): they could reveal whether a deliberate disruption paid
+   * off.
+   */
+  unscored?: boolean;
+  unscoredReason?: string;
+}
+
+/**
+ * Why an attempt is held for review. Manager and admin views only (team
+ * readiness); never part of the candidate's report.
+ */
+export interface ExamAttemptReview {
+  /** Left unscored: the freeze was not confirmed before grading. */
+  unscored: boolean;
+  /** Reasons to review (unconfirmed freeze, units or processes that survived it). */
+  flags: string[];
+  /** The score the checks produced, for the reviewer (not recorded when unscored). */
+  gradedScore: number;
+  /** Whether that score reaches the pass mark. */
+  gradedPassed: boolean;
+}
+
+/** A completed, counted attempt held for review (target of `POST /api/exams/attempts/:id/void`). */
+export interface ExamHeldAttempt {
+  attemptId: string;
+  userId: string;
+  name: string;
+  /** 1-based attempt number for this exam. */
+  number: number;
+  completedAt?: string;
+  review: ExamAttemptReview;
 }
 
 export interface StartExamResponse {
@@ -283,12 +320,21 @@ export interface TeamExamReadiness {
     /** Mean of the members' last scores (attempted members only). */
     averageScore?: number;
     passRate: number;
+    /**
+     * Completed attempts held for review (unscored, or flagged by the
+     * freeze), newest first. Voiding one stops it counting.
+     */
+    heldForReview: ExamHeldAttempt[];
   }[];
 }
 
 /* ------------------------------------------------------- interventions */
 
-/** `POST /api/exams/attempts/:id/void` (session.control on the candidate): ends a running attempt, not scored, not counted. */
+/**
+ * `POST /api/exams/attempts/:id/void` (session.control on the candidate):
+ * ends a running attempt, or withdraws a completed one held for review; either
+ * way it is not scored and not counted.
+ */
 export interface VoidExamAttemptRequest {
   reason?: string;
 }

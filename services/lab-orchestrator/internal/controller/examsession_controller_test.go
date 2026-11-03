@@ -31,11 +31,12 @@ type world struct {
 	boots    map[string]int  // node -> boot counter
 	commands []string        // "<node>|<user>|<script>"
 	provErr  map[string]error
-	execErr  map[string]error // marker in an action -> transient exec error
+	execErr  map[string]error  // marker in an action -> transient exec error
+	stdout   map[string]string // marker in an action -> its stdout
 }
 
 func newWorld() *world {
-	return &world{passing: map[string]bool{}, failRun: map[string]bool{}, boots: map[string]int{}, provErr: map[string]error{}, execErr: map[string]error{}}
+	return &world{passing: map[string]bool{}, failRun: map[string]bool{}, boots: map[string]int{}, provErr: map[string]error{}, execErr: map[string]error{}, stdout: map[string]string{}}
 }
 
 func (w *world) ran(substr string) []string {
@@ -85,6 +86,11 @@ func (d *scriptDriver) Exec(_ context.Context, ref drivers.NodeRef, req drivers.
 	for marker, err := range d.w.execErr {
 		if strings.Contains(script, marker) {
 			return drivers.ExecResult{}, err
+		}
+	}
+	for marker, out := range d.w.stdout {
+		if strings.Contains(script, marker) {
+			return drivers.ExecResult{Stdout: out}, nil
 		}
 	}
 	switch {
@@ -708,5 +714,68 @@ func TestExamEnvironmentBuildErrorFailsAfterBudget(t *testing.T) {
 	es := h.es()
 	if es.Status.Phase != labsv1.ExamFailed || es.Status.Message != ExamMsgEnvFailed || es.Status.Report != nil {
 		t.Fatalf("status %+v", es.Status)
+	}
+}
+
+// grading-3: when the freeze cannot be confirmed (the revoke script cannot
+// reach a node), grading still runs after the stage timeout, but the attempt
+// is left unscored instead of passing on results the candidate may still
+// have been influencing.
+func TestExamUnconfirmedFreezeIsUnscored(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	h.pump(3)
+	h.solveAll()
+	h.w.mu.Lock()
+	h.w.execErr["u=learner"] = fmt.Errorf("connection refused")
+	h.w.mu.Unlock()
+	h.patchES(`{"spec":{"submit":true}}`)
+	h.pumpLenient(6)
+	if st := h.es().Status.Grading; st == nil || st.Stage != labsv1.GradingFreeze {
+		t.Fatalf("grading %+v, want waiting in the freeze", st)
+	}
+	h.now = h.now.Add(DefaultExamStageTimeout + time.Minute)
+	h.pumpLenient(14)
+	es := h.es()
+	if es.Status.Phase != labsv1.ExamCompleted || es.Status.Report == nil {
+		t.Fatalf("phase %s grading %+v", es.Status.Phase, es.Status.Grading)
+	}
+	rep := es.Status.Report
+	if rep.Passed || !rep.Unscored || rep.UnscoredReason == "" || rep.Score != "100" {
+		t.Errorf("report passed=%v unscored=%v reason=%q score=%s; want an unscored 100", rep.Passed, rep.Unscored, rep.UnscoredReason, rep.Score)
+	}
+	// The unreachable node and the reason are kept for the review.
+	if u := es.Status.Grading.RevocationUnconfirmed; len(u) != 1 || !strings.Contains(u[0], "connection refused") || !strings.Contains(u[0], "on workstation") {
+		t.Errorf("revocationUnconfirmed %v", u)
+	}
+	if len(rep.ReviewFlags) != 1 || !strings.Contains(rep.ReviewFlags[0], "connection refused") {
+		t.Errorf("reviewFlags %v", rep.ReviewFlags)
+	}
+}
+
+// grading-3: transient units the candidate may have started through sudo
+// (systemd-run) survive the freeze, since they may be the graded state; the
+// attempt is scored but flagged for review.
+func TestExamFreezeFlagsUnitsStillRunning(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	h.pump(3)
+	h.solveAll()
+	h.w.mu.Lock()
+	h.w.stdout["u=learner"] = "cloudtrain-revoke: still running: run-u7.service\n"
+	h.w.mu.Unlock()
+	h.patchES(`{"spec":{"submit":true}}`)
+	h.pumpLenient(20)
+	es := h.es()
+	if es.Status.Phase != labsv1.ExamCompleted || es.Status.Report == nil {
+		t.Fatalf("phase %s grading %+v", es.Status.Phase, es.Status.Grading)
+	}
+	rep := es.Status.Report
+	if rep.Unscored || !rep.Passed {
+		t.Errorf("report passed=%v unscored=%v; flagged attempts are still scored", rep.Passed, rep.Unscored)
+	}
+	if f := es.Status.Grading.StillRunningAfterFreeze; strings.Join(f, ",") != "es1-env/db: run-u7.service,es1-env/workstation: run-u7.service" {
+		t.Errorf("stillRunningAfterFreeze %v", f)
+	}
+	if len(rep.ReviewFlags) != 1 || !strings.Contains(rep.ReviewFlags[0], "run-u7.service") {
+		t.Errorf("reviewFlags %v", rep.ReviewFlags)
 	}
 }
