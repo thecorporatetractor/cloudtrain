@@ -284,7 +284,30 @@ func (g *Grader) probe(ctx context.Context, c labsv1.Check) (outcome, error) {
 		if c.Command == "" {
 			return outcome{}, fmt.Errorf("shell check has no command")
 		}
-		res, err := g.exec(ctx, g.target(c.On), labsv1.ActionAsAdmin, t, sh(t, c.Command))
+		user := labsv1.ActionAsAdmin
+		if c.As == labsv1.ActionAsLearner {
+			user = labsv1.ActionAsLearner
+		}
+		// The input reads and the command share the check's one timeout.
+		deadline := g.now().Add(t)
+		env, err := g.readInputs(ctx, c, deadline)
+		if err != nil {
+			return outcome{raw: err.Error()}, err
+		}
+		if len(c.Inputs) > 0 {
+			if t, err = remaining(g.now(), deadline); err != nil {
+				return outcome{raw: "the check's input files took its whole timeout"}, err
+			}
+		}
+		argv := sh(t, c.Command)
+		if len(env) > 0 {
+			argv = wrap(t, append(append([]string{"env"}, env...), "/bin/sh", "-c", c.Command)...)
+			if n := quotedLen(argv); n > MaxArgBytes {
+				err := fmt.Errorf("the check's inputs make a %d-byte command (more than %d)", n, MaxArgBytes)
+				return outcome{raw: err.Error()}, err
+			}
+		}
+		res, err := g.exec(ctx, g.target(c.On), user, t, argv)
 		return outcome{output: res.Stdout, raw: raw(res), ok: res.ExitCode == 0}, err
 
 	case "k8s-query":
@@ -442,6 +465,75 @@ func (g *Grader) probe(ctx context.Context, c labsv1.Check) (outcome, error) {
 		return outcome{output: res.Stdout, raw: raw(res), ok: res.ExitCode == 0}, nil
 	}
 	return outcome{}, fmt.Errorf("check type %q: %w", c.Type, drivers.ErrUnsupported)
+}
+
+// MaxInput is the largest learner file a check input reads.
+const MaxInput = 64 << 10
+
+// readInputs reads a shell check's input files as the learner (so a symlink
+// cannot expose a file the learner could not read) and returns them as
+// NAME=value environment entries: NAME_PRESENT=1 and NAME=<content> for a
+// file that exists, nothing for one that does not.
+func (g *Grader) readInputs(ctx context.Context, c labsv1.Check, deadline time.Time) ([]string, error) {
+	var env []string
+	total := 0
+	for _, in := range c.Inputs {
+		t, err := remaining(g.now(), deadline)
+		if err != nil {
+			return nil, fmt.Errorf("input %s: %w", in.Name, err)
+		}
+		res, err := g.exec(ctx, g.target(in.On), labsv1.ActionAsLearner, t,
+			wrap(t, "/bin/sh", "-c", `test -f "$1" || exit 3; head -c "$2" -- "$1"`, "sh", in.File, strconv.Itoa(MaxInput+1)))
+		if err != nil {
+			return nil, fmt.Errorf("input %s: %w", in.Name, err)
+		}
+		switch {
+		case res.ExitCode == 3:
+			continue
+		case res.ExitCode != 0:
+			return nil, fmt.Errorf("input %s: reading %s exited %d", in.Name, in.File, res.ExitCode)
+		case len(res.Stdout) > MaxInput:
+			return nil, fmt.Errorf("input %s: %s is larger than %d bytes", in.Name, in.File, MaxInput)
+		}
+		// NUL cannot travel in an environment variable; such a file is not text.
+		v := strings.ReplaceAll(res.Stdout, "\x00", "")
+		if total += len(v); total > MaxInputTotal {
+			return nil, fmt.Errorf("input %s: the check's input files are larger than %d bytes together", in.Name, MaxInputTotal)
+		}
+		env = append(env, in.Name+"_PRESENT=1", in.Name+"="+v)
+	}
+	return env, nil
+}
+
+// MaxInputTotal caps a check's input files together, and MaxArgBytes the
+// command that carries them: on a VM host the whole argv travels as one
+// shell-quoted ssh argument, and Linux refuses a single argument over
+// MAX_ARG_STRLEN (128 KiB) with E2BIG. Quoting can grow a value (each ' is
+// four bytes), so the quoted size is what is checked.
+const (
+	MaxInputTotal = 96 << 10
+	MaxArgBytes   = 120 << 10
+)
+
+// quotedLen is the length of argv shell-quoted the way the VM driver sends
+// it over ssh: each argument in single quotes, each single quote inside
+// it four bytes.
+func quotedLen(argv []string) int {
+	n := 0
+	for _, a := range argv {
+		n += len(a) + 3*strings.Count(a, "'") + 3
+	}
+	return n
+}
+
+// remaining is the time left before deadline, at least a second (the
+// timeout wrapper counts whole seconds); errTimeout once it is used up.
+func remaining(now, deadline time.Time) (time.Duration, error) {
+	left := deadline.Sub(now)
+	if left < time.Second {
+		return 0, errTimeout
+	}
+	return left, nil
 }
 
 // isNotFound reports whether kubectl failed because the API server has no

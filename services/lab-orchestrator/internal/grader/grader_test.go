@@ -206,3 +206,170 @@ func TestK8sQueryNotFoundIsServerOnly(t *testing.T) {
 		}
 	}
 }
+
+// A shell check with inputs reads each learner file as the learner on its
+// node, then runs the command (as admin, on the check's node) with the
+// contents in its environment.
+func TestShellInputs(t *testing.T) {
+	c := labsv1.Check{ID: "cmp", Type: "shell", On: "c1", Command: `[ "$GOT" = 31000 ] && echo match`,
+		Inputs: []labsv1.CheckInput{{Name: "GOT", On: "ws", File: "/home/learner/a.txt"}, {Name: "GONE", File: "/home/learner/none"}},
+		Expect: &labsv1.Expectation{Match: "exact", Value: "match"}}
+	var main drivers.ExecRequest
+	f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+		cmd := strings.Join(req.Command, " ")
+		switch {
+		case strings.Contains(cmd, "/home/learner/a.txt"):
+			if on != "ws" || req.User != labsv1.ActionAsLearner {
+				t.Errorf("input read on %s as %s; want ws as learner", on, req.User)
+			}
+			return drivers.ExecResult{Stdout: "31000\n"}, nil
+		case strings.Contains(cmd, "/home/learner/none"):
+			if on != "entry" {
+				t.Errorf("input without on read on %s; want the entry node", on)
+			}
+			return drivers.ExecResult{ExitCode: 3}, nil
+		}
+		main = req
+		if on != "c1" || req.User != labsv1.ActionAsAdmin {
+			t.Errorf("command ran on %s as %s; want c1 as admin", on, req.User)
+		}
+		return drivers.ExecResult{Stdout: "match\n"}, nil
+	}}
+	g := &Grader{Exec: f, Entry: "entry"}
+	score, res := g.Grade(context.Background(), []labsv1.Check{c})
+	if score != 100 || !res[0].Passed {
+		t.Fatalf("score %d %+v", score, res)
+	}
+	got := strings.Join(main.Command, "\x1f")
+	if !strings.Contains(got, "env\x1fGOT_PRESENT=1\x1fGOT=31000\n\x1f/bin/sh\x1f-c") {
+		t.Errorf("command argv %q does not pass GOT in the environment", main.Command)
+	}
+	if strings.Contains(got, "GONE") {
+		t.Errorf("a missing input file must leave its variables unset: %q", main.Command)
+	}
+}
+
+// An input file that is too large or unreadable makes the check error out
+// (never pass), and the command does not run.
+func TestShellInputErrors(t *testing.T) {
+	for name, reply := range map[string]drivers.ExecResult{
+		"too large":  {Stdout: strings.Repeat("x", MaxInput+1)},
+		"unreadable": {ExitCode: 1, Stderr: "Permission denied"},
+	} {
+		ran := false
+		f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+			if strings.Contains(strings.Join(req.Command, " "), "/home/learner/a") {
+				return reply, nil
+			}
+			ran = true
+			return drivers.ExecResult{Stdout: "ok"}, nil
+		}}
+		g := &Grader{Exec: f, Entry: "ws"}
+		_, res := g.Grade(context.Background(), []labsv1.Check{{ID: "x", Type: "shell", Command: "echo ok",
+			Inputs: []labsv1.CheckInput{{Name: "A", File: "/home/learner/a"}}}})
+		if res[0].Passed || res[0].Message != MsgError || ran {
+			t.Errorf("%s: %+v ran=%v; want an error and no command run", name, res[0], ran)
+		}
+	}
+}
+
+// as: learner runs the shell check as the learner; the default is admin.
+func TestShellAs(t *testing.T) {
+	var users []labsv1.ActionUser
+	f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+		users = append(users, req.User)
+		return drivers.ExecResult{Stdout: "ok"}, nil
+	}}
+	g := &Grader{Exec: f, Entry: "ws"}
+	g.Grade(context.Background(), []labsv1.Check{{ID: "a", Type: "shell", Command: "true"}, {ID: "l", Type: "shell", Command: "true", As: labsv1.ActionAsLearner}})
+	if len(users) != 2 || users[0] != labsv1.ActionAsAdmin || users[1] != labsv1.ActionAsLearner {
+		t.Errorf("users %v; want [admin learner]", users)
+	}
+}
+
+// Input reads and the command share the check's one timeout: a check with
+// n inputs no longer runs for (n+1) x timeoutSec.
+func TestShellInputsShareTheTimeout(t *testing.T) {
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	var timeouts []time.Duration
+	f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+		timeouts = append(timeouts, req.Timeout-transportSlack)
+		now = now.Add(4 * time.Second) // every exec takes 4 s
+		return drivers.ExecResult{Stdout: "ok"}, nil
+	}}
+	g := &Grader{Exec: f, Entry: "ws", Now: func() time.Time { return now }}
+	in := []labsv1.CheckInput{{Name: "A", File: "/home/learner/a"}, {Name: "B", File: "/home/learner/b"}}
+	_, res := g.Grade(context.Background(), []labsv1.Check{{ID: "x", Type: "shell", Command: "echo ok", TimeoutSec: 10, Inputs: in,
+		Expect: &labsv1.Expectation{Match: "exact", Value: "ok"}}})
+	if !res[0].Passed || len(timeouts) != 3 || timeouts[0] != 10*time.Second || timeouts[1] != 6*time.Second || timeouts[2] != 2*time.Second {
+		t.Fatalf("timeouts %v result %+v; want 10s, 6s, 2s and a pass", timeouts, res[0])
+	}
+	// Used up by the reads: the check times out and the command never runs.
+	timeouts = nil
+	_, res = g.Grade(context.Background(), []labsv1.Check{{ID: "x", Type: "shell", Command: "echo ok", TimeoutSec: 8, Inputs: in}})
+	if res[0].Passed || res[0].Message != MsgTimeout || len(timeouts) != 2 {
+		t.Fatalf("timeouts %v result %+v; want a timeout after the two reads", timeouts, res[0])
+	}
+}
+
+// Inputs together are capped, and so is the quoted command that carries
+// them: on a VM host the whole argv is one shell-quoted ssh argument, and
+// Linux refuses an argument over 128 KiB (E2BIG).
+func TestShellInputsSizeForVMHosts(t *testing.T) {
+	for name, content := range map[string]string{
+		"two 64 KiB files":      strings.Repeat("x", MaxInput),
+		"quotes grow 4x on ssh": strings.Repeat("'", 32<<10),
+	} {
+		ran := false
+		f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+			if strings.Contains(strings.Join(req.Command, " "), "/home/learner/") {
+				return drivers.ExecResult{Stdout: content}, nil
+			}
+			ran = true
+			return drivers.ExecResult{Stdout: "ok"}, nil
+		}}
+		g := &Grader{Exec: f, Entry: "ws"}
+		in := []labsv1.CheckInput{{Name: "A", File: "/home/learner/a"}, {Name: "B", File: "/home/learner/b"}}
+		_, res := g.Grade(context.Background(), []labsv1.Check{{ID: "x", Type: "shell", On: "vm1", Command: "echo ok", Inputs: in}})
+		if res[0].Passed || res[0].Message != MsgError || ran {
+			t.Errorf("%s: %+v ran=%v; want an error before the command runs", name, res[0], ran)
+		}
+	}
+	// Within the caps the quoted ssh argument stays under MAX_ARG_STRLEN.
+	var argv []string
+	f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+		if strings.Contains(strings.Join(req.Command, " "), "/home/learner/") {
+			return drivers.ExecResult{Stdout: strings.Repeat("'", 5<<10) + strings.Repeat("x", 55<<10)}, nil
+		}
+		argv = req.Command
+		return drivers.ExecResult{Stdout: "ok"}, nil
+	}}
+	g := &Grader{Exec: f, Entry: "ws"}
+	g.Grade(context.Background(), []labsv1.Check{{ID: "x", Type: "shell", On: "vm1", Command: "echo ok", Inputs: []labsv1.CheckInput{{Name: "A", File: "/home/learner/a"}}}})
+	quoted := make([]string, len(argv))
+	for i, a := range argv {
+		quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	if n := len(strings.Join(quoted, " ")); argv == nil || n > 128<<10 || n != quotedLen(argv)-1 {
+		t.Errorf("quoted ssh argument %d bytes (quotedLen %d); want it to run and stay under 128 KiB", n, quotedLen(argv))
+	}
+}
+
+// The shared input deadline starts from the bounded check timeout (#383): a
+// timeoutSec past the 300 s cap gives the reads and the command 300 s in all,
+// never 300 s each.
+func TestShellInputsDeadlineIsBounded(t *testing.T) {
+	now := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+	var timeouts []time.Duration
+	f := &fakeExec{reply: func(on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+		timeouts = append(timeouts, req.Timeout-transportSlack)
+		now = now.Add(100 * time.Second)
+		return drivers.ExecResult{Stdout: "ok"}, nil
+	}}
+	g := &Grader{Exec: f, Entry: "ws", Now: func() time.Time { return now }}
+	in := []labsv1.CheckInput{{Name: "A", File: "/home/learner/a"}, {Name: "B", File: "/home/learner/b"}}
+	_, res := g.Grade(context.Background(), []labsv1.Check{{ID: "x", Type: "shell", Command: "echo ok", TimeoutSec: 900, Inputs: in}})
+	if len(timeouts) != 3 || timeouts[0] != MaxTimeout || timeouts[1] != MaxTimeout-100*time.Second || timeouts[2] != MaxTimeout-200*time.Second || !res[0].Passed {
+		t.Fatalf("timeouts %v result %+v; want 300s, 200s, 100s", timeouts, res[0])
+	}
+}

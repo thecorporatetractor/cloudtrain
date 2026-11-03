@@ -280,9 +280,39 @@ type Check struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=300
 	TimeoutSec int32 `json:"timeoutSec,omitempty"`
+	// As is who a shell check runs as: admin (default; root in the admin
+	// sidecar for cluster nodes, root on the node otherwise) or learner (the
+	// learner's account with a clean environment). Use learner when the check
+	// must exercise the learner's own configuration (their kubeconfig): its
+	// output is then learner-controlled and only proves what the learner can do.
+	// +optional
+	As ActionUser `json:"as,omitempty"`
+	// Inputs are learner files the grader reads (as the learner) before the
+	// check runs and hands to the command as environment variables. They let
+	// a check compare a learner's answer file with live state while running
+	// somewhere the learner cannot influence (a cluster node's admin sidecar).
+	// +optional
+	// +kubebuilder:validation:MaxItems=8
+	Inputs []CheckInput `json:"inputs,omitempty"`
 	// Answer is set on answer checks only.
 	// +optional
 	Answer *AnswerSpec `json:"answer,omitempty"`
+}
+
+// CheckInput is a learner file read before a shell check runs. The command
+// sees its content in $<Name>, and $<Name>_PRESENT is "1" when the file
+// exists (unset otherwise).
+type CheckInput struct {
+	// Name is the environment variable: ANSWER, REPORT or MANIFEST, or one of
+	// those or IN followed by _SUFFIX (the compiler refuses other names).
+	// +kubebuilder:validation:Pattern=`^[A-Z][A-Z0-9_]{0,31}$`
+	Name string `json:"name"`
+	// On is the container node holding the file (default: the entry node).
+	// +optional
+	On string `json:"on,omitempty"`
+	// File is the absolute path of the file.
+	// +kubebuilder:validation:Pattern=`^/`
+	File string `json:"file"`
 }
 
 // AnswerMatch is how a submitted answer is compared with the expected one.

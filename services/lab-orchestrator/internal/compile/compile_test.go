@@ -323,3 +323,173 @@ func TestCheckTimeoutBounds(t *testing.T) {
 		t.Errorf("timeoutSec 300: %v", err)
 	}
 }
+
+const inputsLab = `
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata: {id: in-lab, title: In, domain: kubernetes, difficulty: easy, estimatedMinutes: 5}
+spec:
+  description: d
+  topology:
+    entry: ws
+    nodes:
+      - {name: ws, driver: container, image: "jumphost:1"}
+      - {name: k, driver: k8s-cluster, cluster: {mode: virtual, context: qm}}
+  checks:
+    - id: cmp
+      description: c
+      type: shell
+      on: k
+      skills: [s]
+      inputs: [{name: ANSWER, file: /home/learner/a.txt}]
+      command: '[ "$ANSWER" = "$(kubectl get ns -o name | wc -l)" ] && echo ok'
+  solution:
+    steps: [{on: ws, run: "true"}]
+`
+
+func TestCheckInputsCompile(t *testing.T) {
+	lt, err := Compile([]byte(inputsLab), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := lt.Spec.Checks[0]
+	if len(c.Inputs) != 1 || c.Inputs[0] != (labsv1.CheckInput{Name: "ANSWER", File: "/home/learner/a.txt"}) || c.As != "" {
+		t.Fatalf("inputs %+v as %q", c.Inputs, c.As)
+	}
+	lt, err = Compile(mutate(inputsLab, "      on: k\n", "      on: ws\n      as: learner\n", "inputs: [{name: ANSWER, file: /home/learner/a.txt}]", "inputs: [{name: ANSWER, on: ws, file: /home/learner/a.txt}]"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := lt.Spec.Checks[0]; c.As != labsv1.ActionAsLearner || c.Inputs[0].On != "ws" {
+		t.Fatalf("as %q inputs %+v", c.As, c.Inputs)
+	}
+}
+
+func TestCheckInputNamesAllowed(t *testing.T) {
+	for _, n := range []string{"ANSWER", "REPORT", "MANIFEST", "ANSWER_POD", "REPORT_2", "MANIFEST_CRONJOB", "IN_TOKEN"} {
+		if _, err := Compile(mutate(inputsLab, "name: ANSWER", "name: "+n), Options{}); err != nil {
+			t.Errorf("%s: %v", n, err)
+		}
+	}
+}
+
+func TestCheckInputsInvalid(t *testing.T) {
+	in := "inputs: [{name: ANSWER, file: /home/learner/a.txt}]"
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"reserved name", mutate(inputsLab, "name: ANSWER", "name: PATH"), `input name "PATH" is reserved`},
+		// An allowlist (ANSWER, REPORT, MANIFEST, or those or IN with an
+		// _SUFFIX), so variables tools read are refused without being listed.
+		{"proxy", mutate(inputsLab, "name: ANSWER", "name: HTTPS_PROXY"), `input name "HTTPS_PROXY" is reserved`},
+		{"no proxy", mutate(inputsLab, "name: ANSWER", "name: NO_PROXY"), "is reserved"},
+		{"kuberc", mutate(inputsLab, "name: ANSWER", "name: KUBERC"), "is reserved"},
+		{"pythonpath", mutate(inputsLab, "name: ANSWER", "name: PYTHONPATH"), "is reserved"},
+		{"perl5lib", mutate(inputsLab, "name: ANSWER", "name: PERL5LIB"), "is reserved"},
+		{"node options", mutate(inputsLab, "name: ANSWER", "name: NODE_OPTIONS"), "is reserved"},
+		{"shellopts", mutate(inputsLab, "name: ANSWER", "name: SHELLOPTS"), "is reserved"},
+		{"other word", mutate(inputsLab, "name: ANSWER", "name: GOT"), "is reserved"},
+		{"bare IN", mutate(inputsLab, "name: ANSWER", "name: IN"), "is reserved"},
+		{"proxy suffix", mutate(inputsLab, "name: ANSWER", "name: ANSWER_HTTPS_PROXY"), "is reserved"},
+		{"reserved prefix", mutate(inputsLab, "name: ANSWER", "name: LD_PRELOAD"), "is reserved"},
+		{"present suffix", mutate(inputsLab, "name: ANSWER", "name: ANSWER_PRESENT"), "is reserved"},
+		{"lower-case name", mutate(inputsLab, "name: ANSWER", "name: got"), "/spec/checks/0/inputs/0/name"},
+		{"duplicate name", mutate(inputsLab, in, "inputs: [{name: ANSWER, file: /a}, {name: ANSWER, file: /b}]"), `duplicate input name "ANSWER"`},
+		{"relative file", mutate(inputsLab, "file: /home/learner/a.txt", "file: a.txt"), "/spec/checks/0/inputs/0/file"},
+		{"unknown node", mutate(inputsLab, in, "inputs: [{name: ANSWER, on: ghost, file: /a}]"), `unknown node "ghost"`},
+		{"cluster API node", mutate(inputsLab, in, "inputs: [{name: ANSWER, on: k, file: /a}]"), "is a cluster API"},
+		{"cluster member", mutate(inputsLab, in, "inputs: [{name: ANSWER, on: k/cp, file: /a}]"), "input files are read from a container node"},
+		{"vm node", mutate(inputsLab, in, "inputs: [{name: ANSWER, on: vm1, file: /a}]", "      - {name: k, driver: k8s-cluster", "      - {name: vm1, driver: vm, image: \"ubuntu:1\"}\n      - {name: k, driver: k8s-cluster"), "is a vm node"},
+		{"inputs on k8s-query", mutate(inputsLab, "      type: shell\n", "      type: k8s-query\n      query: {cluster: k, resource: ns}\n"), "inputs are only allowed on shell checks"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Compile(tt.data, Options{})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error %v; want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// grading-1: a root (admin) check must never run kubectl with the learner's
+// kubeconfig: a credential plugin in it would run as root.
+func TestAdminCheckRejectsLearnerKubeconfig(t *testing.T) {
+	for _, cmd := range []string{
+		`kubectl --kubeconfig /home/learner/.kube/config --context qm get ns`,
+		`KUBECONFIG=/home/learner/.kube/config kubectl get ns`,
+		`want=$(kubectl --kubeconfig=~learner/.kube/config get svc)`,
+		`helm --kubeconfig /home/learner/.kube/config list`,
+		// Other clients that load a kubeconfig.
+		`stern --kubeconfig /home/learner/.kube/config web`,
+		`flux --kubeconfig /home/learner/.kube/config get all`,
+		`istioctl --kubeconfig /home/learner/.kube/config proxy-status`,
+		`velero --kubeconfig /home/learner/.kube/config backup get`,
+		`k=/home/learner/.kube/config; terraform -chdir=/opt/x plan -var kubeconfig=$k`,
+		// Any client at all: the kubeconfig is handed over by environment or flag.
+		`KUBECONFIG=/home/learner/.kube/config some-new-client status`,
+		`export KUBECONFIG="/home/learner/.kube/config"; ./check.sh`,
+		`mytool --kubeconfig=/home/learner/.kube/config`,
+	} {
+		doc := mutate(inputsLab, `command: '[ "$ANSWER" = "$(kubectl get ns -o name | wc -l)" ] && echo ok'`, "command: '"+cmd+"'")
+		if _, err := Compile(doc, Options{}); err == nil || !strings.Contains(err.Error(), "learner's kubeconfig") {
+			t.Errorf("%s: error %v; want the learner-kubeconfig lint", cmd, err)
+		}
+		// The same command as the learner is allowed (its output is only
+		// what the learner can do anyway).
+		if _, err := Compile(mutate(string(doc), "      on: k\n", "      on: ws\n      as: learner\n"), Options{}); err != nil {
+			t.Errorf("%s as learner: %v", cmd, err)
+		}
+	}
+	// A .kube path that is not the learner's (no learner home anywhere) is fine.
+	if _, err := Compile(mutate(inputsLab, `command: '[ "$ANSWER" = "$(kubectl get ns -o name | wc -l)" ] && echo ok'`, `command: 'kubectl --kubeconfig /root/.kube/config get ns'`), Options{}); err != nil {
+		t.Errorf("root kubeconfig: %v", err)
+	}
+	// Reading the learner's kubeconfig without a Kubernetes client is fine.
+	ok := mutate(inputsLab, `command: '[ "$ANSWER" = "$(kubectl get ns -o name | wc -l)" ] && echo ok'`, `command: 'yq .users /home/learner/.kube/config'`)
+	if _, err := Compile(ok, Options{}); err != nil {
+		t.Errorf("yq on the learner kubeconfig: %v", err)
+	}
+}
+
+// grading-1: the lint reads the whole command (the kubeconfig and the client
+// on different lines) and covers admin actions that can run after the
+// learner had access (setup on reset, teardown, exam rerun).
+func TestLearnerKubeconfigLintWholeCommandAndActions(t *testing.T) {
+	orig := `command: '[ "$ANSWER" = "$(kubectl get ns -o name | wc -l)" ] && echo ok'`
+	for _, cmd := range []string{
+		"export KUBECONFIG=/home/learner/.kube/config\n        kubectl get ns",
+		"k=/home/learner/.kube/config\n        kubectl --kubeconfig $k get ns",
+		// The path built in pieces: a relative .kube after cd, or the home looked up.
+		"cd /home/learner && kubectl --kubeconfig .kube/config get ns",
+		"h=$(getent passwd learner | cut -d: -f6)\n        kubectl --kubeconfig \"$h/.kube/config\" get ns",
+	} {
+		doc := mutate(inputsLab, orig, "command: |\n        "+cmd)
+		if _, err := Compile(doc, Options{}); err == nil || !strings.Contains(err.Error(), "learner's kubeconfig") {
+			t.Errorf("%q: error %v; want the learner-kubeconfig lint", cmd, err)
+		}
+	}
+	bad := "run: |\n        export KUBECONFIG=/home/learner/.kube/config\n        kubectl get ns"
+	for name, block := range map[string]string{
+		"setup":    "  setup:\n    - on: ws\n      " + bad + "\n",
+		"teardown": "  teardown:\n    - on: ws\n      " + bad + "\n",
+		"rerun":    "  exam:\n    rerun:\n      - on: ws\n        " + strings.ReplaceAll(bad, "\n        ", "\n          ") + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			doc := mutate(inputsLab, "  checks:\n", block+"  checks:\n")
+			_, err := Compile(doc, Options{})
+			if err == nil || !strings.Contains(err.Error(), "learner's kubeconfig") {
+				t.Fatalf("error %v; want the learner-kubeconfig lint", err)
+			}
+			if name == "rerun" {
+				return
+			}
+			// As the learner it is their own kubeconfig: allowed.
+			if _, err := Compile(mutate(string(doc), "    - on: ws\n      run:", "    - on: ws\n      as: learner\n      run:"), Options{}); err != nil {
+				t.Errorf("as learner: %v", err)
+			}
+		})
+	}
+}

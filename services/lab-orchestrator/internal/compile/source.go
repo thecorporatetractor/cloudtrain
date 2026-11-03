@@ -152,6 +152,14 @@ type sourceCheck struct {
 	Expect      *sourceExpect `json:"expect"`
 	TimeoutSec  *int32        `json:"timeoutSec"`
 	Answer      *sourceAnswer `json:"answer"`
+	As          string        `json:"as"`
+	Inputs      []sourceInput `json:"inputs"`
+}
+
+type sourceInput struct {
+	Name string `json:"name"`
+	On   string `json:"on"`
+	File string `json:"file"`
 }
 
 type sourceAnswer struct {

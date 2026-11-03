@@ -443,7 +443,10 @@ func convertCheck(c sourceCheck) labsv1.Check {
 	out := labsv1.Check{
 		ID: c.ID, Description: c.Description, Skills: c.Skills, Weight: DefaultCheckWeight,
 		Type: labsv1.CheckType(c.Type), On: c.On, Command: c.Command, Target: c.Target, Port: c.Port,
-		TimeoutSec: DefaultCheckTimeoutSec,
+		TimeoutSec: DefaultCheckTimeoutSec, As: labsv1.ActionUser(c.As),
+	}
+	for _, in := range c.Inputs {
+		out.Inputs = append(out.Inputs, labsv1.CheckInput{Name: in.Name, On: in.On, File: in.File})
 	}
 	if c.Weight != nil {
 		out.Weight = formatFloat(*c.Weight)

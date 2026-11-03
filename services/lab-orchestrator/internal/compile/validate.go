@@ -28,6 +28,100 @@ func literalPlaceholder(m, name string, declared func(string) bool) bool {
 	return m != "{{"+name+"}}" && !declared(name)
 }
 
+// inputNameRe is a check input's environment variable name.
+var inputNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,31}$`)
+
+// inputNamePrefixes: an input name is one of these words, or starts with one
+// of them and an underscore (ANSWER_POD, IN_TOKEN). An allowlist, not a
+// denylist: the variable is set for root, with the cluster-admin kubeconfig,
+// in the admin sidecar, and a name a tool reads (HTTPS_PROXY, NO_PROXY,
+// KUBERC, PYTHONPATH, NODE_OPTIONS, SHELLOPTS, ...) would hand it
+// learner-written content. No tool reads variables with these prefixes.
+var inputNamePrefixes = []string{"ANSWER", "REPORT", "MANIFEST", "IN"}
+
+// reservedInputName: names outside the allowlist above, the _PRESENT suffix
+// the grader sets itself, and the _PROXY suffix (ANSWER_HTTPS_PROXY would
+// still be only an answer, but no name should look like a proxy setting).
+func reservedInputName(n string) bool {
+	if strings.HasSuffix(n, "_PRESENT") || strings.HasSuffix(n, "_PROXY") {
+		return true
+	}
+	for _, p := range inputNamePrefixes {
+		if n == p && p != "IN" || strings.HasPrefix(n, p+"_") && len(n) > len(p)+1 {
+			return false
+		}
+	}
+	return true
+}
+
+// learnerKubeconfigRe matches a reference to a kubeconfig the learner owns.
+var learnerKubeconfigRe = regexp.MustCompile(`(/home/learner|~learner)/\.kube(/|\b)`)
+
+// learnerHomeRe matches any way of naming the learner's home directory
+// (literally, ~learner, or looked up: getent passwd learner, eval echo ~learner).
+var learnerHomeRe = regexp.MustCompile(`/home/learner\b|~learner\b|getent\s+passwd\s+learner\b`)
+
+// kubeDirRe matches a .kube directory or file path, relative or absolute
+// (`.kube/config`, `$h/.kube`), but not a word that merely contains it.
+var kubeDirRe = regexp.MustCompile(`(^|[\s/"'=:])\.kube(/|\b)`)
+
+// The lint covers kubeconfigs only. Other tools that load config or plugins
+// from the directory they run in (git hooks and fsmonitor, terraform/tofu
+// providers, ansible.cfg and plugins, compose files) appear in about a
+// hundred admin checks of the catalog that read learner projects; they run
+// through the sandbox wrappers (ct-ansible run, ct-iac run: unprivileged,
+// no learner-writable code paths) or read files only, so they are left to
+// review rather than refused here. Exam tasks may not run checks as the
+// learner at all (internal/exam taskIssues).
+
+// kubeClientRe matches a command that can run a kubeconfig's credential
+// plugin: kubectl and its kin, and the other common clients that load a
+// kubeconfig (GitOps, mesh, backup, IaC and cluster tools). A command that
+// only reads the file (yq, grep, cat) is not a client. kind and kn are left
+// out (they are YAML keys and a common word); kubeadm loads a kubeconfig only
+// with --kubeconfig, which learnerKubeconfigEnvRe catches.
+var kubeClientRe = regexp.MustCompile(`\b(kubectl|kubectl-[a-z0-9-]+|kubecolor|helm|helmfile|k9s|kubens|kubectx|kubie|oc|stern|flux|argocd|istioctl|linkerd|cilium|hubble|velero|kustomize|kpt|kapp|skaffold|tilt|terraform|tofu|pulumi|clusterctl|vcluster|minikube|k3d|k3s|k0s|tkn|kubeseal|crossplane|krew|popeye|kubescape|kube-bench|trivy|telepresence)\b`)
+
+// learnerKubeconfigEnvRe matches handing a kubeconfig under the learner's home
+// to whatever runs next (KUBECONFIG=..., --kubeconfig ...), whichever client
+// that is: only a Kubernetes client reads either.
+var learnerKubeconfigEnvRe = regexp.MustCompile(`(KUBECONFIG\s*=|--kubeconfig[=\s])\s*["']?(/home/learner|~learner)/`)
+
+// learnerKubeconfigUse returns the line of an admin (root) command that
+// names the learner's kubeconfig when the command also runs a Kubernetes
+// client anywhere ("" if not). The whole command counts, not one line:
+// `export KUBECONFIG=/home/learner/.kube/config` (or `k=/home/learner/...`)
+// followed by `kubectl get ns` (or `kubectl --kubeconfig $k`) loads it too.
+//
+// The path may also be built in pieces: `cd /home/learner && kubectl
+// --kubeconfig .kube/config`, or `h=$(getent passwd learner | cut -d: -f6)`
+// then `$h/.kube/config`. So a command that names the learner's home in any
+// way and a .kube path anywhere counts too.
+func learnerKubeconfigUse(cmd string) string {
+	lines := strings.Split(cmd, "\n")
+	for _, line := range lines {
+		if learnerKubeconfigEnvRe.MatchString(line) {
+			return strings.TrimSpace(line)
+		}
+	}
+	if !kubeClientRe.MatchString(cmd) {
+		return ""
+	}
+	for _, line := range lines {
+		if learnerKubeconfigRe.MatchString(line) {
+			return strings.TrimSpace(line)
+		}
+	}
+	if learnerHomeRe.MatchString(cmd) {
+		for _, line := range lines {
+			if kubeDirRe.MatchString(line) {
+				return strings.TrimSpace(line)
+			}
+		}
+	}
+	return ""
+}
+
 // validateSemantics checks cross references the JSON schema cannot express.
 func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 	var issues []Issue
@@ -247,6 +341,80 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 		case "reachability", "http":
 			if c.Target == "" {
 				add(path, "%s check requires target", c.Type)
+			}
+		}
+		if c.Type != "shell" {
+			if c.As != "" {
+				add(path+"/as", "as is only allowed on shell checks")
+			}
+			if len(c.Inputs) > 0 {
+				add(path+"/inputs", "inputs are only allowed on shell checks")
+			}
+		}
+		inNames := map[string]bool{}
+		for j, in := range c.Inputs {
+			ip := fmt.Sprintf("%s/inputs/%d", path, j)
+			switch {
+			case !inputNameRe.MatchString(in.Name):
+				add(ip+"/name", "input name %q must match %s", in.Name, inputNameRe)
+			case reservedInputName(in.Name):
+				add(ip+"/name", "input name %q is reserved", in.Name)
+			case inNames[in.Name]:
+				add(ip+"/name", "duplicate input name %q", in.Name)
+			}
+			inNames[in.Name] = true
+			if !strings.HasPrefix(in.File, "/") {
+				add(ip+"/file", "input file %q must be an absolute path", in.File)
+			}
+			on := in.On
+			if on == "" {
+				on = s.Topology.Entry
+			}
+			node, _, _ := strings.Cut(on, "/")
+			switch n := nodes[node]; {
+			case n == nil:
+				add(ip+"/on", "unknown node %q", on)
+			case n.Driver == labsv1.DriverK8sCluster && !strings.Contains(on, "/"):
+				add(ip+"/on", "input files are read from a host or container, %q is a cluster API", on)
+			case n.Driver != labsv1.DriverContainer || strings.Contains(on, "/"):
+				// Reading as the learner anywhere else goes through the
+				// learner's own ssh or kubectl config and a login shell on the
+				// far side (~/.ssh/config ProxyCommand, ~/.bashrc): code the
+				// learner controls, run while grading (after an exam freeze).
+				// In a container the read is runuser with a clean environment
+				// and /bin/sh, which runs nothing of theirs.
+				add(ip+"/on", "input files are read from a container node; %q is a %s node, where reading as the learner would run the learner's own ssh or shell config", on, n.Driver)
+			}
+		}
+		if c.Type == "shell" && c.As != labsv1.ActionAsLearner {
+			if line := learnerKubeconfigUse(c.Command); line != "" {
+				add(path+"/command", "runs as root with the learner's kubeconfig (%q): a credential plugin in it would run as root and forge the result. "+
+					"Query the cluster from its admin sidecar (on: <cluster node>, plain kubectl) and read the learner's files with inputs, or set as: learner", line)
+			}
+		}
+	}
+
+	// Admin actions that can run after the learner had access (setup again
+	// on reset, teardown, the exam's idempotency rerun) must not load the
+	// learner's kubeconfig either.
+	actionLists := []struct {
+		path string
+		as   []labsv1.Action
+	}{{"/spec/setup", s.Setup}, {"/spec/teardown", s.Teardown}}
+	if s.Exam != nil {
+		actionLists = append(actionLists, struct {
+			path string
+			as   []labsv1.Action
+		}{"/spec/exam/rerun", s.Exam.Rerun})
+	}
+	for _, l := range actionLists {
+		for i, a := range l.as {
+			if a.Run == nil || a.As == labsv1.ActionAsLearner {
+				continue
+			}
+			if line := learnerKubeconfigUse(*a.Run); line != "" {
+				add(fmt.Sprintf("%s/%d/run", l.path, i), "runs as root with the learner's kubeconfig (%q): a credential plugin in it would run as root. "+
+					"Use the admin kubeconfig, or run the step as: learner", line)
 			}
 		}
 	}
