@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { HttpError } from '../src/errors.js';
 import { SessionService, labelValue, sessionName } from '../src/sessions/service.js';
+import { revealedHints } from '../src/sessions/map.js';
 import { alice, bob, FakeCluster, FakeCompiler, realContent } from './fakes.js';
 
 async function setup(opts: { validateTimeoutMs?: number } = {}) {
@@ -152,9 +153,160 @@ describe('SessionService', () => {
     cluster.markReady(s.id);
     const r = await svc.validate(alice, s.id);
     expect(r.grading).toMatchObject({ state: 'timeout' });
-    expect(r.grading?.message).toMatch(/No grader answered within 2s/);
+    expect(r.grading?.message).toMatch(/longer than 2s/);
     expect(r.summary).toEqual({ passed: 0, total: 2, score: 0, skillsTouched: [] });
     expect(r.session.results.every((x) => x.status === 'pending')).toBe(true);
+  });
+
+  it('validate: joins a run in flight instead of grading again (content-1, grading-4)', async () => {
+    env = await setup({ validateTimeoutMs: 1_000 });
+    const { svc, cluster } = env;
+    const s = await svc.start(alice, 'gateway-smoke');
+    cluster.markReady(s.id);
+    // The first Validate times out with the run still going.
+    expect((await svc.validate(alice, s.id)).grading?.state).toBe('timeout');
+    expect(cluster.sessions.get(s.id)!.spec.validateRequest).toBe(1);
+    // "Try again" while it runs: same request, no second run.
+    cluster.sessions.get(s.id)!.status!.validation = { observedRequest: 1, phase: 'Running', score: 0 };
+    expect((await svc.validate(alice, s.id)).grading?.state).toBe('timeout');
+    expect(cluster.sessions.get(s.id)!.spec.validateRequest).toBe(1);
+    // The run answers while a joined Validate waits: it returns that result.
+    const orig = cluster.getSession.bind(cluster);
+    let reads = 0;
+    cluster.getSession = async (name) => {
+      if (++reads > 1) cluster.sessions.get(name)!.status!.validation = { observedRequest: 1, phase: 'Complete', score: 50, checks: [{ id: 'note-written', passed: true }, { id: 'shell-used', passed: false }] };
+      return orig(name);
+    };
+    const r = await svc.validate(alice, s.id);
+    expect(r.grading?.state).toBe('complete');
+    expect(r.summary.score).toBe(50);
+    expect(cluster.sessions.get(s.id)!.spec.validateRequest).toBe(1);
+  });
+
+  it('validate: new runs are rate limited per person (429), joining is not', async () => {
+    const content = await realContent();
+    const cluster = new FakeCluster();
+    let t = 0;
+    const svc = new SessionService(content, cluster, new FakeCompiler(), { validateTimeoutMs: 1_000, pollMs: 100, validatePerMinute: 2, sleep: async (ms) => void (t += ms), now: () => t });
+    const s = await svc.start(alice, 'gateway-smoke');
+    cluster.markReady(s.id);
+    cluster.onPatch = (ls) => void (ls.status!.validation = { observedRequest: ls.spec.validateRequest!, phase: 'Complete', score: 0, checks: [] });
+    await svc.validate(alice, s.id);
+    await svc.validate(alice, s.id);
+    await expect(svc.validate(alice, s.id)).rejects.toSatisfy((e) => status(e) === 429);
+    expect(cluster.sessions.get(s.id)!.spec.validateRequest).toBe(2);
+    t += 61_000;
+    await svc.validate(alice, s.id);
+    expect(cluster.sessions.get(s.id)!.spec.validateRequest).toBe(3);
+  });
+
+  it('get: records a run that finished after Validate stopped waiting, once (content-1)', async () => {
+    env = await setup({ validateTimeoutMs: 1_000 });
+    const { svc, cluster } = env;
+    const recorded: number[] = [];
+    let hinted = 0;
+    svc.hooks = {
+      beforeStart: async () => ({}),
+      started: async () => {},
+      validated: async (_p, _l, ls, res) => void (res.grading?.state === 'complete' && recorded.push(ls.status!.validation!.observedRequest)),
+      hintRevealed: async () => void hinted++,
+      ended: async () => {},
+      decorate: async (_p, x) => x,
+    };
+    const s = await svc.start(alice, 'gateway-smoke');
+    cluster.markReady(s.id);
+    expect((await svc.validate(alice, s.id)).grading?.state).toBe('timeout');
+    expect(recorded).toEqual([]);
+    cluster.sessions.get(s.id)!.status!.validation = { observedRequest: 1, phase: 'Complete', score: 100, checks: [{ id: 'note-written', passed: true }, { id: 'shell-used', passed: true }] };
+    expect((await svc.get(alice, s.id)).score).toBe(100);
+    await svc.get(alice, s.id);
+    expect(recorded).toEqual([1]);
+    await svc.revealHint(alice, s.id, 0);
+    expect(hinted).toBe(1);
+    // Again for an already revealed hint: the hook is idempotent, and the first recording may have failed.
+    await svc.revealHint(alice, s.id, 0);
+    expect(hinted).toBe(2);
+  });
+
+  it('revealHint: records the reveal before showing it, so a failed recording leaves the hint hidden', async () => {
+    env = await setup({});
+    const { svc, cluster } = env;
+    const seen: number[][] = [];
+    let fail = true;
+    svc.hooks = {
+      beforeStart: async () => ({}),
+      started: async () => {},
+      validated: async () => {},
+      hintRevealed: async (_p, _l, ls) => {
+        seen.push(revealedHints(ls));
+        if (fail) throw new Error('db down');
+      },
+      ended: async () => {},
+      decorate: async (_p, x) => x,
+    };
+    const s = await svc.start(alice, 'gateway-smoke');
+    cluster.markReady(s.id);
+    await expect(svc.revealHint(alice, s.id, 0)).rejects.toThrow('db down');
+    // The hook saw the hint about to be revealed, and the session does not show it.
+    expect(seen).toEqual([[0]]);
+    expect((await svc.get(alice, s.id)).revealedHints ?? []).toEqual([]);
+    fail = false;
+    expect((await svc.revealHint(alice, s.id, 0)).revealedHints).toEqual([0]);
+    expect(seen).toEqual([[0], [0]]);
+  });
+
+  it('validate: concurrent Validates of one run share one status poll', async () => {
+    const content = await realContent();
+    const cluster = new FakeCluster();
+    // Real time: every waiter polling on its own would read ~20 times each.
+    const svc = new SessionService(content, cluster, new FakeCompiler(), { validateTimeoutMs: 200, pollMs: 10 });
+    const s = await svc.start(alice, 'gateway-smoke');
+    cluster.markReady(s.id);
+    cluster.sessions.get(s.id)!.spec.validateRequest = 1;
+    cluster.sessions.get(s.id)!.status!.validation = { observedRequest: 1, phase: 'Running', score: 0 };
+    const orig = cluster.getSession.bind(cluster);
+    let reads = 0;
+    cluster.getSession = async (name) => {
+      reads++;
+      return orig(name);
+    };
+    const all = await Promise.all(Array.from({ length: 8 }, () => svc.validate(alice, s.id)));
+    expect(all.every((r) => r.grading?.state === 'timeout')).toBe(true);
+    expect(cluster.sessions.get(s.id)!.spec.validateRequest).toBe(1);
+    // 8 ownership reads + one poll of at most 200/10 reads, not 8 polls.
+    expect(reads).toBeGreaterThan(8);
+    expect(reads).toBeLessThanOrEqual(8 + 21);
+  });
+
+  it('get: a failure recording a finished run does not fail the read; the next read retries', async () => {
+    env = await setup({ validateTimeoutMs: 1_000 });
+    const { svc, cluster } = env;
+    const warned: string[] = [];
+    (svc as unknown as { opts: { log?: unknown } }).opts.log = { warn: (_o: object, m: string) => void warned.push(m) };
+    let fail = true;
+    const recorded: number[] = [];
+    svc.hooks = {
+      beforeStart: async () => ({}),
+      started: async () => {},
+      validated: async (_p, _l, ls) => {
+        if (fail) throw new Error('lock timeout');
+        recorded.push(ls.status!.validation!.observedRequest);
+      },
+      hintRevealed: async () => {},
+      ended: async () => {},
+      decorate: async (_p, x) => x,
+    };
+    const s = await svc.start(alice, 'gateway-smoke');
+    cluster.markReady(s.id);
+    cluster.sessions.get(s.id)!.spec.validateRequest = 1;
+    cluster.sessions.get(s.id)!.status!.validation = { observedRequest: 1, phase: 'Complete', score: 100, checks: [{ id: 'note-written', passed: true }, { id: 'shell-used', passed: true }] };
+    expect((await svc.get(alice, s.id)).score).toBe(100);
+    expect(warned).toHaveLength(1);
+    expect(recorded).toEqual([]);
+    fail = false;
+    await svc.get(alice, s.id);
+    await svc.get(alice, s.id);
+    expect(recorded).toEqual([1]);
   });
 
   it('validate: grading itself failing marks every check as error', async () => {

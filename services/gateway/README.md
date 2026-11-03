@@ -66,6 +66,7 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 | `CT_EXTRA_LAB_DIRS` | | extra lab directories (`:`-separated), e.g. test fixtures |
 | `CT_LABCTL` | `services/lab-orchestrator/bin/labctl` | Go compiler binary (`task gateway:labctl`; image: `/usr/local/bin/labctl`) |
 | `CT_VALIDATE_TIMEOUT_MS` | `60000` | how long `POST /validate` waits for the grader |
+| `CT_VALIDATE_RATE_PER_MINUTE` | `6` | new grading runs one person may start per minute, per replica (joining a run in flight is free); Helm `gateway.validatePerMinute` |
 | `CT_SESSION_TTL_MINUTES` | controller default | sets `spec.ttl` on new sessions |
 | `CT_LOG_LEVEL` | `info` | |
 | `CT_DATABASE_URL` | `postgres://cloudtrain_app:app-dev-only@127.0.0.1:55432/cloudtrain` | app role: no superuser, no BYPASSRLS, not the table owner |

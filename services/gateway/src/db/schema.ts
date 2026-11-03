@@ -177,6 +177,8 @@ export interface LabAttemptsTable {
   points_possible: Generated<number>;
   questions_solved: Generated<number>;
   questions_total: Generated<number>;
+  /** Grader request number of the last run recorded (0015_lab_hint_reveals); null before it. */
+  graded_request: Generated<number | null>;
 }
 
 export interface AnswerSubmissionsTable {
@@ -245,6 +247,16 @@ export interface AnswerHintRevealsTable {
   event_id: string | null;
   team_id: string | null;
   cost: number;
+  revealed_at: DefaultedTime;
+}
+
+/** Lab hints revealed per person, lab and session (0015_lab_hint_reveals). */
+export interface LabHintRevealsTable {
+  org_id: string;
+  user_id: string;
+  lab_id: string;
+  session_name: string;
+  hint_index: number;
   revealed_at: DefaultedTime;
 }
 
@@ -608,6 +620,7 @@ export interface DB {
   learner_goals: LearnerGoalsTable;
   answer_submissions: AnswerSubmissionsTable;
   answer_hint_reveals: AnswerHintRevealsTable;
+  lab_hint_reveals: LabHintRevealsTable;
   ctf_events: CtfEventsTable;
   ctf_event_teams: CtfEventTeamsTable;
   ctf_event_participants: CtfEventParticipantsTable;

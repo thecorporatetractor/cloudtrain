@@ -27,6 +27,7 @@ export async function collectAccountExport(tx: Tx, userId: string, email: string
     assignments: await q(tx.selectFrom('assignments').select(['item_kind', 'item_id', 'due_at', 'required', 'note', 'created_at']).where('target_kind', '=', 'user').where('target_id', '=', userId).execute()),
     labAttempts: await q(tx.selectFrom('lab_attempts').selectAll().where('user_id', '=', userId).orderBy('started_at').execute()),
     checkResults: await q(tx.selectFrom('check_results as c').innerJoin('lab_attempts as a', 'a.id', 'c.attempt_id').select(['c.attempt_id', 'c.check_id', 'c.run', 'c.passed', 'c.weight', 'c.skills', 'c.message', 'c.graded_at']).where('a.user_id', '=', userId).execute()),
+    labHints: await q(tx.selectFrom('lab_hint_reveals').select(['lab_id', 'session_name', 'hint_index', 'revealed_at']).where('user_id', '=', userId).execute()),
     skillEvidence: await q(tx.selectFrom('skill_evidence').selectAll().where('user_id', '=', userId).execute()),
     skillState: await q(tx.selectFrom('learner_skill_state').selectAll().where('user_id', '=', userId).execute()),
     goals: await q(tx.selectFrom('learner_goals').selectAll().where('user_id', '=', userId).execute()),

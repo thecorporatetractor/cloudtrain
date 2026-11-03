@@ -32,6 +32,12 @@ describe('deployable configuration', () => {
     expect(loadConfig({ CT_CONTENT_DIR: '/c', CT_CURRICULUM_FILE: '/x/cur.yaml' }).curriculumFile).toBe('/x/cur.yaml');
   });
 
+  it('takes the Validate rate from CT_VALIDATE_RATE_PER_MINUTE (default 6, at least 1)', () => {
+    expect(loadConfig({}).validatePerMinute).toBe(6);
+    expect(loadConfig({ CT_VALIDATE_RATE_PER_MINUTE: '12' }).validatePerMinute).toBe(12);
+    expect(loadConfig({ CT_VALIDATE_RATE_PER_MINUTE: '0' }).validatePerMinute).toBe(1);
+  });
+
   it('resolves relative paths against CT_BASE_DIR when set', () => {
     const c = loadConfig({ CT_BASE_DIR: '/srv/ct', CT_CONTENT_DIR: 'content', CT_LABCTL: 'bin/labctl', CT_EXTRA_LAB_DIRS: 'fixtures' });
     expect(c.contentDir).toBe('/srv/ct/content');
