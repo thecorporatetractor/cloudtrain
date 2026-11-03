@@ -312,6 +312,15 @@ mutation, checks, capture) and `hack/netdev-proof.sh` is the end-to-end proof
 3. Computes expiry: `spec.expiresAt`, else creation + `spec.ttl`, else creation +
    max(2 x `estimatedMinutes`, 30m); without a template, creation + 30m. Past
    expiry it destroys all recorded nodes and only then sets `Expired` (terminal).
+   This holds even when the namespace lost its lab label. An `Expired` session
+   object is deleted `--expired-session-retention` (7d) after it expired (also
+   in a namespace that lost its lab label); this includes a claimant served
+   from a warm pool. The orphan sweep (`--orphan-sweep`) does not race this:
+   a session being deleted counts as live until its finalizer is released.
+   Keep the retention well above any billing close lag: the gateway closes an
+   open usage row whose LabSession is gone at the time it notices, not at the
+   expiry, so a row still open when the object is collected (billing disabled
+   meanwhile, the gateway down for the whole retention) is billed past expiry.
 4. Records the resolved topology in status before provisioning anything.
 5. `spec.hibernate`: hibernates nodes whose driver supports it, withdraws
    endpoints, phase `Hibernated`; resuming does **not** re-run setup (see
@@ -319,19 +328,62 @@ mutation, checks, capture) and `hack/netdev-proof.sh` is the end-to-end proof
 6. `spec.resetGeneration` above `status.observedResetGeneration`: `Reset`s every
    node and re-runs setup.
 7. Provisions every node (`NodesReady`); fails the session after
-   `--provision-timeout` (15m). Runs setup actions (`SetupComplete`), persisting
+   `--provision-timeout` (15m), counted from when every node was scheduled: a
+   node waiting for a cluster node (`NodesScheduled` False, e.g. while the
+   autoscaler scales a lab pool up from zero) does not use it up. A pod whose
+   image reference is invalid fails at once; one whose pull keeps naming a
+   missing image or refused credentials fails once the pod has been on its
+   node for 2m (credentials on a node that just joined can lag), and only for
+   a container that never ran: a re-pull on restart (a `:latest` image, an
+   image removed by GC) that hits a briefly failing registry or credential
+   refresh stays transient. The same holds for a vcluster control-plane pod,
+   a KubeVirt VM's containerDisk (the virt-launcher pod's pull) and a
+   persistent VM's root disk import (the CDI DataVolume: `Failed`, or a
+   missing image or refused credentials for 2m since its condition last
+   changed). Runs
+   setup actions (`SetupComplete`), persisting
    `status.setupProgress` after each one so retries resume; setup runs again when
    a node's `instanceID` changes (pod recreated, container restarted). Publishes
    endpoints and sets `Ready`. A `Grading` phase set by the grader is preserved.
+   A Ready session is re-observed every `--ready-recheck` (2m, spread ±20% per
+   session so a class does not recheck in lockstep), so a crashed VM or
+   vcluster is noticed and its setup re-run. Drivers read uncached; the API
+   client rate limit is `--kube-api-qps` (50) / `--kube-api-burst` (100), and
+   `controller_runtime_reconcile_total{controller="labsession"}` shows the
+   reconcile rate.
+8. One provisioning attempt (creation, reset, resume, a replaced node, a Ready
+   session whose nodes stop being ready, e.g. a lab pod lost to a node drain
+   and waiting for capacity again) must be ready within `--provision-deadline`
+   (60m) across all stages (waiting for the LabTemplate, a reset still in
+   progress, topology, capacity, nodes, setup); `Provisioned` False marks the
+   attempt and its start.
+9. A `Failed` session releases its resources (`ResourcesReleased`)
+   `--failed-session-release` (5m) after it failed and stays `Failed` until it
+   expires (also when its LabTemplate is gone: teardown uses the recorded
+   topology, and in a namespace that lost its lab label). Sessions annotated
+   `labs.cloudtrain.dev/keep-failed=true` and labctl verify sessions (any
+   `labs.cloudtrain.dev/verify` label value: `true`, `batch`, `networking`, ...)
+   keep them until expiry, for debugging. Rollout note: a session that was
+   already `Failed` when this version first ran has no `ResourcesReleased`
+   condition; it gets one then and is torn down 5m later. Annotate failed
+   sessions you are still inspecting with `keep-failed=true` before upgrading.
 
-Status is written with a merge patch. Setup runs inside the reconcile (actions
-are capped at 10m; `--max-concurrent-reconciles`, default 8), and **setup
+Status is written with a merge patch. Setup runs inside the reconcile, in
+slices: one reconcile starts actions for at most `--setup-slice` (30s), then
+requeues, and stops early when the session was deleted, hibernated or reset
+(actions are capped at 10m; `--max-concurrent-reconciles`, default 8). A
+session this manager wrote is read uncached until the cache has caught up
+with that write, so a requeue served from a stale cache (still showing a
+Ready session before a replaced node or a reset re-armed setup) never
+re-runs an action or resets twice. **Setup
 actions must be idempotent**: an action whose progress could not be saved, or
 all of them after a node is recreated or reset, run again.
 
 Manager flags: `--metrics-bind-address` (default `0`, off; HTTPS with
 Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
-`--max-concurrent-reconciles`, `--provision-timeout`, `--image-registry`,
+`--max-concurrent-reconciles`, `--provision-timeout`, `--provision-deadline`,
+`--failed-session-release`, `--expired-session-retention`, `--ready-recheck`,
+`--setup-slice`, `--kube-api-qps`, `--kube-api-burst`, `--image-registry`,
 `--runtime-class`, `--image-catalog`, `--admin-image-ref`, `--helm`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,

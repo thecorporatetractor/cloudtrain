@@ -13,7 +13,11 @@ const FAILURE_REASONS = new Set(['NodeFailed', 'SetupFailed', 'ResetFailed', 'Pr
  * deleted), or it expired after it had stopped being ready. Expiry overwrites
  * the Ready reason but keeps its transition time (the status stays False), so
  * a lab that was not ready before its expiry (and was not hibernated) is
- * recognised by Ready going False before Expired went True.
+ * recognised by Ready going False before Expired went True. Ready False
+ * reasons that leave the lab running (NamespaceNotLab: the namespace lost its
+ * lab label) never cap the window: before expiry they are not failures, and
+ * at expiry the orchestrator stamps the Ready transition with the expiry
+ * (labsession_controller.go expire()).
  */
 export function stoppedAt(ls: LabSession): number | undefined {
   const conds = ls.status?.conditions ?? [];

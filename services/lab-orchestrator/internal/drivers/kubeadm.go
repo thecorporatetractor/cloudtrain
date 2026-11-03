@@ -534,9 +534,12 @@ func (d *KubeadmDriver) observe(ctx context.Context, ref NodeRef, l kubeadmLayou
 	if err != nil {
 		return NodeState{}, err
 	}
+	if f := st.failure(); f != "" {
+		return NodeState{Phase: labsv1.NodeFailed, Message: f}, nil
+	}
 	if st.running < st.total {
 		return NodeState{Phase: labsv1.NodeProvisioning,
-			Message: fmt.Sprintf("VMs booting (%d/%d running): %s", st.running, st.total, strings.Join(st.waiting, ", "))}, nil
+			Message: fmt.Sprintf("VMs booting (%d/%d running): %s", st.running, st.total, strings.Join(st.waiting, ", ")), Unscheduled: st.unscheduled > 0}, nil
 	}
 	details := map[string]string{"apiServer": "https://" + l.cpHost.IP + ":6443", "context": clusterContext(ref.Node)}
 	for _, m := range l.members {

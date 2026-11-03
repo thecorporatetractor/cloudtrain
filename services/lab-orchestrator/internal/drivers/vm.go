@@ -148,8 +148,11 @@ func (d *VMDriver) observe(ctx context.Context, ref NodeRef, h PlannedHost, conv
 	if err != nil {
 		return NodeState{}, err
 	}
+	if f := st.failure(); f != "" {
+		return NodeState{Phase: labsv1.NodeFailed, Message: f}, nil
+	}
 	if st.running < st.total {
-		return NodeState{Phase: labsv1.NodeProvisioning, Message: "VM booting: " + strings.Join(st.waiting, ", ")}, nil
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "VM booting: " + strings.Join(st.waiting, ", "), Unscheduled: st.unscheduled > 0}, nil
 	}
 	boot, instance := st.instance, st.instance
 	if d.Disks.Persistent {

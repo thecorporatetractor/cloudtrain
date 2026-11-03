@@ -67,6 +67,11 @@ type NodeState struct {
 	InstanceID string
 	// Details are facts for the grader and other nodes (addresses, member states).
 	Details map[string]string
+	// Unscheduled: the node waits for a cluster node to run on (an
+	// unschedulable pod or VM, e.g. while the node autoscaler adds one). The
+	// node provision timeout does not run meanwhile; the session-level
+	// provisioning deadline still does.
+	Unscheduled bool
 }
 
 // ExecKind tells the driver how to interpret an ExecRequest.

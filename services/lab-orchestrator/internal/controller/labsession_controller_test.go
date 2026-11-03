@@ -273,8 +273,8 @@ func TestReconcileToReady(t *testing.T) {
 	if want := t0.Add(50 * time.Minute); !s.Status.ExpiresAt.Time.Equal(want) {
 		t.Errorf("expiresAt = %v, want %v", s.Status.ExpiresAt, want)
 	}
-	if want := 49 * time.Minute; res.RequeueAfter != want {
-		t.Errorf("requeueAfter = %v, want %v (until expiry)", res.RequeueAfter, want)
+	if want := jitter(DefaultReadyRecheck, s.UID); res.RequeueAfter != want {
+		t.Errorf("requeueAfter = %v, want %v (ready re-check)", res.RequeueAfter, want)
 	}
 
 	// Setup ran once per action with params substituted, on the right node.

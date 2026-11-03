@@ -46,6 +46,21 @@ const (
 	// SandboxUnavailable) when a tier's sandbox is unavailable, with the nodes
 	// that run as KubeVirt VMs or without a sandbox.
 	ConditionSandboxed = "Sandboxed"
+	// ConditionProvisioned is False while the session is being provisioned
+	// (created, reset, resumed or a node was replaced) and True once it was
+	// ready. Its transition time is when the current provisioning attempt
+	// started: the session-level provisioning deadline counts from it.
+	ConditionProvisioned = "Provisioned"
+	// ConditionNodesScheduled is False while a node waits for a cluster node
+	// to run on (its pod is unschedulable, e.g. while the node autoscaler
+	// scales a lab pool up from zero). The node provision timeout counts from
+	// its last transition to True.
+	ConditionNodesScheduled = "NodesScheduled"
+	// ConditionResourcesReleased is set on failed sessions: False until their
+	// nodes and session-scoped resources are torn down (after a short grace
+	// period), True once they are. Its transition to False is when the
+	// session failed.
+	ConditionResourcesReleased = "ResourcesReleased"
 )
 
 // LearnerRef identifies the learner owning a session.

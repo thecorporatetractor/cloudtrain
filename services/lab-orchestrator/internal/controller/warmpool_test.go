@@ -186,8 +186,9 @@ func TestPooledSessionNeverExpiresUnclaimed(t *testing.T) {
 	if s.Status.Phase != labsv1.SessionReady || len(h.cont.destroyed) != 0 {
 		t.Fatalf("pooled session expired: phase %s destroyed %v", s.Status.Phase, h.cont.destroyed)
 	}
-	if res.RequeueAfter != 0 {
-		t.Errorf("requeueAfter = %v, want none", res.RequeueAfter)
+	// No expiry: only the periodic re-observation of a Ready session.
+	if want := jitter(DefaultReadyRecheck, s.UID); res.RequeueAfter != want {
+		t.Errorf("requeueAfter = %v, want %v (ready re-check, no expiry)", res.RequeueAfter, want)
 	}
 }
 
@@ -675,4 +676,41 @@ func (d *slowHibernator) Hibernate(context.Context, drivers.NodeRef) error { ret
 
 func (d *slowHibernator) Status(context.Context, drivers.NodeRef) (drivers.NodeState, error) {
 	return drivers.NodeState{Phase: labsv1.NodeProvisioning, Message: "pod terminating"}, nil
+}
+
+// A claimant served from a warm pool is collected after the expired
+// retention too (it never reaches reconcileSession), once its pooled
+// session is gone.
+func TestExpiredClaimantCollectedAfterRetention(t *testing.T) {
+	h := newPoolHarness(t, template(), warmPool(func(p *labsv1.WarmPool) { p.Spec.Size = 1 }))
+	h.fill()
+	pooledName := h.pooled()[0].Name
+	if err := h.c.Create(context.Background(), claimant("x1", func(s *labsv1.LabSession) {
+		s.Spec.TTL = &metav1.Duration{Duration: time.Hour}
+	})); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcileSession("x1")
+	h.reconcileSession(pooledName)
+	h.reconcileSession("x1")
+	h.now = t0.Add(time.Hour)
+	h.reconcileSession(pooledName)
+	if res := h.reconcileSession("x1"); res.RequeueAfter <= 0 || res.RequeueAfter > DefaultExpiredRetention {
+		t.Errorf("expired claimant requeueAfter = %v, want the rest of the retention", res.RequeueAfter)
+	}
+	if got := h.getSession("x1").Status.Phase; got != labsv1.SessionExpired {
+		t.Fatalf("claimant phase = %s", got)
+	}
+
+	h.now = h.now.Add(DefaultExpiredRetention + time.Minute)
+	h.reconcileSession(pooledName) // deletes the pooled session
+	h.reconcileSession(pooledName) // finalizer
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: pooledName}, &labsv1.LabSession{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pooled session not collected: %v", err)
+	}
+	h.reconcileSession("x1") // deletes the claimant
+	h.reconcileSession("x1") // finalizer
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "x1"}, &labsv1.LabSession{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expired claimant not collected: %v", err)
+	}
 }
