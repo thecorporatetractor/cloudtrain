@@ -115,6 +115,8 @@ type vmSpec struct {
 	// Persistent VMs get blank DataVolumes (kept across hibernate); ephemeral
 	// VMs get KubeVirt emptyDisks (discarded with the VMI).
 	ExtraDisks []string
+	// Placement of the VM's virt-launcher pod (the lab node pool).
+	Placement LabPlacement
 }
 
 // MaxExtraDisks bounds topology resources.disks per VM.
@@ -191,6 +193,22 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 		})
 		volumes = append(volumes, map[string]any{"name": name, "dataVolume": map[string]any{"name": dvName}})
 	}
+	tplSpec := map[string]any{
+		"hostname": v.Hostname,
+		"domain": map[string]any{
+			"cpu":       map[string]any{"cores": v.Cores},
+			"memory":    map[string]any{"guest": mem},
+			"resources": map[string]any{"requests": map[string]any{"memory": mem}},
+			"devices": map[string]any{
+				"disks":      disks,
+				"interfaces": []any{map[string]any{"name": "default", "bridge": map[string]any{}}},
+				"rng":        map[string]any{},
+			},
+		},
+		"networks": net.VMNetworks(),
+		"volumes":  volumes,
+	}
+	v.Placement.vmTemplateFields(tplSpec)
 	vm.Object["spec"] = map[string]any{
 		"runStrategy": "Always",
 		"template": map[string]any{
@@ -198,21 +216,7 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 				"labels":      tplLabels,
 				"annotations": net.VMNetworkAnnotations(v.IP),
 			},
-			"spec": map[string]any{
-				"hostname": v.Hostname,
-				"domain": map[string]any{
-					"cpu":       map[string]any{"cores": v.Cores},
-					"memory":    map[string]any{"guest": mem},
-					"resources": map[string]any{"requests": map[string]any{"memory": mem}},
-					"devices": map[string]any{
-						"disks":      disks,
-						"interfaces": []any{map[string]any{"name": "default", "bridge": map[string]any{}}},
-						"rng":        map[string]any{},
-					},
-				},
-				"networks": net.VMNetworks(),
-				"volumes":  volumes,
-			},
+			"spec": tplSpec,
 		},
 	}
 	if dvTemplates != nil {

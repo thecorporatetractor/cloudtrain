@@ -57,6 +57,7 @@ func main() {
 		isolationEvict                                                                                            bool
 		apiServerCIDRs                                                                                            string
 		vclusterPodCIDRs                                                                                          string
+		labNodeSelector, labTolerations                                                                           string
 		concurrency                                                                                               int
 		provisionTimeout                                                                                          time.Duration
 	)
@@ -108,6 +109,8 @@ func main() {
 	flag.BoolVar(&isolationEvict, "isolation-evict", false, "production profile: delete lab node pods that run neither in a sandbox nor in a user namespace (created before the profile applied) instead of refusing to start; their sessions recreate them under the profile")
 	flag.StringVar(&vclusterPodCIDRs, "vcluster-pod-cidrs", "", "the cluster's pod CIDRs (Helm orchestrator.vclusterPodCIDRs, comma separated): checked at startup against the nodes' addresses, since the vcluster endpoints allowlist needs an overlay pod network")
 	flag.StringVar(&apiServerCIDRs, "apiserver-cidrs", "auto", "where vcluster control planes may reach the host API server (their NetworkPolicy egress): ip[/bits][:port] comma separated; auto = the default/kubernetes Endpoints (the chart's Role in the default namespace); if unknown, public addresses on 443/6443 only")
+	flag.StringVar(&labNodeSelector, "lab-node-selector", "", "node labels every lab pod, VM and vcluster control plane is scheduled on (the lab node pool), key=value comma separated; empty = any node")
+	flag.StringVar(&labTolerations, "lab-tolerations", "", "tolerations of every lab pod, VM and vcluster (control plane and synced pods) for the lab pool's taint: key[=value][:Effect] comma separated, e.g. cloudtrain.dev/labs=true:NoSchedule")
 	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
 	flag.StringVar(&networkModeFlag, "network-mode", string(network.ModePrimary), "how wired lab pods and lab VMs reach the session network (docs/any-kubernetes.md): primary (Kube-OVN is the cluster's primary CNI; eth0 placed with ovn.kubernetes.io/logical_switch) or secondary (another CNI owns eth0, Kube-OVN runs non-primary behind Multus; eth0 = a session segment as the Multus default network, VMs with multus.default)")
 	flag.IntVar(&labMTU, "lab-mtu", network.DefaultLinkMTU, "MTU of every session segment (Kube-OVN Subnet spec.mtu): lab links, management, lab and access subnets; lab content assumes 1400. 0 = Kube-OVN default (node MTU minus tunnel overhead)")
@@ -346,6 +349,12 @@ func main() {
 	} else {
 		log.Info("tier sandboxes: off (no --sandboxes or sandbox config)")
 	}
+	placement, err := drivers.ParseLabPlacement(labNodeSelector, labTolerations)
+	if err != nil {
+		log.Error(err, "invalid --lab-node-selector or --lab-tolerations")
+		os.Exit(1)
+	}
+	log.Info("lab node pool", "nodeSelector", placement.NodeSelector, "tolerations", len(placement.Tolerations))
 	netMode, err := network.ParseMode(networkModeFlag)
 	if err != nil {
 		log.Error(err, "invalid --network-mode")
@@ -433,7 +442,7 @@ func main() {
 		PersistentHome: persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass, HomeStorageClass: homeStorageClass,
 		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent", StorageClass: vmDiskStorageClass,
 			VolumeMode: vmDiskVolumeMode, AccessModes: drivers.SplitList(vmDiskAccessModes)},
-		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
+		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo, Placement: placement,
 		RequireIsolation: profile == drivers.IsolationProduction,
 		Network:          netOpts, NamespaceAccess: nsAccess,
 	})

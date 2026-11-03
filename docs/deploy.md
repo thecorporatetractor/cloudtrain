@@ -394,7 +394,10 @@ with the admission policy (`make test-rbac`).
   outside it, so the read stays cluster-wide.
 - **`pods/exec` in kube-system.** vlan-passthru on lab link switches needs
   `ovn-nbctl` in Kube-OVN's ovn-central pods, whose names are generated, so the Role
-  grants exec into every pod in that namespace. Drop `ovn_central_role.yaml` and set
+  grants exec into every pod in that namespace. The admission policy narrows it: in
+  that namespace the manager may exec (and attach) only into pods named
+  `<selector value>-*` (`ovn-central-*`); exec into CNI, CSI or other system pods is
+  denied (tested against a real API server: `internal/rbac` envtest). Drop `ovn_central_role.yaml` and set
   `--ovn-central=` where 802.1Q on lab links is not needed (tagged frames are then
   dropped on links), or point `--ovn-central` and the Role at another namespace.
 - **Kube-OVN VPCs and subnets.** They are cluster-scoped. The policy limits writes to
@@ -593,6 +596,43 @@ Learners are cluster-admin inside their vclusters, so the host side decides:
   "RuntimeDefault"` on the lab pool) so it is `RuntimeDefault`.
   `--vcluster-pod-security=restricted` would require it outright, but it also refuses
   root, which most of the 126 vcluster labs' stock images need.
+
+## Lab node pool
+
+`orchestrator.labNodes` (`--lab-node-selector`, `--lab-tolerations`) puts every lab
+workload on a dedicated pool:
+
+- container and netdev pods: `nodeSelector` and `tolerations`;
+- KubeVirt VMs (lab VMs and kubeadm nodes): the VM template's `nodeSelector` and
+  `tolerations`, so virt-launcher pods land there;
+- vclusters: the control plane gets `controlPlane.statefulSet.scheduling`, and synced
+  pods get `sync.toHost.pods.enforceTolerations`. vcluster cannot give synced pods a
+  node selector without node sync (a ClusterRole), and a learner's own nodeSelector
+  and tolerations pass through the syncer. So with `labNodes` the chart requires the
+  tier `V` sandbox (its RuntimeClass scheduling pins synced pods to the sandbox pool)
+  and adds the `…-vcluster-placement` admission policy on every pod in `ct-vc-*`: it
+  must carry the lab node selector or the tier `V` RuntimeClass, and may tolerate only
+  the lab pool's taints and `node.kubernetes.io/not-ready|unreachable`
+  (`labNodes.vclusterExtraTolerationKeys` adds more), and may not set `spec.nodeName`
+  (it skips the scheduler). Under the production profile the tier `V` RuntimeClass
+  (or `hostUsers: false`) is required whatever the selector says, the vcluster
+  control plane runs in that RuntimeClass too, and the chart refuses production
+  without `labNodes`. vcluster 0.37 overwrites `runtimeClassName` on every synced pod
+  (`translator.go`), so a learner cannot choose another class;
+- CDI importer and uploader pods (VM disks): the CDI CR's `spec.workload`
+  `nodeSelector`/`tolerations` (see `deploy/kubevirt/cdi-cr.yaml`).
+
+Taint the pool (e.g. `cloudtrain.dev/labs=true:NoSchedule`) so platform pods never
+land on it. Taint the system pool with a key only platform pods tolerate (AKS:
+`CriticalAddonsOnly=true:NoSchedule`) so lab pods, vcluster workloads included, never
+land there, and pin the platform (`gateway`, `web` and `orchestrator` `nodeSelector`,
+plus that toleration) to it; the chart refuses `labNodes` without those node
+selectors. `labctl preflight --lab-node-selector … --lab-tolerations …` fails when
+either pool is untainted. Pending lab pods carry the selector and the toleration, so the
+cluster autoscaler can scale an AKS pool up from zero. KubeVirt's virt-handler must
+tolerate the taint (KubeVirt CR `spec.workloads.nodePlacement.tolerations`), and so
+must the Multus and Kube-OVN daemonsets (they usually tolerate everything). See
+`examples/values-aks-app-routing.yaml`.
 
 ## Not yet
 

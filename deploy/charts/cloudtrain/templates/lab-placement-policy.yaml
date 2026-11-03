@@ -1,0 +1,90 @@
+{{- if .Values.orchestrator.enabled }}
+{{- $o := .Values.orchestrator }}
+{{- $ln := $o.labNodes | default dict }}
+{{- $production := eq (($o.isolation).profile | default "dev") "production" }}
+{{- if and $production (not $ln.nodeSelector) }}
+{{- fail "orchestrator.isolation.profile production needs orchestrator.labNodes (a dedicated, tainted lab pool) and its vcluster placement policy" }}
+{{- end }}
+{{- if or $ln.nodeSelector $ln.tolerations }}
+{{- $name := printf "%s-orchestrator-%s" (include "ct.fullname" .) .Release.Namespace }}
+{{- if not $ln.nodeSelector }}
+{{- fail "orchestrator.labNodes.tolerations needs orchestrator.labNodes.nodeSelector: tolerations alone let lab pods onto any untainted node, and the vcluster control plane is placed by the selector" }}
+{{- end }}
+{{- range $c := list "orchestrator" "gateway" "web" }}
+{{- if and (index $.Values $c).enabled (not (index $.Values $c).nodeSelector) }}
+{{- fail (printf "orchestrator.labNodes is set, so %s.nodeSelector must pin the platform to its own (system) pool: lab pods on a dedicated pool are only half the separation" $c) }}
+{{- end }}
+{{- end }}
+{{- $vrc := "" }}
+{{- with $o.sandboxes }}{{- with .V }}{{- $vrc = .runtimeClass }}{{- end }}{{- end }}
+{{- if not $vrc }}
+{{- fail "orchestrator.labNodes is set, so orchestrator.sandboxes.V is required: vcluster cannot give the pods it syncs a node selector without a ClusterRole, so the tier V RuntimeClass (its scheduling) is what keeps them on the lab pool" }}
+{{- end }}
+{{- $keys := list "node.kubernetes.io/not-ready" "node.kubernetes.io/unreachable" }}
+{{- range $ln.tolerations }}{{- $keys = append $keys (regexReplaceAll "[=:].*$" . "") }}{{- end }}
+{{- range ($ln.vclusterExtraTolerationKeys | default list) }}{{- $keys = append $keys . }}{{- end }}
+---
+# Pods in vcluster host namespaces (ct-vc-*): learners are cluster-admin in their
+# vcluster and their nodeSelector, tolerations and nodeName pass through the syncer.
+# Every pod there must target the lab pool (its node selector, or the tier V sandbox
+# RuntimeClass, whose scheduling pins it; under the production profile the tier V
+# RuntimeClass or hostUsers: false is required whatever the selector says), may
+# tolerate only the lab pool's taints and Kubernetes' own not-ready/unreachable
+# taints, so a tainted system pool stays out of reach, and may not name a node
+# (spec.nodeName skips the scheduler). vcluster 0.37 overwrites runtimeClassName on
+# every synced pod with sync.toHost.pods.runtimeClassName (translator.go), so a
+# learner cannot pick another class. For every user.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}-vcluster-placement
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  matchConditions:
+    - name: vcluster-host-namespace
+      expression: "request.namespace.startsWith('ct-vc-')"
+  variables:
+    - name: sel
+      expression: "object.spec.?nodeSelector.orValue({})"
+  validations:
+    {{- if $production }}
+    - expression: >-
+        object.spec.?runtimeClassName.orValue('') == {{ $vrc | squote }} || object.spec.?hostUsers.orValue(true) == false
+      message: under the production isolation profile pods in virtual cluster host namespaces run only in the tier V sandbox or a user namespace
+      reason: Forbidden
+    {{- end }}
+    - expression: >-
+        request.operation != 'CREATE' || object.spec.?nodeName.orValue('') == ''
+      message: pods in virtual cluster host namespaces may not set spec.nodeName (it skips the scheduler and the lab pool)
+      reason: Forbidden
+    - expression: >-
+        object.spec.?runtimeClassName.orValue('') == {{ $vrc | squote }} ||
+        ({{ if $ln.nodeSelector }}{{ range $i, $k := keys $ln.nodeSelector | sortAlpha }}{{ if $i }} && {{ end }}({{ $k | squote }} in variables.sel && variables.sel[{{ $k | squote }}] == {{ get $ln.nodeSelector $k | squote }}){{ end }}{{ else }}false{{ end }})
+      message: pods in virtual cluster host namespaces must run on the lab pool (its node selector or the tier V sandbox RuntimeClass)
+      reason: Forbidden
+    - expression: >-
+        object.spec.?tolerations.orValue([]).all(t, t.?key.orValue('') in {{ $keys | uniq | toJson }})
+      message: pods in virtual cluster host namespaces may tolerate only the lab pool's taints
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}-vcluster-placement
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  policyName: {{ $name }}-vcluster-placement
+  validationActions: [Deny]
+{{- end }}
+{{- end }}

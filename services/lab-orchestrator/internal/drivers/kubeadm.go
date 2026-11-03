@@ -163,7 +163,7 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 		vm := buildVM(ref.Session, net, vmSpec{
 			Name: l.vms[i], Hostname: m.Name, IP: h.IP, Image: d.image(img.Image), PullSecret: d.Container.vmPullSecret(),
 			Cores: cores, MemMiB: mem, CISecret: ci, Labels: vmLabels(ref, m.Name),
-			Disk: d.Disks, DiskSize: img.DiskSize,
+			Disk: d.Disks, DiskSize: img.DiskSize, Placement: d.Container.labPlacement(),
 		})
 		if err := setOwner(ref.Session, vm, d.Client); err != nil {
 			return fail(err)
