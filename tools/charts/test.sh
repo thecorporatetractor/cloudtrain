@@ -56,6 +56,34 @@ render -f "$CHART/examples/values-kind.yaml" --set gateway.image.tag=dev2 >"$OUT
 check "a new image renames the migrate Job" bash -c "[[ \$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/values-kind.yaml') != \$(yq 'select(.kind == \"Job\") | .metadata.name' '$OUT/migrate-image.yaml') ]]"
 render -f "$CHART/examples/values-kind.yaml" --set global.imageTag=main --set gateway.migrateMutableTag=true >"$OUT/migrate-mutable.yaml"
 check "migrateMutableTag allows a moving tag" q 'select(.kind == "Job") | .spec.template.spec.containers[0].image == "ct-deploy/gateway:main"' "$OUT/migrate-mutable.yaml"
+# Supply chain: digests pin the platform images; cosign verification is opt-in.
+D=sha256:$(printf 'a%.0s' {1..64})
+DIG=(--set "gateway.image.digest=$D" --set "web.image.digest=$D" --set "orchestrator.image.digest=$D")
+check "images by tag, pulled Always, by default" q '[select(.kind == "Deployment") | .spec.template.spec.containers[0] | select(.image | test("^ghcr.io/thecorporatetractor/cloudtrain/")) | (.imagePullPolicy == "Always" and (.image | test("@") | not))] | (length > 0 and all)' "$OUT/values-nginx.yaml"
+render -f "$CHART/examples/values-nginx.yaml" "${DIG[@]}" --set imageVerification.enabled=true --set 'imageVerification.extraGlobs[0]=ghcr.io/thecorporatetractor/cloudtrain/jumphost*' >"$OUT/verify.yaml"
+check "pinned images pulled IfNotPresent" q '[select(.kind == "Deployment") | .spec.template.spec | (.initContainers // []) + .containers | .[] | select(.image | test("^ghcr.io/thecorporatetractor/cloudtrain/")) | .imagePullPolicy == "IfNotPresent"] | (length > 0 and all)' "$OUT/verify.yaml"
+render -f "$CHART/examples/values-nginx.yaml" --set "gateway.image.digest=$D" >"$OUT/gw-pinned.yaml"
+check "per image: pinned gateway IfNotPresent, tagged web Always" q '[select(.kind == "Deployment") | .spec.template.spec.containers[0] | select(.image | test("/(gateway|web)[:@]")) | (((.image | test("/gateway:")) and .imagePullPolicy == "IfNotPresent") or ((.image | test("/web:")) and .imagePullPolicy == "Always"))] | (length == 2 and all)' "$OUT/gw-pinned.yaml"
+check "explicit global.imagePullPolicy wins" q '[select(.kind == "Deployment") | .spec.template.spec.containers[0] | select(.image | test("^ct-deploy/")) | .imagePullPolicy == "Never"] | (length == 3 and all)' "$OUT/values-kind.yaml"
+# NOTES.txt rendered without a cluster (helm 3 install --dry-run needs one, and
+# helm template skips NOTES): a scratch copy of the chart renders it into a ConfigMap.
+NC=$(mktemp -d)/cloudtrain
+cp -rL "$CHART" "$NC"
+mv "$NC/templates/NOTES.txt" "$NC/notes.txt"
+printf '%s\n' 'apiVersion: v1' 'kind: ConfigMap' 'metadata: {name: ct-notes}' 'data:' '  notes: {{ tpl (.Files.Get "notes.txt") . | toJson }}' >"$NC/templates/zz-notes.yaml"
+notes() { helm template ct "$NC" -n cloudtrain -f "$OUT/ci-tag.yaml" "$@" 2>/dev/null | yq 'select(.kind == "ConfigMap" and .metadata.name == "ct-notes") | .data.notes'; }
+notes -f "$CHART/examples/values-nginx.yaml" --set "gateway.image.digest=$D" >"$OUT/notes-gw.txt"
+notes -f "$CHART/examples/values-nginx.yaml" "${DIG[@]}" >"$OUT/notes-pinned.txt"
+notes -f "$CHART/examples/values-nginx.yaml" "${DIG[@]}" --set imageVerification.enabled=true --set postgres.demo.enabled=true >"$OUT/notes-pg.txt"
+check "NOTES name every unpinned image" grep -q 'WARNING: web, orchestrator run by tag' "$OUT/notes-gw.txt"
+check "NOTES quiet when all pinned" bash -c "grep -q '^Check: helm test' '$OUT/notes-pinned.txt' && ! grep -q 'run by tag' '$OUT/notes-pinned.txt'"
+check "NOTES warn: demo postgres with imageVerification" grep -q 'demo Postgres image is not covered' "$OUT/notes-pg.txt"
+check "digest pinned: repository:tag@sha256" q "[select(.kind == \"Deployment\") | .spec.template.spec.containers[0].image | test(\"^ghcr.io/thecorporatetractor/cloudtrain/(gateway|web|lab-orchestrator):0.0.0-test@$D\$\")] | (length == 3 and all)" "$OUT/verify.yaml"
+check "ClusterImagePolicy: platform globs, keyless GitHub identity, Rekor" q 'select(.kind == "ClusterImagePolicy") | (([.spec.images[].glob] | sort | join(",")) == "ghcr.io/thecorporatetractor/cloudtrain/gateway*,ghcr.io/thecorporatetractor/cloudtrain/jumphost*,ghcr.io/thecorporatetractor/cloudtrain/lab-orchestrator*,ghcr.io/thecorporatetractor/cloudtrain/web*" and .spec.authorities[0].keyless.identities[0].issuer == "https://token.actions.githubusercontent.com" and (.spec.authorities[0].keyless.identities[0].subjectRegExp | contains("workflows/images")) and .spec.authorities[0].ctlog.url == "https://rekor.sigstore.dev")' "$OUT/verify.yaml"
+check "no ClusterImagePolicy by default" bash -c "! grep -q '^kind: ClusterImagePolicy' '$OUT/values-nginx.yaml'"
+check "PDBs: unhealthy pods never block a drain" q '[select(.kind == "PodDisruptionBudget") | .spec.unhealthyPodEvictionPolicy == "AlwaysAllow"] | (length == 2 and all)' "$OUT/values-nginx.yaml"
+check "PDBs for gateway and web" bash -c "[[ \$(yq -N 'select(.kind == \"PodDisruptionBudget\") | .metadata.name' '$OUT/values-nginx.yaml' | sort | tr '\n' ' ') == 'ct-cloudtrain-gateway ct-cloudtrain-web ' ]]"
+check "no PDB for a single replica" bash -c "! yq -e 'select(.kind == \"PodDisruptionBudget\" and .metadata.name == \"ct-cloudtrain-web\")' '$OUT/values-kind.yaml'"
 
 # Public URL, OIDC redirect base and cookies follow host and TLS.
 check "https public URL from host" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-gateway") | .spec.template.spec.containers[0].env[] | select(.name == "CT_PUBLIC_URL") | .value == "https://labs.example.com"' "$OUT/values-eks-alb.yaml"
@@ -127,8 +155,12 @@ refuse() { local name=$1 want=$2; shift 2; if out=$(render "$@" 2>&1); then fail
 refuse "missing issuer" "gateway.oidc.issuer is required" --set gateway.existingSecret=s
 refuse "missing secret" "gateway.existingSecret" --set gateway.oidc.issuer=https://i
 refuse "migrate without owner URL" "databaseOwnerUrl is required" -f "$CHART/examples/values-eks-alb.yaml" --set gateway.existingSecret= --set gateway.secrets.create=true --set gateway.secrets.oidcClientSecret=x --set gateway.secrets.databaseUrl=postgres://a --set gateway.secrets.sessionSecret="$(printf 's%.0s' {1..20})" --set gateway.secrets.gdprHmacKey="$(printf 'k%.0s' {1..32})" --set gateway.secrets.databaseOwnerUrl=
-refuse "migrate on a moving tag" "immutable image tag" -f "$CHART/examples/values-kind.yaml" --set global.imageTag=main
-refuse "migrate on the default appVersion" "immutable image tag" -f "$CHART/examples/values-eks-alb.yaml" --set global.imageTag=
+refuse "migrate on a moving tag" "immutable image" -f "$CHART/examples/values-kind.yaml" --set global.imageTag=main
+refuse "migrate on the default appVersion" "immutable image" -f "$CHART/examples/values-eks-alb.yaml" --set global.imageTag=
+if render -f "$CHART/examples/values-kind.yaml" --set global.imageTag=main --set "gateway.image.digest=sha256:$(printf 'a%.0s' {1..64})" >"$OUT/migrate-digest.yaml" 2>&1; then pass "a digest makes a moving tag safe to migrate"; else fail "a digest makes a moving tag safe to migrate: $(tail -2 "$OUT/migrate-digest.yaml")"; fi
+refuse "unpinned images with verification" "requireDigests" -f "$CHART/examples/values-nginx.yaml" --set imageVerification.enabled=true
+refuse "bad digest" "digest" -f "$CHART/examples/values-eks-alb.yaml" --set gateway.image.digest=sha256:abc
+refuse "generated keys without generate (helm template, Argo CD)" "is empty and no existing Secret holds one" -f "$CHART/examples/values-kind.yaml" --set gateway.secrets.generate=false
 refuse "bad exposure" "exposure.type" -f "$CHART/examples/values-kind.yaml" --set exposure.type=nodeport
 refuse "quote in runtime config" "web.runtimeConfig" -f "$CHART/examples/values-kind.yaml" --set 'web.runtimeConfig.environment=a"b'
 refuse "path in apiBase" "apiBase" -f "$CHART/examples/values-kind.yaml" --set web.runtimeConfig.apiBase=https://x/y

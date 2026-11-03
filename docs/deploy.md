@@ -137,6 +137,18 @@ Upgrades: `helm upgrade cloudtrain-crds ...` first, then `helm upgrade cloudtrai
 with the new release's overlay. Uninstalling `cloudtrain` keeps the CRDs, the sessions
 namespace and with them running labs (`helm.sh/resource-policy: keep`).
 
+Upgrade note (breaking for `gateway.secrets.create`): the chart no longer generates an
+empty `gateway.secrets.sessionSecret` or `gateway.secrets.gdprHmacKey` unless
+`gateway.secrets.generate=true`. `helm upgrade` against the cluster still reads keys
+back from the existing Secret, but a Secret created before `CT_GDPR_HMAC_KEY` existed,
+and every `helm template` or Argo CD render with empty keys, now fails with "is empty
+and no existing Secret holds one". Set both keys explicitly (copy the current
+`CT_SESSION_SECRET` out of the Secret so nobody is signed out), or move to
+`gateway.existingSecret`. Use `generate=true` only with `helm install/upgrade`.
+`global.imagePullPolicy` changed from `IfNotPresent` to empty (per image, see
+[Image signatures at admission](#image-signatures-at-admission)); set it explicitly to
+keep the old behaviour.
+
 ### Main values
 
 | Value | Default | Meaning |
@@ -164,6 +176,11 @@ namespace and with them running labs (`helm.sh/resource-policy: keep`).
 | `orchestrator.rbac.admissionPolicy` | `true` | the ValidatingAdmissionPolicy that limits the manager's cluster-wide writes ([Orchestrator RBAC](#orchestrator-rbac)) |
 | `orchestrator.rbac.ovnCentral.enabled`, `.namespace`, `.selector` | `true`, `kube-system`, `app=ovn-central` | exec into Kube-OVN's ovn-central for 802.1Q on lab links; `false` drops that Role |
 | `networkPolicy.enabled`, `.ingressNamespaceSelector` | off | admit gateway/web traffic only from the ingress data plane |
+| `gateway.image.digest`, `web.image.digest`, `orchestrator.image.digest` | | pin the build (`repository:tag@sha256:...`) |
+| `global.imagePullPolicy` | empty (per image) | `IfNotPresent` for images pinned by digest, `Always` for tags; set it to force one policy |
+| `imageVerification.*` | off | cosign signature check at admission ([Image signatures at admission](#image-signatures-at-admission)) |
+| `podDisruptionBudget.enabled`, `.maxUnavailable` | on, `1` | PDBs for gateway and web when they run more than one replica |
+| `gateway.secrets.generate` | `false` | with `gateway.secrets.create`: generate an empty session secret or GDPR HMAC key. Only with `helm install/upgrade` against the cluster, because `helm template` and Argo CD can't read the existing Secret and would rotate both keys on every render. Without it, an empty key that can't be read back fails the render |
 | `postgres.demo.enabled` | off | demo Postgres on an emptyDir; never for real data |
 | `extraObjects` | | provider policies rendered with the release (templated) |
 
@@ -195,7 +212,10 @@ on vCenter). `exposure.type: none` renders no route; route the two paths yoursel
 `gateway.trustProxy` must cover the addresses the proxy connects from: the
 controller's pod CIDR, the VPC CIDR for an ALB in IP mode, or Google's front-end ranges
 `35.191.0.0/16,130.211.0.0/22` for GKE. Otherwise audit entries and the public
-API's rate limits see the proxy's address instead of the client's. Hop counts are
+API's rate limits see the proxy's address instead of the client's. The default
+trusts every private range, so any pod that can reach the gateway can forge a client
+IP. Narrow it to the proxy's CIDR, or turn on `networkPolicy` so only the ingress
+data plane reaches the gateway. The install notes warn when neither is done. Hop counts are
 not supported (Fastify ignores forwarded headers with them).
 
 ### Security headers
@@ -657,6 +677,45 @@ cosign verify ghcr.io/<owner>/<repo>/jumphost@sha256:... \
 
 An admission policy (Kyverno `verifyImages`, Sigstore policy-controller) can enforce
 the same identity on the mirror's repositories once signatures are copied there.
+
+### Image signatures at admission
+
+`imageVerification.enabled` (off by default) renders a Sigstore policy-controller
+`ClusterImagePolicy` for gateway, web and lab-orchestrator under
+`global.imageRegistry`. Its keyless identity is the issuer
+`https://token.actions.githubusercontent.com` and the subject `images.yml` of this
+repository on `main` or a `v*` tag, with the signature in Rekor.
+`imageVerification.extraGlobs` holds more images to the same identity, for example
+published lab images. With it on, `imageVerification.requireDigests` (default on)
+fails the render unless `gateway.image.digest`, `web.image.digest` and
+`orchestrator.image.digest` are set. That pins what runs to the signed build.
+
+```bash
+helm install policy-controller sigstore/policy-controller -n cosign-system --create-namespace
+kubectl label namespace cloudtrain policy.sigstore.dev/include=true
+helm upgrade cloudtrain deploy/charts/cloudtrain -n cloudtrain ... \
+  --set imageVerification.enabled=true \
+  --set gateway.image.digest=sha256:... --set web.image.digest=sha256:... \
+  --set orchestrator.image.digest=sha256:...
+```
+
+The digests are in the `images.yml` run (the `Build and push` step) and in
+`crane digest ghcr.io/<owner>/<repo>/gateway:<tag>`. In a labelled namespace,
+policy-controller rejects images that no policy matches unless its
+`no-match-policy` is `warn` or `allow`. Label only namespaces whose images are all
+covered (the release namespace, not the sessions namespace, until lab images are
+listed in `extraGlobs`). `postgres.demo` runs an image no policy covers (it is
+not signed by this repository), so with `postgres.demo.enabled` a labelled release
+namespace denies the postgres pod; the install notes warn about the combination.
+Use an external database, or leave the namespace unlabelled for a demo. A mirror
+registry needs the signatures copied (`cosign copy`) for verification to pass.
+
+`global.imagePullPolicy` is empty by default, which picks a policy per image:
+`IfNotPresent` for an image pinned by digest (it can't drift, and a restart doesn't
+need the registry) and `Always` for a moving tag such as `main`. `Always` narrows
+drift but doesn't remove it: a crash restart or a reschedule pulls whatever the tag
+points at then, and needs the registry to be reachable. The install notes list the
+images that still run by tag. Pin all three digests for production.
 
 ## Charts
 

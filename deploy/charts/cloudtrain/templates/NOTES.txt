@@ -28,4 +28,31 @@ resolve to the dev names in the catalog (cloudtrain/<name>:<tag>), which a real 
 cannot pull. Use the release's catalog-release.yaml (docs/deploy.md).
 {{- end }}
 
+{{- if and (not .Values.networkPolicy.enabled) (contains "10.0.0.0/8" .Values.gateway.trustProxy) }}
+
+WARNING: gateway.trustProxy trusts every private address and networkPolicy is off, so
+any pod that can reach the gateway can forge X-Forwarded-For (per-IP rate limits,
+audit IPs). Narrow gateway.trustProxy to the ingress data plane's CIDR, or set
+networkPolicy.enabled with networkPolicy.ingressNamespaceSelector.
+{{- end }}
+{{- $unpinned := list }}
+{{- range $c := list "gateway" "web" "orchestrator" }}
+{{- if not (index $.Values $c).image.digest }}{{ $unpinned = append $unpinned $c }}{{ end }}
+{{- end }}
+{{- if $unpinned }}
+
+WARNING: {{ join ", " $unpinned }} run by tag ({{ .Values.global.imageTag | default .Chart.AppVersion }}), which can move: a restart
+or reschedule may start a different build than its siblings. Pin each with
+<component>.image.digest and consider imageVerification (cosign) for production
+(docs/deploy.md, "Image signatures at admission").
+{{- end }}
+{{- if and .Values.imageVerification.enabled .Values.postgres.demo.enabled }}
+
+WARNING: imageVerification is on and the demo Postgres image is not covered by the
+ClusterImagePolicy. If the release namespace is labelled
+policy.sigstore.dev/include=true, policy-controller's default no-match-policy denies
+the postgres pod (it is not signed by this repository's workflow). Leave that
+namespace unlabelled, set no-match-policy to warn, or use an external database.
+{{- end }}
+
 Check: helm test {{ .Release.Name }} -n {{ .Release.Namespace }}

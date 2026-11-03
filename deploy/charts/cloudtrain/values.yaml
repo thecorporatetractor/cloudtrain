@@ -10,9 +10,15 @@ global:
   # Registry path holding gateway, web and lab-orchestrator (a mirror of GHCR,
   # docs/deploy.md "Pulling from the cluster's own registry").
   imageRegistry: ghcr.io/thecorporatetractor/cloudtrain
-  # Image tag of all three; empty = the chart's appVersion.
+  # Image tag of all three; empty = the chart's appVersion. Tags are mutable
+  # (main moves with every build): pin each image with <component>.image.digest
+  # for a reproducible rollout and a meaningful rollback.
   imageTag: ""
-  imagePullPolicy: IfNotPresent
+  # Empty = per image: IfNotPresent when it is pinned by digest (restarts then do
+  # not depend on the registry), Always for a moving tag (a restart resolves the
+  # current build instead of whatever a node cached). A moving tag still lets
+  # replicas drift across restarts and reschedules: pin digests in production.
+  imagePullPolicy: ""
   # Pull secrets (names) for the platform pods.
   imagePullSecrets: []
 
@@ -77,11 +83,17 @@ gateway:
   image:
     repository: gateway
     tag: ""
+    # sha256:... of the build to run (rendered as repository:tag@digest).
+    digest: ""
   port: 8787
   # Namespace of LabTemplates and LabSessions (CT_NAMESPACE).
   sessionsNamespace: cloudtrain-sessions
   # Proxies whose X-Forwarded-* headers the gateway trusts (CT_TRUST_PROXY):
-  # the pod CIDR(s) of the Ingress/Gateway data plane. Private ranges by default.
+  # the pod CIDR(s) of the Ingress/Gateway data plane. Private ranges by default,
+  # which trusts every pod in the cluster: any of them that can reach the gateway
+  # can forge client IPs (per-IP rate limits, audit IPs). Narrow this to the
+  # ingress data plane's CIDR, or turn networkPolicy on so only the ingress
+  # reaches the gateway (NOTES warns when neither is done).
   trustProxy: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7"
   # Extra web origins allowed to call /api cross-origin (CT_CORS_ORIGINS); only
   # needed when web.runtimeConfig.apiBase points at another origin.
@@ -110,14 +122,19 @@ gateway:
   # postgres.demo.enabled and gateway.secrets.create are used.
   existingSecret: ""
   secrets:
-    # Create the Secret from these values (demos; prefer existingSecret).
-    # sessionSecret is generated once and kept across upgrades when empty.
+    # Create the Secret from these values (demos; prefer existingSecret, External
+    # Secrets or the Key Vault CSI driver).
     create: false
     oidcClientSecret: ""
     keycloakAdminClientSecret: ""
     sessionSecret: ""
-    # The key behind the erasure ledger's subject hashes; generated once and kept when empty.
+    # The key behind the erasure ledger's subject hashes (>= 32 chars). Never rotate it.
     gdprHmacKey: ""
+    # Generate sessionSecret and gdprHmacKey when empty and not in the existing
+    # Secret. Only for helm install/upgrade against the cluster: helm template and
+    # Argo CD cannot read the existing Secret and would rotate both keys on every
+    # render. Without it, empty keys fail the render.
+    generate: false
     databaseUrl: ""
     databaseOwnerUrl: ""
   # Run the schema migrations (dist/db/cli.js migrate, as the owner role) in a
@@ -159,6 +176,8 @@ web:
   image:
     repository: web
     tag: ""
+    # sha256:... of the build to run (rendered as repository:tag@digest).
+    digest: ""
   port: 8080
   # window.__CLOUDTRAIN_CONFIG__ (apps/web/src/lib/runtimeConfig.ts), rendered
   # at container start: no rebuild per environment.
@@ -196,6 +215,8 @@ orchestrator:
   image:
     repository: lab-orchestrator
     tag: ""
+    # sha256:... of the build to run (rendered as repository:tag@digest).
+    digest: ""
   # Restrict the manager to one namespace ("" = all; vcluster host namespaces
   # need all) and to sessions with these labels ("" = all). Only one manager may
   # reconcile a session.
@@ -298,6 +319,30 @@ networkPolicy:
   enabled: false
   ingressNamespaceSelector: {}
   #  matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+
+# PodDisruptionBudgets for gateway and web (when replicas > 1): a node drain
+# takes one replica at a time, so the API and terminals stay up.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Verify the cosign signatures of the platform images at admission, opt-in.
+# Renders a Sigstore policy-controller ClusterImagePolicy (policy.sigstore.dev)
+# for gateway, web and lab-orchestrator under global.imageRegistry: keyless
+# signatures by this repository's images workflow (.github/workflows/images.yml).
+# Needs policy-controller installed and the release namespace labelled
+# policy.sigstore.dev/include=true (docs/deploy.md, "Image signatures").
+imageVerification:
+  enabled: false
+  # Fail the render unless gateway, web and orchestrator are pinned by image.digest.
+  requireDigests: true
+  issuer: https://token.actions.githubusercontent.com
+  subjectRegExp: '^https://github\.com/thecorporatetractor/cloudtrain/\.github/workflows/images\.yml@refs/(heads/main|tags/v.+)$'
+  # More globs held to the same signature (e.g. published lab images:
+  # ghcr.io/thecorporatetractor/cloudtrain/jumphost*).
+  extraGlobs: []
+  # A mirror (global.imageRegistry not ghcr.io) keeps the signatures only when it
+  # copies them (cosign copy, ACR artifact cache does): see docs/deploy.md.
 
 # Extra manifests rendered with the release (templated), e.g. GKE
 # HealthCheckPolicy/GCPBackendPolicy or Envoy Gateway BackendTrafficPolicy.

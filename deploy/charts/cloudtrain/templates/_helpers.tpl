@@ -25,7 +25,33 @@ app.kubernetes.io/component: {{ index . 1 }}
 {{- $ctx := index . 0 -}}
 {{- $c := index . 1 -}}
 {{- $tag := $c.image.tag | default $ctx.Values.global.imageTag | default $ctx.Chart.AppVersion -}}
+{{- $digest := $c.image.digest | default "" -}}
+{{- $v := $ctx.Values.imageVerification | default dict -}}
+{{- if and $v.enabled $v.requireDigests (not $digest) -}}
+{{- fail (printf "imageVerification.requireDigests: set %s image.digest (sha256:...) so every replica runs the signed build, not whatever %s points at now" $c.image.repository $tag) -}}
+{{- end -}}
+{{- if $digest -}}
+{{- printf "%s/%s:%s@%s" (trimSuffix "/" $ctx.Values.global.imageRegistry) $c.image.repository $tag $digest -}}
+{{- else -}}
 {{- printf "%s/%s:%s" (trimSuffix "/" $ctx.Values.global.imageRegistry) $c.image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+  ct.pullPolicy <ctx> <component values>: global.imagePullPolicy when set;
+  otherwise IfNotPresent for an image pinned by digest (it cannot drift, and a
+  restart then does not depend on the registry) and Always for a moving tag.
+*/}}
+{{- define "ct.pullPolicy" -}}
+{{- $ctx := index . 0 -}}
+{{- $c := index . 1 -}}
+{{- if $ctx.Values.global.imagePullPolicy -}}
+{{- $ctx.Values.global.imagePullPolicy -}}
+{{- else if $c.image.digest -}}
+IfNotPresent
+{{- else -}}
+Always
+{{- end -}}
 {{- end -}}
 
 {{/* https://<host> unless TLS is off. */}}
@@ -121,7 +147,7 @@ automountServiceAccountToken: false
 containers:
   - name: migrate
     image: {{ include "ct.image" (list $ $g) }}
-    imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+    imagePullPolicy: {{ include "ct.pullPolicy" (list $ $g) }}
     args: [dist/db/cli.js, migrate]
     env:
       {{- include "ct.gatewayOwnerDbEnv" $ | nindent 6 }}
