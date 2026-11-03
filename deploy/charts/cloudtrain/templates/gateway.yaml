@@ -88,13 +88,22 @@ subjects:
 {{- end }}
 {{- if and $g.secrets.create (not $g.existingSecret) }}
 ---
+{{- /*
+  Keys left empty are read back from the existing Secret (lookup) or, only with
+  secrets.generate, generated. helm template and Argo CD cannot look up, so
+  generating there would rotate the session secret and the GDPR HMAC key on
+  every render (signing everyone out and breaking the erasure ledger's hashes):
+  without generate, an empty key that cannot be read back fails the render.
+*/}}
 {{- $prev := lookup "v1" "Secret" .Release.Namespace $name }}
 {{- $session := $g.secrets.sessionSecret }}
 {{- if and (not $session) $prev }}{{ $session = index $prev.data "CT_SESSION_SECRET" | b64dec }}{{ end }}
-{{- if not $session }}{{ $session = randAlphaNum 48 }}{{ end }}
+{{- if and (not $session) $g.secrets.generate }}{{ $session = randAlphaNum 48 }}{{ end }}
+{{- if not $session }}{{ fail "gateway.secrets.sessionSecret is empty and no existing Secret holds one: set it, use gateway.existingSecret, or set gateway.secrets.generate=true (helm install/upgrade only; never with helm template or Argo CD, which would rotate it on every render)" }}{{ end }}
 {{- $gdprKey := $g.secrets.gdprHmacKey }}
 {{- if and (not $gdprKey) $prev }}{{ $gdprKey = index $prev.data "CT_GDPR_HMAC_KEY" | default "" | b64dec }}{{ end }}
-{{- if not $gdprKey }}{{ $gdprKey = randAlphaNum 64 }}{{ end }}
+{{- if and (not $gdprKey) $g.secrets.generate }}{{ $gdprKey = randAlphaNum 64 }}{{ end }}
+{{- if not $gdprKey }}{{ fail "gateway.secrets.gdprHmacKey is empty and no existing Secret holds one: set it (>= 32 chars, docs/gdpr.md), use gateway.existingSecret, or set gateway.secrets.generate=true (helm install/upgrade only; never with helm template or Argo CD, which would rotate it on every render)" }}{{ end }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -170,7 +179,7 @@ spec:
         # Waits, as the app role, until the migrate Job has applied this build's migrations.
         - name: wait-for-schema
           image: {{ include "ct.image" (list . $g) }}
-          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          imagePullPolicy: {{ include "ct.pullPolicy" (list . $g) }}
           args: [dist/db/cli.js, wait]
           env:
             {{- include "ct.gatewayDbEnv" . | nindent 12 }}
@@ -181,7 +190,7 @@ spec:
       containers:
         - name: gateway
           image: {{ include "ct.image" (list . $g) }}
-          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          imagePullPolicy: {{ include "ct.pullPolicy" (list . $g) }}
           ports:
             - {name: http, containerPort: {{ $g.port }}}
           env:
@@ -282,8 +291,8 @@ spec:
   gateway.migrateRetry (hashed into the name) or delete the Job (docs/deploy.md).
 */}}
 {{- $tag := $g.image.tag | default .Values.global.imageTag | default .Chart.AppVersion }}
-{{- if and (has $tag (list "main" "latest")) (not $g.migrateMutableTag) }}
-{{- fail (printf "gateway.migrate needs an immutable image tag (a release version or sha-<commit>), not %q: the migrate Job is named by the image reference, so a new build under the same tag would never be migrated. Set global.imageTag (or gateway.image.tag), or gateway.migrateMutableTag=true for development and bump gateway.migrateRetry after each new build (docs/deploy.md)." $tag) }}
+{{- if and (has $tag (list "main" "latest")) (not $g.image.digest) (not $g.migrateMutableTag) }}
+{{- fail (printf "gateway.migrate needs an immutable image (a release version, sha-<commit> tag or gateway.image.digest), not %q: the migrate Job is named by the image reference, so a new build under the same tag would never be migrated. Set global.imageTag (or gateway.image.tag), or gateway.migrateMutableTag=true for development and bump gateway.migrateRetry after each new build (docs/deploy.md)." $tag) }}
 {{- end }}
 {{- $podTemplate := printf "metadata:\n  labels:\n    app.kubernetes.io/part-of: cloudtrain\n    app.kubernetes.io/instance: %s\n    app.kubernetes.io/managed-by: %s\n    app.kubernetes.io/component: gateway-migrate\nspec:\n%s" .Release.Name .Release.Service (include "ct.gatewayMigrateSpec" (dict "ctx" . "name" $name) | indent 2) }}
 apiVersion: batch/v1

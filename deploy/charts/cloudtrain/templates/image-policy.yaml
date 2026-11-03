@@ -1,0 +1,32 @@
+{{- with .Values.imageVerification }}
+{{- if .enabled }}
+{{- $reg := trimSuffix "/" $.Values.global.imageRegistry }}
+---
+# Admission-time cosign verification of the platform images (Sigstore
+# policy-controller). Keyless: the Fulcio certificate must come from this
+# repository's images workflow through GitHub's OIDC issuer, and the signature
+# must be in the Rekor transparency log. docs/deploy.md, "Image signatures".
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: {{ include "ct.fullname" $ }}-{{ $.Release.Namespace }}-platform
+  labels:
+    {{- include "ct.labels" $ | nindent 4 }}
+spec:
+  images:
+    {{- range $c := list $.Values.gateway $.Values.web $.Values.orchestrator }}
+    - glob: {{ printf "%s/%s*" $reg $c.image.repository | quote }}
+    {{- end }}
+    {{- range .extraGlobs }}
+    - glob: {{ . | quote }}
+    {{- end }}
+  authorities:
+    - keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          - issuer: {{ .issuer | quote }}
+            subjectRegExp: {{ .subjectRegExp | quote }}
+      ctlog:
+        url: https://rekor.sigstore.dev
+{{- end }}
+{{- end }}
