@@ -127,6 +127,39 @@ subjects:
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+---
+# The API server's addresses for vcluster control plane NetworkPolicies
+# (config/rbac/apiserver_endpoints_role.yaml; --apiserver-cidrs auto). Only that object.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $cluster }}-apiserver-endpoints
+  namespace: default
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+rules:
+  - apiGroups: [""]
+    resources: [endpoints]
+    resourceNames: [kubernetes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $cluster }}-apiserver-endpoints
+  namespace: default
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $cluster }}-apiserver-endpoints
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
 {{- if $o.rbac.admissionPolicy }}
 ---
 # What RBAC cannot express (config/rbac/admission_policy.yaml): RoleBinding writes only
@@ -153,6 +186,61 @@ metadata:
 spec:
   policyName: {{ $cluster }}
   validationActions: [Deny]
+{{- $vh := index (splitList "\n---\n" (.Files.Get "files/vcluster-host-policy.txt")) 0 | fromYaml }}
+---
+# What learners may publish from vcluster host namespaces (config/rbac/vcluster_host_policy.yaml):
+# no externalIPs, LoadBalancer or NodePort Services, no Ingresses. For every user.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $cluster }}-vcluster-host
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  {{- with $o.vclusterPodCIDRs }}
+  {{- $q := list }}{{- range (. | toStrings | uniq | sortAlpha) }}{{- $q = append $q (squote .) }}{{- end }}
+  {{- $_ := set (index $vh.spec.variables 0) "expression" (printf "[%s]" (join ", " $q)) }}
+  {{- end }}
+  {{- $vh.spec | toYaml | nindent 2 }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $cluster }}-vcluster-host
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  policyName: {{ $cluster }}-vcluster-host
+  validationActions: [Deny]
+{{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/MutatingAdmissionPolicy" }}
+{{- $vm := index (splitList "\n---\n" (.Files.Get "files/vcluster-host-services-mutation.txt")) 0 | fromYaml }}
+---
+# The host copy of a learner's NodePort or LoadBalancer Service is a plain ClusterIP
+# Service (config/rbac/vcluster_host_services_mutation.yaml), so labs can create them
+# inside their vcluster; the policy above still refuses anything else. Kubernetes 1.36+
+# (helm template: --api-versions admissionregistration.k8s.io/v1/MutatingAdmissionPolicy).
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: {{ $cluster }}-vcluster-host-services
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  {{- $vm.spec | toYaml | nindent 2 }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: {{ $cluster }}-vcluster-host-services
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  policyName: {{ $cluster }}-vcluster-host-services
+{{- end }}
 {{- end }}
 ---
 apiVersion: v1
@@ -247,6 +335,9 @@ spec:
             - --session-cluster-role={{ $session }}
             - --service-account={{ .Release.Namespace }}/{{ $name }}
             - --isolation-profile={{ ($o.isolation).profile | default "dev" }}
+            {{- with $o.vclusterPodCIDRs }}
+            - --vcluster-pod-cidrs={{ join "," . }}
+            {{- end }}
             {{- if $o.rbac.ovnCentral.enabled }}
             - --ovn-central={{ $o.rbac.ovnCentral.namespace }}/{{ $o.rbac.ovnCentral.selector }}
             {{- else }}

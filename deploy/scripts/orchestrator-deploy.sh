@@ -105,13 +105,13 @@ manifests() {
     | NS="$NS" SUF="$SUF" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" TRC="${TIER_RUNTIME_CLASSES:-}" SBX="${SANDBOXES:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
-        (select(.kind == "ClusterRole" or .kind == "Role" or .kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding") | .metadata.name) += strenv(SUF) |
+        (select(.kind == "ClusterRole" or .kind == "Role" or .kind == "ValidatingAdmissionPolicy" or .kind == "ValidatingAdmissionPolicyBinding" or .kind == "MutatingAdmissionPolicy" or .kind == "MutatingAdmissionPolicyBinding") | .metadata.name) += strenv(SUF) |
         (select(.kind == "ClusterRole") | .rules[] | select(has("resourceNames")) | .resourceNames) |= map(. + strenv(SUF)) |
         (select(.kind == "ClusterRoleBinding" or .kind == "RoleBinding") | .roleRef.name) += strenv(SUF) |
         (select(.kind == "ClusterRoleBinding") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
         (select(.kind == "RoleBinding") | .metadata.name) += strenv(SUF) |
         (select(.kind == "ClusterRoleBinding" or .kind == "RoleBinding") | .subjects[0].namespace) = strenv(NS) |
-        (select(.kind == "ValidatingAdmissionPolicyBinding") | .spec.policyName) += strenv(SUF) |
+        (select(.kind == "ValidatingAdmissionPolicyBinding" or .kind == "MutatingAdmissionPolicyBinding") | .spec.policyName) += strenv(SUF) |
         (select(.kind == "ValidatingAdmissionPolicy") | .spec.matchConditions[].expression) |= sub("system:serviceaccount:cloudtrain-system:"; "system:serviceaccount:" + strenv(NS) + ":") |
         (select(.kind == "ValidatingAdmissionPolicy") | .spec.validations[].expression) |= sub("lab-orchestrator-session"; "lab-orchestrator-session" + strenv(SUF)) |
         (select(.kind == "Deployment" and strenv(SUF) != "") | .spec.template.spec.containers[0].args) += ["--session-cluster-role=lab-orchestrator-session" + strenv(SUF)] |

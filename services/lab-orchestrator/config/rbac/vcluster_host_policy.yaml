@@ -1,0 +1,82 @@
+# Virtual cluster host namespaces (ct-vc-*): what learners, cluster-admin inside
+# their vcluster, may publish to the host through the syncer, enforced for every
+# user (security review network-1, follow-up). vcluster 0.37 copies a virtual
+# Service's type and spec.externalIPs to the host Service (translate.go strips
+# only node ports), so a learner could claim a public IP, a node port or any
+# external IP (CVE-2020-8554). Ingresses are not synced (sync.toHost.ingresses
+# is off by default); they are refused here too in case a values change turns
+# it on. The per-vcluster ResourceQuota also caps LoadBalancer and NodePort at 0.
+# On Kubernetes 1.36+ the lab-vcluster-host-services MutatingAdmissionPolicy
+# (vcluster_host_services_mutation.yaml) runs first and turns the host copy of a
+# learner's NodePort or LoadBalancer Service into ClusterIP; this policy is the
+# backstop if it is missing or does not apply.
+# Endpoints and EndpointSlices there (a selector-less Service with manual
+# endpoints, synced by vcluster) may only name pod addresses: never link-local
+# (IMDS), loopback, unspecified or the Azure wireserver (168.63.129.16), and,
+# when the chart knows the cluster's pod
+# CIDRs (orchestrator.vclusterPodCIDRs), only addresses inside them (not node
+# or VNet IPs). FQDN EndpointSlices are refused. An EndpointSlice without
+# endpoints (a Service with no ready pods) has endpoints: null, not []: it is
+# admitted, or the host EndpointSlice controller could never empty a slice and
+# it would keep naming the addresses of pods that are gone.
+# Needs Kubernetes 1.30+ (ValidatingAdmissionPolicy GA).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: lab-vcluster-host
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [services]
+      - apiGroups: [networking.k8s.io]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [ingresses]
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [endpoints]
+      - apiGroups: [discovery.k8s.io]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [endpointslices]
+  matchConditions:
+    - name: vcluster-host-namespace
+      expression: "request.namespace.startsWith('ct-vc-')"
+  variables:
+    # Pod CIDRs endpoints may point into; the chart sets the cluster's
+    # (orchestrator.vclusterPodCIDRs). Default: any address.
+    - name: allowed
+      expression: "['0.0.0.0/0', '::/0']"
+  validations:
+    - expression: "request.resource.resource != 'services' || object.spec.?externalIPs.orValue([]).size() == 0"
+      message: Services in virtual cluster host namespaces may not set externalIPs
+      reason: Forbidden
+    - expression: "request.resource.resource != 'services' || !(object.spec.?type.orValue('ClusterIP') in ['LoadBalancer', 'NodePort'])"
+      message: Services in virtual cluster host namespaces must be ClusterIP or headless (no LoadBalancer, no NodePort)
+      reason: Forbidden
+    - expression: "request.resource.resource != 'ingresses'"
+      message: Ingresses are not published from virtual cluster host namespaces
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'endpoints' ||
+        object.?subsets.orValue([]).all(s, (s.?addresses.orValue([]) + s.?notReadyAddresses.orValue([])).all(a, isIP(a.ip) && !ip(a.ip).isLinkLocalUnicast() && !ip(a.ip).isLoopback() && !ip(a.ip).isUnspecified() && ip(a.ip) != ip('168.63.129.16') && variables.allowed.exists(c, cidr(c).containsIP(ip(a.ip)))))
+      message: Endpoints in virtual cluster host namespaces may only name pod addresses (no link-local, loopback, node or external IPs)
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'endpointslices' ||
+        (object.addressType != 'FQDN' && (object.?endpoints.orValue([]) == null ? [] : object.endpoints).all(e, e.addresses.all(x, isIP(x) && !ip(x).isLinkLocalUnicast() && !ip(x).isLoopback() && !ip(x).isUnspecified() && ip(x) != ip('168.63.129.16') && variables.allowed.exists(c, cidr(c).containsIP(ip(x))))))
+      message: EndpointSlices in virtual cluster host namespaces may only name pod addresses (no FQDN, link-local, loopback, node or external IPs)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: lab-vcluster-host
+spec:
+  policyName: lab-vcluster-host
+  validationActions: [Deny]

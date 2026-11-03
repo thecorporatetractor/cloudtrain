@@ -55,6 +55,8 @@ func main() {
 		allowLearnerSudo                                                                                          bool
 		isolationProfile                                                                                          string
 		isolationEvict                                                                                            bool
+		apiServerCIDRs                                                                                            string
+		vclusterPodCIDRs                                                                                          string
 		concurrency                                                                                               int
 		provisionTimeout                                                                                          time.Duration
 	)
@@ -104,6 +106,8 @@ func main() {
 	flag.IntVar(&linkRateMbps, "link-rate-mbps", 10, "rate limit of every lab link attachment in Mbit/s, each direction (Kube-OVN ingress_rate/egress_rate: OVS policing and an HTB queue on the host side of the port, out of the learner's reach), so a bridging loop cannot saturate the host; 0 = none")
 	flag.StringVar(&isolationProfile, "isolation-profile", drivers.IsolationDev, "dev or production. production fails closed: the manager exits without tier sandboxes, and every lab pod must run in a sandbox RuntimeClass or with hostUsers: false (a pod that would run with host users on the host kernel is refused); see internal/drivers/isolation.go")
 	flag.BoolVar(&isolationEvict, "isolation-evict", false, "production profile: delete lab node pods that run neither in a sandbox nor in a user namespace (created before the profile applied) instead of refusing to start; their sessions recreate them under the profile")
+	flag.StringVar(&vclusterPodCIDRs, "vcluster-pod-cidrs", "", "the cluster's pod CIDRs (Helm orchestrator.vclusterPodCIDRs, comma separated): checked at startup against the nodes' addresses, since the vcluster endpoints allowlist needs an overlay pod network")
+	flag.StringVar(&apiServerCIDRs, "apiserver-cidrs", "auto", "where vcluster control planes may reach the host API server (their NetworkPolicy egress): ip[/bits][:port] comma separated; auto = the default/kubernetes Endpoints (the chart's Role in the default namespace); if unknown, public addresses on 443/6443 only")
 	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
 	flag.StringVar(&networkModeFlag, "network-mode", string(network.ModePrimary), "how wired lab pods and lab VMs reach the session network (docs/any-kubernetes.md): primary (Kube-OVN is the cluster's primary CNI; eth0 placed with ovn.kubernetes.io/logical_switch) or secondary (another CNI owns eth0, Kube-OVN runs non-primary behind Multus; eth0 = a session segment as the Multus default network, VMs with multus.default)")
 	flag.IntVar(&labMTU, "lab-mtu", network.DefaultLinkMTU, "MTU of every session segment (Kube-OVN Subnet spec.mtu): lab links, management, lab and access subnets; lab content assumes 1400. 0 = Kube-OVN default (node MTU minus tunnel overhead)")
@@ -366,6 +370,54 @@ func main() {
 	} else {
 		log.Info("session permissions: not bound by the manager (--session-cluster-role empty)")
 	}
+	var apiServer drivers.APIServerEndpoints
+	switch apiServerCIDRs {
+	case "auto":
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for API server detection")
+			os.Exit(1)
+		}
+		actx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		apiServer, err = drivers.DetectAPIServerEndpoints(actx, direct)
+		cancel()
+		if err != nil {
+			log.Error(err, "cannot read the API server endpoints: vcluster control planes may reach public addresses on 443/6443 (set --apiserver-cidrs)")
+		}
+	case "":
+	default:
+		apiServer, err = drivers.ParseAPIServerCIDRs(apiServerCIDRs)
+		if err != nil {
+			log.Error(err, "invalid --apiserver-cidrs")
+			os.Exit(1)
+		}
+	}
+	if len(apiServer.CIDRs) == 0 && profile == drivers.IsolationProduction {
+		log.Error(nil, "refusing to start: the production isolation profile needs the API server's addresses for vcluster control plane policies (set --apiserver-cidrs or grant the default/kubernetes Endpoints Role)")
+		os.Exit(1)
+	}
+	log.Info("vcluster control plane egress to the API server", "cidrs", apiServer.CIDRs, "ports", apiServer.Ports)
+	if cidrs := drivers.SplitList(vclusterPodCIDRs); len(cidrs) > 0 {
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for the pod CIDR check")
+			os.Exit(1)
+		}
+		nodes := &corev1.NodeList{}
+		if err := direct.List(context.Background(), nodes); err != nil {
+			if profile == drivers.IsolationProduction {
+				log.Error(err, "refusing to start: cannot list nodes for the vcluster pod CIDR check")
+				os.Exit(1)
+			}
+			log.Error(err, "cannot list nodes for the pod CIDR check")
+		} else if err := drivers.CheckPodCIDRs(nodes.Items, cidrs); err != nil {
+			if profile == drivers.IsolationProduction {
+				log.Error(err, "refusing to start")
+				os.Exit(1)
+			}
+			log.Error(err, "vcluster endpoints allowlist is ineffective")
+		}
+	}
 	// Typed nil pointers must not reach the interfaces.
 	var nsAccess drivers.NamespaceAccess
 	var sessionAccess controller.SessionNamespaceAccess
@@ -377,8 +429,8 @@ func main() {
 		Catalog: catalog, ImageRegistry: registry, ImageMirrors: mirrors, ImagePullSecrets: pullSecrets,
 		RuntimeClassName: runtimeClass, Sandboxes: sandboxes, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
-		VClusterPodSecurity: vclusterPodSecurity,
-		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass, HomeStorageClass: homeStorageClass,
+		VClusterPodSecurity: vclusterPodSecurity, VClusterAPIServer: apiServer,
+		PersistentHome: persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass, HomeStorageClass: homeStorageClass,
 		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent", StorageClass: vmDiskStorageClass,
 			VolumeMode: vmDiskVolumeMode, AccessModes: drivers.SplitList(vmDiskAccessModes)},
 		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
@@ -537,6 +589,7 @@ func uncached() []client.Object {
 		&corev1.Endpoints{}, &corev1.Namespace{}, &corev1.Node{}, &appsv1.StatefulSet{}, &appsv1.Deployment{},
 		&networkingv1.NetworkPolicy{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}, &rbacv1.ClusterRole{},
 		&rbacv1.ClusterRoleBinding{}, &storagev1.StorageClass{}, &nodev1.RuntimeClass{},
+		&corev1.ResourceQuota{}, &corev1.LimitRange{},
 	}
 }
 

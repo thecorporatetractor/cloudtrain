@@ -40,6 +40,9 @@ type RuntimeOptions struct {
 	// VClusterPodSecurity is the Pod Security Standard enforced on vcluster
 	// host namespaces (default baseline).
 	VClusterPodSecurity string
+	// VClusterAPIServer: where vcluster control planes may reach the host
+	// API server (see vcluster_isolation.go).
+	VClusterAPIServer APIServerEndpoints
 	// Lab state persistence (what hibernate/resume preserves):
 	// PersistentHome gives container nodes a /home/learner PVC,
 	// VClusterPersistence keeps vcluster databases on a PVC, VMDisks makes
@@ -130,7 +133,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	cluster := &ClusterDriver{
 		Virtual: &VClusterDriver{Client: o.Client, Reader: o.Reader, Container: container, Helm: o.Helm,
 			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
-			PodSecurity: o.VClusterPodSecurity, NamespaceAccess: o.NamespaceAccess},
+			PodSecurity: o.VClusterPodSecurity, NamespaceAccess: o.NamespaceAccess, APIServer: o.VClusterAPIServer},
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
 			Session: session, ImageRegistry: registry, Disks: disks},
 	}
