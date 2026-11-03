@@ -336,3 +336,83 @@ func TestSessionRoleCoversVClusterRole(t *testing.T) {
 		}
 	}
 }
+
+// TestVClusterHostServicesMutation: the mutating policy that turns the host
+// copy of a learner's NodePort/LoadBalancer Service into ClusterIP is shipped
+// (kustomization), fails closed, applies only in ct-vc-* namespaces and is
+// bound; the validating policy keeps refusing NodePort, LoadBalancer and
+// externalIPs there, so the mutation is never the only guard.
+func TestVClusterHostServicesMutation(t *testing.T) {
+	k, err := os.ReadFile(filepath.Join(configDir, "kustomization.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(k), "- vcluster_host_services_mutation.yaml\n") {
+		t.Error("kustomization.yaml does not include vcluster_host_services_mutation.yaml")
+	}
+	var policy, binding struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Spec struct {
+			FailurePolicy   string `json:"failurePolicy"`
+			PolicyName      string `json:"policyName"`
+			MatchConditions []struct {
+				Expression string `json:"expression"`
+			} `json:"matchConditions"`
+			MatchConstraints struct {
+				ResourceRules []struct {
+					Resources  []string `json:"resources"`
+					Operations []string `json:"operations"`
+				} `json:"resourceRules"`
+			} `json:"matchConstraints"`
+			Mutations []struct {
+				PatchType string `json:"patchType"`
+				JSONPatch struct {
+					Expression string `json:"expression"`
+				} `json:"jsonPatch"`
+			} `json:"mutations"`
+		} `json:"spec"`
+	}
+	docs := loadDocs(t, "vcluster_host_services_mutation.yaml")
+	if len(docs) != 2 {
+		t.Fatalf("%d documents, want the policy and its binding", len(docs))
+	}
+	if err := sigsyaml.Unmarshal(docs[0], &policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := sigsyaml.Unmarshal(docs[1], &binding); err != nil {
+		t.Fatal(err)
+	}
+	if policy.APIVersion != "admissionregistration.k8s.io/v1" || policy.Kind != "MutatingAdmissionPolicy" || policy.Spec.FailurePolicy != "Fail" {
+		t.Errorf("policy: %s %s, failurePolicy %q", policy.APIVersion, policy.Kind, policy.Spec.FailurePolicy)
+	}
+	if binding.Kind != "MutatingAdmissionPolicyBinding" || binding.Spec.PolicyName != policy.Metadata.Name {
+		t.Errorf("binding %s names %q, want %q", binding.Kind, binding.Spec.PolicyName, policy.Metadata.Name)
+	}
+	if len(policy.Spec.MatchConditions) == 0 || policy.Spec.MatchConditions[0].Expression != "request.namespace.startsWith('ct-vc-')" {
+		t.Errorf("first match condition must limit the policy to ct-vc-* namespaces: %+v", policy.Spec.MatchConditions)
+	}
+	rr := policy.Spec.MatchConstraints.ResourceRules
+	if len(rr) != 1 || !slices.Equal(rr[0].Resources, []string{"services"}) || !slices.Equal(rr[0].Operations, []string{"CREATE", "UPDATE"}) {
+		t.Errorf("must match Service creates and updates only: %+v", rr)
+	}
+	if len(policy.Spec.Mutations) != 1 || policy.Spec.Mutations[0].PatchType != "JSONPatch" {
+		t.Fatalf("one JSONPatch mutation: %+v", policy.Spec.Mutations)
+	}
+	expr := policy.Spec.Mutations[0].JSONPatch.Expression
+	for _, want := range []string{`path: "/spec/type", value: "ClusterIP"`, `"/nodePort"`, `"/spec/externalIPs"`, `"/spec/externalTrafficPolicy"`,
+		`"/spec/healthCheckNodePort"`, `"/spec/loadBalancerIP"`, `"/spec/loadBalancerSourceRanges"`, `"/spec/loadBalancerClass"`, `"/spec/allocateLoadBalancerNodePorts"`} {
+		if !strings.Contains(expr, want) {
+			t.Errorf("mutation does not set or remove %s", want)
+		}
+	}
+	vh := string(loadDocs(t, "vcluster_host_policy.yaml")[0])
+	for _, want := range []string{"in ['LoadBalancer', 'NodePort']", "externalIPs.orValue([]).size() == 0"} {
+		if !strings.Contains(vh, want) {
+			t.Errorf("validating backstop lost %q", want)
+		}
+	}
+}

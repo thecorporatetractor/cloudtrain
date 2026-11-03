@@ -87,6 +87,12 @@ type VClusterDriver struct {
 	// Access, when set, binds the manager's session permissions in every
 	// host namespace it creates (Helm installs the chart as the manager).
 	NamespaceAccess NamespaceAccess
+	// Quota of every host namespace (DefaultVClusterQuota when zero).
+	Quota VClusterQuota
+	// APIServer is where the control plane may connect to the host API
+	// server (see vcluster_isolation.go); empty = public addresses on
+	// 443/6443 only.
+	APIServer APIServerEndpoints
 }
 
 // Pod Security Standard levels for vcluster host namespaces.
@@ -340,6 +346,11 @@ func (d *VClusterDriver) workloadPolicy(ref NodeRef, release string) *networking
 
 // values renders the per-session Helm values overlay.
 func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
+	return d.valuesFor(ref, release, "")
+}
+
+// valuesFor is values with the RuntimeClass of synced pods ("" = none).
+func (d *VClusterDriver) valuesFor(ref NodeRef, release, podRuntimeClass string) ([]byte, error) {
 	labels := SessionLabels(ref.Session)
 	labels[LabelNode] = LabelValue(ref.Node.Name)
 	// Without persistence the embedded database lives in an emptyDir (no
@@ -362,7 +373,7 @@ func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return yaml.Marshal(map[string]any{
+	vals := map[string]any{
 		"experimental": map[string]any{"deploy": map[string]any{"vcluster": map[string]any{"manifests": manifests}}},
 		"controlPlane": map[string]any{
 			"proxy": map[string]any{"extraSANs": []string{release + "." + d.hostNS(ref) + ".svc"}},
@@ -370,9 +381,14 @@ func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
 				"persistence": map[string]any{"volumeClaim": vc},
 				"labels":      labels,
 				"pods":        map[string]any{"labels": labels},
+				"resources":   vclusterControlPlaneResources,
 			},
 		},
-	})
+	}
+	if podRuntimeClass != "" {
+		vals["sync"] = map[string]any{"toHost": map[string]any{"pods": map[string]any{"runtimeClassName": podRuntimeClass}}}
+	}
+	return yaml.Marshal(vals)
 }
 
 // Provision installs the vcluster once, waits for it, then publishes the
@@ -393,12 +409,21 @@ func (d *VClusterDriver) Provision(ctx context.Context, ref NodeRef) (NodeState,
 	if err := ensure(ctx, d.Client, d.reader(), ref.Session, np); err != nil {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 	}
+	if err := d.ensureHostIsolation(ctx, ref, release); err != nil {
+		if IsPermanent(err) {
+			return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+		}
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
+	}
 	wl, err := d.workload(ctx, ref, release)
 	if err != nil {
 		return NodeState{}, err
 	}
 	if wl == nil {
 		if err := d.install(ctx, ref, release); err != nil {
+			if IsPermanent(err) {
+				return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+			}
 			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 		}
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster installing"}, nil
@@ -444,7 +469,11 @@ func (d *VClusterDriver) install(ctx context.Context, ref NodeRef, release strin
 	if d.Helm == nil || d.Chart == "" {
 		return &NotImplementedError{Driver: labsv1.DriverK8sCluster, Backend: "vcluster", Op: "install without helm chart"}
 	}
-	vals, err := d.values(ref, release)
+	rc, err := d.VClusterPodRuntimeClass(ctx)
+	if err != nil {
+		return err
+	}
+	vals, err := d.valuesFor(ref, release, rc)
 	if err != nil {
 		return err
 	}

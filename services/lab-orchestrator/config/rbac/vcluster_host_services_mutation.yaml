@@ -1,0 +1,70 @@
+# Virtual cluster host namespaces (ct-vc-*): the host copy of a learner's
+# NodePort or LoadBalancer Service becomes a plain ClusterIP Service, so
+# Kubernetes labs can create them inside their vcluster (CKA tasks, Helm charts
+# with service.type=NodePort) while nothing reaches the host: no node port, no
+# load balancer, no externalIPs. vcluster 0.37 (open source) copies a virtual
+# Service's type, ports and externalIPs to the host (services/translate.go,
+# filters/service.go); its translate patches that could rewrite them are a Pro
+# feature. Inside the vcluster the Service keeps its type: the virtual API
+# server allocates its own node port, and the syncer copies type, ports and
+# externalIPs only from the side that changed (patcher.CopyBidirectional), so it
+# never writes ClusterIP back.
+# The lab-vcluster-host ValidatingAdmissionPolicy (vcluster_host_policy.yaml)
+# still refuses any Service there that is not ClusterIP or headless, or has
+# externalIPs: if this policy is missing or fails, the write is refused, never
+# published.
+# Needs Kubernetes 1.36+ (MutatingAdmissionPolicy GA). The chart renders it
+# only when the cluster serves admissionregistration.k8s.io/v1
+# MutatingAdmissionPolicy; without it such Services are refused as before.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: lab-vcluster-host-services
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [services]
+  matchConditions:
+    - name: vcluster-host-namespace
+      expression: "request.namespace.startsWith('ct-vc-')"
+    # ExternalName Services have no ports or cluster IP to publish; the
+    # validating policy still refuses externalIPs on them.
+    - name: published
+      expression: >-
+        object.spec.?type.orValue('ClusterIP') != 'ExternalName' &&
+        (object.spec.?type.orValue('ClusterIP') in ['NodePort', 'LoadBalancer'] ||
+        object.spec.?externalIPs.orValue([]).size() > 0 ||
+        object.spec.?ports.orValue([]).exists(p, p.?nodePort.orValue(0) != 0) ||
+        has(object.spec.externalTrafficPolicy) || has(object.spec.healthCheckNodePort) ||
+        has(object.spec.loadBalancerIP) || has(object.spec.loadBalancerSourceRanges) ||
+        has(object.spec.loadBalancerClass) || has(object.spec.allocateLoadBalancerNodePorts))
+  mutations:
+    # ClusterIP, and every field the API server allows only on NodePort and
+    # LoadBalancer Services (or with externalIPs) removed. Node ports are
+    # removed port by port (ports are unique by port and protocol, so indexOf
+    # finds each one), keeping the rest of each port as it is.
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: >-
+          [JSONPatch{op: "add", path: "/spec/type", value: "ClusterIP"}] +
+          object.spec.?ports.orValue([]).filter(p, p.?nodePort.orValue(0) != 0).map(p,
+            JSONPatch{op: "remove", path: "/spec/ports/" + string(object.spec.ports.indexOf(p)) + "/nodePort"}) +
+          (has(object.spec.externalIPs) ? [JSONPatch{op: "remove", path: "/spec/externalIPs"}] : []) +
+          (has(object.spec.externalTrafficPolicy) ? [JSONPatch{op: "remove", path: "/spec/externalTrafficPolicy"}] : []) +
+          (has(object.spec.healthCheckNodePort) ? [JSONPatch{op: "remove", path: "/spec/healthCheckNodePort"}] : []) +
+          (has(object.spec.loadBalancerIP) ? [JSONPatch{op: "remove", path: "/spec/loadBalancerIP"}] : []) +
+          (has(object.spec.loadBalancerSourceRanges) ? [JSONPatch{op: "remove", path: "/spec/loadBalancerSourceRanges"}] : []) +
+          (has(object.spec.loadBalancerClass) ? [JSONPatch{op: "remove", path: "/spec/loadBalancerClass"}] : []) +
+          (has(object.spec.allocateLoadBalancerNodePorts) ? [JSONPatch{op: "remove", path: "/spec/allocateLoadBalancerNodePorts"}] : [])
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: lab-vcluster-host-services
+spec:
+  policyName: lab-vcluster-host-services
