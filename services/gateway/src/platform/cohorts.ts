@@ -315,6 +315,7 @@ export async function controlSession(ps: PlatformService, sessions: SessionServi
     message = 'Your lab environment is being reset to its starting state.';
   } else {
     await sessions.terminate(id);
+    await ps.labEnded?.(orgId, ls).catch((e: unknown) => ps.log?.warn({ err: e, session: id }, 'billing: could not record usage end'));
     res = { sessionId: id, action };
     message = 'This lab session was ended by your instructor or administrator.';
   }

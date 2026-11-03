@@ -249,10 +249,12 @@ export class SessionService {
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
   }
 
-  async end(principal: Principal, id: string): Promise<void> {
+  /** Ends (deletes) a session; returns it as it was, for metering (sessions/usage.ts). */
+  async end(principal: Principal, id: string): Promise<LabSession> {
     const { ls } = await this.owned(principal, id);
     await this.cluster.deleteSession(id);
     await this.hooks?.ended(principal, id, ls);
+    return ls;
   }
 
   async revealHint(principal: Principal, id: string, index: number): Promise<WebSession> {

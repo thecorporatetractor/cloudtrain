@@ -100,10 +100,39 @@ export type StartKind = 'lab' | 'exam' | 'event';
  * orchestrator deleted after its end is missing too; the usage row's `session_confirmed` tells
  * the two apart (see closeOpen).
  */
-export type SessionEndResolver = (sessionName: string, kind: StartKind) => Promise<Date | null | 'missing'>;
+export type SessionEndResolver = (sessionName: string, kind: StartKind) => Promise<Date | UsageEnd | RunningSession | null | 'missing'>;
+
+/**
+ * A lab session that still runs, with its first Ready (null: not ready yet). The resolver may
+ * answer this instead of null, so running estimates (the spend cap, the plan's minutes, the
+ * billing page) count from the first Ready like the final charge, not from the start.
+ */
+export interface RunningSession {
+  readyAt: Date | null;
+}
+const isRunning = (v: unknown): v is RunningSession => typeof v === 'object' && v !== null && !(v instanceof Date) && 'readyAt' in v && !('end' in v);
+/** Open usage rows, for running estimates (BillingService.openUsage). */
+const openQuery = (tx: Tx) => tx.selectFrom('billing_usage').select(['session_name', 'kind', 'started_at', 'units_per_minute', 'unit_price', 'billable']).where('ended_at', 'is', null);
+type OpenQuery = ReturnType<typeof openQuery>;
+/** How long a "not ready yet" answer is trusted for running estimates; after that the start counts again until asked anew. */
+const NOT_READY_TTL_MS = 2 * 60_000;
+/** Bound of the readiness cache (sessions with open usage rows; entries go when the row closes). */
+const LIVE_MAX = 20_000;
+
+/**
+ * When a lab session ended and when it first became ready. Compute is billed
+ * from the first Ready (provisioning is not the learner's time), and a lab
+ * that never became ready is not billed at all. A bare Date (an exam, or a
+ * session whose readiness is unknown) bills from the start.
+ */
+export interface UsageEnd {
+  end: Date;
+  readyAt: Date | null;
+}
+const isUsageEnd = (v: unknown): v is UsageEnd => typeof v === 'object' && v !== null && (v as UsageEnd).end instanceof Date;
 
 /** What the sweep or the gate does with an open usage row. */
-type Verdict = Date | 'orphan' | 'confirm';
+type Verdict = Date | UsageEnd | 'orphan' | 'confirm';
 
 /** A reservation whose session still does not exist after this long is an orphan: closed unbilled. */
 export const START_TIMEOUT_MS = 10 * 60_000;
@@ -202,11 +231,18 @@ export class BillingService {
   readonly enabled: boolean;
   readonly enforced: boolean;
   readonly pricing: PricingModel;
-  private readonly now: () => Date;
+  /** The billing clock (injectable in tests). */
+  readonly now: () => Date;
   private readonly priceIds = new Map<string, string>();
   private readonly facts = new Map<string, LabFacts & { title: string }>();
   private flushing: Promise<unknown> | undefined;
   private readonly deadlines = new WeakMap<Tx, number>();
+  /**
+   * First Ready of running lab sessions as the resolver last reported it (readyAt is set once
+   * and never changes; "not ready yet" is trusted for NOT_READY_TTL_MS). Filled before any
+   * transaction (no cluster call under a lock), read when estimating open usage rows.
+   */
+  private readonly live = new Map<string, { readyAt: Date | null; seen: number }>();
 
   constructor(private readonly d: BillingDeps) {
     this.enabled = !!d.stripe;
@@ -295,6 +331,12 @@ export class BillingService {
         dunning: { state: 'ok', graceDays: this.pricing.graceDays },
       };
     }
+    // Running labs are estimated from their first Ready (openMinutes): ask the cluster first, outside the transaction.
+    const open = await this.tx(p, (tx) => {
+      const q = openQuery(tx).where('org_id', '=', p.orgId);
+      return (userId === null ? q.where('payer_key', '=', '') : q.where((eb) => eb.or([eb('user_id', '=', userId), eb('payer_key', '=', userId)]))).execute();
+    });
+    await this.refreshLive(open);
     return this.tx(p, async (tx) => {
       const ent = await tx.selectFrom('billing_entitlements').selectAll().where('org_id', '=', p.orgId).where('scope_key', '=', userId ?? '').executeTakeFirst();
       const sub = await this.latestPlanSub(tx, p.orgId, userId);
@@ -430,11 +472,14 @@ export class BillingService {
 
   /* ------------------------------------------------------------- usage */
 
-  /** SQL for the billed minutes of a row, counting a running session up to `at`. */
-  private minutesExpr(at: Date, alias?: string) {
-    const min = this.pricing.compute.minimumMinutes ?? 1;
-    const col = (c: string) => sql.ref(alias ? `${alias}.${c}` : c);
-    return sql<number>`CASE WHEN ${col('ended_at')} IS NULL THEN greatest(${min}::int, ceil(greatest(0, extract(epoch FROM (${at}::timestamptz - ${col('started_at')}))) / 60)::int) ELSE coalesce(${col('minutes')}, 0) END`;
+  /**
+   * The open usage rows matching `scope`, with their live minutes (openMinutes): running
+   * estimates are computed here, not in SQL, so they count from the first Ready like the final
+   * charge (closeUsage).
+   */
+  private async openUsage(tx: Tx, scope: (q: OpenQuery) => OpenQuery, at: Date) {
+    const rows = await scope(openQuery(tx)).execute();
+    return rows.map((r) => ({ ...r, minutes: this.openMinutes(r, at) }));
   }
 
   /** Compute spend this month (sessions ended this month or still running; Stripe dates a meter event at the session's end). */
@@ -443,15 +488,22 @@ export class BillingService {
     const { start, end } = monthOf(at);
     let q = tx
       .selectFrom('billing_usage')
-      .select(sql<string>`coalesce(sum(${this.minutesExpr(at)} * units_per_minute * unit_price), 0)`.as('amount'))
+      .select(sql<string>`coalesce(sum(coalesce(minutes, 0) * units_per_minute * unit_price), 0)`.as('amount'))
       .where('org_id', '=', orgId)
       .where('billable', '=', true)
-      .where('started_at', '<', end)
-      .where((eb) => eb.or([eb('ended_at', 'is', null), eb('ended_at', '>=', start)]));
+      .where('ended_at', '>=', start)
+      .where('started_at', '<', end);
     if (who.payerKey !== undefined) q = q.where('payer_key', '=', who.payerKey);
     if (who.userId !== undefined) q = q.where('user_id', '=', who.userId);
     const r = await q.executeTakeFirstOrThrow();
-    return { amount: round2(Number(r.amount)) };
+    const open = await this.openUsage(tx, (o) => {
+      let oq = o.where('org_id', '=', orgId).where('billable', '=', true).where('started_at', '<', end);
+      if (who.payerKey !== undefined) oq = oq.where('payer_key', '=', who.payerKey);
+      if (who.userId !== undefined) oq = oq.where('user_id', '=', who.userId);
+      return oq;
+    }, at);
+    const running = open.reduce((sum, o) => sum + o.minutes * o.units_per_minute * Number(o.unit_price), 0);
+    return { amount: round2(Number(r.amount) + running) };
   }
 
   private async usage(tx: Tx, orgId: string, who: { payerKey?: string; userId?: string }): Promise<BillingUsage> {
@@ -461,8 +513,7 @@ export class BillingService {
       .selectFrom('billing_usage as u')
       .leftJoin('billing_meter_outbox as o', 'o.usage_id', 'u.id')
       .leftJoin('users as us', 'us.id', 'u.user_id')
-      .select(['u.id', 'u.session_name', 'u.lab_id', 'u.user_id', 'us.name as user_name', 'u.compute_tier', 'u.started_at', 'u.ended_at', 'u.units_per_minute', 'u.unit_price', 'u.payer_key', 'u.trial', 'u.billable', 'o.status as report'])
-      .select(this.minutesExpr(at, 'u').as('minutes'))
+      .select(['u.id', 'u.session_name', 'u.kind', 'u.lab_id', 'u.user_id', 'us.name as user_name', 'u.compute_tier', 'u.started_at', 'u.ended_at', 'u.minutes', 'u.units_per_minute', 'u.unit_price', 'u.payer_key', 'u.trial', 'u.billable', 'o.status as report'])
       .where('u.org_id', '=', orgId)
       .where('u.started_at', '<', end)
       .where((eb) => eb.or([eb('u.ended_at', 'is', null), eb('u.ended_at', '>=', start)]));
@@ -473,7 +524,7 @@ export class BillingService {
     const tiers = new Map<ComputeTier, { tier: ComputeTier; minutes: number; units: number; amount: number }>();
     const members = new Map<string, { userId: string; name: string; minutes: number; units: number; amount: number }>();
     for (const r of rows) {
-      const mins = Number(r.minutes);
+      const mins = r.ended_at ? Number(r.minutes ?? 0) : this.openMinutes(r, at);
       const units = mins * r.units_per_minute;
       const amount = r.billable ? this.pricing.amount(units, Number(r.unit_price)) : 0;
       const running = !r.ended_at;
@@ -531,12 +582,13 @@ export class BillingService {
     const at = this.now();
     const r = await tx
       .selectFrom('billing_usage')
-      .select([sql<number>`count(*)::int`.as('n'), sql<number>`coalesce(sum(${this.minutesExpr(at)}), 0)::int`.as('m')])
+      .select([sql<number>`count(*)::int`.as('n'), sql<number>`coalesce(sum(coalesce(minutes, 0)) FILTER (WHERE ended_at IS NOT NULL), 0)::int`.as('m')])
       .where('org_id', '=', orgId)
       .where('user_id', '=', userId)
       .where('trial', '=', true)
       .executeTakeFirstOrThrow();
-    return { sessions: Number(r.n), minutes: Number(r.m) };
+    const open = await this.openUsage(tx, (o) => o.where('org_id', '=', orgId).where('user_id', '=', userId).where('trial', '=', true), at);
+    return { sessions: Number(r.n), minutes: Number(r.m) + open.reduce((sum, o) => sum + o.minutes, 0) };
   }
 
   private async trialView(tx: Tx, orgId: string, userId: string): Promise<BillingTrial> {
@@ -603,11 +655,18 @@ export class BillingService {
   private async assertStart(p: Principal, kind: StartKind, lab: LabFacts & { title: string }, trialLab: boolean, sessionName: string): Promise<StartDecision | undefined> {
     if (!p.orgId) return undefined;
     // Whether the person's open sessions still run, asked before the transaction (no cluster call under the lock).
-    const { open, orgPays } = await this.tx(p, async (tx) => ({
-      open: await tx.selectFrom('billing_usage').select(['session_name', 'kind', 'started_at', 'session_confirmed']).where('org_id', '=', p.orgId).where('user_id', '=', p.sub).where('ended_at', 'is', null).execute(),
-      orgPays: (await this.payerState(tx, p.orgId, p.sub)).payer === 'org',
-    }));
+    const { open, orgPays, orgOpen } = await this.tx(p, async (tx) => {
+      const orgPays = (await this.payerState(tx, p.orgId, p.sub)).payer === 'org';
+      return {
+        open: await tx.selectFrom('billing_usage').select(['session_name', 'kind', 'started_at', 'session_confirmed']).where('org_id', '=', p.orgId).where('user_id', '=', p.sub).where('ended_at', 'is', null).execute(),
+        orgPays,
+        // The organisation's spend cap counts every member's running labs.
+        orgOpen: orgPays ? await openQuery(tx).where('org_id', '=', p.orgId).where('payer_key', '=', '').execute() : [],
+      };
+    });
     const ends = await this.resolveOpen(open);
+    // Running labs count towards the cap from their first Ready (openMinutes): learn it before the locks.
+    await this.refreshLive(orgOpen);
     // A seated member's start also takes the organisation's lock, for the organisation's spend
     // cap: always in the order organisation, then person (no deadlocks). Whether the person is
     // seated is read before the locks as a hint; if a seat appeared in between, start over.
@@ -664,10 +723,12 @@ export class BillingService {
     for (const r of rows) {
       const end = await resolver(r.session_name, r.kind).catch(() => undefined);
       if (end === undefined) continue; // the cluster did not answer: leave it
-      if (end === null) {
+      if (isRunning(end)) this.noteLive(r.session_name, end.readyAt);
+      else if (isUsageEnd(end)) this.noteLive(r.session_name, end.readyAt);
+      if (end === null || isRunning(end)) {
         // Running: a reservation whose confirmation was lost is confirmed now (the repair path).
         if (!r.session_confirmed) out.set(r.session_name, 'confirm');
-      } else if (end instanceof Date) out.set(r.session_name, end);
+      } else if (end instanceof Date || isUsageEnd(end)) out.set(r.session_name, end);
       else if (end === 'missing') {
         // A session that ran and was deleted after its end: billed up to now. A reservation that
         // never got its session: an orphan once the start timeout has passed, open until then.
@@ -676,6 +737,45 @@ export class BillingService {
       }
     }
     return out;
+  }
+
+  private noteLive(sessionName: string, readyAt: Date | null): void {
+    if (this.live.size >= LIVE_MAX) this.live.clear();
+    this.live.set(sessionName, { readyAt, seen: this.now().getTime() });
+  }
+
+  /**
+   * Asks the resolver for the first Ready of open lab rows whose readiness is not known yet
+   * (before a transaction: no cluster call under a lock). Exams are billed from their start.
+   */
+  private async refreshLive(rows: { session_name: string; kind: StartKind }[]): Promise<void> {
+    const resolver = this.d.sessionEnd;
+    if (!resolver) return;
+    const now = this.now().getTime();
+    const ask = rows.filter((r) => {
+      if (r.kind === 'exam') return false;
+      const e = this.live.get(r.session_name);
+      return !e || (!e.readyAt && now - e.seen > NOT_READY_TTL_MS / 4);
+    });
+    await Promise.all(
+      ask.slice(0, 200).map(async (r) => {
+        const end = await resolver(r.session_name, r.kind).catch(() => undefined);
+        if (isRunning(end) || isUsageEnd(end)) this.noteLive(r.session_name, end.readyAt);
+      }),
+    );
+  }
+
+  /**
+   * The billed minutes of an open usage row up to `at`, as it would be charged if it ended
+   * now: a lab from its first Ready (none while it is not ready yet), an exam from its start;
+   * from its start too when the lab's readiness is not known (the cluster did not answer).
+   */
+  private openMinutes(r: { session_name: string; kind: StartKind; started_at: Date }, at: Date): number {
+    const e = r.kind === 'exam' ? undefined : this.live.get(r.session_name);
+    let from = r.started_at;
+    if (e?.readyAt) from = e.readyAt > r.started_at ? e.readyAt : r.started_at;
+    else if (e && at.getTime() - e.seen <= NOT_READY_TTL_MS) return 0;
+    return this.pricing.billedMinutes(at.getTime() - from.getTime());
   }
 
   /**
@@ -770,13 +870,14 @@ export class BillingService {
     const open = await tx.selectFrom('billing_usage').select(sql<number>`count(*)::int`.as('n')).where('org_id', '=', orgId).where('user_id', '=', userId).where('ended_at', 'is', null).executeTakeFirstOrThrow();
     const r = await tx
       .selectFrom('billing_usage')
-      .select([sql<number>`coalesce(sum(${this.minutesExpr(at)}), 0)::int`.as('m'), sql<number>`count(*) FILTER (WHERE kind = 'exam' AND NOT (ended_at IS NOT NULL AND minutes = 0))::int`.as('exams')])
+      .select([sql<number>`coalesce(sum(coalesce(minutes, 0)) FILTER (WHERE ended_at IS NOT NULL), 0)::int`.as('m'), sql<number>`count(*) FILTER (WHERE kind = 'exam' AND NOT (ended_at IS NOT NULL AND minutes = 0))::int`.as('exams')])
       .where('org_id', '=', orgId)
       .where('user_id', '=', userId)
       .where('started_at', '>=', start)
       .where('started_at', '<', end)
       .executeTakeFirstOrThrow();
-    return { running: Number(open.n), minutes: Number(r.m), exams: Number(r.exams) };
+    const live = await this.openUsage(tx, (o) => o.where('org_id', '=', orgId).where('user_id', '=', userId).where('started_at', '>=', start).where('started_at', '<', end), at);
+    return { running: Number(open.n), minutes: Number(r.m) + live.reduce((sum, o) => sum + o.minutes, 0), exams: Number(r.exams) };
   }
 
   /** The lowest-level plan of the payer's kind above `level` that `ok` accepts (what to upgrade to). */
@@ -932,16 +1033,22 @@ export class BillingService {
   }
 
   /** Ends a metered session: billed minutes and units, and its meter event into the outbox (same transaction). */
-  async meterEnd(orgId: string, sessionName: string, endedAt: Date = this.now()): Promise<void> {
+  async meterEnd(orgId: string, sessionName: string, endedAt: Date | UsageEnd = this.now()): Promise<void> {
     const queued = await withTenant(this.d.db, { orgId }, (tx) => this.closeUsage(tx, sessionName, endedAt));
     if (queued) this.kick();
   }
 
-  private async closeUsage(tx: Tx, sessionName: string, endedAt: Date): Promise<boolean> {
+  private async closeUsage(tx: Tx, sessionName: string, ended: Date | UsageEnd): Promise<boolean> {
     const row = await tx.selectFrom('billing_usage').selectAll().where('session_name', '=', sessionName).where('ended_at', 'is', null).forUpdate().executeTakeFirst();
+    this.live.delete(sessionName);
     if (!row) return false;
+    const endedAt = isUsageEnd(ended) ? ended.end : ended;
     const end = endedAt < row.started_at ? row.started_at : endedAt;
-    const minutes = this.pricing.billedMinutes(end.getTime() - row.started_at.getTime());
+    // Billed from the first Ready; a lab that never became ready (or only after it ended) is free.
+    const readyAt = isUsageEnd(ended) ? ended.readyAt : row.started_at;
+    const neverReady = readyAt === null || readyAt >= end;
+    const from = readyAt && readyAt > row.started_at ? readyAt : row.started_at;
+    const minutes = isUsageEnd(ended) && neverReady ? 0 : this.pricing.billedMinutes(end.getTime() - from.getTime());
     const units = minutes * row.units_per_minute;
     await tx.updateTable('billing_usage').set({ ended_at: end, minutes, units }).where('id', '=', row.id).execute();
     if (!row.billable || !row.customer_id || units === 0) return false;

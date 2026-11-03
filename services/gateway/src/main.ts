@@ -19,6 +19,7 @@ import { SessionService } from './sessions/service.js';
 import { phaseOf } from './sessions/map.js';
 import { TerminalHub } from './terminal/hub.js';
 import { PgTerminalBus } from './terminal/pgbus.js';
+import { usageEnd } from './sessions/usage.js';
 import { loadExamCatalog } from './exams/catalog.js';
 import { LabctlExamCompiler } from './exams/compile.js';
 import { KubeExamCluster } from './exams/kube.js';
@@ -104,7 +105,7 @@ async function main() {
   // Billing (Stripe, test mode only, behind CT_BILLING_ENABLED): plans from the site configuration.
   // Pay for compute: lab sessions are metered and reported to a Stripe Billing Meter; the
   // lab-start gate is on with billing unless CT_BILLING_ENFORCE=0 (docs/billing.md).
-  // When a metered session ended (null while it runs): a LabSession for labs and CTF event labs, the
+  // When a metered session ended (while it runs: null, or for a lab its first Ready): a LabSession for labs and CTF event labs, the
   // ExamSession for an exam attempt (its environments run until it completes or fails).
   const sessionEnd: SessionEndResolver = async (name, kind) => {
     if (kind === 'exam') {
@@ -117,9 +118,13 @@ async function main() {
     }
     const ls = await cluster.getSession(name);
     if (!ls) return 'missing';
-    if (!['expired', 'failed'].includes(phaseOf(ls))) return null;
-    const exp = ls?.status?.expiresAt ? Date.parse(ls.status.expiresAt) : NaN;
-    return new Date(Number.isNaN(exp) ? Date.now() : Math.min(exp, Date.now()));
+    // Running: its first Ready, so running estimates (spend cap, /billing) count like the final charge.
+    if (!['expired', 'failed'].includes(phaseOf(ls))) {
+      const readyAt = Date.parse(ls.status?.readyAt ?? '');
+      return { readyAt: Number.isNaN(readyAt) ? null : new Date(readyAt) };
+    }
+    // Billed from the first Ready to the end (expiry, or when a failed lab stopped being ready).
+    return usageEnd(ls);
   };
   const billing = new BillingService({
     db,

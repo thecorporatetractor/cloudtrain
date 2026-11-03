@@ -8,8 +8,21 @@ off by default.** Every amount in `site.yaml` is a placeholder.
 
 ## The model
 
-1. **Pay for compute.** Every lab session started through the gateway is metered from start
-   to stop (wall-clock minutes, rounded up, at least `compute.minimumMinutes`). The lab's
+1. **Pay for compute.** Every lab session started through the gateway is metered from its
+   first Ready to its end, at most until its expiry (wall-clock minutes, rounded up, at least
+   `compute.minimumMinutes`); provisioning time is not billed, and a lab that never became
+   ready (ended while provisioning, or failed before it was ready) is not billed. A failed
+   lab's usage ends when it stopped being ready, also when the orchestrator expired or
+   deleted it before the gateway saw the failure (a lab that stopped being ready before its
+   expiry, and was not hibernated, ends there). Running labs are estimated the same way (the
+   running cost on the billing page, the monthly minutes and the spend cap): from their first
+   Ready, nothing while they provision; the gateway asks the cluster for the first Ready before
+   it takes the start locks, and counts from the start only when the cluster does not answer.
+   This holds however the lab ends: the learner,
+   an instructor or admin (terminate), offboarding (deactivation) and data-subject erasure all
+   meter the same window. Only a lab deleted outside the gateway (kubectl, the orchestrator's
+   expired-session cleanup before the sweep saw it) is closed by the sweep from its start
+   to the sweep, since its readiness is no longer known. The lab's
    *compute tier* comes from its topology: `pod` (container nodes and virtual clusters),
    `vm` (exactly one VM) or `heavy` (two or more VMs, a kubeadm cluster or a netdev
    topology). Billed units = minutes x the tier's `unitsPerMinute`; money = units x
