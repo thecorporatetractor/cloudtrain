@@ -147,8 +147,10 @@ func TestCompileIssues(t *testing.T) {
 	def3.Blueprint[1].Pool = append(def3.Blueprint[1].Pool, "xt-scale-manifest-api")
 	ctxLab := labs3["xt-secret-literal"]
 	ctxLab.Spec.Checks = append(ctxLab.Spec.Checks, labsv1.Check{ID: "ctx", Type: "k8s-context", Skills: []string{"s"}})
+	// grading-1: a check run as the candidate would run their code after the freeze.
+	ctxLab.Spec.Checks = append(ctxLab.Spec.Checks, labsv1.Check{ID: "mine", Type: "shell", As: labsv1.ActionAsLearner, Command: "kubectl get ns", Skills: []string{"s"}})
 	_, err = Compile(def3, labs3, CompileOptions{})
-	for _, want := range []string{"taskCount is 4 but the blueprint draws 3", "is in the pools of both", "k8s-context checks are not allowed"} {
+	for _, want := range []string{"taskCount is 4 but the blueprint draws 3", "is in the pools of both", "k8s-context checks are not allowed", "check mine: checks run as the learner are not allowed in exam tasks"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("missing issue %q in %v", want, err)
 		}

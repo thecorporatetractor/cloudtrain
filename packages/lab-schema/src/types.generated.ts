@@ -382,4 +382,535 @@ export interface Check {
    * Seconds before the check counts as timed out (1-300; the grader never waits longer). Default 30 for shell checks (they often make several calls), 20 for k8s-query, k8s-can-i and k8s-context (one kubectl call, slow under load), 5 for every other type.
    */
   timeoutSec?: number;
+  /**
+   * shell checks only: who the command runs as. admin (default) is root on the node, or the admin sidecar with the cluster-admin kubeconfig when `on` is a cluster node. learner runs it as the learner with a clean environment: use it only when the check must exercise the learner's own configuration (their kubeconfig), never with root to read learner-owned config.
+   */
+  as?: "admin" | "learner";
+  /**
+   * shell checks only: learner files the grader reads (as the learner) before the command runs. The command sees the content in $NAME and NAME_PRESENT=1 when the file exists (both unset otherwise). Lets a check compare an answer file with live state from the cluster's admin sidecar (on: <cluster node>) instead of running kubectl with the learner's kubeconfig as root.
+   *
+   * @maxItems 8
+   */
+  inputs?:
+    | []
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ]
+    | [
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        },
+        {
+          /**
+           * The environment variable: ANSWER, REPORT or MANIFEST, or one of those or IN followed by _SUFFIX (ANSWER_POD, IN_TOKEN). Other names are refused, so no input can set a variable a shell or tool reads (HTTPS_PROXY, PYTHONPATH, ...); a _PRESENT or _PROXY suffix is refused too.
+           */
+          name: string;
+          /**
+           * Container node holding the file (default: the entry node). VM, network device and cluster nodes are refused: reading there as the learner would run their own ssh or shell config.
+           */
+          on?: string;
+          /**
+           * Absolute path (at most 64 KiB is read).
+           */
+          file: string;
+        }
+      ];
 }

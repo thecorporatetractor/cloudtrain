@@ -176,6 +176,21 @@ func taskIssues(t *labsv1.LabTemplate) []string {
 			// Exam attempts are graded on end state only; CTF questions belong to CTF labs and events.
 			out = append(out, fmt.Sprintf("task %s check %s: answer checks are not allowed in exam tasks", id, c.ID))
 		}
+		if c.As == labsv1.ActionAsLearner {
+			// Grading runs after the freeze; a check run as the candidate runs
+			// code they control (a kubeconfig credential plugin, a shell rc, a
+			// git hook) while it grades them.
+			//
+			// Known gap, not closed by this rule: admin checks that switch to
+			// the learner themselves (su learner -c, runuser -u learner) to run
+			// a learner-written script or git repo are still accepted, and they
+			// run candidate-controlled code after the freeze too (for example
+			// xlp-script-exit-codes, xlp-script-fix-loop, xlp-git-revert-commit).
+			// Those need a sandbox wrapper with a fresh environment before they
+			// can be refused here; until then this rule covers the kubeconfig
+			// case only.
+			out = append(out, fmt.Sprintf("task %s check %s: checks run as the learner are not allowed in exam tasks (they would run candidate-controlled code after the freeze); read the candidate's files with inputs and query as admin", id, c.ID))
+		}
 	}
 	return out
 }
