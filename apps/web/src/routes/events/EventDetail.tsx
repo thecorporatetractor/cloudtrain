@@ -5,6 +5,7 @@ import { ApiError } from '@/api/client';
 import { useEvent, useJoinEvent, useLeaveEvent, useScoreboard, useStartEventLab } from '@/api/events';
 import type { CtfEventDetail } from '@/api/types';
 import { useShell } from '@/app/shell-context';
+import { BLOCK_TITLE, billingBlockOf } from '@/lib/billing';
 import { DifficultyBadge } from '@/components/domain';
 import { EventCountdown, EventStatusBadge, ScoreTable, eventWindow, useServerClock } from '@/components/events/ui';
 import { Prose } from '@/components/prose';
@@ -45,7 +46,10 @@ function EventScreen({ e }: { e: CtfEventDetail }) {
     if (resume) return void navigate({ to: '/labs/$labId/work', params: { labId }, search: { s: resume } });
     start.mutate(labId, {
       onSuccess: (s) => void navigate({ to: '/labs/$labId/work', params: { labId }, search: { s: s.id } }),
-      onError: (err) => toast({ title: 'The lab could not start', description: err.message, tone: 'warn' }),
+      onError: (err) => {
+        const block = billingBlockOf(err);
+        toast({ title: block ? BLOCK_TITLE[block.reason] : 'The lab could not start', description: err.message, tone: 'warn' });
+      },
     });
   };
 

@@ -35,6 +35,12 @@ off by default.** Every amount in `site.yaml` is a placeholder.
 6. **Spend caps.** A monthly compute spend cap per account and per organisation (defaults in
    `plans.limits`, each account or org admin may change theirs). With `hardStop` new paid
    labs are refused at the cap; without it the page only warns (at 80% and at the cap).
+7. **Plan limits.** The plan's `entitlements` are enforced per person on every start, also
+   for a seated member of an organisation plan (each member has the allowance; the spend cap
+   stays the organisation's):
+   `concurrentLabs`, `labHoursPerMonth`, `examSimulationsPerMonth` and `ctfEvents`.
+8. **Every start path.** Lab sessions, exam simulation attempts and CTF event labs all go
+   through the same gate and are metered the same way.
 
 ### Why premium is a site.yaml rule list, not a lab-schema field
 
@@ -44,16 +50,79 @@ with pricing, and covers hundreds of labs. Rules over existing lab facts (`labs`
 `domains`, `difficulties`, `computeTiers`, `tags`) gate whole groups without touching a lab
 file, and `CT_SITE_CONFIG` can swap them per deployment. A single lab is listed by id.
 
-### Enforcement order (`BillingService.assertLabStart`)
+### Enforcement order (`BillingService.assertLabStart`, `assertExamStart`)
 
 | Check | Refusal (`402`, `code: payment_required`, `details: BillingBlockDetails`) |
 |---|---|
 | Premium: the lab's required plan level vs the person's (own plan, or the org's when seated) | `plan_required`, `action: upgrade`, `requiredPlan` |
-| Trial lab with allowance left | allowed, uncharged (`trial`) |
+| Exam simulation and the plan has `examSimulationsPerMonth: 0`, or a CTF event lab and the plan has `ctfEvents: false` | `plan_required`, `action: upgrade`, `requiredPlan` (the lowest plan that includes it) |
+| Trial lab with allowance left | allowed, uncharged (`trial`); the plan limits below still apply |
 | Trial used up and no payment method | `trial_exhausted`, `action: add_payment_method` |
 | No payment method (and no plan) for the payer | `payment_method_required`, `action: add_payment_method` |
 | Payer past the dunning grace period | `payment_overdue`, `action: portal` |
 | Payer at the spend cap with `hardStop` | `spend_cap_reached`, `action: raise_cap` |
+| `concurrentLabs` sessions of the person already run (labs, exam attempts and event labs, reservations included) | `concurrent_limit`, `action: end_session`, `limit`, `used`, `requiredPlan` when a higher plan allows more |
+| The person's metered minutes this month (UTC, all kinds, trial included) reach `labHoursPerMonth` | `lab_hours_exhausted`, `action: upgrade`, `limit`, `used` (hours) |
+| Exam simulation and the person started `examSimulationsPerMonth` this month (released starts do not count) | `exam_limit_reached`, `action: upgrade`, `limit`, `used` |
+
+The limits come from the plan that applies to the person: the seat's org plan when it is
+higher than the person's own plan, otherwise the person's own plan (Free when there is none).
+Usage is counted per person: an individual plan lives in the person's own org, and a Team
+seat gives each member the plan's allowances, counted on that member's own usage (not
+pooled). The spend cap is the payer's: the organisation's for seated members.
+`unlimited` skips a limit.
+
+**Reservation.** The gate takes transaction-scoped advisory locks first, then reads everything
+it decides on. It always takes the person's lock (`billing-start:<org>:<user>`). For a seated
+member it first takes the organisation's lock (`billing-start:<org>:`), so the organisation's
+spend cap is decided one start at a time. The order is always organisation, then person, so
+there are no deadlocks. Whether the person is seated is read before the locks as a hint; if a
+seat appears in between, the gate starts over with both locks. It writes the usage row before the session exists, under the
+session (or exam attempt) name chosen up front. Concurrent starts therefore see each other,
+so the limits cannot be raced past. A second start of the same lab or event lab while the
+first is still in flight answers 409. Once the session exists, `meterStart` confirms the row
+(`session_confirmed`, the real start time) before any other hook runs; it is retried, and
+if it still fails the sweep confirms any open row whose session runs. A reattach confirms an
+unconfirmed row too. If the row was closed as an orphan meanwhile (a session that came up
+later than the start timeout), confirming reopens it as it was reserved, so a running session
+is always metered.
+
+When the create call fails, the gateway asks the cluster whether the session exists anyway
+(the write committed, the client timed out). If it does, the start succeeds and is metered.
+Only a start that left no session releases its reservation: the row is closed at 0 minutes
+and never billed.
+
+Before the lock is taken, the gate asks the same resolver as the sweep whether the person's
+open sessions have ended, so no cluster call runs while the lock is held. Under the lock it
+closes those, then counts. The resolver answers one of three things for each session:
+- running (or still starting);
+- ended at a given time;
+- `missing`: neither a LabSession nor an ExamSession of that name exists.
+
+Before acting, the gate and the sweep read each row again `FOR UPDATE`; an orphan verdict on a
+row that has been confirmed since is dropped, and the sweep asks the cluster once more right
+before closing an orphan. A missing session is never taken as "ended now". If the row is confirmed
+(`session_confirmed`), the session ran and was deleted after its end, so it is billed up to
+now. If the row is still only a reservation, the session may simply not exist yet (it is in
+`ensureTemplate` or `createSession`), so the row stays open. After `START_TIMEOUT_MS`
+(10 minutes) such a reservation counts as an orphan: the start died first, or its release
+failed. Orphans are closed with 0 minutes and are never billed, exactly like a release. A
+failed release is logged at error level, and the sweep (`CT_BILLING_SWEEP_MS`, default 60 s)
+closes the orphan. With the sweep off (`0`), the gateway warns at startup, and orphans are
+only closed by that person's next start.
+
+**Fail closed.** While enforcing, a lab or exam that billing cannot price (no compute facts
+for the lab or any lab in the exam's pool) is refused with 409. The catalog's `locked` reflects the plan and payment checks, not the
+usage limits, so a lab you are running still shows its Resume button.
+
+**Starting a lab you already run reattaches to it.** `POST /api/labs/:id/sessions` answers 200
+with the person's newest running session of that lab, so the environment is not created or
+metered a second time. It is scoped to the person's current organisation (and excludes CTF
+event sessions). Reattaching runs the access checks of a start: restricted processing and
+lab visibility (`SessionHooks.beforeResume`), but not the quotas. Listing
+(`GET /api/labs/:id/sessions`, `GET /api/sessions`) and every per-session route are scoped
+to the current organisation too. CTF event labs already reattach per event
+(`EventService.startLab`).
 
 When the organisation pays and the caller cannot manage billing, `action` is
 `contact_admin`. `details.href` names the page that fixes it. The catalog
@@ -61,9 +130,16 @@ When the organisation pays and the caller cannot manage billing, `action` is
 as `access` (`computeTier`, `pricePerHour`, `requiredPlan`, `trial`, `free`, `locked`), so the
 UI shows locked labs and the reason before anyone clicks.
 
-What is metered: lab sessions started through `POST /api/labs/:id/sessions`. Exam simulations
-and CTF event sessions start through their own services and are not metered or gated yet
-(an open decision).
+What is metered: every start path goes through the same gate and is metered the same way,
+with `billing_usage.kind` recording which path it was (migration `0012_billing_usage_kind`):
+
+- `lab`: `POST /api/labs/:id/sessions`.
+- `event`: `POST /api/events/:id/labs/:labId/sessions`. Both start through
+  `SessionService.start`, whose `billing` hook gates and meters.
+- `exam`: `POST /api/exams/:examId/attempts`. `lab_id` holds the exam id and
+  `session_name` the attempt. The attempt is metered at the heaviest compute tier of the
+  exam's task pool, because the attempt only draws its tasks after it starts. It ends when
+  the ExamSession completes or fails (the sweep), or when it is gone.
 
 ## Switches
 
@@ -218,6 +294,29 @@ Migration `0009_billing_compute` (same tenancy):
 | `billing_customers` + | `has_payment_method`, `invoice_failed_at`, `delinquent_since`, `compute_subscription_id` |
 | `billing_subscriptions` + | `kind` (`plan` or `compute`) |
 
+Migration `0012_billing_usage_kind` adds two columns to `billing_usage`:
+- `kind` (`lab`, `exam`, `event`; existing rows are `lab`);
+- `session_confirmed` (false while the row is a start reservation). The database default
+  is true, so existing rows, and any row an older gateway writes, read as confirmed; the gate
+  sets false explicitly.
+
+Both use constant defaults, so they only change the catalogue. The `CHECK` on `kind` is added
+`NOT VALID`.
+
+Migration `0013_billing_usage_kind_validate` validates the `CHECK`. `VALIDATE` takes only
+SHARE UPDATE EXCLUSIVE, so reads and writes go on while it scans.
+
+Kysely's `migrateToLatest` runs **all** pending migrations in one transaction. Splitting
+`VALIDATE` into 0013 therefore would not, by itself, release 0012's ACCESS EXCLUSIVE lock
+first. The gateway's `migrateToLatest` (`src/db/index.ts`) instead applies one migration per
+transaction (`Migrator.migrateUp` in a loop), and each commits before the next starts. Both
+migrations set `lock_timeout` to 5 s, so they fail rather than queue every write behind a long
+wait.
+
+There is no new index: the per-person counts use `billing_usage_user`. `CREATE INDEX
+CONCURRENTLY` cannot run inside a transaction, and every migration runs in one.
+`down` drops the constraint and both columns (`IF EXISTS`). Roll the gateway back first.
+
 ### Metering and the outbox
 
 The usage row is written right after the session is created (`POST /api/labs/:id/sessions`)
@@ -243,9 +342,27 @@ visit, subscription change and webhook.
 
 `PlanEntitlements`: lab hours per month, concurrent labs, environment tiers, exam
 simulations per month, CTF events. Shown on `/account/billing` (everyone) and
-`/admin/billing` (org admins, with seats and the event history). They are still recorded
-and displayed only; what is enforced is the model above (premium level, trial, payment
-method, dunning, spend cap).
+`/admin/billing` (org admins, with seats and the event history). Concurrent labs, lab
+hours, exam simulations and CTF events are enforced at start (see the enforcement order
+above); `envTiers` is display-only.
+
+### Plan limits: not built
+
+- **Roll-over** of unused hours or exam simulations into the next month needs:
+  - a per-person, per-month ledger of what was granted and what was used;
+  - a cap on how much may roll over (a plan setting), and expiry;
+  - a monthly job that closes each month;
+  - the gate reading the balance instead of counting this month's usage.
+  
+  How it interacts with mid-month plan changes (prorate the grant or not) is a pricing
+  decision.
+- **Packs** (extra hours or exam simulations bought once) need:
+  - Stripe one-off prices and Checkout in `payment` mode, with a webhook
+    (`checkout.session.completed`, `mode: payment`) that credits the pack to the same ledger;
+  - refunds (`charge.refunded`) that take the credit back;
+  - the summary showing the remaining balance;
+  - a decision on whether packs expire, and whether they are per person or pooled for an
+    organisation.
 
 Entitlements follow **all** of a scope's active plan subscriptions (`trialing`, `active`,
 `past_due`), not just the one an event was about: the highest plan level wins, and the scope
@@ -319,8 +436,9 @@ Not done in this version; all of it is required before `STRIPE_MODE=live` exists
   period and the premium rules; drop `plans.placeholder`, `placeholderPrices` and
   `compute.placeholder`; re-run `stripe:sync` against the live account once live mode is
   implemented (it creates the live meter and metered price too).
-- Decide whether exam simulations and CTF event sessions are metered and gated (today only
-  `POST /api/labs/:id/sessions` is).
+- Exam attempts are metered at the heaviest tier of the task pool; metering each exam
+  environment at its own tier needs the drawn tasks at start (or metering from the
+  ExamSession's environments).
 - Monitor `billing_meter_outbox` (`status = 'failed'`, old `pending` rows) and the meter's
   error reports (`v1.billing.meter.error_report_triggered`); Stripe accepts meter events at
   most 35 days old.
@@ -334,8 +452,9 @@ Not done in this version; all of it is required before `STRIPE_MODE=live` exists
   trademarks in alignment badges.
 - Webhook endpoint registered in the live dashboard with its own secret; alerting on
   `billing_events.status = 'failed'` rows that the reconciliation could not replay.
-- Review the remaining entitlements (lab hours, concurrent labs, exam simulations, CTF
-  events) that are still display-only.
+- `envTiers` is still display-only. Roll-over of unused lab hours or exam simulations and
+  extra packs (more hours or exams bought once) do not exist yet (see "Plan limits: not
+  built").
 - Dunning in the live account: Smart Retries and the customer emails in Billing settings
   (ours complement them), the subscription status after all retries fail (`unpaid` vs
   `canceled`).

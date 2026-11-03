@@ -122,7 +122,7 @@ export type EnvTier = 'A' | 'B' | 'C' | 'K' | 'V' | 'N';
 export type PlanKind = 'free' | 'individual' | 'organisation';
 export type PlanInterval = 'monthly' | 'yearly';
 
-/** What a plan allows. Recorded and displayed; enforcement covers premium labs, the free trial, payment, dunning and spend caps (docs/billing.md). */
+/** What a plan allows. Enforced on lab, exam and CTF event starts when billing enforces: concurrent labs, lab hours, exam simulations per month and CTF events (docs/billing.md). `envTiers` is display-only. */
 export interface PlanEntitlements {
   labHoursPerMonth: number | 'unlimited';
   concurrentLabs: number;

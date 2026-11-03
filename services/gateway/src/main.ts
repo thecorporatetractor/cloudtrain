@@ -24,7 +24,7 @@ import { KubeExamCluster } from './exams/kube.js';
 import { PgEvidenceSink, PgExamStore, PgTeamDirectory } from './exams/pg.js';
 import { ExamService } from './exams/service.js';
 import { loadSiteConfig } from './site/config.js';
-import { BillingService } from './billing/service.js';
+import { BillingService, type SessionEndResolver } from './billing/service.js';
 import { StripeApi, maskKey } from './billing/stripe.js';
 import { PgWaitlistStore } from './waitlist/store.js';
 import { createLedger } from './gdpr/ledger.js';
@@ -101,8 +101,26 @@ async function main() {
   // Billing (Stripe, test mode only, behind CT_BILLING_ENABLED): plans from the site configuration.
   // Pay for compute: lab sessions are metered and reported to a Stripe Billing Meter; the
   // lab-start gate is on with billing unless CT_BILLING_ENFORCE=0 (docs/billing.md).
+  // When a metered session ended (null while it runs): a LabSession for labs and CTF event labs, the
+  // ExamSession for an exam attempt (its environments run until it completes or fails).
+  const sessionEnd: SessionEndResolver = async (name, kind) => {
+    if (kind === 'exam') {
+      const es = await examCluster.getExamSession(name);
+      const phase = es?.status?.phase;
+      if (!es) return 'missing';
+      if (phase !== 'Completed' && phase !== 'Failed') return null;
+      const done = Date.parse(es?.status?.completedAt ?? es?.status?.frozenAt ?? '');
+      return new Date(Number.isNaN(done) ? Date.now() : Math.min(done, Date.now()));
+    }
+    const ls = await cluster.getSession(name);
+    if (!ls) return 'missing';
+    if (!['expired', 'failed'].includes(phaseOf(ls))) return null;
+    const exp = ls?.status?.expiresAt ? Date.parse(ls.status.expiresAt) : NaN;
+    return new Date(Number.isNaN(exp) ? Date.now() : Math.min(exp, Date.now()));
+  };
   const billing = new BillingService({
     db,
+    sessionEnd,
     site,
     ...(config.billing.enabled ? { stripe: new StripeApi(config.billing.secretKey), webhookSecret: config.billing.webhookSecret } : {}),
     enforce: config.billing.enforce,
@@ -176,12 +194,7 @@ async function main() {
 
   const sweep = config.sweepIntervalMs > 0 ? setInterval(() => void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed')), config.sweepIntervalMs) : undefined;
   // Metered usage: close sessions that ended outside the gateway (expiry, admin), flush the meter outbox.
-  const sessionEnd = async (name: string): Promise<Date | null> => {
-    const ls = await cluster.getSession(name);
-    if (ls && !['expired', 'failed'].includes(phaseOf(ls))) return null;
-    const exp = ls?.status?.expiresAt ? Date.parse(ls.status.expiresAt) : NaN;
-    return new Date(Number.isNaN(exp) ? Date.now() : Math.min(exp, Date.now()));
-  };
+  if (config.billing.enabled && config.billing.sweepMs === 0) app.log.warn({}, 'billing: CT_BILLING_SWEEP_MS=0: usage of sessions that end outside the gateway and orphaned start reservations are only closed when that person starts again');
   const billingSweep = config.billing.sweepMs > 0 ? setInterval(() => void billing.sweep(sessionEnd).catch((e: unknown) => app.log.warn({ err: e }, 'billing sweep failed')), config.billing.sweepMs) : undefined;
   // Webhooks can be missed or fail for good: re-read subscriptions from Stripe and replay failed events.
   const billingReconcile =

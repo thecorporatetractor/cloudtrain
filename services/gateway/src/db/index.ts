@@ -12,6 +12,8 @@ import * as m0008 from './migrations/0008_waitlist.js';
 import * as m0009 from './migrations/0009_billing_compute.js';
 import * as m0010 from './migrations/0010_gdpr.js';
 import * as m0011 from './migrations/0011_gdpr_lifecycle.js';
+import * as m0012 from './migrations/0012_billing_usage_kind.js';
+import * as m0013 from './migrations/0013_billing_usage_kind_validate.js';
 import type { DB } from './schema.js';
 
 export type Db = Kysely<DB>;
@@ -57,13 +59,23 @@ export function migrationProvider(appRole: string): MigrationProvider {
     up: (db) => mod.up(db, appRole),
     down: (db) => mod.down(db),
   });
-  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007), '0008_waitlist': bind(m0008), '0009_billing_compute': bind(m0009), '0010_gdpr': bind(m0010), '0011_gdpr_lifecycle': bind(m0011) }) };
+  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007), '0008_waitlist': bind(m0008), '0009_billing_compute': bind(m0009), '0010_gdpr': bind(m0010), '0011_gdpr_lifecycle': bind(m0011), '0012_billing_usage_kind': bind(m0012), '0013_billing_usage_kind_validate': bind(m0013) }) };
 }
 
-/** Applies pending migrations; run as the schema owner. */
+/**
+ * Applies pending migrations, one transaction each; run as the schema owner. Kysely's
+ * migrateToLatest runs every pending migration in one transaction, so a lock taken by an early
+ * one (ALTER TABLE: ACCESS EXCLUSIVE) would be held through all later ones; migrateUp applies
+ * one per call, each committed before the next starts.
+ */
 export async function migrateToLatest(ownerDb: Kysely<unknown>, appRole = 'cloudtrain_app'): Promise<string[]> {
   const migrator = new Migrator({ db: ownerDb, provider: migrationProvider(appRole) });
-  const { error, results } = await migrator.migrateToLatest();
-  if (error) throw error instanceof Error ? error : new Error(String(error));
-  return (results ?? []).filter((r) => r.status === 'Success').map((r) => r.migrationName);
+  const applied: string[] = [];
+  for (;;) {
+    const { error, results } = await migrator.migrateUp();
+    if (error) throw error instanceof Error ? error : new Error(String(error));
+    const done = (results ?? []).filter((r) => r.status === 'Success').map((r) => r.migrationName);
+    if (done.length === 0) return applied;
+    applied.push(...done);
+  }
 }

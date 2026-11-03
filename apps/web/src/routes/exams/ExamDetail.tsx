@@ -2,9 +2,11 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import { AlertTriangle, ChevronLeft, Clock, FileText, Play } from 'lucide-react';
 import { useState } from 'react';
 import { useExam, useStartExam } from '@/api/exams';
+import { BillingBlocked } from '@/components/billing';
 import { alignLabel, Disclaimer, ExamDomainIcon, examDomainLabel, RuleChips, ScoreBar } from '@/components/exams/ui';
 import { Badge, Button, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { examDetailRoute } from '@/router';
+import { billingBlockOf } from '@/lib/billing';
 import { formatMinutes, relativeTime } from '@/lib/utils';
 import { AttemptsTable } from '../Exams';
 import { RequireAccess } from '@/app/access';
@@ -187,11 +189,16 @@ function ExamDetailScreen() {
                   </p>
                 )}
                 {soon && <p className="small subtle" style={{ marginTop: 12 }}>{e.availabilityNote ?? 'This simulation is not available yet.'}</p>}
-                {start.isError && (
-                  <p className="small text-err" style={{ marginTop: 12 }}>
-                    {start.error.message}
-                  </p>
-                )}
+                {start.isError &&
+                  (billingBlockOf(start.error) ? (
+                    <div style={{ marginTop: 12 }}>
+                      <BillingBlocked compact block={billingBlockOf(start.error)!} />
+                    </div>
+                  ) : (
+                    <p className="small text-err" style={{ marginTop: 12 }}>
+                      {start.error.message}
+                    </p>
+                  ))}
                 <Button variant="primary" size="lg" style={{ width: '100%', marginTop: 14 }} icon={<Play size={14} />} disabled={!canStart} loading={start.isPending} onClick={begin}>
                   Start exam
                 </Button>

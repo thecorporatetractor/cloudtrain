@@ -3,7 +3,7 @@ import { parse } from 'yaml';
 import raw from '../../../../content/site.yaml?raw';
 import { ApiError } from '@/api/client';
 import type { SiteConfig } from '@/api/types';
-import { accessChip, billingBlockOf, blockAction, formatMinor, siteComputeRates } from './billing';
+import { BLOCK_TITLE, accessChip, billingBlockOf, blockAction, formatMinor, siteComputeRates } from './billing';
 
 const site = parse(raw) as SiteConfig;
 
@@ -14,6 +14,14 @@ describe('billing helpers', () => {
     expect(billingBlockOf(new ApiError(429, 'slow down', 'quota_exceeded'))).toBeUndefined();
     expect(billingBlockOf(new Error('x'))).toBeUndefined();
     expect(blockAction({ action: 'upgrade', requiredPlan: { id: 'pro', name: 'Pro', level: 1 } })).toBe('Upgrade to Pro');
+  });
+
+  it('reads the plan-limit refusals (concurrent labs, lab hours, exam simulations)', () => {
+    const e = new ApiError(402, 'You already have 2 labs running, and the Pro plan allows 2 at a time.', 'payment_required', undefined, { reason: 'concurrent_limit', action: 'end_session', href: '/account/billing', scope: 'user', limit: 2, used: 2 });
+    expect(billingBlockOf(e)).toMatchObject({ reason: 'concurrent_limit', action: 'end_session', limit: 2, used: 2, message: expect.stringMatching(/2 labs running/) });
+    expect(blockAction({ action: 'end_session' })).toBe('See your running labs');
+    expect(BLOCK_TITLE.exam_limit_reached).toMatch(/Exam simulations/);
+    expect(BLOCK_TITLE.lab_hours_exhausted).toMatch(/Lab hours/);
   });
 
   it('derives the compute rates per hour from site.yaml', () => {

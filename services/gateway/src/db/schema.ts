@@ -509,8 +509,13 @@ export interface BillingUsageTable {
   org_id: string;
   /** Null once the person has been erased: the row stays as the anonymous basis of the bill (0010_gdpr). */
   user_id: string | null;
+  /** The lab id; for an exam attempt, the exam id (0012_billing_usage_kind). */
   lab_id: string;
   session_name: string;
+  /** lab, exam (an exam simulation attempt) or event (a CTF event lab): 0012_billing_usage_kind. */
+  kind: Generated<'lab' | 'exam' | 'event'>;
+  /** False while the row is only a reservation (the gate wrote it before the session existed); true once the session exists (0012). */
+  session_confirmed: Generated<boolean>;
   compute_tier: 'pod' | 'vm' | 'heavy';
   units_per_minute: number;
   /** numeric: pg returns a string. */

@@ -20,7 +20,7 @@ import { registerDevImpersonation } from './routes/dev.js';
 import { registerPlatformRoutes } from './routes/platform.js';
 import { registerPublicRoutes } from './routes/public.js';
 import { registerBillingRoutes } from './billing/routes.js';
-import type { BillingService } from './billing/service.js';
+import type { BillingService, StartDecision } from './billing/service.js';
 import type { WaitlistStore } from './waitlist/store.js';
 import { registerWaitlistRoutes } from './waitlist/routes.js';
 import type { SessionService } from './sessions/service.js';
@@ -247,13 +247,38 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   /* --------------------------------- sessions -------------------------------- */
 
+  // Billing gate (premium plan, free trial, payment method, dunning, spend cap, plan limits;
+  // 402 when CT_BILLING_ENFORCE is on) and metering from the start, on every path that starts
+  // a lab session: here and CTF event labs (src/billing). Exams: registerExamRoutes.
+  if (deps.billing) {
+    const billing = deps.billing;
+    sessions.billing = {
+      gate: (p, labId, kind, name) => billing.assertLabStart(p, labId, kind, name),
+      // Confirms the gate's reservation now that the session exists, retried; if it still fails,
+      // the sweep confirms it (the session runs, the row stays open and is billed either way).
+      metered: async (p, decision, s) => {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            if (!(await billing.meterStart(p, decision as StartDecision | undefined, s))) app.log.error({ session: s.id }, 'billing: no usage row to confirm for a started session');
+            return;
+          } catch (e) {
+            if (attempt >= 3) return void app.log.error({ err: e, session: s.id }, 'billing: could not confirm usage start; the sweep confirms it');
+            await new Promise((r) => setTimeout(r, 200 * attempt));
+          }
+        }
+      },
+      confirm: (p, name) => billing.confirmSession(p, name).then(() => undefined, (e: unknown) => app.log.error({ err: e, session: name }, 'billing: could not confirm a reattached session; the sweep confirms it')),
+      // A release that fails leaves an orphan reservation: the sweep (or the person's next start) closes it unbilled after START_TIMEOUT_MS.
+      release: (p, decision) =>
+        billing.release(p, decision as StartDecision | undefined).catch((e: unknown) => app.log.error({ err: e, session: (decision as StartDecision | undefined)?.sessionName }, 'billing: could not release a failed start; the sweep closes it unbilled')),
+    };
+  }
+
   app.post<{ Params: { id: string } }>('/api/labs/:id/sessions', run, async (req, reply) => {
-    // Billing gate (premium plan, free trial, payment method, dunning, spend cap; 402 when
-    // CT_BILLING_ENFORCE is on), then the session is metered from its start (src/billing).
-    const decision = await deps.billing?.assertLabStart(req.principal, req.params.id);
-    const s = await sessions.start(req.principal, req.params.id);
-    await deps.billing?.meterStart(req.principal, decision, s).catch((e: unknown) => req.log.error({ err: e, session: s.id }, 'billing: could not record usage start'));
-    return reply.code(201).send(s);
+    // Starting a lab that already runs for this person reattaches to it (200): one environment, metered once.
+    const live = await sessions.live(req.principal, req.params.id);
+    if (live) return reply.code(200).send(live);
+    return reply.code(201).send(await sessions.start(req.principal, req.params.id));
   });
   app.get<{ Params: { id: string } }>('/api/labs/:id/sessions', run, async (req) => {
     if (!content.labs.has(req.params.id)) throw notFound('Lab');
@@ -318,7 +343,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   /* ---------------------------------- exams ---------------------------------- */
 
-  if (deps.exams) registerExamRoutes(app, deps.exams, cluster, ps ? (p) => ps.ensureNotRestricted(p) : undefined);
+  if (deps.exams) registerExamRoutes(app, deps.exams, cluster, ps ? (p) => ps.ensureNotRestricted(p) : undefined, deps.billing);
 
   return app;
 }

@@ -83,6 +83,36 @@ export interface BillingDeps {
   log?: { info: (o: object, m: string) => void; warn: (o: object, m: string) => void };
   /** Time budget of one webhook or reconciliation transaction (default 30 s): lock wait, statements, idle time and Stripe writes. */
   txBudgetMs?: number;
+  /**
+   * When a metered session ended (null while it runs). The gate uses it to close usage of
+   * sessions that ended outside the gateway before counting what runs (concurrent labs);
+   * without it, open usage rows count until the sweep closes them.
+   */
+  sessionEnd?: SessionEndResolver;
+}
+
+/** What a metered session is: a lab, an exam simulation attempt or a CTF event lab. */
+export type StartKind = 'lab' | 'exam' | 'event';
+/**
+ * Whether a metered session still runs: null while it runs (or is starting), a Date when it
+ * ended, 'missing' when neither a LabSession nor an ExamSession of that name exists. Missing is
+ * not "ended": a reserved start has no session until createSession, and a session the
+ * orchestrator deleted after its end is missing too; the usage row's `session_confirmed` tells
+ * the two apart (see closeOpen).
+ */
+export type SessionEndResolver = (sessionName: string, kind: StartKind) => Promise<Date | null | 'missing'>;
+
+/** What the sweep or the gate does with an open usage row. */
+type Verdict = Date | 'orphan' | 'confirm';
+
+/** A reservation whose session still does not exist after this long is an orphan: closed unbilled. */
+export const START_TIMEOUT_MS = 10 * 60_000;
+
+/** What runs and was used, for the plan limits. */
+interface StartUsage {
+  running: number;
+  minutes: number;
+  exams: number;
 }
 
 const ACTIVE: ReadonlySet<string> = new Set<SubscriptionStatus>(['trialing', 'active', 'past_due']);
@@ -103,7 +133,11 @@ export interface WebhookOutcome {
 
 /** What `assertLabStart` decided; `meterStart` records it. */
 export interface StartDecision {
+  kind: StartKind;
+  /** The lab id (an exam attempt: the exam id). */
   labId: string;
+  /** The session (or exam attempt) name the start is reserved under. */
+  sessionName: string;
   tier: ComputeTier;
   unitsPerMinute: number;
   unitPrice: number;
@@ -137,6 +171,8 @@ interface PayerState {
   seat?: { plan: SitePlan };
   limit: { monthlyCap: number; hardStop: boolean; source: 'default' | 'custom' };
   spent: number;
+  /** The plan whose entitlements (limits) apply: the seat's plan when it is higher, else the account's own (free without one). */
+  plan?: SitePlan;
 }
 
 /** Stripe objects read before the event's transaction (see prefetch). */
@@ -363,7 +399,8 @@ export class BillingService {
     const spent = (await this.spend(tx, orgId, { payerKey: userId ?? '' })).amount;
     let since = customer?.delinquent_since ?? null;
     if (!since && sub && DELINQUENT.has(sub.status)) since = sub.updated_at;
-    return { payer: scope, payerKey: userId ?? '', ...(customer ? { customer } : {}), level, paymentMethod: !!customer?.has_payment_method || subActive, dunning: this.dunningView(since), limit, spent };
+    const ownPlan = (userId ? (ent?.source === 'subscription' ? this.plan(ent.plan_id) : undefined) : subActive ? this.plan(sub!.plan_id) : undefined) ?? this.defaultPlan();
+    return { payer: scope, payerKey: userId ?? '', ...(customer ? { customer } : {}), level, paymentMethod: !!customer?.has_payment_method || subActive, dunning: this.dunningView(since), limit, spent, ...(ownPlan ? { plan: ownPlan } : {}) };
   }
 
   /** Who pays for `userId`'s labs (the org for a seated member of an active org plan) and what applies. */
@@ -375,7 +412,8 @@ export class BillingService {
     const seated = !!orgPlan && !!(await tx.selectFrom('billing_seats').select('user_id').where('org_id', '=', orgId).where('user_id', '=', userId).executeTakeFirst());
     if (!seated) return own;
     const org = await this.accountState(tx, orgId, null);
-    return { ...org, level: Math.max(own.level, this.pricing.level(orgPlan)), seat: { plan: orgPlan! } };
+    const plan = this.pricing.level(orgPlan) >= own.level ? orgPlan : own.plan;
+    return { ...org, level: Math.max(own.level, this.pricing.level(orgPlan)), seat: { plan: orgPlan! }, ...(plan ? { plan } : {}) };
   }
 
   private dunningView(since: Date | null): BillingDunning {
@@ -518,22 +556,92 @@ export class BillingService {
 
   /**
    * The billing gate for a lab start: premium plan level, the free-trial
-   * allowance, a payment method, dunning and the spend cap, in that order.
-   * Refuses with 402 `payment_required` (`details`: BillingBlockDetails) when
-   * enforcement is on; returns what it decided so `meterStart` records who pays.
+   * allowance, a payment method, dunning, the spend cap and the plan limits,
+   * in that order. Refuses with 402 `payment_required` (`details`:
+   * BillingBlockDetails) when enforcement is on. On success the usage row is
+   * already written as a reservation under `sessionName` (see assertStart);
+   * the caller creates the session under that name, then calls `meterStart`,
+   * or `release` when the start fails. `kind: 'event'` is a CTF event lab
+   * (needs the plan's CTF events).
    */
-  async assertLabStart(p: Principal, labId: string): Promise<StartDecision | undefined> {
+  async assertLabStart(p: Principal, labId: string, kind: 'lab' | 'event', sessionName: string): Promise<StartDecision | undefined> {
     const lab = this.facts.get(labId);
-    if (!p.orgId || !lab) return undefined;
+    if (!lab) return this.unpriced(`lab ${labId}`);
+    return this.assertStart(p, kind, lab, this.pricing.isTrialLab(labId) && kind === 'lab', sessionName);
+  }
+
+  /**
+   * The same gate for an exam simulation attempt: no premium rule, the plan's
+   * exam simulations per month. Compute is metered at the heaviest tier of
+   * the exam's task pool (an attempt draws its tasks after the start).
+   */
+  async assertExamStart(p: Principal, exam: { id: string; title: string; labIds: string[] }, attemptName: string): Promise<StartDecision | undefined> {
+    const tiers = exam.labIds.map((id) => this.facts.get(id)?.tier).filter((t): t is ComputeTier => !!t);
+    if (tiers.length === 0) return this.unpriced(`exam ${exam.id}`);
+    const rank: Record<ComputeTier, number> = { pod: 0, vm: 1, heavy: 2 };
+    const tier = tiers.reduce((a, b) => (rank[b] > rank[a] ? b : a));
+    return this.assertStart(p, 'exam', { id: exam.id, domain: '', difficulty: '', tier, title: exam.title }, false, attemptName);
+  }
+
+  /** Nothing to price a start by (no lab facts): refused while enforcing (fail closed), else started unmetered and logged. */
+  private unpriced(what: string): undefined {
+    if (this.enforced) throw new HttpError(409, `Billing cannot price this ${what.split(' ')[0]}, so it cannot start. Ask an administrator to check the billing configuration.`, { code: 'conflict' });
+    if (this.enabled) this.d.log?.warn({ what }, 'billing: no compute facts; starting unmetered');
+    return undefined;
+  }
+
+  /**
+   * Decides a start and reserves it. Under a transaction-scoped advisory lock
+   * per payer (the person, or the organisation for a seated member: the plan
+   * limits belong to whoever holds the plan), it counts what runs and was used,
+   * decides, and writes the usage row before the session exists. Concurrent
+   * starts therefore see each other: limits cannot be raced past, and a second
+   * start of the same lab while the first is in flight is refused (409).
+   * Whether open sessions have ended is resolved before the transaction, so no
+   * cluster call runs while the lock is held.
+   */
+  private async assertStart(p: Principal, kind: StartKind, lab: LabFacts & { title: string }, trialLab: boolean, sessionName: string): Promise<StartDecision | undefined> {
+    if (!p.orgId) return undefined;
+    // Whether the person's open sessions still run, asked before the transaction (no cluster call under the lock).
+    const { open, orgPays } = await this.tx(p, async (tx) => ({
+      open: await tx.selectFrom('billing_usage').select(['session_name', 'kind', 'started_at', 'session_confirmed']).where('org_id', '=', p.orgId).where('user_id', '=', p.sub).where('ended_at', 'is', null).execute(),
+      orgPays: (await this.payerState(tx, p.orgId, p.sub)).payer === 'org',
+    }));
+    const ends = await this.resolveOpen(open);
+    // A seated member's start also takes the organisation's lock, for the organisation's spend
+    // cap: always in the order organisation, then person (no deadlocks). Whether the person is
+    // seated is read before the locks as a hint; if a seat appeared in between, start over.
+    for (let lockOrg = orgPays; ; lockOrg = true) {
+      const result = await this.decideUnderLock(p, kind, lab, trialLab, sessionName, ends, lockOrg);
+      if (result === 'relock') continue;
+      if (result.queued) this.kick();
+      return result.decision;
+    }
+  }
+
+  private async decideUnderLock(p: Principal, kind: StartKind, lab: LabFacts & { title: string }, trialLab: boolean, sessionName: string, ends: Map<string, Verdict>, lockOrg: boolean): Promise<'relock' | { decision: StartDecision; queued: boolean }> {
+    let queued = false;
     return this.tx(p, async (tx) => {
+      // The locks first, then everything the decision reads.
+      if (lockOrg) await sql`SELECT pg_advisory_xact_lock(hashtext(${`billing-start:${p.orgId}:`}))`.execute(tx);
+      await sql`SELECT pg_advisory_xact_lock(hashtext(${`billing-start:${p.orgId}:${p.sub}`}))`.execute(tx);
       const state = await this.payerState(tx, p.orgId, p.sub);
-      const trialUse = this.pricing.isTrialLab(labId) ? await this.trialUse(tx, p.orgId, p.sub) : undefined;
-      const verdict = this.decide(p, lab, state, trialUse);
+      if (state.payer === 'org' && !lockOrg) return 'relock' as const;
+      if (await this.closeOpen(tx, ends)) queued = true;
+      const usage = await this.startUsage(tx, p.orgId, p.sub);
+      if (kind !== 'exam') {
+        const inFlight = await tx.selectFrom('billing_usage').select('session_name').where('org_id', '=', p.orgId).where('user_id', '=', p.sub).where('lab_id', '=', lab.id).where('kind', '=', kind).where('ended_at', 'is', null).executeTakeFirst();
+        if (inFlight) throw new HttpError(409, 'This lab is already starting or running for you. Reload the page to attach to it.', { code: 'conflict', details: { sessionId: inFlight.session_name } });
+      }
+      const trialUse = trialLab ? await this.trialUse(tx, p.orgId, p.sub) : undefined;
+      const verdict = this.decide(p, lab, state, trialUse, { kind, usage });
       if (verdict.block && this.enforced) throw new HttpError(402, verdict.block.message, { code: 'payment_required', details: verdict.block.details as unknown as Record<string, unknown> });
       const trial = !!verdict.trial;
       const billable = this.enabled && !trial && !!state.customer;
-      return {
-        labId,
+      const d: StartDecision = {
+        kind,
+        labId: lab.id,
+        sessionName,
         tier: lab.tier,
         unitsPerMinute: this.pricing.unitsPerMinute(lab.tier),
         unitPrice: this.pricing.unitPrice,
@@ -543,10 +651,149 @@ export class BillingService {
         trial,
         billable,
       };
+      // The reservation: from here on the start counts, and is billed once the session exists.
+      await tx.insertInto('billing_usage').values(this.usageRow(p, d, this.now())).execute();
+      return { decision: d, queued };
     });
   }
 
-  private decide(p: Principal, lab: LabFacts & { title: string }, s: PayerState, trialUse?: { sessions: number; minutes: number }): { trial?: boolean; block?: { reason: BillingBlockReason; message: string; details: BillingBlockDetails } } {
+  /** What to do with open usage rows: close at a time (ended), close unbilled (an orphan reservation), or leave open. */
+  private async resolveOpen(rows: { session_name: string; kind: StartKind; started_at: Date; session_confirmed: boolean }[], resolver = this.d.sessionEnd): Promise<Map<string, Verdict>> {
+    const out = new Map<string, Verdict>();
+    if (!resolver) return out;
+    for (const r of rows) {
+      const end = await resolver(r.session_name, r.kind).catch(() => undefined);
+      if (end === undefined) continue; // the cluster did not answer: leave it
+      if (end === null) {
+        // Running: a reservation whose confirmation was lost is confirmed now (the repair path).
+        if (!r.session_confirmed) out.set(r.session_name, 'confirm');
+      } else if (end instanceof Date) out.set(r.session_name, end);
+      else if (end === 'missing') {
+        // A session that ran and was deleted after its end: billed up to now. A reservation that
+        // never got its session: an orphan once the start timeout has passed, open until then.
+        if (r.session_confirmed) out.set(r.session_name, this.now());
+        else if (this.now().getTime() - r.started_at.getTime() > START_TIMEOUT_MS) out.set(r.session_name, 'orphan');
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Applies resolveOpen's verdicts; true when a meter event was queued. Each row is read
+   * again FOR UPDATE first: the verdict is a snapshot, and meanwhile the session may have been
+   * confirmed (a slow start that got there after all) or closed. An orphan verdict on a row that
+   * is confirmed by now is dropped.
+   */
+  private async closeOpen(tx: Tx, ends: Map<string, Verdict>): Promise<boolean> {
+    let queued = false;
+    for (const [name, verdict] of ends) {
+      const row = await tx.selectFrom('billing_usage').select(['ended_at', 'session_confirmed']).where('session_name', '=', name).forUpdate().executeTakeFirst();
+      if (!row || row.ended_at) continue;
+      if (verdict === 'confirm') await tx.updateTable('billing_usage').set({ session_confirmed: true }).where('session_name', '=', name).execute();
+      else if (verdict === 'orphan') {
+        if (!row.session_confirmed) await this.closeUnbilled(tx, name);
+      } else if (await this.closeUsage(tx, name, verdict)) queued = true;
+    }
+    return queued;
+  }
+
+  /** Closes a usage row at zero minutes, never billed: a released or orphaned reservation. */
+  private async closeUnbilled(tx: Tx, sessionName: string): Promise<void> {
+    await tx.updateTable('billing_usage').set({ ended_at: sql`started_at`, minutes: 0, units: 0, billable: false }).where('session_name', '=', sessionName).where('ended_at', 'is', null).where('session_confirmed', '=', false).execute();
+  }
+
+  /**
+   * Marks a usage row's session as existing (and its real start time). A reservation that was
+   * closed as an orphan or released meanwhile (its session came up later than the start
+   * timeout, or the release raced it) is reopened as it was reserved: the session runs, so it
+   * is metered. Returns false only when there is no row to confirm (the caller logs it).
+   */
+  private async confirmRow(tx: Tx, sessionName: string, startedAt?: Date): Promise<boolean> {
+    const open = await tx
+      .updateTable('billing_usage')
+      .set({ session_confirmed: true, ...(startedAt ? { started_at: startedAt } : {}) })
+      .where('session_name', '=', sessionName)
+      .where('ended_at', 'is', null)
+      .returning('id')
+      .executeTakeFirst();
+    if (open) return true;
+    const reopened = await tx
+      .updateTable('billing_usage')
+      .set({ ended_at: null, minutes: null, units: null, billable: sql`customer_id IS NOT NULL AND NOT trial`, session_confirmed: true, ...(startedAt ? { started_at: startedAt } : {}) })
+      .where('session_name', '=', sessionName)
+      .where('session_confirmed', '=', false)
+      .where('minutes', '=', 0)
+      .where(({ not, exists, selectFrom }) => not(exists(selectFrom('billing_meter_outbox as o').select('o.id').whereRef('o.usage_id', '=', 'billing_usage.id'))))
+      .returning('id')
+      .executeTakeFirst();
+    if (reopened) this.d.log?.warn({ session: sessionName }, 'billing: reopened a reservation closed before its session came up');
+    return !!reopened;
+  }
+
+  /** Reattaching to a running session: its usage row is confirmed (or reopened) if it is not yet. */
+  async confirmSession(p: Principal, sessionName: string): Promise<boolean> {
+    if (!p.orgId) return false;
+    return this.tx(p, async (tx) => {
+      const row = await tx.selectFrom('billing_usage').select(['session_confirmed', 'ended_at']).where('session_name', '=', sessionName).executeTakeFirst();
+      if (!row || (row.session_confirmed && !row.ended_at)) return !!row;
+      return this.confirmRow(tx, sessionName);
+    });
+  }
+
+  private usageRow(p: Principal, d: StartDecision, startedAt: Date) {
+    return {
+      org_id: p.orgId,
+      user_id: p.sub,
+      lab_id: d.labId,
+      session_name: d.sessionName,
+      kind: d.kind,
+      compute_tier: d.tier,
+      units_per_minute: d.unitsPerMinute,
+      unit_price: d.unitPrice,
+      payer_key: d.payerKey,
+      customer_id: d.customerId,
+      trial: d.trial,
+      billable: d.billable,
+      started_at: startedAt,
+      session_confirmed: false,
+    };
+  }
+
+  /**
+   * What the person runs now and used this month (UTC), for the plan limits: their own usage,
+   * also for a seated member of an organisation plan (the allowances are per member; the spend
+   * cap is the organisation's).
+   */
+  private async startUsage(tx: Tx, orgId: string, userId: string): Promise<StartUsage> {
+    const at = this.now();
+    const { start, end } = monthOf(at);
+    const open = await tx.selectFrom('billing_usage').select(sql<number>`count(*)::int`.as('n')).where('org_id', '=', orgId).where('user_id', '=', userId).where('ended_at', 'is', null).executeTakeFirstOrThrow();
+    const r = await tx
+      .selectFrom('billing_usage')
+      .select([sql<number>`coalesce(sum(${this.minutesExpr(at)}), 0)::int`.as('m'), sql<number>`count(*) FILTER (WHERE kind = 'exam' AND NOT (ended_at IS NOT NULL AND minutes = 0))::int`.as('exams')])
+      .where('org_id', '=', orgId)
+      .where('user_id', '=', userId)
+      .where('started_at', '>=', start)
+      .where('started_at', '<', end)
+      .executeTakeFirstOrThrow();
+    return { running: Number(open.n), minutes: Number(r.m), exams: Number(r.exams) };
+  }
+
+  /** The lowest-level plan of the payer's kind above `level` that `ok` accepts (what to upgrade to). */
+  private upgradeFor(s: PayerState, ok: (e: PlanEntitlements) => boolean): SitePlan | undefined {
+    const current = this.pricing.level(s.plan);
+    return this.plansFor(s.payer === 'org' ? 'org' : 'user')
+      .filter((pl) => ok(pl.entitlements) && this.pricing.level(pl) >= current && pl.id !== s.plan?.id)
+      .sort((a, b) => this.pricing.level(a) - this.pricing.level(b))[0];
+  }
+
+  private decide(
+    p: Principal,
+    lab: LabFacts & { title: string },
+    s: PayerState,
+    trialUse?: { sessions: number; minutes: number },
+    start?: { kind: StartKind; usage?: StartUsage },
+  ): { trial?: boolean; block?: { reason: BillingBlockReason; message: string; details: BillingBlockDetails } } {
     const orgPays = s.payer === 'org';
     const manage = can(p, 'billing.manage', { kind: 'org' });
     const href = orgPays ? '/admin/billing' : '/account/billing';
@@ -559,23 +806,69 @@ export class BillingService {
       const requiredPlan = { id: required.id, name: required.name, level: this.pricing.level(required) };
       return { block: { reason: 'plan_required', message: `"${lab.title}" is a premium lab: it needs the ${required.name} plan or higher.`, details: { reason: 'plan_required', action: 'upgrade', href: '/account/billing', scope: 'user', requiredPlan } } };
     }
+    const ent = s.plan?.entitlements;
+    const planName = s.plan?.name ?? 'current';
+    // Features of the plan: exam simulations and CTF events.
+    const feature = start?.kind === 'exam' ? (ent && ent.examSimulationsPerMonth === 0 ? 'Exam simulations' : undefined) : start?.kind === 'event' ? (ent && !ent.ctfEvents ? 'CTF event labs' : undefined) : undefined;
+    if (feature) {
+      const up = this.upgradeFor(s, (e) => (start!.kind === 'exam' ? e.examSimulationsPerMonth !== 0 : e.ctfEvents));
+      const requiredPlan = up ? { id: up.id, name: up.name, level: this.pricing.level(up) } : undefined;
+      return block('plan_required', `${feature} are not included in the ${planName} plan${up ? `: they need the ${up.name} plan or higher` : ''}.`, requiredPlan ? { requiredPlan } : {}, 'upgrade');
+    }
+    // A trial start is free: no payment method, dunning or spend cap; the plan limits below still apply.
+    let trial = false;
     if (trialUse) {
       const t = this.pricing.trial;
-      if (trialUse.sessions < t.maxSessions && trialUse.minutes < t.maxMinutes) return { trial: true };
-      if (!s.paymentMethod) return block('trial_exhausted', `You have used your free trial (${t.maxSessions} sessions or ${t.maxMinutes} minutes). Add a payment method to keep going; you pay only for the compute you use.`, {}, 'add_payment_method');
+      if (trialUse.sessions < t.maxSessions && trialUse.minutes < t.maxMinutes) trial = true;
+      else if (!s.paymentMethod) return block('trial_exhausted', `You have used your free trial (${t.maxSessions} sessions or ${t.maxMinutes} minutes). Add a payment method to keep going; you pay only for the compute you use.`, {}, 'add_payment_method');
     }
-    if (!s.paymentMethod) {
+    if (!trial && !s.paymentMethod) {
       return block('payment_method_required', orgPays ? 'Your organisation has no payment method on file. Ask an organisation admin to set up billing.' : 'Add a payment method to start this lab. A free account includes the trial lab only; other labs are billed per compute minute.', {}, 'add_payment_method');
     }
-    if (s.dunning.state === 'blocked') {
+    if (!trial && s.dunning.state === 'blocked') {
       const who = orgPays ? "Your organisation's" : 'Your';
       return block('payment_overdue', `${who} last payment failed and the ${s.dunning.graceDays}-day grace period has ended. Update the payment method in the billing portal to start new labs; running labs are not affected.`, { ...(s.dunning.graceEndsAt ? { graceEndedAt: s.dunning.graceEndsAt } : {}) }, 'portal');
     }
-    if (s.limit.hardStop && s.limit.monthlyCap > 0 && s.spent >= s.limit.monthlyCap) {
+    if (!trial && s.limit.hardStop && s.limit.monthlyCap > 0 && s.spent >= s.limit.monthlyCap) {
       const cap = formatMoney(s.limit.monthlyCap, this.currency);
       return block('spend_cap_reached', `${orgPays ? 'Your organisation has' : 'You have'} reached the monthly compute spend cap of ${cap}. ${orgPays && !manage ? 'Ask an organisation admin to raise it' : 'Raise the cap on the billing page'} to start new labs; running labs continue.`, { currency: this.currency, cap: s.limit.monthlyCap, spent: s.spent }, 'raise_cap');
     }
-    return {};
+    // Plan limits (PlanEntitlements), counted per person.
+    const u = start?.usage;
+    if (u && ent) {
+      if (u.running >= ent.concurrentLabs) {
+        const up = this.upgradeFor(s, (e) => e.concurrentLabs > ent.concurrentLabs);
+        const n = ent.concurrentLabs;
+        return {
+          block: {
+            reason: 'concurrent_limit',
+            message: `You already have ${u.running} ${u.running === 1 ? 'lab' : 'labs'} running, and the ${planName} plan allows ${n} at a time. End a running lab (or let it expire) before starting another${up ? `, or upgrade to ${up.name} for ${up.entitlements.concurrentLabs}` : ''}.`,
+            details: { reason: 'concurrent_limit', action: 'end_session', href, scope: s.payer, limit: n, used: u.running, ...(up ? { requiredPlan: { id: up.id, name: up.name, level: this.pricing.level(up) } } : {}) },
+          },
+        };
+      }
+      const hours = ent.labHoursPerMonth;
+      if (hours !== 'unlimited' && u.minutes >= hours * 60) {
+        const up = this.upgradeFor(s, (e) => e.labHoursPerMonth === 'unlimited' || e.labHoursPerMonth > hours);
+        return block(
+          'lab_hours_exhausted',
+          `You have used the ${hours} lab ${hours === 1 ? 'hour' : 'hours'} of the ${planName} plan this month (they renew on the 1st, UTC)${up ? `. ${up.name} includes more` : ''}.`,
+          { limit: hours, used: Math.round((u.minutes / 60) * 10) / 10, ...(up ? { requiredPlan: { id: up.id, name: up.name, level: this.pricing.level(up) } } : {}) },
+          'upgrade',
+        );
+      }
+      const exams = ent.examSimulationsPerMonth;
+      if (start!.kind === 'exam' && exams !== 'unlimited' && u.exams >= exams) {
+        const up = this.upgradeFor(s, (e) => e.examSimulationsPerMonth === 'unlimited' || e.examSimulationsPerMonth > exams);
+        return block(
+          'exam_limit_reached',
+          `You have started the ${exams} exam ${exams === 1 ? 'simulation' : 'simulations'} the ${planName} plan includes this month (they renew on the 1st, UTC)${up ? `. ${up.name} includes more` : ''}.`,
+          { limit: exams, used: u.exams, ...(up ? { requiredPlan: { id: up.id, name: up.name, level: this.pricing.level(up) } } : {}) },
+          'upgrade',
+        );
+      }
+    }
+    return trial ? { trial: true } : {};
   }
 
   /** Billing view of labs for the catalog and the lab page: tier, rate, premium plan, trial, lock. */
@@ -616,30 +909,26 @@ export class BillingService {
 
   /* ------------------------------------------------------------ metering */
 
-  /** Records the start of a metered session (after the session was created). */
-  async meterStart(p: Principal, decision: StartDecision | undefined, session: { id: string; startedAt?: string }): Promise<void> {
+  /**
+   * Confirms a start once the session exists: the reserved usage row takes the
+   * session's real start time. The row was written by the gate, so a failure
+   * here leaves the session metered from the reservation, never unmetered.
+   */
+  async meterStart(p: Principal, decision: StartDecision | undefined, session: { id: string; startedAt?: string }): Promise<boolean> {
+    if (!decision || !p.orgId) return true;
+    const parsed = session.startedAt ? new Date(session.startedAt) : this.now();
+    const startedAt = Number.isNaN(parsed.getTime()) ? this.now() : parsed;
+    return this.tx(p, async (tx) => {
+      // The gate's reservation is normally there; insert it when it is not (a caller without one).
+      await tx.insertInto('billing_usage').values({ ...this.usageRow(p, decision, startedAt), session_name: session.id }).onConflict((oc) => oc.column('session_name').doNothing()).execute();
+      return this.confirmRow(tx, session.id, startedAt);
+    });
+  }
+
+  /** Releases a reservation whose start failed: closed at zero minutes, never billed. */
+  async release(p: Principal, decision: StartDecision | undefined): Promise<void> {
     if (!decision || !p.orgId) return;
-    const startedAt = session.startedAt ? new Date(session.startedAt) : this.now();
-    await this.tx(p, (tx) =>
-      tx
-        .insertInto('billing_usage')
-        .values({
-          org_id: p.orgId,
-          user_id: p.sub,
-          lab_id: decision.labId,
-          session_name: session.id,
-          compute_tier: decision.tier,
-          units_per_minute: decision.unitsPerMinute,
-          unit_price: decision.unitPrice,
-          payer_key: decision.payerKey,
-          customer_id: decision.customerId,
-          trial: decision.trial,
-          billable: decision.billable,
-          started_at: Number.isNaN(startedAt.getTime()) ? this.now() : startedAt,
-        })
-        .onConflict((oc) => oc.column('session_name').doNothing())
-        .execute(),
-    );
+    await this.tx(p, (tx) => this.closeUnbilled(tx, decision.sessionName));
   }
 
   /** Ends a metered session: billed minutes and units, and its meter event into the outbox (same transaction). */
@@ -671,13 +960,17 @@ export class BillingService {
    * and flushes the outbox. `sessionEnd` answers null while the session runs,
    * else when it ended. Runs in the platform context across orgs.
    */
-  async sweep(sessionEnd: (sessionName: string) => Promise<Date | null>): Promise<{ closed: number; sent: number }> {
-    const open = await withTenant(this.d.db, { platform: true }, (tx) => tx.selectFrom('billing_usage').select(['org_id', 'session_name']).where('ended_at', 'is', null).orderBy('started_at').limit(500).execute());
+  async sweep(sessionEnd: SessionEndResolver): Promise<{ closed: number; sent: number }> {
+    const open = await withTenant(this.d.db, { platform: true }, (tx) => tx.selectFrom('billing_usage').select(['org_id', 'session_name', 'kind', 'started_at', 'session_confirmed']).where('ended_at', 'is', null).orderBy('started_at').limit(500).execute());
+    const ends = await this.resolveOpen(open, sessionEnd);
     let closed = 0;
     for (const u of open) {
-      const end = await sessionEnd(u.session_name).catch(() => null);
+      const end = ends.get(u.session_name);
       if (!end) continue;
-      await withTenant(this.d.db, { orgId: u.org_id }, (tx) => this.closeUsage(tx, u.session_name, end));
+      // An orphan verdict is checked once more right before acting on it (outside any transaction).
+      if (end === 'orphan' && (await sessionEnd(u.session_name, u.kind).catch(() => undefined)) !== 'missing') continue;
+      // Orphaned reservations (the start died before its session existed, or its release failed) close unbilled.
+      await withTenant(this.d.db, { orgId: u.org_id }, (tx) => this.closeOpen(tx, new Map([[u.session_name, end]])));
       closed++;
     }
     const r = await this.flushOutbox();

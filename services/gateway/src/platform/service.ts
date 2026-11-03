@@ -264,6 +264,15 @@ export class PlatformService implements SessionHooks {
     });
   }
 
+  /** Reattaching to a running session: the access checks of a start (restriction, visibility), not the quotas. */
+  async beforeResume(p: Principal, lab: ContentLab): Promise<void> {
+    if (!p.orgId) return;
+    await this.tx(p, async (tx) => {
+      await this.assertNotRestricted(tx, p.sub);
+      if (!this.labVisible(await this.visibility(tx), lab.lab.metadata.id)) throw notFound('Lab');
+    });
+  }
+
   async started(p: Principal, lab: ContentLab, ls: LabSession): Promise<void> {
     if (!p.orgId) return;
     await this.tx(p, (tx) => startAttempt(tx, { orgId: p.orgId, userId: p.sub, lab: lab.lab, sessionName: ls.metadata.name, startedAt: ls.metadata.creationTimestamp ? new Date(ls.metadata.creationTimestamp) : this.now() }));

@@ -1,12 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import type { Principal } from '../auth.js';
+import type { BillingService } from '../billing/service.js';
 import type { FlagTaskRequest, GrantExamRetakeRequest, VoidExamAttemptRequest } from '@cloudtrain/api-types';
 import { HttpError } from '../errors.js';
 import type { LabCluster } from '../kube/cluster.js';
 import type { LabSession } from '../kube/types.js';
 import { bridge, clampSize } from '../terminal/bridge.js';
 import { loginShellCommand, parseExecTarget, sshCommand, type TerminalPlan } from '../terminal/target.js';
-import type { ExamService } from './service.js';
+import { attemptName, type ExamService } from './service.js';
 
 /**
  * Where an exam terminal runs: like a lab terminal (own k8s-exec endpoint ->
@@ -34,7 +35,7 @@ export function planExamTerminal(ls: LabSession, node: string): TerminalPlan {
  * scope, plus the CSRF header on writes); the service checks the exact scope
  * (own attempts, a managed team, the candidate's teams/cohorts).
  */
-export function registerExamRoutes(app: FastifyInstance, exams: ExamService, labs: LabCluster, assertMayStart?: (p: Principal) => Promise<void>): void {
+export function registerExamRoutes(app: FastifyInstance, exams: ExamService, labs: LabCluster, assertMayStart?: (p: Principal) => Promise<void>, billing?: Pick<BillingService, 'assertExamStart' | 'meterStart' | 'release'>): void {
   const run = { config: { permission: 'lab.run' as const } };
   const team = { config: { permission: 'progress.read.team' as const } };
   const control = { config: { permission: 'session.control' as const } };
@@ -58,7 +59,21 @@ export function registerExamRoutes(app: FastifyInstance, exams: ExamService, lab
   app.get<{ Params: { examId: string } }>('/api/exams/:examId', run, async (req) => exams.detail(req.principal, req.params.examId));
   app.post<{ Params: { examId: string } }>('/api/exams/:examId/attempts', run, async (req, reply) => {
     await assertMayStart?.(req.principal);
-    const attempt = await exams.start(req.principal, req.params.examId, req.ip);
+    // The billing gate (payment, dunning, spend cap, the plan's exam simulations; 402) and metering, as for labs.
+    // The gate reserves the usage row under the attempt's name; a start that fails releases it.
+    const name = attemptName();
+    const decision = await billing?.assertExamStart(req.principal, exams.billingFacts(req.params.examId), name);
+    let attempt;
+    try {
+      attempt = await exams.start(req.principal, req.params.examId, req.ip, name);
+    } catch (e) {
+      // An ExamSession that exists despite the error runs: the sweep confirms and meters it.
+      if (await exams.environmentExists(name)) throw e;
+      await billing?.release(req.principal, decision).catch((err: unknown) => req.log.error({ err, attempt: name }, 'billing: could not release a failed exam start; the sweep closes it unbilled'));
+      throw e;
+    }
+    // The sweep confirms the attempt if this fails (the ExamSession exists).
+    await billing?.meterStart(req.principal, decision, { id: attempt.id, startedAt: attempt.startedAt }).catch((e: unknown) => req.log.error({ err: e, attempt: attempt.id }, 'billing: could not confirm usage start; the sweep confirms it'));
     return reply.code(201).send({ attempt });
   });
   app.post<{ Params: { examId: string }; Body: GrantExamRetakeRequest }>('/api/exams/:examId/retake-grants', assign, async (req, reply) => {

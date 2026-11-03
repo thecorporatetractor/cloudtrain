@@ -33,6 +33,9 @@ export const BLOCK_TITLE: Record<BillingBlockReason, string> = {
   payment_method_required: 'Add a payment method to start this lab',
   payment_overdue: 'A payment is overdue',
   spend_cap_reached: 'Monthly spend cap reached',
+  concurrent_limit: 'Too many labs running at once',
+  lab_hours_exhausted: 'Lab hours used up for this month',
+  exam_limit_reached: 'Exam simulations used up for this month',
 };
 
 export function blockAction(d: Pick<BillingBlockDetails, 'action' | 'requiredPlan'>): string {
@@ -47,6 +50,8 @@ export function blockAction(d: Pick<BillingBlockDetails, 'action' | 'requiredPla
       return 'Change the spend cap';
     case 'contact_admin':
       return 'See billing';
+    case 'end_session':
+      return 'See your running labs';
   }
 }
 
