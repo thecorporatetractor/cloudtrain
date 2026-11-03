@@ -5,7 +5,7 @@ import type { AuthDiscovery, LogoutResponse, SwitchOrgRequest } from '@cloudtrai
 import { withTenant } from '../db/index.js';
 import { badRequest, HttpError, unauthenticated } from '../errors.js';
 import { randomToken, type OidcClient } from '../oidc/client.js';
-import type { SessionStore } from '../oidc/sessions.js';
+import { csrfMatches, type SessionStore } from '../oidc/sessions.js';
 import { audit } from '../platform/audit.js';
 import { loadPrincipal, membershipsOf, orgForDomain, orgForIdp, provision, type IdentityClaims } from '../platform/identity.js';
 import { brokerOrigins, releaseForeignAddress } from '../platform/kc-address.js';
@@ -19,6 +19,34 @@ export interface AuthRouteDeps {
 }
 
 const STATE_TTL_MS = 15 * 60_000;
+/**
+ * Login CSRF: the callback must come back to the browser that started the
+ * login. Each login sets an HttpOnly cookie holding a random binding secret;
+ * the OIDC state is sha256(secret), so the state (public: it travels in the
+ * callback URL) does not reveal the cookie's value. The cookie is named by a
+ * hash of its state (one per state, so parallel logins in two tabs both work).
+ * A callback whose state has no matching cookie is refused, so an attacker's
+ * own callback link cannot sign a victim into the attacker's account.
+ *
+ * Over https the cookie is `__Host-` prefixed (Secure, Path=/, no Domain): a
+ * sibling subdomain cannot plant or overwrite it (cookie tossing), which is
+ * the only way left to pair an attacker's own state and cookie in a victim's
+ * browser. Plain-http development keeps an unprefixed cookie scoped to the
+ * callback path.
+ */
+const sha256url = (v: string) => createHash('sha256').update(v).digest('base64url');
+export const stateOf = (binding: string) => sha256url(binding);
+export const loginCookieName = (state: string, secure: boolean) => `${secure ? '__Host-' : ''}ct_login_${sha256url(state).slice(0, 16)}`;
+const loginCookieOptions = (secure: boolean) => ({ path: secure ? '/' : '/api/auth/callback', httpOnly: true, secure, sameSite: 'lax' as const });
+/**
+ * Login cookies one browser may hold at once. Over https they are Path=/, so every API request
+ * carries them: without a cap, many sign-in clicks (or a site driving the browser to
+ * /api/auth/login over and over) would pile them up until the Cookie header passed Node's header
+ * limit and every request failed with 431. A new login clears all but the newest ones; browsers
+ * send cookies of one path oldest first (RFC 6265, 5.4).
+ */
+export const MAX_PENDING_LOGINS = 3;
+const LOGIN_COOKIE = /^(?:__Host-)?ct_login_[A-Za-z0-9_-]{16}$/;
 /** Starting a login writes a state row. Per IP, and high enough for an office behind one address. */
 const LOGIN_PER_MINUTE = 120;
 
@@ -51,6 +79,8 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
   const web = ps.config.webUrl;
   const pub = { public: true } as const;
   const loginLimiter = new RateLimiter(LOGIN_PER_MINUTE);
+  // Callbacks are counted apart from login starts (one sign-in is one of each).
+  const callbackLimiter = new RateLimiter(LOGIN_PER_MINUTE);
 
   const loginError = (reply: FastifyReply, reason: string, message: string) => reply.redirect(`${web}/login?error=${encodeURIComponent(reason)}&message=${encodeURIComponent(message)}`, 302);
 
@@ -99,7 +129,8 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
   /** Writes the login state and sends the browser to the provider. `invite` is set only by the invitation link. */
   async function startLogin(req: FastifyRequest, reply: FastifyReply, p: { email?: string; returnTo?: string; orgId: string | null; idpHint?: string; invite?: string; reauth?: boolean }) {
     if (!loginLimiter.take(req.ip)) throw new HttpError(429, 'Too many requests, try again later', { code: 'rate_limited', details: { retryAfterSeconds: loginLimiter.resetIn(req.ip) } });
-    const state = randomToken(24);
+    const binding = randomToken(24);
+    const state = stateOf(binding);
     const nonce = randomToken(24);
     const verifier = randomToken(48);
     await ps.db.deleteFrom('auth_login_states').where('created_at', '<', new Date(Date.now() - STATE_TTL_MS)).execute();
@@ -108,6 +139,11 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
       .values({ state, verifier, nonce, return_to: safeReturnTo(p.returnTo), email: p.email?.trim().toLowerCase() ?? null, org_id: p.orgId, invite: p.invite ?? null })
       .execute();
     const url = await oidc.authorizationUrl({ state, nonce, verifier, ...(p.email ? { loginHint: p.email.trim() } : {}), ...(p.idpHint ? { idpHint: p.idpHint } : {}), ...(p.reauth ? { prompt: 'login' } : {}) });
+    // Older logins of this browser beyond the cap lose their cookie (and so can no longer complete).
+    const pending = Object.keys(req.cookies ?? {}).filter((n) => LOGIN_COOKIE.test(n));
+    for (const n of pending.slice(0, Math.max(0, pending.length - (MAX_PENDING_LOGINS - 1)))) reply.clearCookie(n, loginCookieOptions(n.startsWith('__Host-')));
+    // SameSite=Lax: sent on the IdP's top-level redirect back to the callback.
+    reply.setCookie(loginCookieName(state, store.secureCookie), binding, { ...loginCookieOptions(store.secureCookie), maxAge: STATE_TTL_MS / 1000 });
     return reply.redirect(url, 302);
   }
 
@@ -131,10 +167,18 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
     return startLogin(req, reply, { ...(q.email ? { email: q.email } : {}), ...(q.returnTo ? { returnTo: q.returnTo } : {}), orgId, ...(idpHint ? { idpHint } : {}), reauth: q.reauth === '1' });
   });
 
-  app.get<{ Querystring: { code?: string; state?: string; error?: string; error_description?: string } }>('/api/auth/callback', { config: pub }, async (req, reply) => {
+  app.get<{ Querystring: { code?: string; state?: string; error?: string; error_description?: string } }>('/api/auth/callback', { config: { ...pub, rateLimit: { perMinute: LOGIN_PER_MINUTE } } }, async (req, reply) => {
+    if (!callbackLimiter.take(req.ip)) throw new HttpError(429, 'Too many requests, try again later', { code: 'rate_limited', details: { retryAfterSeconds: callbackLimiter.resetIn(req.ip) } });
     const q = req.query;
     if (q.error) return loginError(reply, q.error, q.error_description ?? 'Sign-in was cancelled or failed.');
-    if (!q.code || !q.state) return loginError(reply, 'invalid_request', 'Missing code or state.');
+    if (typeof q.code !== 'string' || typeof q.state !== 'string' || !q.code || !q.state) return loginError(reply, 'invalid_request', 'Missing code or state.');
+    const cookieName = loginCookieName(q.state, store.secureCookie);
+    const bound = req.cookies?.[cookieName];
+    reply.clearCookie(cookieName, loginCookieOptions(store.secureCookie));
+    if (!bound || !csrfMatches(stateOf(bound), q.state)) {
+      req.log.warn('OIDC callback without the login cookie of its state (another browser, or login CSRF)');
+      return loginError(reply, 'invalid_state', 'The sign-in was started in another browser or has expired; please try again.');
+    }
     const st = await ps.db.deleteFrom('auth_login_states').where('state', '=', q.state).returningAll().executeTakeFirst();
     if (!st || st.created_at.getTime() < Date.now() - STATE_TTL_MS) return loginError(reply, 'invalid_state', 'The sign-in request expired; please try again.');
     let tokens;

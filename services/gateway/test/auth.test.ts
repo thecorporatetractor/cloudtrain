@@ -1,9 +1,11 @@
+import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FakeOidcProvider } from './fake-oidc.js';
 import { harness, Q, type Harness } from './harness.js';
 import { pgAvailable } from './pg.js';
 import { Sealer, SessionStore } from '../src/oidc/sessions.js';
 import { createDb } from '../src/db/index.js';
+import { loginCookieName, MAX_PENDING_LOGINS, stateOf } from '../src/routes/auth.js';
 import { inviteUser } from '../src/platform/admin.js';
 import { loadPrincipal, provision } from '../src/platform/identity.js';
 import { repairTenantIdps } from '../src/keycloak/repair.js';
@@ -61,6 +63,14 @@ const cookieOf = (res: { headers: Record<string, unknown> }) => {
   return set.find((c) => c.startsWith('ct_session='))?.split(';')[0];
 };
 
+/** The login-state cookie the login (or invitation) redirect set, as a Cookie header value. */
+const loginCookie = (res: { headers: Record<string, unknown> }) => {
+  const set = ([] as string[]).concat((res.headers['set-cookie'] as string | string[]) ?? []);
+  return set.find((c) => c.startsWith('ct_login_'))?.split(';')[0] ?? '';
+};
+/** The browser that started the login comes back to the callback with its cookie. */
+const callbackOf = (start: { headers: Record<string, unknown> }, code: string, state: string) => ({ url: `/api/auth/callback?code=${code}&state=${state}`, headers: { cookie: loginCookie(start) } });
+
 describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
   let op: FakeOidcProvider;
   let h: Harness;
@@ -80,7 +90,7 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
     expect(start.statusCode).toBe(302);
     const auth = new URL(start.headers.location as string);
     const { code, state } = op.authorize(auth.toString(), claims);
-    const cb = await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`);
+    const cb = await h.app.inject(callbackOf(start, code, state));
     return { start: auth, cb };
   }
 
@@ -90,6 +100,12 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
     const over = await h.app.inject({ url: '/api/auth/login', ...from });
     expect(over.statusCode).toBe(429);
     expect((await h.app.inject({ url: '/api/auth/login', remoteAddress: '203.0.113.78' })).statusCode).toBe(302);
+  });
+
+  it('limits how often one address can hit the callback', async () => {
+    const from = { remoteAddress: '203.0.113.79' };
+    for (let i = 0; i < 120; i++) expect((await h.app.inject({ url: '/api/auth/callback?code=x&state=y', ...from })).statusCode).toBe(302);
+    expect((await h.app.inject({ url: '/api/auth/callback?code=x&state=y', ...from })).statusCode).toBe(429);
   });
 
   it('discovers the org by verified email domain', async () => {
@@ -168,9 +184,83 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
   it('rejects a replayed or forged state', async () => {
     const start = await h.app.inject('/api/auth/login?email=amara.nwosu@quillmoor.example');
     const { code, state } = op.authorize(start.headers.location as string, { sub: Q.amara, email: 'amara.nwosu@quillmoor.example', name: 'Amara Nwosu' });
-    expect((await h.app.inject(`/api/auth/callback?code=${code}&state=forged`)).headers.location).toMatch(/error=invalid_state/);
-    expect((await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`)).statusCode).toBe(302);
-    expect((await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`)).headers.location).toMatch(/error=invalid_state/);
+    expect((await h.app.inject(callbackOf(start, code, 'forged'))).headers.location).toMatch(/error=invalid_state/);
+    expect((await h.app.inject(callbackOf(start, code, state))).statusCode).toBe(302);
+    expect((await h.app.inject(callbackOf(start, code, state))).headers.location).toMatch(/error=invalid_state/);
+  });
+
+  it('a repeated state or code parameter is an invalid request, not a server error', async () => {
+    for (const qs of ['code=c&state=a&state=b', 'code=a&code=b&state=s']) {
+      const res = await h.app.inject(`/api/auth/callback?${qs}`);
+      expect(res.statusCode).toBe(302);
+      expect(res.headers.location).toMatch(/error=invalid_request/);
+    }
+  });
+
+  it('completes a login only in the browser that started it (login CSRF)', async () => {
+    // The attacker starts a login, signs in at the IdP as themselves and sends the victim the callback link.
+    const attacker = await h.app.inject('/api/auth/login?email=amara.nwosu@quillmoor.example');
+    const raw = ([] as string[]).concat(attacker.headers['set-cookie'] as string).find((c) => c.startsWith('ct_login_'))!;
+    expect(raw).toMatch(/HttpOnly/);
+    expect(raw).toMatch(/SameSite=Lax/);
+    expect(raw).toMatch(/Path=\/api\/auth\/callback/);
+    const { code, state } = op.authorize(attacker.headers.location as string, { sub: Q.amara, email: 'amara.nwosu@quillmoor.example', name: 'Amara Nwosu' });
+    const victim = await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`);
+    expect(victim.headers.location).toMatch(/error=invalid_state/);
+    expect(cookieOf(victim)).toBeUndefined();
+    // Another login's cookie does not fit this state either.
+    const other = await h.app.inject('/api/auth/login?email=amara.nwosu@quillmoor.example');
+    expect((await h.app.inject(callbackOf(other, code, state))).headers.location).toMatch(/error=invalid_state/);
+    // Two logins in parallel (two tabs) each complete with their own cookie.
+    const tab2 = op.authorize(other.headers.location as string, { sub: Q.amara, email: 'amara.nwosu@quillmoor.example', name: 'Amara Nwosu' });
+    const done = await h.app.inject(callbackOf(other, tab2.code, tab2.state));
+    expect(done.headers.location).toBe('http://web.test/');
+    expect(([] as string[]).concat(done.headers['set-cookie'] as string).some((c) => c.startsWith(loginCookie(other).split('=')[0]! + '=;'))).toBe(true);
+  });
+
+  it('a browser holds a bounded number of login cookies, however many logins it starts', async () => {
+    // A cookie jar: what the browser would send next.
+    const jar = new Map<string, string>();
+    const apply = (res: { headers: Record<string, unknown> }) => {
+      for (const c of ([] as string[]).concat((res.headers['set-cookie'] as string | string[]) ?? [])) {
+        const [pair] = c.split(';') as [string];
+        const i = pair.indexOf('=');
+        const [name, value] = [pair.slice(0, i), pair.slice(i + 1)];
+        if (!value || /Max-Age=0|Expires=Thu, 01 Jan 1970/i.test(c)) jar.delete(name);
+        else jar.set(name, value);
+      }
+    };
+    const header = () => [...jar].map(([n, v]) => `${n}=${v}`).join('; ');
+    const starts: { location: string; cookie: string }[] = [];
+    for (let i = 0; i < 12; i++) {
+      const start = await h.app.inject({ url: '/api/auth/login?email=amara.nwosu@quillmoor.example', headers: { cookie: header() }, remoteAddress: '203.0.113.80' });
+      apply(start);
+      starts.push({ location: start.headers.location as string, cookie: loginCookie(start) });
+      expect([...jar.keys()].filter((n) => n.includes('ct_login_')).length).toBeLessThanOrEqual(MAX_PENDING_LOGINS);
+    }
+    // The newest logins complete; the oldest one's cookie is gone.
+    const claims = { sub: Q.amara, email: 'amara.nwosu@quillmoor.example', name: 'Amara Nwosu' };
+    const newest = op.authorize(starts.at(-1)!.location, claims);
+    expect((await h.app.inject({ url: `/api/auth/callback?code=${newest.code}&state=${newest.state}`, headers: { cookie: header() } })).headers.location).toBe('http://web.test/');
+    const oldest = op.authorize(starts[0]!.location, claims);
+    expect((await h.app.inject({ url: `/api/auth/callback?code=${oldest.code}&state=${oldest.state}`, headers: { cookie: header() } })).headers.location).toMatch(/error=invalid_state/);
+  });
+
+  it('the login cookie holds a secret the public state does not reveal (no planted cookie)', async () => {
+    const start = await h.app.inject('/api/auth/login?email=amara.nwosu@quillmoor.example');
+    const { code, state } = op.authorize(start.headers.location as string, { sub: Q.amara, email: 'amara.nwosu@quillmoor.example', name: 'Amara Nwosu' });
+    const [name, value] = loginCookie(start).split('=') as [string, string];
+    expect(name).toBe(loginCookieName(state, false));
+    expect(stateOf(value)).toBe(state);
+    // A cookie computed from the state alone (what an attacker who can set cookies could plant) is refused.
+    const planted = createHash('sha256').update(state).digest('base64url');
+    expect(value).not.toBe(planted);
+    expect((await h.app.inject({ url: `/api/auth/callback?code=${code}&state=${state}`, headers: { cookie: `${name}=${planted}` } })).headers.location).toMatch(/error=invalid_state/);
+  });
+
+  it('over https the login cookie is __Host- prefixed (a sibling subdomain cannot toss it)', () => {
+    expect(loginCookieName('abc', true)).toMatch(/^__Host-ct_login_[A-Za-z0-9_-]{16}$/);
+    expect(loginCookieName('abc', false)).toMatch(/^ct_login_[A-Za-z0-9_-]{16}$/);
   });
 
   it('refreshes server-side, and a refused refresh ends the session', async () => {
@@ -302,7 +392,7 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
   it('only redirects back inside the app', async () => {
     const start = await h.app.inject('/api/auth/login?returnTo=%2F%2Fevil.example%2Fx');
     const { code, state } = op.authorize(start.headers.location as string, { sub: Q.sofia, email: 'sofia.lindqvist@quillmoor.example', name: 'Sofia Lindqvist' });
-    expect((await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`)).headers.location).toBe('http://web.test/');
+    expect((await h.app.inject(callbackOf(start, code, state))).headers.location).toBe('http://web.test/');
   });
 
   describe('invitations and pre-provisioned identities only go to a trusted email', () => {
@@ -353,7 +443,7 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
       const link = await h.app.inject(`/api/auth/invite/${token}`);
       expect(link.statusCode).toBe(302);
       const { code, state } = op.authorize(link.headers.location as string, { sub: 'kc-yusuf', email, email_verified: false, name: 'Yusuf' });
-      const cb = await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`);
+      const cb = await h.app.inject(callbackOf(link, code, state));
       expect(cb.headers.location).toBe('http://web.test/');
       expect(await membership('kc-yusuf')).toMatchObject({ status: 'active' });
     });
@@ -559,7 +649,7 @@ describe('recent sign-in before a download or a deletion', () => {
       // The whole way through: an old auth_time in the ID token reaches the session and the route.
       const start = await h.app.inject(`/api/auth/login?email=${encodeURIComponent(p.email)}`);
       const { code, state } = oidc.authorize(start.headers.location as string, { sub: p.id, email: p.email, name: p.name, auth_time: Math.floor(Date.now() / 1000) - 3600 });
-      const cb = await h.app.inject(`/api/auth/callback?code=${code}&state=${state}`);
+      const cb = await h.app.inject(callbackOf(start, code, state));
       const cookie = ([cb.headers['set-cookie']].flat() as string[]).find((c) => c.startsWith('ct_session='))!.split(';')[0]!;
       const row = await h.t.owner.selectFrom('auth_sessions').select('authenticated_at').where('user_id', '=', p.id).orderBy('created_at', 'desc').limit(1).executeTakeFirstOrThrow();
       expect(row.authenticated_at!.getTime()).toBeLessThan(Date.now() - 3000_000);

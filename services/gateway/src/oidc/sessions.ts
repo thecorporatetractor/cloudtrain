@@ -256,6 +256,11 @@ export class SessionStore {
     reply.setCookie(SESSION_COOKIE, token, { path: '/', httpOnly: true, secure: this.opts.secureCookie, sameSite: 'lax', maxAge: this.opts.maxAgeSeconds });
   }
 
+  /** Whether cookies carry the Secure attribute (https public URL). */
+  get secureCookie(): boolean {
+    return this.opts.secureCookie;
+  }
+
   clearCookie(reply: FastifyReply) {
     reply.clearCookie(SESSION_COOKIE, { path: '/', httpOnly: true, secure: this.opts.secureCookie, sameSite: 'lax' });
   }
