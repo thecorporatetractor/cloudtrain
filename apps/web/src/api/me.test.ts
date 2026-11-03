@@ -57,6 +57,21 @@ describe('me query for a signed-out visitor', () => {
     expect(retry(0, new ApiError(401, 'Not signed in', 'unauthenticated'))).toBe(false);
     expect(retry(0, new ApiError(403, 'Forbidden', 'forbidden'))).toBe(false);
     expect(retry(0, new Error('network'))).toBe(true);
-    expect(retry(1, new Error('network'))).toBe(false);
+    // A cold gateway: network and server errors are retried for about half a minute, then shown.
+    expect(retry(4, new Error('network'))).toBe(true);
+    expect(retry(5, new Error('network'))).toBe(false);
+  });
+});
+
+describe('me query when the gateway is cold', () => {
+  it('retries server and network errors for about half a minute, never a 401 or 403', async () => {
+    const { retryMe, ME_RETRIES } = await import('./client');
+    expect(ME_RETRIES).toBeGreaterThanOrEqual(5);
+    const e503 = new ApiError(503, 'Service unavailable');
+    for (let i = 0; i < ME_RETRIES; i++) expect(retryMe(i, e503)).toBe(true);
+    expect(retryMe(ME_RETRIES, e503)).toBe(false);
+    expect(retryMe(0, new TypeError('Failed to fetch'))).toBe(true);
+    expect(retryMe(0, new ApiError(401, 'Not signed in'))).toBe(false);
+    expect(retryMe(0, new ApiError(403, 'Suspended'))).toBe(false);
   });
 });

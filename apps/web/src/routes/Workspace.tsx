@@ -1,14 +1,16 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Panel, Separator, usePanelRef, type Layout, type PanelSize } from 'react-resizable-panels';
-import { AlertTriangle, CheckCircle2, ChevronLeft, Eye, Keyboard, Lightbulb, Loader2, Maximize2, Megaphone, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronLeft, Eye, Keyboard, Lightbulb, Maximize2, Megaphone, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, useEndSession, useLab, useQuestions, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
 import { isRealApi } from '@/api/mode';
-import type { LabSession, SessionNotice, TopologyLink, ValidateResponse } from '@/api/types';
+import type { SessionNotice, TopologyLink, ValidateResponse } from '@/api/types';
 import { useScreenShortcuts, useShell } from '@/app/shell-context';
 import { BillingBlocked } from '@/components/billing';
 import { DifficultyBadge, SkillTags, StatusDot } from '@/components/domain';
 import { Badge, Button, ErrorState, Kbd, Skeleton, Tooltip } from '@/components/ui';
+import { ConnectionBanner } from '@/components/workspace/ConnectionBanner';
+import { EnvironmentState } from '@/components/workspace/EnvironmentState';
 import { PersistedGroup } from '@/components/ui/panels';
 import { TaskPanel } from '@/components/workspace/TaskPanel';
 import { TerminalArea, focusActiveTerminal, useTerminalModel } from '@/components/workspace/TerminalArea';
@@ -17,6 +19,7 @@ import { TopologyCanvas } from '@/components/workspace/Topology';
 import { useHotkeys } from '@/lib/hotkeys';
 import { useMediaQuery } from '@/lib/media';
 import { billingBlockOf } from '@/lib/billing';
+import { errorToast, loadView, sessionErrorPage, sessionLoadError } from '@/lib/loadState';
 import { personalize } from '@/lib/personalize';
 import { cn } from '@/lib/utils';
 import { workspaceRoute } from '@/router';
@@ -193,8 +196,11 @@ export function Workspace() {
         const all = r.summary.passed === r.summary.total;
         toast({ title: all ? 'All checks passed' : `${r.summary.passed} of ${r.summary.total} checks passed`, description: `Score ${r.summary.score} / 100`, tone: all ? 'ok' : r.summary.passed ? 'neutral' : 'warn' });
       },
+      onError: (e) => toast(errorToast('Validation did not run', e, () => runValidateRef.current())),
     });
   }, [search.s, validate, toast]);
+  const runValidateRef = useRef(runValidate);
+  runValidateRef.current = runValidate;
 
   const endLab = useCallback(() => {
     if (!search.s || end.isPending) return;
@@ -207,12 +213,19 @@ export function Workspace() {
     });
   }, [search.s, end, toast, navigate, labId]);
 
+  const revealHint = useCallback(
+    (i: number) => {
+      const attempt = () => reveal.mutate(i, { onError: (e) => toast(errorToast('Could not reveal the hint', e, attempt)) });
+      attempt();
+    },
+    [reveal, toast],
+  );
   const revealNext = useCallback(() => {
     const hints = lab.data?.spec.hints ?? [];
     const revealed = session.data?.revealedHints ?? [];
     const next = hints.findIndex((_, i) => !revealed.includes(i));
-    if (next >= 0) reveal.mutate(next);
-  }, [lab.data, session.data, reveal]);
+    if (next >= 0) revealHint(next);
+  }, [lab.data, session.data, revealHint]);
 
   /**
    * Keys the workspace takes before xterm sees them. Matched on the physical key (e.code)
@@ -293,6 +306,24 @@ export function Workspace() {
     );
   }
 
+  const sessionView = loadView(session);
+  // 404 starts a new session (above); anything else must not spin forever as "Requesting",
+  // and a loaded session that starts answering 403 says access was lost (not "Lost contact").
+  if (sessionErrorPage(sessionView, session.error)) {
+    const copy = sessionLoadError(session.error);
+    return (
+      <div className="page page-narrow">
+        <ErrorState title={copy.title} error={session.error} onRetry={() => void session.refetch()} />
+        <p className="small muted" style={{ textAlign: 'center' }}>
+          {copy.description}{' '}
+          <Link to="/labs/$labId" params={{ labId }} className="link-quiet">
+            Back to the lab
+          </Link>
+        </p>
+      </div>
+    );
+  }
+
   const l = effLab!;
   const s = session.data;
   const ended = s?.phase === 'failed' || s?.phase === 'expired' || s?.status === 'failed' || s?.status === 'expired';
@@ -307,7 +338,7 @@ export function Workspace() {
 
   const taskPanel = (
     <Panel id="task" panelRef={taskRef} collapsible collapsedSize="0%" minSize="18%" defaultSize="28%" maxSize="45%" onResize={onTaskResize} className="ws-task-panel">
-      <TaskPanel lab={l} session={s} validating={validate.isPending} onRevealHint={(i) => reveal.mutate(i)} revealing={reveal.isPending} ready={envReady} />
+      <TaskPanel lab={l} session={s} validating={validate.isPending} onRevealHint={revealHint} revealing={reveal.isPending} ready={envReady} />
     </Panel>
   );
 
@@ -414,6 +445,7 @@ export function Workspace() {
         </div>
       </header>
 
+      {sessionView === 'stale' && <ConnectionBanner what="the lab service" error={session.error} retrying={session.isFetching} onRetry={() => void session.refetch()} />}
       {observers.length > 0 && (
         <div className="ws-notice ws-notice-observed" role="status" aria-live="polite">
           <span className="row small" style={{ gap: 8 }}>
@@ -511,56 +543,6 @@ function NoticeBar({ notice, onDismiss }: { notice: SessionNotice; onDismiss: ()
         <span className="muted truncate">{notice.message}</span>
       </span>
       <Button variant="ghost" size="sm" iconOnly aria-label="Dismiss" icon={<X size={12} />} onClick={onDismiss} />
-    </div>
-  );
-}
-
-const phaseLabel: Record<NonNullable<LabSession['phase']>, string> = {
-  pending: 'Queued',
-  provisioning: 'Provisioning',
-  ready: 'Ready',
-  grading: 'Grading',
-  hibernated: 'Hibernated',
-  expired: 'Ended',
-  failed: 'Failed',
-};
-
-/** Real API mode: what stands in for the terminals until the environment is ready (or after it failed). */
-function EnvironmentState({ session, onRestart }: { session: LabSession | undefined; onRestart: () => void }) {
-  const failed = session?.status === 'failed' || session?.phase === 'failed';
-  const over = session?.status === 'expired' || session?.phase === 'expired';
-  const ready = session?.nodes.filter((n) => n.status === 'ready').length ?? 0;
-  const total = session?.nodes.length ?? 0;
-  return (
-    <div className="ws-env" role="status" aria-live="polite">
-      <div className="ws-env-card">
-        <div className="row" style={{ gap: 8 }}>
-          {failed ? <AlertTriangle size={15} className="text-err" /> : over ? <Power size={15} className="subtle" /> : <Loader2 size={15} className="spin subtle" aria-hidden />}
-          <strong>{failed ? 'The lab environment could not start' : over ? 'This session has ended' : session ? `Starting your lab environment · ${ready}/${total} nodes ready` : 'Requesting a lab environment'}</strong>
-          {session?.phase && <Badge tone={failed ? 'err' : 'neutral'}>{phaseLabel[session.phase]}</Badge>}
-        </div>
-        {session?.message && <p className="small muted ws-env-msg">{session.message}</p>}
-        {session && session.nodes.length > 0 && (
-          <ul className="ws-env-nodes">
-            {session.nodes.map((n) => (
-              <li key={n.name} className="row small" style={{ gap: 8 }}>
-                <StatusDot status={n.status} />
-                <span className="mono">{n.name}</span>
-                <span className="subtle xs">{n.status}</span>
-                {n.ip && <span className="subtle xs mono">{n.ip}</span>}
-                {n.message && <span className="subtle xs truncate">{n.message}</span>}
-              </li>
-            ))}
-          </ul>
-        )}
-        {(failed || over) && (
-          <div className="row" style={{ gap: 8 }}>
-            <Button variant="primary" size="sm" onClick={onRestart}>
-              Start a new session
-            </Button>
-          </div>
-        )}
-      </div>
     </div>
   );
 }

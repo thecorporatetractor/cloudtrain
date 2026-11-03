@@ -68,11 +68,15 @@ export function QuestionsPanel({ sessionId, ready }: Props) {
       </section>
     );
   }
-  if (view.isError || !v) {
+  // A failed background poll (team events poll every 10 s) keeps the questions and typed answers on screen.
+  if (!v) {
     return (
       <section className="task-section">
         <h2 className="task-h">Questions</h2>
-        <p className="small text-err">{view.error instanceof Error ? view.error.message : 'The questions could not be loaded.'}</p>
+        <p className="small text-err" role="alert">{view.error instanceof Error ? view.error.message : 'The questions could not be loaded.'}</p>
+        <Button variant="secondary" size="sm" loading={view.isFetching} onClick={() => void view.refetch()}>
+          Try again
+        </Button>
       </section>
     );
   }

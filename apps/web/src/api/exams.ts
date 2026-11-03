@@ -63,6 +63,11 @@ export function useFlagTask(attemptId: string) {
       qc.setQueryData<ExamAttemptState>(['exam-attempt', attemptId], (a) => (a ? { ...a, tasks: a.tasks.map((t) => (t.index === index ? { ...t, flagged } : t)) } : a));
     },
     onSuccess: (a) => qc.setQueryData(['exam-attempt', a.id], a),
+    // The optimistic flag did not stick: put the task back and fetch the server's view.
+    onError: (_e, { index, flagged }) => {
+      qc.setQueryData<ExamAttemptState>(['exam-attempt', attemptId], (a) => (a ? { ...a, tasks: a.tasks.map((t) => (t.index === index ? { ...t, flagged: !flagged } : t)) } : a));
+      void qc.invalidateQueries({ queryKey: ['exam-attempt', attemptId] });
+    },
   });
 }
 
@@ -74,6 +79,10 @@ export function useSubmitExam(attemptId: string) {
       qc.setQueryData(['exam-attempt', a.id], a);
       void qc.invalidateQueries({ queryKey: ['exams'] });
     },
+    // A lost response or a 409 can hide a submit the gateway did take (submit is idempotent:
+    // a graded or grading attempt answers with its state). Refetch, so a submitted exam moves
+    // on to grading instead of saying it was not submitted.
+    onError: () => void qc.invalidateQueries({ queryKey: ['exam-attempt', attemptId] }),
   });
 }
 

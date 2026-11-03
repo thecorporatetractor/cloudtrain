@@ -18,7 +18,7 @@ import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { SiteLayout } from '@/site/SiteLayout';
 import { CommandPalette } from './CommandPalette';
 import { PersonaSwitcher } from './PersonaSwitcher';
-import { ShellProvider, useShell } from './shell-context';
+import { ShellProvider, useShell, type ToastItem } from './shell-context';
 import { ShortcutsDialog } from './ShortcutsDialog';
 import { PrivacyNoticeDialog } from './PrivacyNotice';
 import { hrefFor, surfaceConfig } from '@/lib/surface';
@@ -486,6 +486,10 @@ export const roleLabel = (r: string): string => ({ learner: 'Learner', manager: 
 
 function Toasts() {
   const { toasts, dismissToast } = useShell();
+  return <ToastList toasts={toasts} onDismiss={dismissToast} />;
+}
+
+export function ToastList({ toasts, onDismiss }: { toasts: ToastItem[]; onDismiss: (id: number) => void }) {
   // The live region is always in the tree; only its children change, so screen readers announce new toasts.
   return (
     <div className="toasts" role="status" aria-live="polite" aria-relevant="additions">
@@ -497,8 +501,21 @@ function Toasts() {
               {t.title}
             </div>
             {t.description && <div className="xs muted">{t.description}</div>}
+            {t.action && (
+              <Button
+                variant="secondary"
+                size="sm"
+                style={{ marginTop: 6 }}
+                onClick={() => {
+                  onDismiss(t.id);
+                  t.action!.onClick();
+                }}
+              >
+                {t.action.label}
+              </Button>
+            )}
           </div>
-          <Button variant="ghost" size="sm" iconOnly aria-label="Dismiss" onClick={() => dismissToast(t.id)} icon={<X size={12} />} />
+          <Button variant="ghost" size="sm" iconOnly aria-label="Dismiss" onClick={() => onDismiss(t.id)} icon={<X size={12} />} />
         </div>
       ))}
     </div>

@@ -1,8 +1,10 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useRouterState } from '@tanstack/react-router';
 import { useEffect, useRef, type ReactNode } from 'react';
+import { useShell } from './shell-context';
 import { ApiError, UNAUTHENTICATED_EVENT, useMe } from '@/api/client';
 import { PageSkeleton } from '@/components/ui';
+import { AccountUnavailable, accountLoadFailed } from './access';
 import { HYBRID_PATHS, isHybridRoute, isSiteOnlyPath, ON_APP, PUBLIC_PATHS, SITE_PATHS } from '@/lib/surface';
 
 export { HYBRID_PATHS, PUBLIC_PATHS, SITE_PATHS };
@@ -35,6 +37,17 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const location = useRouterState({ select: (s) => s.location });
   const wasSignedIn = useRef(false);
   const openPage = isOpenPath(location.pathname);
+  const { toast } = useShell();
+  const hybridAccountFailed = isHybridPath(location.pathname) && accountLoadFailed(me);
+
+  // A hybrid page falls back to its visitor variant when /api/me fails (cold gateway, network):
+  // a signed-in user must be told, with a retry, instead of silently seeing the public page.
+  // Once per failure (errorUpdatedAt), not on every render or navigation.
+  useEffect(() => {
+    if (!hybridAccountFailed) return;
+    toast({ title: 'Could not load your account', description: 'You are seeing the public page. If you are signed in, try again in a moment.', tone: 'err', action: { label: 'Try again', onClick: () => void me.refetch() } });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hybridAccountFailed, me.errorUpdatedAt]);
 
   useEffect(() => {
     if (me.isSuccess) wasSignedIn.current = true;
@@ -57,7 +70,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }, [navigate, qc]);
 
   if (isPublicPath(location.pathname) || isSitePath(location.pathname)) return <>{children}</>;
-  if (me.isPending) {
+  if (waitForMe(openPage, me)) {
     return (
       <div className="page">
         <PageSkeleton />
@@ -68,8 +81,18 @@ export function AuthGate({ children }: { children: ReactNode }) {
     // Hybrid pages render their public variant; elsewhere the listener above already navigated.
     return openPage ? <>{children}</> : null;
   }
+  // App pages need the principal (navigation, permissions, the CSRF token): no empty shell.
+  if (!openPage && accountLoadFailed(me)) return <AccountUnavailable error={me.error} onRetry={() => void me.refetch()} />;
   return <>{children}</>;
 }
+
+/**
+ * Whether to hold the page behind a skeleton while `/api/me` loads. App pages wait for the
+ * principal (it retries for about half a minute on a cold gateway). Hybrid pages ('/', the
+ * catalog) wait only for the first answer: once an attempt failed they render their visitor
+ * variant at once, and switch to the signed-in one if a retry then succeeds.
+ */
+export const waitForMe = (openPage: boolean, me: { isPending: boolean; failureCount: number }) => me.isPending && !(openPage && me.failureCount > 0);
 
 /** True once `/api/me` answered with a principal (not while loading). */
 export function useSignedIn(): boolean {
