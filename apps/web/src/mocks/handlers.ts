@@ -12,7 +12,7 @@ import { eventHandlers } from './events';
 import { publicHandlers } from './public';
 import { privacyHandlers } from './privacy';
 import { annotateLab, annotateLabs, billingHandlers, gateLabStart, meterEnd, meterStart } from './billing';
-import { newSession, sessions } from './sessionStore';
+import { liveSessionOf, newSession, seededAt, seededSessionIds, sessions } from './sessionStore';
 
 /* ------------------------------------------------------------------ */
 /* In-memory state (resets on reload)                                  */
@@ -179,11 +179,22 @@ const coreHandlers = [
     return HttpResponse.json(annotateLab(lab));
   }),
 
+  // The caller's sessions of a lab, newest first: what Resume reattaches to.
+  http.get('/api/labs/:id/sessions', async ({ params }) => {
+    await delay(80);
+    if (!labById.has(String(params.id))) return HttpResponse.json({ error: 'Lab not found' }, { status: 404 });
+    // The new learner has started nothing: the demo's running sessions are not theirs.
+    const cold = currentSession()?.userId === COLD_START_USER;
+    return HttpResponse.json([...sessions.values()].filter((s) => s.labId === String(params.id) && !(cold && seededSessionIds.has(s.id))).sort((a, b) => b.startedAt.localeCompare(a.startedAt)));
+  }),
   http.post('/api/labs/:id/sessions', async ({ params }) => {
     await delay(600);
     const lab = labById.get(String(params.id));
     if (!lab) return HttpResponse.json({ error: 'Lab not found' }, { status: 404 });
     // Billing gate and metering, as the gateway does (docs/billing.md).
+    // Idempotent, as the gateway: a lab that already runs for this person is reattached to (200).
+    const live = liveSessionOf(lab.metadata.id, currentSession()?.userId !== COLD_START_USER);
+    if (live) return HttpResponse.json(live, { status: 200 });
     const refused = gateLabStart(lab);
     if (refused) return refused;
     const created = newSession(lab.metadata.id);
@@ -194,7 +205,7 @@ const coreHandlers = [
     await delay(120);
     const s = sessions.get(String(params.id));
     if (!s) return HttpResponse.json({ error: 'Session not found' }, { status: 404 });
-    return HttpResponse.json({ ...s, notices: mockNotices(s.startedAt, s.id) });
+    return HttpResponse.json({ ...s, notices: mockNotices(seededSessionIds.has(s.id) ? seededAt : s.startedAt, s.id) });
   }),
   http.delete('/api/sessions/:id', async ({ params }) => {
     await delay(150);

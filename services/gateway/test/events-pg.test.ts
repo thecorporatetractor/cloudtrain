@@ -74,8 +74,11 @@ describe.skipIf(!available)('CTF events (teams, shared progress, scoreboard, exp
     expect(ls(Q.lucas).spec.seed).not.toBe(ls(Q.sofia).spec.seed);
     expect(ls(Q.lucas).metadata.labels).toMatchObject({ [LABEL_CTF_EVENT]: ev.id, [LABEL_CTF_TEAM]: owls });
     expect(Date.parse(ls(Q.lucas).spec.expiresAt!)).toBeLessThanOrEqual(Date.parse(ev.endsAt));
-    // Starting again resumes the same session.
-    expect((await start(Q.lucas)).json().id).toBe(sessions[Q.lucas]);
+    // Starting again resumes the same session; it says whose event it is (the lab page does not resume it).
+    const resumed = (await start(Q.lucas)).json();
+    expect(resumed.id).toBe(sessions[Q.lucas]);
+    expect(resumed.eventId).toBe(ev.id);
+    expect((await as(h, Q.lucas).get(`/api/labs/${LAB}/sessions`)).json()).toEqual([expect.objectContaining({ id: sessions[Q.lucas], eventId: ev.id })]);
 
     expect((await answer(Q.lucas, 'q-attacker-ip', '203.0.113.77')).json()).toMatchObject({ correct: true });
     const mei = (await as(h, Q.mei).get(`/api/sessions/${sessions[Q.mei]}/questions`)).json();

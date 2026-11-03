@@ -278,6 +278,7 @@ export const eventHandlers = [
     const me = e.participants.get(mine());
     if (!me) return HttpResponse.json({ error: 'Join the event first.', code: 'forbidden' }, { status: 403 });
     const s = newSession(String(params.labId));
+    s.eventId = e.id; // the event's, never reattached to from the lab page
     const team = e.teams.find((t) => t.id === me.teamId);
     sessionEvents.set(s.id, { id: e.id, title: e.title, ...(team ? { teamId: team.id, teamName: team.name } : {}), endsAt: e.endsAt, scoring: e.scoring });
     // Teammates already solved the first questions in the seeded live event.

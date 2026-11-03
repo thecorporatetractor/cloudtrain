@@ -403,7 +403,8 @@ export const paths: Path[] = [
 ];
 
 const completed = new Set(['orchard-psa-baseline', 'orchard-worker-upgrade', 'orchard-ingress-tls-rotation', 'harbor-ssh-key-only', 'ledger-rbac-least-privilege']);
-const inProgress = new Set(['orchard-netpol-isolation', 'quill-lvm-extend']);
+/** Labs the demo learner has started: each has a running mock session at load, so Resume reattaches to it. */
+export const inProgress = new Set(['orchard-netpol-isolation', 'quill-lvm-extend']);
 
 export const labSummaries: LabSummary[] = labs.map((l) => {
   const skillIds = Array.from(new Set(l.spec.checks.flatMap((c) => c.skills)));
