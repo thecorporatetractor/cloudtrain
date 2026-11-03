@@ -373,20 +373,38 @@ func (d *VClusterDriver) valuesFor(ref NodeRef, release, podRuntimeClass string)
 	if err != nil {
 		return nil, err
 	}
+	statefulSet := map[string]any{
+		"persistence": map[string]any{"volumeClaim": vc},
+		"labels":      labels,
+		"pods":        map[string]any{"labels": labels},
+		"resources":   vclusterControlPlaneResources,
+	}
 	vals := map[string]any{
 		"experimental": map[string]any{"deploy": map[string]any{"vcluster": map[string]any{"manifests": manifests}}},
 		"controlPlane": map[string]any{
-			"proxy": map[string]any{"extraSANs": []string{release + "." + d.hostNS(ref) + ".svc"}},
-			"statefulSet": map[string]any{
-				"persistence": map[string]any{"volumeClaim": vc},
-				"labels":      labels,
-				"pods":        map[string]any{"labels": labels},
-				"resources":   vclusterControlPlaneResources,
-			},
+			"proxy":       map[string]any{"extraSANs": []string{release + "." + d.hostNS(ref) + ".svc"}},
+			"statefulSet": statefulSet,
 		},
 	}
+	// Synced pods: the sandbox RuntimeClass and the lab pool's tolerations,
+	// in one map (two writes of vals["sync"] would drop one of them).
+	syncedPods := map[string]any{}
 	if podRuntimeClass != "" {
-		vals["sync"] = map[string]any{"toHost": map[string]any{"pods": map[string]any{"runtimeClassName": podRuntimeClass}}}
+		syncedPods["runtimeClassName"] = podRuntimeClass
+		// The control plane (the virtual API server a learner is admin of)
+		// runs in the sandbox too: the vcluster placement policy admits only
+		// the tier V RuntimeClass in ct-vc-* under the production profile.
+		statefulSet["runtimeClassName"] = podRuntimeClass
+	}
+	// The lab node pool: the control plane and the pods it syncs.
+	if sched, tols := d.Container.labPlacement().vclusterValues(); sched != nil {
+		statefulSet["scheduling"] = sched
+		if len(tols) > 0 {
+			syncedPods["enforceTolerations"] = tols
+		}
+	}
+	if len(syncedPods) > 0 {
+		vals["sync"] = map[string]any{"toHost": map[string]any{"pods": syncedPods}}
 	}
 	return yaml.Marshal(vals)
 }

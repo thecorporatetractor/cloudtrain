@@ -109,6 +109,8 @@ type preflightOpts struct {
 	tiers                              map[string]drivers.SandboxTier
 	// systemdImage, with probe: a tier-B systemd image to boot in each sandbox.
 	systemdImage string
+	// labPool is the manager's --lab-node-selector/--lab-tolerations.
+	labPool drivers.LabPlacement
 }
 
 func cmdPreflight(args []string, stdout, stderr io.Writer) int {
@@ -128,6 +130,8 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 	sbCM := fl.String("sandbox-configmap", "", "write the sandbox verdict per tier as the ConfigMap the orchestrator reads (--sandbox-preflight) to this file (- = stdout; the report then goes to stderr); apply it with kubectl apply -f")
 	sbCMName := fl.String("sandbox-configmap-name", "cloudtrain-system/"+sandboxPreflightDefault, "<namespace>/<name> of that ConfigMap (Helm: <release namespace>/<orchestrator.sandboxPreflightConfigMap>)")
 	systemdImage := fl.String("systemd-image", "", "with --probe: a tier-B systemd image (e.g. cloudtrain/deb-sys:24.04, on the nodes) to boot in each sandbox RuntimeClass and exec into")
+	labSelector := fl.String("lab-node-selector", "", "the orchestrator's --lab-node-selector: check the lab pool and the system pool are tainted apart")
+	labTolerations := fl.String("lab-tolerations", "", "the orchestrator's --lab-tolerations")
 	asJSON := fl.Bool("json", false, "print the report as JSON")
 	if err := fl.Parse(args); err != nil {
 		return 2
@@ -146,6 +150,11 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
+	labPool, err := drivers.ParseLabPlacement(*labSelector, *labTolerations)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	root := *repoRoot
 	if root == "" {
 		root = findRepoRoot()
@@ -157,7 +166,7 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 	}
 	o := preflightOpts{mode: *mode, probe: *probe, toolsImage: *toolsImage, mtu: *mtu, timeout: *timeout,
 		modulesFile: filepath.Join(root, "deploy", "scripts", "lab-kernel-modules.txt"), systemdImage: *systemdImage,
-		sandboxesConfig: *sandboxesConfig, sandboxes: *sandboxes, tierRC: *tierRC}
+		sandboxesConfig: *sandboxesConfig, sandboxes: *sandboxes, tierRC: *tierRC, labPool: labPool}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+2*time.Minute)
 	defer cancel()
 	rep, sbVerdict, err := runNetworkPreflight(ctx, cfg, o, stderr)
@@ -245,6 +254,7 @@ func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts,
 	rep := &pfReport{Section: "network, sandbox"}
 	mode := evaluateNetwork(cl, o.mode, rep)
 	rep.Mode = string(mode)
+	rep.Checks = append(rep.Checks, labPoolChecks(cl.Nodes, o.labPool)...)
 	var ex drivers.PodExecutor
 	if o.probe {
 		if ex, err = drivers.NewRESTPodExecutor(cfg); err != nil {
