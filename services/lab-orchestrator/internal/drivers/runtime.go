@@ -62,6 +62,8 @@ type RuntimeOptions struct {
 	DenyLearnerSudo bool
 	// RequireIsolation: the production isolation profile (isolation.go).
 	RequireIsolation bool
+	// Placement: the lab node pool (placement.go).
+	Placement LabPlacement
 	// NamespaceAccess, when set, binds the manager's session permissions in
 	// the namespaces drivers create (vcluster host namespaces).
 	NamespaceAccess NamespaceAccess
@@ -112,6 +114,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		PersistentHome: o.PersistentHome, HomeStorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
 		UserNamespaces: o.UserNamespaces, DenyLearnerSudo: o.DenyLearnerSudo,
 		RequireIsolation: o.RequireIsolation,
+		Placement:        o.Placement,
 	}
 	disks := o.VMDisks
 	if disks.StorageClass == "" {

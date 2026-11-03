@@ -8,7 +8,10 @@
 #     manager itself as the only subject (vcluster's own Role binding is a Role,
 #     which RBAC already limits to what the manager holds there);
 #   - Kube-OVN VPCs and subnets: only the ones carrying its managed-by label, so
-#     ovn-cluster, ovn-default and join cannot be changed.
+#     ovn-cluster, ovn-default and join cannot be changed;
+#   - pods/exec in the ovn-central namespace (kube-system): only into the
+#     ovn-central pods (names ovn-central-*), although its Role there allows
+#     exec into every pod (RBAC cannot name generated pod names).
 # Needs Kubernetes 1.30+ (ValidatingAdmissionPolicy GA). Per-instance names are
 # rewritten by deploy/scripts/orchestrator-deploy.sh and the Helm chart.
 apiVersion: admissionregistration.k8s.io/v1
@@ -31,6 +34,10 @@ spec:
         apiVersions: ["*"]
         operations: [CREATE, UPDATE, DELETE]
         resources: [vpcs, subnets]
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CONNECT]
+        resources: [pods/exec, pods/attach]
   matchConditions:
     - name: lab-orchestrator
       expression: "request.userInfo.username == 'system:serviceaccount:cloudtrain-system:lab-orchestrator'"
@@ -72,6 +79,11 @@ spec:
       reason: Forbidden
     - expression: "request.resource.group != 'kubeovn.io' || (variables.managed && variables.wasManaged)"
       message: the lab-orchestrator may only change Kube-OVN VPCs and subnets it created (managed-by cloudtrain-lab-orchestrator)
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'pods' || !(request.subResource in ['exec', 'attach']) ||
+        request.namespace != 'kube-system' || request.name.startsWith('ovn-central-')
+      message: in the ovn-central namespace the lab-orchestrator may exec only into the ovn-central pods
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

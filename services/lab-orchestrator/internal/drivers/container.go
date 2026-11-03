@@ -110,6 +110,17 @@ type ContainerDriver struct {
 	// pod that would run neither in a sandbox RuntimeClass nor in a user
 	// namespace (see isolation.go).
 	RequireIsolation bool
+	// Placement steers lab pods and VMs onto the lab node pool
+	// (--lab-node-selector, --lab-tolerations; see placement.go).
+	Placement LabPlacement
+}
+
+// labPlacement is d.Placement (none for a nil driver).
+func (d *ContainerDriver) labPlacement() LabPlacement {
+	if d == nil {
+		return LabPlacement{}
+	}
+	return d.Placement
 }
 
 var (
@@ -234,6 +245,7 @@ func (d *ContainerDriver) BuildPod(ref NodeRef) *corev1.Pod {
 		d.decorateEntryPod(ref, pod)
 	}
 	hardenPod(pod)
+	d.Placement.ApplyToPod(&pod.Spec)
 	return pod
 }
 

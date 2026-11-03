@@ -156,6 +156,18 @@ check "vcluster host services: no mutating policy before 1.36" bash -c "! grep -
 render -f "$CHART/examples/values-kind.yaml" --api-versions admissionregistration.k8s.io/v1/MutatingAdmissionPolicy --set orchestrator.rbac.admissionPolicy=false >"$OUT/map-off.yaml"
 check "vcluster host services: none without the admission policies" bash -c "! grep -q '^kind: MutatingAdmissionPolicy' '$OUT/map-off.yaml'"
 
+check "rbac: ovn-central exec scoped by the admission policy" q 'select(.kind == "ValidatingAdmissionPolicy") | (.spec.matchConstraints.resourceRules[] | select(.operations[0] == "CONNECT") | .resources[0] == "pods/exec") and ([.spec.validations[] | .expression | select(contains("request.name.startsWith") and contains("ovn-central-") and contains("kube-system"))] | length == 1)' "$K"
+render -f "$CHART/examples/values-kind.yaml" --set orchestrator.rbac.ovnCentral.namespace=kube-ovn --set orchestrator.rbac.ovnCentral.selector=app=central >"$OUT/ovn-ns.yaml"
+check "rbac: ovn-central namespace and pod prefix follow the values" q '[select(.kind == "ValidatingAdmissionPolicy") | .spec.validations[] | .expression | select(contains("request.name.startsWith") and contains("central-") and contains("kube-ovn") and (contains("kube-system") | not))] | length == 1' "$OUT/ovn-ns.yaml"
+
+# Lab node pool: no placement by default; the AKS example pins labs to a tainted pool
+# and the platform to the system pool.
+check "lab pool off by default" bash -c "! yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-orchestrator\") | .spec.template.spec.containers[0].args[] | select(test(\"^--lab-\"))' '$OUT/values-kind.yaml'"
+check "aks: lab pool flags" q '[select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--lab-node-selector=cloudtrain.dev/pool=labs" or . == "--lab-tolerations=cloudtrain.dev/labs=true:NoSchedule")] | length == 2' "$OUT/values-aks-app-routing.yaml"
+check "aks: vcluster placement policy (lab selector or tier V class; lab tolerations only)" q 'select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "ct-cloudtrain-orchestrator-cloudtrain-vcluster-placement") | ([.spec.validations[].expression | select(contains("kata-vm-isolation") and contains("cloudtrain.dev/pool"))] | length == 1) and ([.spec.validations[].expression | select(contains("cloudtrain.dev/labs") and (contains("CriticalAddonsOnly") | not))] | length == 1) and ([.spec.validations[].expression | select(contains("nodeName"))] | length == 1) and ([.spec.validations[].expression | select(contains("hostUsers") and contains("kata-vm-isolation"))] | length == 1)' "$OUT/values-aks-app-routing.yaml"
+check "aks: platform tolerates the tainted system pool" q '[select(.kind == "Deployment") | .spec.template.spec.tolerations[0].key == "CriticalAddonsOnly"] | all' "$OUT/values-aks-app-routing.yaml"
+check "aks: platform on the system pool" q '[select(.kind == "Deployment") | .spec.template.spec.nodeSelector["kubernetes.azure.com/mode"] == "system"] | all' "$OUT/values-aks-app-routing.yaml"
+
 # Tier sandboxes: off by default (no flag, no ConfigMap, no mount); set, a
 # SandboxConfig ConfigMap the manager reads and the optional preflight mount.
 check "sandboxes off by default" bash -c "! yq -e 'select(.kind == \"Deployment\" and .metadata.name == \"ct-cloudtrain-orchestrator\") | .spec.template.spec | (.containers[0].args[] | select(test(\"sandbox|tier-runtime\"))), (.volumes[] | select(.name | test(\"sandbox\")))' '$OUT/values-kind.yaml' && ! yq -e 'select(.kind == \"ConfigMap\" and .metadata.name == \"ct-cloudtrain-orchestrator-sandboxes\")' '$OUT/values-kind.yaml'"
@@ -197,6 +209,12 @@ refuse "bad sandbox tier" "invalid propertyName" -f "$CHART/examples/values-kind
 refuse "production profile without sandboxes" "production needs orchestrator.sandboxes" -f "$CHART/examples/values-kind.yaml" --set orchestrator.isolation.profile=production
 refuse "production profile without a tier V sandbox" "orchestrator.sandboxes.V" -f "$CHART/examples/values-kind.yaml" --set orchestrator.isolation.profile=production --set orchestrator.sandboxes.B.runtimeClass=kata
 refuse "unknown isolation profile" "isolation" -f "$CHART/examples/values-kind.yaml" --set orchestrator.isolation.profile=strict
+
+refuse "production profile without a lab pool" "needs orchestrator.labNodes" -f "$CHART/examples/values-aks-app-routing.yaml" --set orchestrator.labNodes.nodeSelector=null --set orchestrator.labNodes.tolerations=null
+refuse "lab pool without platform node selectors" "pin the platform" -f "$CHART/examples/values-kind.yaml" --set orchestrator.labNodes.nodeSelector.pool=labs --set orchestrator.sandboxes.V.runtimeClass=kata
+refuse "lab pool without a tier V sandbox" "sandboxes.V is required" -f "$CHART/examples/values-kind.yaml" --set orchestrator.labNodes.nodeSelector.pool=labs --set orchestrator.nodeSelector.sys=x --set gateway.nodeSelector.sys=x --set web.nodeSelector.sys=x
+refuse "lab tolerations without a lab node selector" "needs orchestrator.labNodes.nodeSelector" -f "$CHART/examples/values-kind.yaml" --set 'orchestrator.labNodes.tolerations[0]=cloudtrain.dev/labs=true:NoSchedule' --set orchestrator.sandboxes.V.runtimeClass=kata --set orchestrator.nodeSelector.sys=x --set gateway.nodeSelector.sys=x --set web.nodeSelector.sys=x
+refuse "bad lab toleration" "tolerations" -f "$CHART/examples/values-kind.yaml" --set 'orchestrator.labNodes.tolerations[0]=k=v:Sometimes'
 refuse "sandboxes and tierRuntimeClasses" "exclusive" -f "$CHART/examples/values-kind.yaml" --set orchestrator.sandboxes.B.runtimeClass=kata --set orchestrator.tierRuntimeClasses.B=kata
 
 # Dev sign-in-as is never set by the chart.

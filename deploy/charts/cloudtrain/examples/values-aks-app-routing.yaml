@@ -31,6 +31,11 @@ gateway:
     clientId: <app-registration-client-id>
   # Azure CNI overlay pod CIDR (default 10.244.0.0/16) holds the NGINX pods.
   trustProxy: "10.244.0.0/16"
+  nodeSelector: {kubernetes.azure.com/mode: system}
+  tolerations: [{key: CriticalAddonsOnly, operator: Exists}]
+web:
+  nodeSelector: {kubernetes.azure.com/mode: system}
+  tolerations: [{key: CriticalAddonsOnly, operator: Exists}]
 orchestrator:
   storageClass: managed-csi-premium
   # Azure CNI overlay pod CIDR: vcluster Endpoints may point only there.
@@ -46,6 +51,18 @@ orchestrator:
     C: {runtimeClass: kata-vm-isolation, fallback: fail}
     "N": {runtimeClass: kata-vm-isolation, fallback: fail}   # quoted: bare N is YAML 1.1 false
     V: {runtimeClass: kata-vm-isolation, fallback: fail}     # pods learners create inside vclusters
+  # Lab pods and VMs on their own tainted, autoscaled pool (can scale to zero):
+  #   az aks nodepool add -g <rg> --cluster-name <cluster> -n labs --min-count 0 --max-count 20 \
+  #     --enable-cluster-autoscaler --labels cloudtrain.dev/pool=labs \
+  #     --node-taints cloudtrain.dev/labs=true:NoSchedule
+  # The platform stays on the system pool (gateway/web/orchestrator nodeSelector).
+  # Taint that pool so only the platform (and AKS add-ons) run there:
+  #   az aks nodepool update ... -n system --node-taints CriticalAddonsOnly=true:NoSchedule
+  labNodes:
+    nodeSelector: {cloudtrain.dev/pool: labs}
+    tolerations: ["cloudtrain.dev/labs=true:NoSchedule"]
+  nodeSelector: {kubernetes.azure.com/mode: system}
+  tolerations: [{key: CriticalAddonsOnly, operator: Exists}]
   images:
     mirrors:
       - ghcr.io/thecorporatetractor/cloudtrain=myacr.azurecr.io/cloudtrain

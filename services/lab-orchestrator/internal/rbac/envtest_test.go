@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
@@ -292,6 +293,45 @@ func TestEnvtestScopedRBAC(t *testing.T) {
 			} else if !strings.Contains(err.Error(), "ValidatingAdmissionPolicy") {
 				t.Errorf("%s: denied, but not by the policy: %v", name, err)
 			}
+		}
+	})
+	t.Run("exec in kube-system only into ovn-central pods", func(t *testing.T) {
+		// The Role allows exec into every kube-system pod (RBAC cannot name
+		// generated pod names); the policy narrows it to ovn-central-*.
+		_ = admin.Create(ctx, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "default"}})
+		for _, n := range []string{"ovn-central-7d9f-abcde", "coredns-5d78c9869d-x2x4z"} {
+			p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: n},
+				Spec: corev1.PodSpec{AutomountServiceAccountToken: ptrFalse(), Containers: []corev1.Container{{Name: "c", Image: "busybox"}}}}
+			if err := admin.Create(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cs, err := kubernetes.NewForConfig(saCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec := func(pod string) error {
+			return cs.CoreV1().RESTClient().Post().Namespace("kube-system").Resource("pods").Name(pod).SubResource("exec").
+				Param("container", "c").Param("command", "true").Param("stdout", "true").Do(ctx).Error()
+		}
+		// Not scheduled, so exec fails after admission, but not by the policy.
+		if err := exec("ovn-central-7d9f-abcde"); err == nil || strings.Contains(err.Error(), "ValidatingAdmissionPolicy") {
+			t.Errorf("exec into ovn-central: %v", err)
+		}
+		err = exec("coredns-5d78c9869d-x2x4z")
+		if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "ValidatingAdmissionPolicy") {
+			t.Errorf("exec into another kube-system pod: want denied by the policy, got %v", err)
+		}
+		// Exec into lab pods (setup, grading) is not the policy's business.
+		_ = admin.Create(ctx, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: "ctv-lab", Name: "default"}})
+		if err := admin.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ctv-lab", Name: "lab-node"},
+			Spec: corev1.PodSpec{AutomountServiceAccountToken: ptrFalse(), Containers: []corev1.Container{{Name: "c", Image: "busybox"}}}}); err != nil {
+			t.Fatal(err)
+		}
+		err = cs.CoreV1().RESTClient().Post().Namespace("ctv-lab").Resource("pods").Name("lab-node").SubResource("exec").
+			Param("container", "c").Param("command", "true").Param("stdout", "true").Do(ctx).Error()
+		if err == nil || strings.Contains(err.Error(), "ValidatingAdmissionPolicy") {
+			t.Errorf("exec into a lab pod: %v", err)
 		}
 	})
 }
@@ -590,6 +630,8 @@ func TestEnvtestVClusterHostServices(t *testing.T) {
 		t.Errorf("NodePort elsewhere: type %s, ports %+v, %v", np.Spec.Type, np.Spec.Ports, err)
 	}
 }
+
+func ptrFalse() *bool { f := false; return &f }
 
 func endpoints(ns, name, ip string) *corev1.Endpoints { //nolint:staticcheck // what vcluster syncs for selector-less Services
 	return &corev1.Endpoints{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, //nolint:staticcheck // see above
