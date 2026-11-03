@@ -551,6 +551,42 @@ Sandboxing (`kata-vm-isolation`) with `fallback: fail`; see
 `examples/values-aks-app-routing.yaml`. Catalog tiers of one letter that YAML 1.1 reads
 as booleans (`N`, `Y`) must be quoted.
 
+## Virtual cluster isolation
+
+Learners are cluster-admin inside their vclusters, so the host side decides:
+
+- Synced pods run in the tier `V` sandbox RuntimeClass when configured. The production
+  profile refuses vclusters without it.
+- Each `ct-vc-*` namespace gets a ResourceQuota (no LoadBalancer or NodePort) and a
+  LimitRange. The `lab-vcluster-host` admission policy refuses Services with
+  externalIPs, LoadBalancer or NodePort and Ingresses there, and Endpoints or
+  EndpointSlices outside `orchestrator.vclusterPodCIDRs` or at the wireserver. That
+  allowlist needs an overlay pod network (AKS: Azure CNI overlay). In node-subnet mode
+  pods share the VNet range; the manager detects this at startup (a node address
+  inside the pod CIDRs) and refuses to start under the production profile. vcluster 0.37 copies a
+  Service's type and externalIPs to the host; Ingress sync is off by default.
+- On Kubernetes 1.36+ the `lab-vcluster-host-services` MutatingAdmissionPolicy turns
+  the host copy of a NodePort or LoadBalancer Service into a plain ClusterIP Service
+  (no node ports, externalIPs or load balancer fields). Inside the vcluster the
+  Service keeps its type and gets a node port from the virtual API server, so labs
+  that create NodePort Services (Helm `service.type=NodePort`, `kubectl expose
+  --type=NodePort`) work, but nothing is published on the host's nodes. A
+  LoadBalancer Service inside the vcluster stays `<pending>`. The validating policy
+  still refuses anything that is not ClusterIP or headless, so if the mutating policy
+  is missing (older clusters; the chart renders it only when the API server serves
+  `admissionregistration.k8s.io/v1` MutatingAdmissionPolicy, for `helm template`
+  pass `--api-versions admissionregistration.k8s.io/v1/MutatingAdmissionPolicy`)
+  such Services are refused instead.
+- The control plane pod gets a NetworkPolicy. Egress to the API server goes only to the
+  `default/kubernetes` addresses. When they are unknown, the production profile
+  refuses; other profiles fall back to public addresses on 443/6443.
+- Synced pods get no seccomp profile from anyone: Pod Security baseline allows it
+  unset. Turn on kubelet `seccompDefault` on the lab nodes (kind:
+  `deploy/kind/cluster.yaml`; AKS: `--kubelet-config` with `"seccompDefault":
+  "RuntimeDefault"` on the lab pool) so it is `RuntimeDefault`.
+  `--vcluster-pod-security=restricted` would require it outright, but it also refuses
+  root, which most of the 126 vcluster labs' stock images need.
+
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.
