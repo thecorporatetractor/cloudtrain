@@ -1,0 +1,30 @@
+{{- /*
+The production isolation profile fails closed in the chart too: every lab
+isolation layer that only a value turns on must be on. The sandboxes and the
+lab pool are checked where they render (orchestrator.yaml, lab-placement-policy.yaml).
+*/}}
+{{- if .Values.orchestrator.enabled }}
+{{- if eq ((.Values.orchestrator.isolation).profile | default "dev") "production" }}
+{{- $labs := .Values.networkPolicy.labs | default dict }}
+{{- if not $labs.denyCloudMetadata }}
+{{- fail "orchestrator.isolation.profile production needs networkPolicy.labs.denyCloudMetadata (lab pods never reach link-local IMDS or the wireserver; Cilium)" }}
+{{- end }}
+{{- if not $labs.defaultDeny }}
+{{- fail "orchestrator.isolation.profile production needs networkPolicy.labs.defaultDeny (with orchestrator.networkMode secondary)" }}
+{{- end }}
+{{- $cap := .Values.gateway.capacity | default dict }}
+{{- if not (gt (int ($cap.maxActiveSessions | default 0)) 0) }}
+{{- fail "orchestrator.isolation.profile production needs gateway.capacity.maxActiveSessions > 0 (a platform session cap)" }}
+{{- end }}
+{{- $q := .Values.sessions.quota | default dict }}
+{{- if not (hasKey $q "count/labsessions.labs.cloudtrain.dev") }}
+{{- fail "orchestrator.isolation.profile production needs sessions.quota with count/labsessions.labs.cloudtrain.dev (the hard session cap behind gateway.capacity)" }}
+{{- end }}
+{{- if not (and (hasKey $q "requests.ephemeral-storage") (hasKey $q "limits.ephemeral-storage")) }}
+{{- fail "orchestrator.isolation.profile production needs sessions.quota requests.ephemeral-storage and limits.ephemeral-storage (scratch disk of all lab pods together)" }}
+{{- end }}
+{{- if not .Values.orchestrator.vclusterPodCIDRs }}
+{{- fail "orchestrator.isolation.profile production needs orchestrator.vclusterPodCIDRs (the overlay pod CIDRs vcluster endpoints may point into)" }}
+{{- end }}
+{{- end }}
+{{- end }}

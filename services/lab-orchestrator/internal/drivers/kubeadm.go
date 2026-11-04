@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 // Kubeadm cluster defaults. Node resources of the cluster node apply to every
@@ -168,6 +169,10 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 		if err := setOwner(ref.Session, vm, d.Client); err != nil {
 			return fail(err)
 		}
+		// The gate holds a resume too (see VMDriver.Provision).
+		if err := gate.Err(ctx); err != nil {
+			return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, err
+		}
 		if err := ensure(ctx, d.Client, d.reader(), ref.Session, vm); err != nil {
 			if IsPermanent(err) {
 				return fail(err)
@@ -273,6 +278,9 @@ func (d *KubeadmDriver) newPKI(ctx context.Context, ref NodeRef, l kubeadmLayout
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: PKISecretName(ref), Labels: SessionLabels(ref.Session)}, Data: data}
 	if err := setOwner(ref.Session, sec, d.Client); err != nil {
+		return nil, err
+	}
+	if err := gate.Err(ctx); err != nil {
 		return nil, err
 	}
 	if err := d.Client.Create(ctx, sec); err != nil {

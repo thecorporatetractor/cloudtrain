@@ -28,6 +28,7 @@ import (
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/compile"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/rbac"
 )
 
@@ -138,6 +139,11 @@ type LabSessionReconciler struct {
 	Now func() time.Time
 	// ProvisionTimeout defaults to DefaultProvisionTimeout.
 	ProvisionTimeout time.Duration
+	// Gate: every create of a lab object during a reconcile checks it
+	// (internal/gate). Production: the profile is on, and a missing Gate
+	// then refuses every create (fail closed).
+	Gate       gate.Checker
+	Production bool
 	// MaxConcurrentReconciles defaults to DefaultMaxConcurrentReconciles.
 	// Setup actions run inside Reconcile, so this must be > 1 for one slow
 	// session not to stall every other one.
@@ -251,6 +257,7 @@ func (r *LabSessionReconciler) event(obj runtime.Object, typ, reason, msg string
 // other writers own (e.g. phase Grading) survive and our own progress is
 // never thrown away on a conflict.
 func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	ctx = gate.With(ctx, r.Production, r.Gate)
 	log := logf.FromContext(ctx)
 
 	s := &labsv1.LabSession{}

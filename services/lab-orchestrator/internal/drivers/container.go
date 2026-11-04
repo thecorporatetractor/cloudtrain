@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 // Labels set on every object a driver creates.
@@ -348,6 +349,10 @@ func (d *ContainerDriver) createIfAbsent(ctx context.Context, ref NodeRef, obj c
 		if err := d.checkIsolation(ref, pod); err != nil {
 			return err
 		}
+	}
+	// The production profile's gate holds every lab object, not only pods.
+	if err := gate.Err(ctx); err != nil {
+		return err
 	}
 	err = d.Client.Create(ctx, obj)
 	if err == nil {
