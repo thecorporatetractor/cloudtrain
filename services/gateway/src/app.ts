@@ -222,7 +222,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.setErrorHandler((err: unknown, req, reply) => {
     if (err instanceof HttpError) {
       const retry = err.extra.details?.retryAfterSeconds;
-      if (err.status === 429 && typeof retry === 'number') reply.header('retry-after', String(retry));
+      if ((err.status === 429 || err.status === 503) && typeof retry === 'number') reply.header('retry-after', String(retry));
       return reply.code(err.status).send(err.body());
     }
     // Only Fastify's own client errors (body too large, unsupported media type, schema

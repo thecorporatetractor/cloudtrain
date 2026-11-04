@@ -624,6 +624,66 @@ tolerate the taint (KubeVirt CR `spec.workloads.nodePlacement.tolerations`), and
 must the Multus and Kube-OVN daemonsets (they usually tolerate everything). See
 `examples/values-aks-app-routing.yaml`.
 
+## Lab resources and budgets
+
+- **Per node.** A lab node that declares no resources is never BestEffort. Container
+  nodes get requests of 100m CPU and 256Mi memory, a 2Gi memory limit, and 256Mi/8Gi
+  ephemeral storage. Netdev devices get 50m, 128Mi/512Mi and 64Mi/1Gi. Declared CPU
+  and memory stay request = limit. VMs get a CPU limit of their cores, and the CPU
+  request KubeVirt would derive (100m per core).
+- **Sessions namespace.** `sessions.limitRange` sets default requests for anything
+  else there. It sets requests only, because a default memory limit would cut
+  KubeVirt's compute container below the VM. `sessions.quota` is a ResourceQuota
+  for this namespace; set `requests.ephemeral-storage` and `limits.ephemeral-storage`
+  in it too (lab nodes default to 8Gi of scratch disk each). `count/labsessions.labs.cloudtrain.dev` counts every session,
+  vcluster labs included (their LabSessions live here). Its compute ceiling does not
+  cover the `ct-vc-*` namespaces; each has its own quota (4 CPU, 8Gi), so vcluster
+  compute is at most sessions times that.
+- **Per learner and exams.** One shared count lets one account fill the platform, so
+  the gateway caps it before the quota does (`gateway.capacity`): live lab
+  environments per learner (default 3), and `maxActiveSessions` with an
+  `examReserve`. Lab starts stop at `maxActiveSessions - examReserve`, and exam starts
+  can use the reserve. Keep `count/labsessions` at `maxActiveSessions` as the
+  backstop. A start lists the sessions by label, then under a short Postgres advisory
+  lock (every gateway replica; tried with capped exponential backoff for at most 5 s,
+  at most 16 waiting per gateway process, then a 503 with Retry-After, and a 503 too
+  when its list is older than 30 s by then) counts
+  them plus the pending start reservations (`session_reservations`; an exam reserves
+  one per environment and must fit with all of them, against the platform cap and
+  the org quota alike) and writes its own; the Kubernetes create runs after the
+  lock, and a failed create deletes the reservation. So parallel starts cannot pass a
+  cap, and no lock is held across a cluster call. Exam starts reserve the same way
+  (until their environment sessions exist); their retake decision is taken again
+  under a per-exam lock in the transaction that writes the attempt. Sessions count
+  until their teardown finishes, and a Failed session's resources are released
+  `orchestrator.failedSessionReleaseMinutes` (default 5; the orchestrator's
+  `--failed-session-release` and the gateway's capacity count read the same value) after it
+  failed; one still holding nodes 5 minutes past that has a stuck teardown,
+  is logged and stops counting (0 = keep failed sessions' resources until expiry, never
+  stuck). A failed session kept for debugging (`labs.cloudtrain.dev/keep-failed`, labctl
+  verify) counts until it expires.
+  Condition times are written by the orchestrator's clock and compared with the
+  database clock; skew above a minute is logged. An exam's reservation is released
+  when the attempt ends or fails, which the gateway's attempt sweep
+  (`CT_SWEEP_INTERVAL_MS`) notices even when nobody looks at the attempt, and lapses
+  at its deadline at the latest. The per-learner cap counts exam environments too, so
+  nobody runs several exams at once; one exam larger than the cap starts only when
+  the learner runs nothing else.
+- **vcluster host namespaces** get their own quota and limit range from the manager.
+- **PIDs and seccomp.** Kubernetes caps PIDs per pod only in the kubelet:
+  `podPidsLimit`. kind sets it, and `seccompDefault`, in `deploy/kind/cluster.yaml`.
+  On AKS, create the lab pool with `--kubelet-config` containing
+  `{"podMaxPids": 4096, "seccompDefault": "RuntimeDefault"}`. This is required:
+  `labctl preflight --lab-node-selector …` reads each lab node's `/configz` and fails
+  without both. Without a lab pool it only warns. There is no Terraform in this
+  repository; whatever provisions the pool must set it. Under the production profile
+  the manager refuses to start unless `labctl preflight … --node-configmap` wrote a
+  passing verdict into `orchestrator.nodePreflightConfigMap`, or
+  `orchestrator.isolation.kubeletLimitsAttested` attests the pool's kubelet config (an
+  autoscaled pool at zero has no node to read). A failed verdict always refuses. The
+  manager does not read kubelets itself: that needs `nodes/proxy`, which also allows
+  exec into every pod.
+
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.

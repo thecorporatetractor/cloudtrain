@@ -88,6 +88,14 @@ gateway:
   port: 8787
   # Namespace of LabTemplates and LabSessions (CT_NAMESPACE).
   sessionsNamespace: cloudtrain-sessions
+  # Session caps beyond each org's quota: live lab environments per learner, the
+  # platform's live sessions, and how many of those are kept for exams (lab starts
+  # stop at maxActiveSessions - examReserve). 0 = no limit. Keep sessions.quota's
+  # count/labsessions at maxActiveSessions as the hard backstop.
+  capacity:
+    maxSessionsPerLearner: 3
+    maxActiveSessions: 0
+    examReserve: 0
   # Proxies whose X-Forwarded-* headers the gateway trusts (CT_TRUST_PROXY):
   # the pod CIDR(s) of the Ingress/Gateway data plane. Private ranges by default,
   # which trusts every pod in the cluster: any of them that can reach the gateway
@@ -247,6 +255,15 @@ orchestrator:
   # the lab pool's kubelet seccompDefault. See examples/values-aks-app-routing.yaml.
   isolation:
     profile: dev
+    # production: the lab nodes' kubelets must cap PIDs per pod and default seccomp.
+    # The manager reads labctl preflight's verdict (nodePreflightConfigMap); with an
+    # autoscaled pool at zero there is no node to read, so the operator may attest
+    # instead that the pool's kubelet config sets both (a failed verdict still refuses).
+    kubeletLimitsAttested: false
+  # ConfigMap in the release namespace with labctl preflight's kubelet verdict
+  # (labctl preflight --lab-node-selector ... --node-configmap out.yaml
+  # --node-configmap-name <ns>/<this>; kubectl apply -f out.yaml). Optional.
+  nodePreflightConfigMap: lab-node-preflight
   # The dedicated lab node pool (--lab-node-selector, --lab-tolerations): every lab
   # pod, KubeVirt VM and vcluster (control plane; synced pods get the tolerations)
   # is placed there. Taint the pool so platform pods never land on it, and pin the
@@ -298,6 +315,13 @@ orchestrator:
   # fail. Exclusive with sandboxes.
   tierRuntimeClasses: {}
   vclusterPodSecurity: baseline
+  # A Failed lab session keeps its resources this many minutes after it failed,
+  # then they are released (--failed-session-release; the session stays Failed
+  # until it expires; keep-failed and labctl verify sessions keep them). The
+  # gateway's capacity count uses the same value: a session still holding nodes
+  # 5 minutes past it has a stuck teardown and stops counting.
+  # 0 = keep failed sessions' resources until expiry.
+  failedSessionReleaseMinutes: 5
   # The cluster's pod CIDRs: Endpoints and EndpointSlices in vcluster host
   # namespaces may only point inside them (not at node, VNet or external IPs;
   # link-local and the Azure wireserver are refused always). [] = any other address.
@@ -349,6 +373,23 @@ orchestrator:
 sessions:
   createNamespace: true
   podSecurity: privileged
+  # Default requests for containers in the sessions namespace that set none (lab
+  # node containers get per-driver requests and limits from the orchestrator; this
+  # covers everything else there, e.g. CDI importers), so nothing there is
+  # BestEffort. Requests only: a default memory limit would cut KubeVirt's
+  # virt-launcher compute container below the VM's memory.
+  limitRange:
+    enabled: true
+    defaultRequest: {cpu: 50m, memory: 64Mi, ephemeral-storage: 64Mi}
+  # Budget of all lab sessions together (ResourceQuota spec.hard), e.g. a global
+  # session cap and a compute ceiling under autoscaling:
+  #   quota:
+  #     count/labsessions.labs.cloudtrain.dev: "200"
+  #     requests.cpu: "200"
+  #     requests.memory: 800Gi
+  #     pods: "1500"
+  # {} = no quota.
+  quota: {}
 
 # Demo only: a single Postgres pod on an emptyDir (data is lost with the pod),
 # with the cloudtrain_owner/cloudtrain_app roles and generated passwords.

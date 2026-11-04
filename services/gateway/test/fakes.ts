@@ -73,8 +73,11 @@ export class FakeCluster implements LabCluster {
     return s ? clone(s) : null;
   }
   async listSessions(selector: string) {
-    const want = selector.split(',').map((kv) => kv.split('=') as [string, string]);
-    return [...this.sessions.values()].filter((s) => want.every(([k, v]) => s.metadata.labels?.[k] === v)).map(clone);
+    // key=value terms, and bare `key` terms (the label exists), as in Kubernetes.
+    const want = selector.split(',').filter(Boolean).map((kv) => kv.split('=') as [string, string | undefined]);
+    return [...this.sessions.values()]
+      .filter((s) => want.every(([k, v]) => (v === undefined ? s.metadata.labels?.[k] !== undefined : s.metadata.labels?.[k] === v)))
+      .map(clone);
   }
   async createSession(s: LabSession) {
     const created: LabSession = clone(s);

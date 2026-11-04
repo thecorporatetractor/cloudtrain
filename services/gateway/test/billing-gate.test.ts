@@ -99,6 +99,7 @@ describe.skipIf(!available)('billing gate and metering on labs, exams and CTF ev
     // The platform's hooks, as in main.ts: restriction, visibility, quotas, attempts.
     const sessions = new SessionService(content, h.cluster, new FakeCompiler(), { validateTimeoutMs: 200, pollMs: 20, hooks: h.ps });
     const exams = new ExamService(await catalog(), content, examCluster, new StubExamCompiler(), new PgExamStore(h.t.db), new PgEvidenceSink(h.t.db, content), new PgTeamDirectory(h.t.db), { now: () => clock });
+    exams.gate = h.ps; // the capacity gate, as in main.ts
     app = await buildApp({ content, auth: new HeaderAuthenticator(h.t), sessions, cluster: h.cluster, platform: h.ps, hub: new TerminalHub(), billing, events: new EventService(h.ps, sessions), exams, site: { config: site } });
 
     // Mei: Pro with a card (the plan subscription implies the payment method).

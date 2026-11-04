@@ -14,6 +14,7 @@ import * as m0010 from './migrations/0010_gdpr.js';
 import * as m0011 from './migrations/0011_gdpr_lifecycle.js';
 import * as m0012 from './migrations/0012_billing_usage_kind.js';
 import * as m0013 from './migrations/0013_billing_usage_kind_validate.js';
+import * as m0014 from './migrations/0014_session_reservations.js';
 import type { DB } from './schema.js';
 
 export type Db = Kysely<DB>;
@@ -23,7 +24,9 @@ export type Tx = Transaction<DB>;
 pg.types.setTypeParser(20, (v) => Number(v));
 
 export function createDb(connectionString: string, max = 10): Db {
-  const pool = new pg.Pool({ connectionString, max });
+  // A request that cannot get a connection fails after 10 s instead of waiting
+  // forever, so a saturated pool degrades into errors, never a hung gateway.
+  const pool = new pg.Pool({ connectionString, max, connectionTimeoutMillis: 10_000 });
   // An idle client that loses its connection (server restart, 57P01) emits 'error' on the pool;
   // with no listener that is an uncaught exception. The pool drops the dead client and the next
   // query opens a new one, so log and carry on.
@@ -59,7 +62,7 @@ export function migrationProvider(appRole: string): MigrationProvider {
     up: (db) => mod.up(db, appRole),
     down: (db) => mod.down(db),
   });
-  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007), '0008_waitlist': bind(m0008), '0009_billing_compute': bind(m0009), '0010_gdpr': bind(m0010), '0011_gdpr_lifecycle': bind(m0011), '0012_billing_usage_kind': bind(m0012), '0013_billing_usage_kind_validate': bind(m0013) }) };
+  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005), '0006_ctf_events': bind(m0006), '0007_billing': bind(m0007), '0008_waitlist': bind(m0008), '0009_billing_compute': bind(m0009), '0010_gdpr': bind(m0010), '0011_gdpr_lifecycle': bind(m0011), '0012_billing_usage_kind': bind(m0012), '0013_billing_usage_kind_validate': bind(m0013), '0014_session_reservations': bind(m0014) }) };
 }
 
 /**

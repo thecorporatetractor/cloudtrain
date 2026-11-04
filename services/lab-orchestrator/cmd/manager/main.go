@@ -55,6 +55,8 @@ func main() {
 		allowLearnerSudo                                                                                          bool
 		isolationProfile                                                                                          string
 		isolationEvict                                                                                            bool
+		nodePreflight                                                                                             string
+		kubeletLimitsAttested                                                                                     bool
 		apiServerCIDRs                                                                                            string
 		vclusterPodCIDRs                                                                                          string
 		labNodeSelector, labTolerations                                                                           string
@@ -106,6 +108,8 @@ func main() {
 	flag.BoolVar(&linkSysctls, "link-sysctls", true, "run wired lab pods (topology links) in a user namespace with writable network sysctls (ip_forward, rp_filter, accept_ra, proxy_arp, ping_group_range) when user namespaces are available (--user-namespaces); false = privileged net-init and read-only /proc/sys")
 	flag.IntVar(&linkRateMbps, "link-rate-mbps", 10, "rate limit of every lab link attachment in Mbit/s, each direction (Kube-OVN ingress_rate/egress_rate: OVS policing and an HTB queue on the host side of the port, out of the learner's reach), so a bridging loop cannot saturate the host; 0 = none")
 	flag.StringVar(&isolationProfile, "isolation-profile", drivers.IsolationDev, "dev or production. production fails closed: the manager exits without tier sandboxes, and every lab pod must run in a sandbox RuntimeClass or with hostUsers: false (a pod that would run with host users on the host kernel is refused); see internal/drivers/isolation.go")
+	flag.StringVar(&nodePreflight, "node-preflight", "", "NodePreflight file written by labctl preflight --node-configmap (a ConfigMap mount, kubelet.yaml): the lab nodes' kubelet PID limit and seccompDefault verdict; a missing file = none")
+	flag.BoolVar(&kubeletLimitsAttested, "kubelet-limits-attested", false, "production profile: the operator attests that the lab pool's kubelet config sets podPidsLimit and seccompDefault (an autoscaled pool at zero has no node for labctl preflight to read); a failed verdict still refuses")
 	flag.BoolVar(&isolationEvict, "isolation-evict", false, "production profile: delete lab node pods that run neither in a sandbox nor in a user namespace (created before the profile applied) instead of refusing to start; their sessions recreate them under the profile")
 	flag.StringVar(&vclusterPodCIDRs, "vcluster-pod-cidrs", "", "the cluster's pod CIDRs (Helm orchestrator.vclusterPodCIDRs, comma separated): checked at startup against the nodes' addresses, since the vcluster endpoints allowlist needs an overlay pod network")
 	flag.StringVar(&apiServerCIDRs, "apiserver-cidrs", "auto", "where vcluster control planes may reach the host API server (their NetworkPolicy egress): ip[/bits][:port] comma separated; auto = the default/kubernetes Endpoints (the chart's Role in the default namespace); if unknown, public addresses on 443/6443 only")
@@ -291,6 +295,15 @@ func main() {
 		}
 		for _, w := range warnings {
 			log.Info("isolation profile production: " + w)
+		}
+		verdict, err := drivers.LoadNodePreflight(nodePreflight)
+		if err != nil {
+			log.Error(err, "invalid --node-preflight")
+			os.Exit(1)
+		}
+		if err := drivers.CheckKubeletLimits(verdict, kubeletLimitsAttested); err != nil {
+			log.Error(err, "refusing to start: the production isolation profile needs PID limits and seccompDefault on the lab nodes")
+			os.Exit(1)
 		}
 		direct, err := client.New(cfg, client.Options{Scheme: scheme})
 		if err != nil {

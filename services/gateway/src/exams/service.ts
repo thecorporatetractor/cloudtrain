@@ -47,6 +47,12 @@ export interface ExamServiceOptions {
   /** Override every exam's duration (dev/demo only). */
   durationMinutes?: number;
   now?: () => Date;
+  /**
+   * Tests only: start exams without the capacity gate. Otherwise a start
+   * without one (ExamService.gate) is refused: capacity is never skipped
+   * silently.
+   */
+  withoutCapacityGate?: boolean;
 }
 
 const PHASES: Record<string, ExamAttemptPhase> = {
@@ -87,8 +93,18 @@ const num = (s: string | undefined) => (s === undefined || s === '' ? 0 : Number
  * the caller's own attempts (team readiness: members of a team the caller
  * manages).
  */
+/** The platform's capacity gate (PlatformService): admit and reserve, release on failure. */
+export interface ExamStartGate {
+  reserveStart(p: Principal, kind: 'exam', name: string, units: number): Promise<void>;
+  releaseStart(orgId: string, name: string): Promise<void>;
+  /** An unconfirmed reservation lapses at the attempt's deadline at the latest. */
+  expireStartBy(orgId: string, name: string, at: Date): Promise<void>;
+}
+
 export class ExamService {
   private readonly now: () => Date;
+  /** Set by main: exam starts share the lab starts' capacity gate. */
+  gate?: ExamStartGate;
 
   constructor(
     private readonly catalog: ExamCatalog,
@@ -224,6 +240,21 @@ export class ExamService {
     return this.syncList(await this.store.listByUser(p.orgId, p.sub, examId));
   }
 
+  /**
+   * The sweep: brings every running attempt up to date with its ExamSession,
+   * so attempts whose ExamSession is gone, failed or over are settled (and
+   * their capacity reservations released) even when nobody looks at them.
+   * Returns how many attempts it settled.
+   */
+  async sweep(): Promise<number> {
+    let settled = 0;
+    for (const rec of await this.store.listActive()) {
+      const r = await this.sync(rec).catch(() => null);
+      if (r && !isActive(r.rec)) settled++;
+    }
+    return settled;
+  }
+
   /** Brings running attempts up to date with their ExamSessions. */
   private async syncList(rows: AttemptRecord[]): Promise<AttemptRecord[]> {
     const out: AttemptRecord[] = [];
@@ -265,12 +296,25 @@ export class ExamService {
       flagged: [],
       evidenceRecorded: false,
     };
+    // Capacity first (its own short transaction): the exam's reservation
+    // counts until its environment sessions exist. Then the attempt row, with
+    // the retake decision taken again under the per-exam lock in the same
+    // transaction. No step holds a connection while waiting for another.
+    if (!this.gate && !this.opts.withoutCapacityGate) throw new HttpError(503, 'Exam starts are not available: the capacity gate is not configured.', { code: 'upstream' });
+    // Shared: one environment; per-task: one per drawn task.
+    const units = ex.def.environment === 'shared' ? 1 : Math.max(1, ex.def.taskCount);
+    await this.gate?.reserveStart(p, 'exam', name, units);
     try {
       await this.store.create(rec, {
+        recheck: (attempts, openGrants) => {
+          const again = retakeStatus(policy, attempts, this.now(), openGrants);
+          if (!again.allowed) throw new HttpError(409, again.reason ?? 'You cannot start this exam now.', { code: 'conflict', details: { ...(again.activeAttemptId ? { activeAttemptId: again.activeAttemptId } : {}) } });
+        },
         audit: auditOf(p, 'exam.start', 'exam_attempt', name, { examId, number: rec.number, ...(status.viaGrant ? { retakeGrant: true } : {}), ...(avoid.length ? { avoidTasks: avoid.length } : {}) }, ip, ex.def.title),
         useGrant: !!status.viaGrant,
       });
     } catch (e) {
+      await this.gate?.releaseStart(p.orgId, name).catch(() => undefined);
       if (e instanceof RunningAttemptExists) throw new HttpError(409, e.message, { code: 'conflict' });
       throw e;
     }
@@ -320,6 +364,8 @@ export class ExamService {
       await this.cluster.createExamSession(es);
     } catch (e) {
       // The platform could not start it: not counted, the person may start again.
+      // An ExamSession that exists despite the error keeps its reservation.
+      if (!(await this.environmentExists(name))) await this.gate?.releaseStart(p.orgId, name).catch(() => undefined);
       await this.store.update(rec.orgId, rec.id, (r) => ({ ...r, phase: 'failed', completedAt: this.now().toISOString() }));
       throw e;
     }
@@ -340,6 +386,7 @@ export class ExamService {
       if (isActive(rec)) {
         rec = await this.store.update(rec.orgId, rec.id, (r) => ({ ...r, phase: 'failed', completedAt: this.now().toISOString() }));
       }
+      await this.settleReservation(rec);
       return { rec, es: null };
     }
     const st = es.status ?? {};
@@ -369,7 +416,20 @@ export class ExamService {
       await this.recordEvidence(rec);
       rec = await this.store.update(rec.orgId, rec.id, (r) => ({ ...r, evidenceRecorded: true }));
     }
+    await this.settleReservation(rec);
     return { rec, es };
+  }
+
+  /**
+   * The capacity reservation follows the attempt: released once it is over
+   * (completed, failed: its environments are gone or going), and lapsing at
+   * its deadline at the latest while it runs, so environments that fail or
+   * vanish never hold their units for the reservation's full lifetime.
+   */
+  private async settleReservation(rec: AttemptRecord): Promise<void> {
+    if (!this.gate) return;
+    if (!isActive(rec)) await this.gate.releaseStart(rec.orgId, rec.id).catch(() => undefined);
+    else if (rec.deadline) await this.gate.expireStartBy(rec.orgId, rec.id, new Date(rec.deadline)).catch(() => undefined);
   }
 
   private async recordEvidence(rec: AttemptRecord): Promise<void> {

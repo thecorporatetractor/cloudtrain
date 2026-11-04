@@ -105,7 +105,7 @@ export interface ApiError {
 }
 
 export interface QuotaExceededDetails {
-  quota: 'max_concurrent_sessions' | 'monthly_lab_hours' | 'max_session_minutes';
+  quota: 'max_concurrent_sessions' | 'monthly_lab_hours' | 'max_session_minutes' | 'sessions_per_learner' | 'platform_sessions';
   limit: number;
   current: number;
 }

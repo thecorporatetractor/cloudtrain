@@ -63,6 +63,10 @@ export interface Config {
   smtp: { host: string; port: number; from: string };
   /** IdP aliases trusted to grant platform_admin through the CloudTrain.PlatformAdmin app role. */
   platformIdps: string[];
+  /** Session caps: CT_MAX_SESSIONS_PER_LEARNER, CT_MAX_ACTIVE_SESSIONS, CT_EXAM_SESSION_RESERVE. */
+  capacity: { perLearner: number; maxActive: number; examReserve: number };
+  /** The orchestrator's --failed-session-release in minutes (CT_FAILED_SESSION_RELEASE_MINUTES, default 5; 0 = kept until expiry). */
+  failedSessionReleaseMinutes: number;
   /** Dev only: accept domain verification without the DNS TXT record. */
   devDomainVerifyBypass: boolean;
   /** How often open lab attempts are reconciled with the cluster (ms, 0 = off). */
@@ -275,6 +279,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     cookieSecure: env.CT_COOKIE_SECURE ? env.CT_COOKIE_SECURE === 'true' : !publicUrl.startsWith('http://'),
     smtp: { host: env.CT_SMTP_HOST ?? '127.0.0.1', port: num(env.CT_SMTP_PORT, 1025), from: env.CT_SMTP_FROM ?? 'CloudTrain <no-reply@cloudtrain.local>' },
     platformIdps: (env.CT_PLATFORM_IDPS ?? 'azarguard-entra').split(',').map((s) => s.trim()).filter(Boolean),
+    failedSessionReleaseMinutes: num(env.CT_FAILED_SESSION_RELEASE_MINUTES, 5),
+    capacity: { perLearner: num(env.CT_MAX_SESSIONS_PER_LEARNER, 3), maxActive: num(env.CT_MAX_ACTIVE_SESSIONS, 0), examReserve: num(env.CT_EXAM_SESSION_RESERVE, 0) },
     devDomainVerifyBypass: !prod && env.CT_DEV_DOMAIN_VERIFY_BYPASS === '1',
     sweepIntervalMs: num(env.CT_SWEEP_INTERVAL_MS, 60_000),
     curriculumFile: env.CT_CURRICULUM_FILE ? fromRoot(env.CT_CURRICULUM_FILE) : path.join(contentDir, 'curriculum.yaml'),

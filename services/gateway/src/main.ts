@@ -82,7 +82,7 @@ async function main() {
     mailer: new SmtpMailer(config.smtp.host, config.smtp.port, config.smtp.from),
     store,
     kc: kcAdmin,
-    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace },
+    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace, capacity: config.capacity, failedSessionReleaseMinutes: config.failedSessionReleaseMinutes },
     log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
   });
   sessions.hooks = platform;
@@ -101,6 +101,7 @@ async function main() {
     new PgTeamDirectory(db),
     { sessionLabels: config.examSessionLabels, ...(config.examDurationMinutes ? { durationMinutes: config.examDurationMinutes } : {}) },
   );
+  exams.gate = platform;
 
   // CTF questions: submissions and hint reveals in Postgres (RLS, audited, rate-limited).
   // CTF events: event sessions answer for their team (or entrant), with the event's scoring.
@@ -206,7 +207,15 @@ async function main() {
   else app.log.info({}, 'billing: off (CT_BILLING_ENABLED unset); plans are informational');
   app.log.info({ issuer: config.oidc.issuer, publicUrl: config.publicUrl, webUrl: config.webUrl, platformIdps: config.platformIdps, domainVerifyBypass: config.devDomainVerifyBypass }, 'auth: OIDC (BFF)');
 
-  const sweep = config.sweepIntervalMs > 0 ? setInterval(() => void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed')), config.sweepIntervalMs) : undefined;
+  // The attempt sweep: lab attempts and stale start reservations (platform), and exam
+  // attempts whose ExamSession is gone, failed or over (their reservations with them).
+  const sweep =
+    config.sweepIntervalMs > 0
+      ? setInterval(() => {
+          void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed'));
+          void exams.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'exam sweep failed'));
+        }, config.sweepIntervalMs)
+      : undefined;
   // Metered usage: close sessions that ended outside the gateway (expiry, admin), flush the meter outbox.
   if (config.billing.enabled && config.billing.sweepMs === 0) app.log.warn({}, 'billing: CT_BILLING_SWEEP_MS=0: usage of sessions that end outside the gateway and orphaned start reservations are only closed when that person starts again');
   const billingSweep = config.billing.sweepMs > 0 ? setInterval(() => void billing.sweep(sessionEnd).catch((e: unknown) => app.log.warn({ err: e }, 'billing sweep failed')), config.billing.sweepMs) : undefined;

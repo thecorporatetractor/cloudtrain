@@ -28,7 +28,7 @@ import { withTenant, type Db, type Tx } from '../db/index.js';
 import type { AttemptRow, OrgSettingsJson } from '../db/schema.js';
 import { HttpError, notFound } from '../errors.js';
 import type { LabCluster } from '../kube/cluster.js';
-import { LABEL_MANAGED_BY, LABEL_ORG, MANAGED_BY, type LabSession } from '../kube/types.js';
+import { LABEL_LEARNER, LABEL_MANAGED_BY, LABEL_ORG, MANAGED_BY, type LabSession } from '../kube/types.js';
 import type { KeycloakAdmin } from '../keycloak/admin.js';
 import { readGoals, writeGoals } from '../learner/goals.js';
 import { buildHome, minutesSince, practiceSeconds, skillStates, streakDays, type AttemptLite } from '../learner/home.js';
@@ -38,6 +38,7 @@ import type { SessionStore } from '../oidc/sessions.js';
 import { phaseOf, revealedHints } from '../sessions/map.js';
 import { labelValue, type SessionHooks } from '../sessions/service.js';
 import { membershipsOf } from './identity.js';
+import { assertCapacity, busy, CAPACITY_LOCK, CAPACITY_LOCK_BUDGET_MS, CLOCK_SKEW_WARN_MS, clockSkewMs, LOCK_BACKOFF_MS, MAX_LOCK_WAITERS, CONFIRMED_RETENTION_SECONDS, LIST_MAX_AGE_SECONDS, DEFAULT_CAPACITY, liveSessions, occupancy, RESERVATION_TTL_SECONDS, type CapacityConfig, type StartKind } from './capacity.js';
 
 /** Change it when the first-sign-in notice says something materially new: everyone sees it once more. */
 export const PRIVACY_NOTICE_VERSION = '2026-11';
@@ -50,6 +51,10 @@ export interface PlatformConfig {
   devDomainVerifyBypass: boolean;
   kubeContext: string;
   namespace: string;
+  /** Per-learner and platform session caps (capacity.ts); defaults when absent. */
+  capacity?: CapacityConfig;
+  /** The orchestrator's --failed-session-release, in minutes (default 5; 0 = failed sessions keep their resources until expiry). */
+  failedSessionReleaseMinutes?: number;
 }
 
 export interface PlatformDeps {
@@ -116,6 +121,8 @@ export class PlatformService implements SessionHooks {
    * most until expiry, and not at all if it never became ready.
    */
   labEnded?: (orgId: string, ls: LabSession) => Promise<void>;
+  /** Starts of this process waiting for the capacity lock (capacity.ts MAX_LOCK_WAITERS). */
+  private lockWaiters = 0;
 
   constructor(d: PlatformDeps) {
     this.db = d.db;
@@ -251,13 +258,6 @@ export class PlatformService implements SessionHooks {
       await this.assertNotRestricted(tx, p.sub);
       if (!this.labVisible(await this.visibility(tx), lab.lab.metadata.id)) throw notFound('Lab');
       const q = await this.quotas(tx, p.orgId);
-      const live = (await this.liveClusterSessions(p.orgId)).length;
-      if (live >= q.maxConcurrentSessions) {
-        throw new HttpError(429, `Your organization already runs ${live} of ${q.maxConcurrentSessions} allowed concurrent lab sessions.`, {
-          code: 'quota_exceeded',
-          details: { quota: 'max_concurrent_sessions', limit: q.maxConcurrentSessions, current: live },
-        });
-      }
       const hours = await this.labHoursThisMonth(tx);
       if (hours >= q.monthlyLabHours) {
         throw new HttpError(429, `Your organization used ${hours} of ${q.monthlyLabHours} lab hours this month.`, {
@@ -277,6 +277,133 @@ export class PlatformService implements SessionHooks {
       await this.assertNotRestricted(tx, p.sub);
       if (!this.labVisible(await this.visibility(tx), lab.lab.metadata.id)) throw notFound('Lab');
     });
+  }
+
+  /**
+   * Admits a start and reserves its slot (capacity.ts): lists the sessions
+   * by label first, then, under the short capacity lock (5 s lock_timeout,
+   * then 503), counts them and the pending reservations against the org's
+   * concurrency quota (labs; exam environments count too), the learner's cap
+   * and the platform cap with its exam reserve, and writes the reservation
+   * `name` (the LabSession's name, or the exam attempt's) for `units`
+   * sessions (an exam's environment count). Throws 429. The caller creates
+   * the session after this returns, then confirms (a lab) or releases (a
+   * failed create) the reservation.
+   */
+  async reserveStart(p: Principal, kind: StartKind, name: string, units = 1): Promise<void> {
+    if (!p.orgId) throw new HttpError(409, 'Select an organization before starting a lab.', { code: 'conflict' });
+    const need = Math.max(1, units);
+    // The database clock before the LIST: confirmations after it may be missing from it.
+    const { now: listedAt } = await sql<{ now: Date }>`SELECT now() AS now`.execute(this.db).then((r) => r.rows[0]!);
+    const live = this.liveForCapacity(await this.cluster.listSessions(LABEL_LEARNER), listedAt);
+    await this.withCapacityLock(async (tx) => {
+      // A LIST older than the confirmations the prune may drop cannot be trusted any more.
+      const { stale } = await sql<{ stale: boolean }>`SELECT now() - ${listedAt}::timestamptz > make_interval(secs => ${LIST_MAX_AGE_SECONDS}) AS stale`.execute(tx).then((r) => r.rows[0]!);
+      if (stale) throw busy();
+      await this.pruneIn(tx);
+      const rows = await tx.selectFrom('session_reservations').select(['session_name', 'kind', 'org_id', 'user_id', 'units', 'confirmed_at']).execute();
+      const occ = occupancy(live, rows, listedAt);
+      // Exams whose environments are all listed: confirmed now (database clock).
+      for (const r of occ.examsSeen) {
+        await tx.updateTable('session_reservations').set({ confirmed_at: sql`now()` }).where('org_id', '=', r.org_id).where('session_name', '=', r.session_name).execute();
+      }
+      // The org's concurrency quota, labs and exams alike, by the sessions this start adds.
+      const q = await this.quotas(tx, p.orgId);
+      const org = occ.orgSessions(p.orgId);
+      if (org + need > q.maxConcurrentSessions) {
+        throw new HttpError(429, `Your organization already runs ${org} of ${q.maxConcurrentSessions} allowed concurrent lab sessions${need > 1 ? `; this exam needs ${need}` : ''}.`, {
+          code: 'quota_exceeded',
+          details: { quota: 'max_concurrent_sessions', limit: q.maxConcurrentSessions, current: org },
+        });
+      }
+      assertCapacity(this.config.capacity ?? DEFAULT_CAPACITY, p.sub, occ, kind, need);
+      await tx
+        .insertInto('session_reservations')
+        .values({ session_name: name, kind, units: need, org_id: p.orgId, user_id: p.sub, expires_at: sql`now() + make_interval(secs => ${RESERVATION_TTL_SECONDS[kind]})` })
+        .execute();
+    });
+  }
+
+  /**
+   * Runs fn holding the capacity lock in its own transaction. The lock is
+   * tried, not waited for: a busy lock releases the connection, waits a
+   * short jittered moment and tries again, for at most CAPACITY_LOCK_BUDGET_MS,
+   * then answers 503 with Retry-After. No pool connection waits on the lock.
+   */
+  private async withCapacityLock<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    const deadline = Date.now() + CAPACITY_LOCK_BUDGET_MS;
+    const held = Symbol('busy');
+    let waiting = false;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const out = await withTenant(this.db, { platform: true }, async (tx) => {
+          const { ok } = await sql<{ ok: boolean }>`SELECT pg_try_advisory_xact_lock(hashtext(${CAPACITY_LOCK})) AS ok`.execute(tx).then((r) => r.rows[0]!);
+          return ok ? { v: await fn(tx) } : held;
+        });
+        if (out !== held) return (out as { v: T }).v;
+        if (Date.now() >= deadline) throw busy();
+        if (!waiting) {
+          // A storm of starts: beyond MAX_LOCK_WAITERS waiting here, refuse at once.
+          if (this.lockWaiters >= MAX_LOCK_WAITERS) throw busy();
+          this.lockWaiters++;
+          waiting = true;
+        }
+        const step = Math.min(LOCK_BACKOFF_MS.cap, LOCK_BACKOFF_MS.first * 2 ** attempt);
+        await new Promise((r) => setTimeout(r, step / 2 + Math.random() * step));
+      }
+    } finally {
+      if (waiting) this.lockWaiters--;
+    }
+  }
+
+  /** Live sessions for the capacity count (stuck teardowns reported), judged on the database clock. */
+  private liveForCapacity(items: LabSession[], dbNow: Date): LabSession[] {
+    const release = (this.config.failedSessionReleaseMinutes ?? 5) * 60_000;
+    const skew = clockSkewMs(items, dbNow);
+    if (skew > CLOCK_SKEW_WARN_MS) {
+      this.log?.warn({ skewSeconds: Math.round(skew / 1000) }, 'clock skew: the orchestrator writes condition times ahead of the database clock; stuck-teardown detection is off by that much');
+    }
+    return liveSessions(items, dbNow, release, (s) =>
+      this.log?.warn({ session: s.metadata.name, phase: s.status?.phase }, 'lab session teardown is stuck: it no longer counts toward capacity; check the orchestrator'),
+    );
+  }
+
+  private pruneIn(tx: Tx): Promise<number> {
+    return tx
+      .deleteFrom('session_reservations')
+      .where((eb) => eb.or([eb('expires_at', '<', sql<Date>`now()`), eb('confirmed_at', '<', sql<Date>`now() - make_interval(secs => ${CONFIRMED_RETENTION_SECONDS})`)]))
+      .executeTakeFirst()
+      .then((r) => Number(r.numDeletedRows));
+  }
+
+  /** Drops expired and long-confirmed reservations (database clock), under the capacity lock. */
+  async pruneReservations(): Promise<number> {
+    return this.withCapacityLock((tx) => this.pruneIn(tx));
+  }
+
+  /** Marks a lab start's session as created (it is listed from now on). */
+  async confirmStart(orgId: string, name: string): Promise<void> {
+    await withTenant(this.db, { platform: true }, (tx) =>
+      tx.updateTable('session_reservations').set({ confirmed_at: sql`now()` }).where('org_id', '=', orgId).where('session_name', '=', name).execute(),
+    );
+  }
+
+  /** Drops a start's reservation (the create failed, or the exam is over). */
+  async releaseStart(orgId: string, name: string): Promise<void> {
+    await withTenant(this.db, { platform: true }, (tx) => tx.deleteFrom('session_reservations').where('org_id', '=', orgId).where('session_name', '=', name).execute());
+  }
+
+  /** Lets an unconfirmed reservation lapse at `at` at the latest (an exam's deadline). */
+  async expireStartBy(orgId: string, name: string, at: Date): Promise<void> {
+    await withTenant(this.db, { platform: true }, (tx) =>
+      tx
+        .updateTable('session_reservations')
+        .set({ expires_at: sql`least(expires_at, ${at}::timestamptz)` })
+        .where('org_id', '=', orgId)
+        .where('session_name', '=', name)
+        .where('confirmed_at', 'is', null)
+        .execute(),
+    );
   }
 
   async started(p: Principal, lab: ContentLab, ls: LabSession): Promise<void> {
@@ -343,6 +470,8 @@ export class PlatformService implements SessionHooks {
   /** Closes attempts whose LabSession is gone or over (expiry, deletion outside the gateway). */
   async sweep(): Promise<number> {
     let closed = 0;
+    // Stale start reservations go even when nobody starts anything.
+    await this.pruneReservations().catch((e: unknown) => this.log?.warn({ err: e }, 'reservation prune failed'));
     const orgs = (await sql<{ sys_org_ids: string }>`SELECT sys_org_ids()`.execute(this.db)).rows.map((r) => r.sys_org_ids);
     for (const orgId of orgs) {
       await this.orgTx(orgId, null, async (tx) => {

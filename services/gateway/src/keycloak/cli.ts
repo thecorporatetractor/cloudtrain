@@ -18,7 +18,7 @@ async function main() {
     cluster: { listSessions: async () => [] } as never,
     mailer: new MemoryMailer(),
     kc,
-    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace },
+    config: { webUrl: config.webUrl, publicUrl: config.publicUrl, oidcClientId: config.oidc.clientId, platformIdps: config.platformIdps, devDomainVerifyBypass: config.devDomainVerifyBypass, kubeContext: config.kubeContext, namespace: config.namespace, capacity: config.capacity, failedSessionReleaseMinutes: config.failedSessionReleaseMinutes },
   });
   try {
     const r = await syncKeycloak(ps, kc, db);
