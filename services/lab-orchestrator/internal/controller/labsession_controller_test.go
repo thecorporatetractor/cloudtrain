@@ -22,6 +22,7 @@ import (
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 const ns = "labs"
@@ -36,6 +37,8 @@ type fakeDriver struct {
 	provErr  map[string]error
 	instance map[string]string // per node InstanceID
 	execExit int
+	// gateErrs records gate.Err(ctx) at each Provision (the reconcile's gate).
+	gateErrs []error
 	// stdout, when set, answers every exec with this output.
 	stdout func(req drivers.ExecRequest) string
 	// execErr fails the exec call with this (0-based) index.
@@ -56,9 +59,10 @@ func newFakeDriver(name labsv1.DriverName) *fakeDriver {
 
 func (f *fakeDriver) Name() labsv1.DriverName { return f.name }
 
-func (f *fakeDriver) Provision(_ context.Context, ref drivers.NodeRef) (drivers.NodeState, error) {
+func (f *fakeDriver) Provision(ctx context.Context, ref drivers.NodeRef) (drivers.NodeState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.gateErrs = append(f.gateErrs, gate.Err(ctx))
 	f.provisioned = append(f.provisioned, ref.Node.Name)
 	delete(f.asleep, ref.Node.Name)
 	if err := f.provErr[ref.Node.Name]; err != nil {
@@ -481,6 +485,40 @@ func TestReconcileExpires(t *testing.T) {
 	h.reconcile()
 	if len(h.cont.provisioned) != n {
 		t.Error("expired session was re-provisioned")
+	}
+}
+
+// The reconciler hands its provisioning gate to the drivers through the
+// context: every create they make checks it (internal/gate).
+func TestReconcileCarriesTheGate(t *testing.T) {
+	h := newHarness(t, template(), session())
+	g := &drivers.ProvisionGate{}
+	g.Set(drivers.GateNetworkPolicy, "no engine")
+	h.r.Gate = g
+	h.reconcile()
+	if len(h.cont.gateErrs) == 0 {
+		t.Fatal("nothing provisioned")
+	}
+	for _, err := range h.cont.gateErrs {
+		if err == nil || !strings.Contains(err.Error(), "no engine") {
+			t.Fatalf("driver saw gate %v", err)
+		}
+	}
+	h2 := newHarness(t, template(), session())
+	h2.reconcile()
+	for _, err := range h2.cont.gateErrs {
+		if err != nil {
+			t.Fatalf("no gate configured, driver saw %v", err)
+		}
+	}
+	// Production without a gate fails closed.
+	h3 := newHarness(t, template(), session())
+	h3.r.Production = true
+	h3.reconcile()
+	for _, err := range h3.cont.gateErrs {
+		if err == nil {
+			t.Fatal("production without a gate let a create through")
+		}
 	}
 }
 

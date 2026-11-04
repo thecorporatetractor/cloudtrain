@@ -431,7 +431,11 @@ func evaluateNetwork(cl *pfCluster, requested string, rep *pfReport) network.Mod
 		case cni == "":
 			rep.add("primary-cni", pfWarn, "no known primary CNI found (Cilium, Calico, AWS VPC CNI, Azure CNI, GKE Dataplane V2, Flannel, kindnet)", "make sure a NetworkPolicy engine enforces policies on eth0")
 		case !policy:
-			rep.add("primary-cni", pfWarn, cni+": NetworkPolicy may not be enforced (entry and lab peer isolation depend on it)", "enable network policy (EKS: VPC CNI enableNetworkPolicy; or install Calico/Cilium policy)")
+			// Fail, not warn (security review network-4): without an engine every
+			// lab pod on eth0 reaches IMDS, the wireserver, the API server, the
+			// platform, other learners and the internet.
+			rep.add("primary-cni", pfFail, cni+": no NetworkPolicy engine, so entry, lab peer and vcluster isolation would not be enforced",
+				"enable network policy (AKS: --network-dataplane cilium --network-policy cilium; EKS: VPC CNI enableNetworkPolicy; or install Calico/Cilium policy)")
 		default:
 			rep.add("primary-cni", pfPass, cni+" (enforces NetworkPolicy)", "")
 		}

@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
@@ -499,6 +500,9 @@ func (r *SessionRuntime) keys(ctx context.Context, s *labsv1.LabSession, create 
 			"admin": admin.Private, "admin.pub": admin.Public},
 	}
 	if err := setOwner(s, sec, r.Client); err != nil {
+		return sessionKeys{}, err
+	}
+	if err := gate.Err(ctx); err != nil {
 		return sessionKeys{}, err
 	}
 	if err := r.Client.Create(ctx, sec); err != nil {

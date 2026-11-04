@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 // Defaults for vm nodes without resources.
@@ -103,6 +104,11 @@ func (d *VMDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error
 	})
 	if err := setOwner(ref.Session, vm, d.Client); err != nil {
 		return fail(err)
+	}
+	// The gate holds a resume too: ensure() creates nothing for an existing
+	// (hibernated) VM, and setRunStrategy would start it.
+	if err := gate.Err(ctx); err != nil {
+		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, err
 	}
 	if err := ensure(ctx, d.Client, d.reader(), ref.Session, vm); err != nil {
 		if IsPermanent(err) {

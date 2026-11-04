@@ -13,6 +13,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 // Isolation of virtual clusters (security review escape-3, network-1,
@@ -297,6 +299,9 @@ func (d *VClusterDriver) ensureHostIsolation(ctx context.Context, ref NodeRef, r
 		// The fallback (any public address on 443/6443) would let the virtual
 		// API server reach the internet: not under the production profile.
 		return fmt.Errorf("the production isolation profile needs the API server's addresses for the vcluster control plane policy (--apiserver-cidrs, or the default/kubernetes Endpoints): %w", ErrUnsupported)
+	}
+	if err := gate.Err(ctx); err != nil {
+		return err
 	}
 	for _, obj := range []client.Object{d.resourceQuota(ref, release), d.limitRange(ref, release), d.controlPlanePolicy(ref, release)} {
 		if err := ensure(ctx, d.Client, d.reader(), ref.Session, obj); err != nil {

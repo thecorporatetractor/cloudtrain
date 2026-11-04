@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 // LabelVClusterManagedBy is set by vcluster on every object it syncs to the host.
@@ -239,6 +240,9 @@ func (d *VClusterDriver) ensureHostNamespace(ctx context.Context, ref NodeRef) (
 		labels[k] = v
 	}
 	ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: d.hostNS(ref), Labels: labels}}
+	if err := gate.Err(ctx); err != nil {
+		return false, err
+	}
 	if err := d.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, err
 	}
@@ -589,6 +593,9 @@ func (d *VClusterDriver) publish(ctx context.Context, ref NodeRef, release, inst
 		if err := setOwner(ref.Session, sec, d.Client); err != nil {
 			return err
 		}
+		if err := gate.Err(ctx); err != nil {
+			return err
+		}
 		return d.Client.Create(ctx, sec)
 	case err != nil:
 		return err
@@ -820,6 +827,12 @@ func replicas(wl client.Object) int32 {
 
 // scale sets the control plane's replica count.
 func (d *VClusterDriver) scale(ctx context.Context, wl client.Object, n int32) error {
+	// Scaling up (a resume) is provisioning: the gate holds it.
+	if n > 0 {
+		if err := gate.Err(ctx); err != nil {
+			return err
+		}
+	}
 	patch := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, n))
 	return d.Client.Patch(ctx, wl, client.RawPatch("application/merge-patch+json", patch))
 }

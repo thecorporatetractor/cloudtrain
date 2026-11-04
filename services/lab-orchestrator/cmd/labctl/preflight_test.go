@@ -135,13 +135,25 @@ func TestPreflightMissingPieces(t *testing.T) {
 	if status(rep, "kube-ovn") != pfWarn {
 		t.Errorf("Kube-OVN 1.15: %+v", rep.Checks)
 	}
-	// AWS VPC CNI without a policy engine.
-	aws := managedCluster("90")
-	aws.DaemonSets[1] = ds("aws-node", 3)
+	// AWS VPC CNI or plain Azure CNI without a policy engine: lab isolation
+	// would silently not be enforced, so preflight fails.
+	for _, name := range []string{"aws-node", "azure-cns"} {
+		cl := managedCluster("90")
+		cl.DaemonSets[1] = ds(name, 3)
+		rep = &pfReport{}
+		evaluateNetwork(cl, "auto", rep)
+		if status(rep, "primary-cni") != pfFail {
+			t.Errorf("%s: %+v", name, rep.Checks)
+		}
+	}
+	// Azure CNI powered by Cilium enforces policy.
+	cil := managedCluster("90")
+	cil.DaemonSets[1] = ds("azure-cns", 3)
+	cil.DaemonSets = append(cil.DaemonSets, ds("cilium", 3))
 	rep = &pfReport{}
-	evaluateNetwork(aws, "auto", rep)
-	if status(rep, "primary-cni") != pfWarn {
-		t.Errorf("aws-node: %+v", rep.Checks)
+	evaluateNetwork(cil, "auto", rep)
+	if status(rep, "primary-cni") != pfPass {
+		t.Errorf("azure-cns + cilium: %+v", rep.Checks)
 	}
 }
 

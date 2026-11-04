@@ -20,13 +20,17 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -36,6 +40,9 @@ import (
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/rbac"
 )
+
+// policyEngineRecheck is how often the NetworkPolicy engine is re-checked.
+const policyEngineRecheck = 2 * time.Minute // fallback; DaemonSet changes trigger a re-check at once
 
 func main() {
 	var (
@@ -332,6 +339,41 @@ func main() {
 		}
 	}
 	log.Info("isolation profile", "profile", profile, "userNamespaces", useUserNS, "sandboxes", sandboxes.Enabled())
+	// Lab isolation rests on NetworkPolicy: something must enforce it, now
+	// and later (re-checked every policyEngineRecheck; under the production
+	// profile nothing is provisioned while it does not).
+	provisionGate := &drivers.ProvisionGate{}
+	var policyClient client.Client
+	var labNodeSel labels.Selector
+	if lp, err := drivers.ParseLabPlacement(labNodeSelector, labTolerations); err == nil && len(lp.NodeSelector) > 0 {
+		labNodeSel = labels.SelectorFromSet(lp.NodeSelector)
+	}
+	{
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		policyClient = direct
+		if err != nil {
+			log.Error(err, "unable to create client for the NetworkPolicy engine check")
+			os.Exit(1)
+		}
+		pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		engine, err := drivers.CheckPolicyEngine(pctx, direct, labNodeSel)
+		cancel()
+		provisionGate.Set(drivers.GateNetworkPolicy, engine.Verdict(err))
+		switch {
+		case err != nil && profile == drivers.IsolationProduction:
+			log.Error(err, "refusing to start: cannot tell whether NetworkPolicy is enforced (the manager's Role in kube-system reads DaemonSets, Deployments and cilium-config)")
+			os.Exit(1)
+		case err != nil:
+			log.Error(err, "cannot tell whether NetworkPolicy is enforced; lab isolation depends on it")
+		case !engine.Enforcing && profile == drivers.IsolationProduction:
+			log.Error(nil, "refusing to start: lab isolation needs an enforcing NetworkPolicy engine", "reason", engine.Reason)
+			os.Exit(1)
+		case !engine.Enforcing:
+			log.Error(nil, "lab pods are NOT isolated: no enforcing NetworkPolicy engine", "reason", engine.Reason)
+		default:
+			log.Info("NetworkPolicy engine", "engines", engine.Engines)
+		}
+	}
 	if sandboxes.Enabled() {
 		direct, err := client.New(cfg, client.Options{Scheme: scheme})
 		if err != nil {
@@ -492,6 +534,66 @@ func main() {
 	}
 	rt.Container.Network = linkNet
 
+	// Live preconditions of the production profile, re-checked while running:
+	// the NetworkPolicy engine on every change of a kube-system DaemonSet (a
+	// watch) and every policyEngineRecheck, and labctl preflight's kubelet
+	// verdict (its ConfigMap mount) every policyEngineRecheck.
+	dsEvents := make(chan struct{}, 1)
+	if cs, err := kubernetes.NewForConfig(cfg); err != nil {
+		log.Error(err, "cannot watch kube-system DaemonSets; the NetworkPolicy engine is polled only")
+	} else {
+		inf := informers.NewSharedInformerFactoryWithOptions(cs, 10*time.Minute, informers.WithNamespace("kube-system")).Apps().V1().DaemonSets().Informer()
+		poke := func(any) {
+			select {
+			case dsEvents <- struct{}{}:
+			default:
+			}
+		}
+		if _, err := inf.AddEventHandler(toolscache.ResourceEventHandlerFuncs{AddFunc: poke, UpdateFunc: func(_, n any) { poke(n) }, DeleteFunc: poke}); err != nil {
+			log.Error(err, "cannot watch kube-system DaemonSets")
+		} else if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error { inf.Run(ctx.Done()); return nil })); err != nil {
+			log.Error(err, "cannot run the DaemonSet watch")
+			os.Exit(1)
+		}
+	}
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		t := time.NewTicker(policyEngineRecheck)
+		defer t.Stop()
+		plog := ctrl.Log.WithName("isolation-gate")
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-t.C:
+			case <-dsEvents:
+				// A burst of DaemonSet updates (a rollout) settles first.
+				time.Sleep(5 * time.Second)
+			}
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			engine, err := drivers.CheckPolicyEngine(cctx, policyClient, labNodeSel)
+			cancel()
+			reason := engine.Verdict(err)
+			if reason != "" {
+				plog.Error(nil, "lab pods are not known to be isolated: NetworkPolicy engine check failed", "reason", reason, "provisioningHeld", profile == drivers.IsolationProduction)
+			}
+			provisionGate.Set(drivers.GateNetworkPolicy, reason)
+			if profile == drivers.IsolationProduction {
+				verdict, err := drivers.LoadNodePreflight(nodePreflight)
+				if err == nil {
+					err = drivers.CheckKubeletLimits(verdict, kubeletLimitsAttested)
+				}
+				kr := ""
+				if err != nil {
+					kr = err.Error()
+					plog.Error(err, "kubelet verdict no longer passes: provisioning held")
+				}
+				provisionGate.Set(drivers.GateKubelet, kr)
+			}
+		}
+	})); err != nil {
+		log.Error(err, "unable to add the isolation re-check")
+		os.Exit(1)
+	}
 	poolMetrics := controller.NewPoolMetrics()
 	poolMetrics.Register()
 	if err := (&controller.LabSessionReconciler{
@@ -501,6 +603,7 @@ func main() {
 		ProvisionDeadline: provisionDeadline, FailedRelease: failedRelease, ExpiredRetention: expiredRetention,
 		ReadyRecheck: readyRecheck, SetupSlice: setupSlice,
 		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics, Access: sessionAccess,
+		Gate: provisionGate, Production: profile == drivers.IsolationProduction,
 		Sandboxes: sandboxes, Catalog: catalog,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
