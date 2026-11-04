@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 )
 
 const (
@@ -605,6 +606,12 @@ func vmIdentity(ctx context.Context, r client.Reader, ns string, names []string)
 // setRunStrategy sets spec.runStrategy of the VMs ("Always" or "Halted")
 // where it differs.
 func setRunStrategy(ctx context.Context, c client.Client, r client.Reader, ns string, names []string, strategy string) error {
+	// Starting (resuming) VMs is provisioning: the gate holds it. Halting never.
+	if strategy != "Halted" {
+		if err := gate.Err(ctx); err != nil {
+			return err
+		}
+	}
 	for _, n := range names {
 		vm := newObj(GVKVirtualMachine, ns, n)
 		if err := r.Get(ctx, client.ObjectKeyFromObject(vm), vm); err != nil {

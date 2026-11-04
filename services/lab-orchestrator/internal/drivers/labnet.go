@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
@@ -226,6 +227,9 @@ func ensure(ctx context.Context, c client.Client, r client.Reader, s *labsv1.Lab
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
+	if err := gate.Err(ctx); err != nil {
+		return err
+	}
 	if err := c.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
 		return err
 	}
@@ -248,7 +252,7 @@ func (l *LabNetwork) Ensure(ctx context.Context, s *labsv1.LabSession) (bool, er
 
 	vpc := newObj(GVKVpc, "", n.VPC())
 	vpc.SetLabels(labels)
-	_ = unstructured.SetNestedMap(vpc.Object, map[string]any{}, "spec")
+	_ = unstructured.SetNestedMap(vpc.Object, network.SessionVPCSpec(), "spec")
 
 	labSpec := map[string]any{
 		"vpc": n.VPC(), "protocol": "IPv4", "cidrBlock": LabCIDR, "gateway": LabGateway,

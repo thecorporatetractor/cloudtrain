@@ -160,6 +160,45 @@ subjects:
   - kind: ServiceAccount
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
+---
+# The NetworkPolicy engine startup check (config/rbac/policy_engine_role.yaml). Read-only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $cluster }}-policy-engine
+  namespace: kube-system
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+rules:
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [kube-ovn-controller]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [cilium-config]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $cluster }}-policy-engine
+  namespace: kube-system
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $cluster }}-policy-engine
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
 {{- if $o.rbac.admissionPolicy }}
 ---
 # What RBAC cannot express (config/rbac/admission_policy.yaml): RoleBinding writes only
@@ -344,6 +383,7 @@ spec:
             {{- if ($o.isolation).kubeletLimitsAttested }}
             - --kubelet-limits-attested
             {{- end }}
+            - --network-mode={{ $o.networkMode | default "primary" }}
             {{- if $o.rbac.ovnCentral.enabled }}
             - --ovn-central={{ $o.rbac.ovnCentral.namespace }}/{{ $o.rbac.ovnCentral.selector }}
             {{- else }}

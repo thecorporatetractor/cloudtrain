@@ -15,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/gate"
+
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 )
 
@@ -82,7 +84,7 @@ func (m *Manager) Objects(p *Plan) []*unstructured.Unstructured {
 	s := p.Session
 	var out []*unstructured.Unstructured
 	vpc := newObj(VpcGVK, "", p.VPC, m.labels(s, "vpc"))
-	vpc.Object["spec"] = map[string]any{}
+	vpc.Object["spec"] = SessionVPCSpec()
 	out = append(out, vpc, m.subnet(p, p.Mgmt, "mgmt", nil))
 	if p.Mgmt.NAD != "" {
 		out = append(out, m.nad(p, p.Mgmt, "mgmt"))
@@ -141,6 +143,9 @@ func (m *Manager) Ensure(ctx context.Context, p *Plan) (bool, error) {
 		err := m.Client.Get(ctx, client.ObjectKeyFromObject(want), got)
 		switch {
 		case apierrors.IsNotFound(err):
+			if err := gate.Err(ctx); err != nil {
+				return false, err
+			}
 			if err := m.Client.Create(ctx, want); err != nil && !apierrors.IsAlreadyExists(err) {
 				return false, fmt.Errorf("create %s %s: %w", want.GetKind(), want.GetName(), err)
 			}

@@ -684,6 +684,63 @@ must the Multus and Kube-OVN daemonsets (they usually tolerate everything). See
   manager does not read kubelets itself: that needs `nodes/proxy`, which also allows
   exec into every pod.
 
+## Network policy floor
+
+Lab isolation rests on NetworkPolicy. Per-session policies cover the entry node,
+the lab peers, vcluster workloads and the vcluster control plane. They need an
+enforcing engine:
+
+- `labctl preflight` fails without one. In network mode secondary, a primary CNI
+  that is known not to enforce policy (plain Azure CNI, AWS VPC CNI, Flannel) is a
+  failure.
+- On AKS, pin it at cluster creation: `az aks create ... --network-plugin azure
+  --network-plugin-mode overlay --network-dataplane cilium --network-policy cilium`.
+- `networkPolicy.enabled` adds ingress rules for the platform: gateway and web only
+  from the ingress, no ingress to the orchestrator, demo Postgres only from the
+  release.
+- `networkPolicy.labs.defaultDeny` (network mode secondary only) denies all traffic
+  of session-labelled pods in the sessions namespace that no per-session policy
+  allows.
+- `networkPolicy.labs.denyCloudMetadata` (Cilium only) adds a
+  CiliumClusterwideNetworkPolicy. It denies egress from lab pods and vcluster
+  workloads to all of link-local `169.254.0.0/16` (IMDS) and `168.63.129.16` (the
+  Azure wireserver), and it wins over any allow.
+- `networkPolicy.labs.defaultDeny` needs `orchestrator.networkMode: secondary`, which
+  the chart now passes as `--network-mode`. The chart refuses the combination
+  otherwise.
+- At startup the manager checks that a NetworkPolicy engine enforces: Cilium with
+  `enable-policy` not `never`, Calico, Azure NPM, GKE Dataplane V2, or Kube-OVN
+  without `--enable-np=false`. Under the production profile it refuses to start
+  without one. It reads only kube-system DaemonSets, `kube-ovn-controller` and
+  `cilium-config` (a Role there).
+
+Under the production profile the chart refuses to render unless all of these are
+set: `networkPolicy.labs.denyCloudMetadata`, `networkPolicy.labs.defaultDeny` (with
+`orchestrator.networkMode: secondary`), `gateway.capacity.maxActiveSessions > 0`, and
+`sessions.quota` with `count/labsessions.labs.cloudtrain.dev` and ephemeral-storage
+requests and limits, and `orchestrator.vclusterPodCIDRs`. `labNodes` and the sandboxes
+are checked too. The manager re-checks the policy engine on every change of a
+kube-system DaemonSet (a watch) and every two minutes. With a lab pool it requires a
+Ready agent on every lab node; otherwise every scheduled agent must be ready. It also
+re-reads labctl preflight's kubelet verdict every two minutes. Under production it
+creates no lab pod, VM or vcluster while either check fails.
+
+**Secondary NICs and node NAT.** The Multus/Kube-OVN interfaces of lab pods and VMs
+(session management, lab, access and link segments) sit in a per-session Kube-OVN
+VPC. It has no static routes, no external gateway, no NAT gateway or EIP, and
+custom-VPC subnets have no `natOutgoing`. So they have no route to the node and cannot
+reach IMDS through node NAT. As a second layer, every session VPC's logical router
+drops `169.254.0.0/16` and `168.63.129.16` outright (`spec.policyRoutes`, action drop,
+priority 32000; `internal/network/vpc.go`). The only way out of a lab pod is its cloud-CNI
+`eth0`, which the policies above cover. NSGs cannot filter IMDS or the wireserver:
+Azure platform traffic to `169.254.169.254` and `168.63.129.16` bypasses NSG rules.
+At the node level, use AKS IMDS restriction (`az aks update --enable-imds-restriction`,
+which blocks non-host-network pods from IMDS) as the layer under the Cilium deny.
+Pods are already kept off the wireserver's ports by AKS's own iptables rules.
+
+A unit test checks that no policy the orchestrator writes allows those two
+addresses.
+
 ## Not yet
 
 - `cloudtrain-prereqs` (KubeVirt, CDI, Multus, Kube-OVN) and `labctl preflight`.
