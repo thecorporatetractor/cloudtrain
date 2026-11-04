@@ -1,4 +1,4 @@
-import type { Selectable } from 'kysely';
+import { sql, type Selectable } from 'kysely';
 import type { ExamReport } from '@cloudtrain/api-types';
 import type { Principal } from '../auth.js';
 import { can } from '../authz.js';
@@ -8,9 +8,10 @@ import type { ExamAttemptsTable } from '../db/schema.js';
 import { notFound } from '../errors.js';
 import { endAttempt, recordRun } from '../learner/learning.js';
 import { audit } from '../platform/audit.js';
+import { examLock } from '../platform/capacity.js';
 import type { ExamEvidenceInput, ExamEvidenceSink } from './evidence.js';
 import type { TeamDirectory } from './service.js';
-import { RunningAttemptExists, type AttemptRecord, type AttemptTask, type ExamAuditEntry, type ExamStore, type RetakeGrantRecord } from './store.js';
+import { RunningAttemptExists, type AttemptRecord, type AttemptTask, type CreateAttemptOptions, type ExamAuditEntry, type ExamStore, type RetakeGrantRecord } from './store.js';
 
 /*
  * Postgres adapters of the exam engine (tables: src/db/migrations/0003_exams.ts).
@@ -96,9 +97,17 @@ export class PgExamStore implements ExamStore {
     return tx.selectFrom('exam_attempts as a').leftJoin('users as u', 'u.id', 'a.user_id').selectAll('a').select('u.name as user_name');
   }
 
-  async create(rec: AttemptRecord, opts: { audit?: ExamAuditEntry; useGrant?: boolean } = {}): Promise<void> {
+  async create(rec: AttemptRecord, opts: CreateAttemptOptions = {}): Promise<void> {
     try {
       await this.tx(rec.orgId, rec.userId, async (tx) => {
+        if (opts.recheck) {
+          // The retake decision again, under the person's per-exam lock and in
+          // the transaction that writes the attempt: one connection, no window.
+          await sql`SELECT pg_advisory_xact_lock(hashtext(${examLock(rec.orgId, rec.userId, rec.examId)}))`.execute(tx);
+          const mine = (await this.select(tx).where('a.user_id', '=', rec.userId).where('a.exam_id', '=', rec.examId).orderBy('a.started_at', 'desc').execute()).map((r) => toRecord(r as unknown as Row));
+          const grants = await tx.selectFrom('exam_retake_grants').select('id').where('user_id', '=', rec.userId).where('exam_id', '=', rec.examId).where('used_at', 'is', null).execute();
+          opts.recheck(mine, grants.length);
+        }
         await tx
           .insertInto('exam_attempts')
           .values({
@@ -162,6 +171,11 @@ export class PgExamStore implements ExamStore {
       if (examId) q = q.where('a.exam_id', '=', examId);
       return q.orderBy('a.started_at', 'desc').execute();
     });
+    return rows.map((r) => toRecord(r as unknown as Row));
+  }
+
+  async listActive(): Promise<AttemptRecord[]> {
+    const rows = await withTenant(this.db, { platform: true }, (tx) => this.select(tx).where('a.phase', 'in', ['preparing', 'in-progress', 'grading']).execute());
     return rows.map((r) => toRecord(r as unknown as Row));
   }
 

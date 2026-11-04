@@ -19,6 +19,12 @@ export interface SessionHooks {
   beforeStart(p: Principal, lab: ContentLab): Promise<{ ttlMinutes?: number }>;
   /** Throws to refuse reattaching to a running session (404 hidden lab, 409 restricted processing); no quotas: it runs already. */
   beforeResume?(p: Principal, lab: ContentLab): Promise<void>;
+  /** Admits the start and reserves its slot (429, 503 when the lock is busy), before the create. */
+  reserveStart?(p: Principal, kind: 'lab' | 'exam', name: string, units?: number): Promise<void>;
+  /** Drops the reservation of a start whose create failed. */
+  releaseStart?(orgId: string, name: string): Promise<void>;
+  /** Marks the reservation's session as created. */
+  confirmStart?(orgId: string, name: string): Promise<void>;
   started(p: Principal, lab: ContentLab, ls: LabSession): Promise<void>;
   validated(p: Principal, lab: ContentLab, ls: LabSession, res: ValidateResponse): Promise<void>;
   ended(p: Principal, sessionName: string, ls?: LabSession): Promise<void>;
@@ -209,7 +215,25 @@ export class SessionService {
         ...(expiresAt ? { expiresAt } : ttl ? { ttl: `${ttl}m` } : {}),
       },
     };
-    return this.cluster.createSession(ls);
+    // Capacity: admitted and reserved under a short lock, created outside it.
+    // A refusal (429) or a failed create throws out of create(), and start()
+    // then releases the billing gate's reservation as for any failed start.
+    await this.hooks?.reserveStart?.(principal, 'lab', ls.metadata.name);
+    let created: LabSession;
+    try {
+      created = await this.cluster.createSession(ls);
+    } catch (e) {
+      // The write may have committed although the call failed: then the
+      // session runs and keeps its slot (confirmed); otherwise it is freed.
+      // When even that read fails, it may run: the reservation is kept (it lapses on its own).
+      const exists = await this.cluster.getSession(ls.metadata.name).then((x) => !!x, () => true);
+      if (exists) await this.hooks?.confirmStart?.(principal.orgId, ls.metadata.name).catch(() => undefined);
+      else await this.hooks?.releaseStart?.(principal.orgId, ls.metadata.name).catch(() => undefined);
+      throw e;
+    }
+    // A failure here only keeps the reservation counted until it expires.
+    await this.hooks?.confirmStart?.(principal.orgId, ls.metadata.name).catch(() => undefined);
+    return created;
   }
 
   /**

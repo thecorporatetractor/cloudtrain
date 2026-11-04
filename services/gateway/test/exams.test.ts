@@ -38,6 +38,7 @@ async function make() {
   const evidence = new MemoryEvidenceSink();
   const compiler = new StubExamCompiler();
   const svc = new ExamService(cat, await examContent(), cluster, compiler, store, evidence, new StaticTeamDirectory(), {
+    withoutCapacityGate: true,
     sessionLabels: { 'labs.cloudtrain.dev/exam-proof': 'true' },
     now: () => now,
   });

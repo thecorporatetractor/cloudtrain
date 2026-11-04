@@ -61,7 +61,7 @@ describe.skipIf(!available)('exam simulations on Postgres (RLS, learner model, t
     }
     await t.owner.insertInto('team_members').values({ org_id: orgs.acme, team_id: linehaul, user_id: ACME.marcus, role: 'manager', source: 'manual' }).execute();
     exams = new FakeExamCluster();
-    const svc = new ExamService(await catalog(), content, exams, new StubExamCompiler(), new PgExamStore(t.db), new PgEvidenceSink(t.db, content), new PgTeamDirectory(t.db), { now: () => now });
+    const svc = new ExamService(await catalog(), content, exams, new StubExamCompiler(), new PgExamStore(t.db), new PgEvidenceSink(t.db, content), new PgTeamDirectory(t.db), { now: () => now, withoutCapacityGate: true });
     const labs = new FakeCluster();
     app = await buildApp({ content, auth: new CsrfHeaderAuthenticator(t), sessions: new SessionService(content, labs, new FakeCompiler(), { validateTimeoutMs: 100 }), cluster: labs, exams: svc });
   }, 90_000);

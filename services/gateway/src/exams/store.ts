@@ -96,12 +96,17 @@ export interface ExamStore {
   /**
    * Inserts a new attempt; refuses (RunningAttemptExists) when the person has
    * a running attempt of the same exam. `useGrant` consumes one open retake
-   * grant in the same transaction.
+   * grant in the same transaction. `recheck` runs inside that transaction,
+   * under the person's per-exam lock, with their attempts of the exam and
+   * their open grant count as stored now: it throws to refuse (the retake
+   * policy decided once more, so concurrent starts cannot both pass it).
    */
-  create(rec: AttemptRecord, opts?: { audit?: ExamAuditEntry; useGrant?: boolean }): Promise<void>;
+  create(rec: AttemptRecord, opts?: CreateAttemptOptions): Promise<void>;
   get(orgId: string, id: string): Promise<AttemptRecord | null>;
   /** Read-modify-write of one attempt (Postgres: SELECT ... FOR UPDATE in one transaction). */
   update(orgId: string, id: string, fn: (rec: AttemptRecord) => AttemptRecord, audit?: ExamAuditEntry): Promise<AttemptRecord>;
+  /** Every running attempt of every org (the sweep). */
+  listActive(): Promise<AttemptRecord[]>;
   /** A user's attempts, newest first, optionally for one exam. */
   listByUser(orgId: string, userId: string, examId?: string): Promise<AttemptRecord[]>;
   /** Attempts of several users (team readiness), newest first. */
@@ -114,6 +119,12 @@ export interface ExamStore {
 const clone = <T>(v: T): T => structuredClone(v);
 const newestFirst = (a: AttemptRecord, b: AttemptRecord) => b.startedAt.localeCompare(a.startedAt);
 
+export interface CreateAttemptOptions {
+  audit?: ExamAuditEntry;
+  useGrant?: boolean;
+  recheck?: (attempts: AttemptRecord[], openGrants: number) => void;
+}
+
 export class MemoryExamStore implements ExamStore {
   private readonly rows = new Map<string, AttemptRecord>();
   private readonly key = (orgId: string, id: string) => `${orgId}\u0000${id}`;
@@ -121,8 +132,12 @@ export class MemoryExamStore implements ExamStore {
   readonly audits: (ExamAuditEntry & { orgId: string })[] = [];
   private readonly grants: RetakeGrantRecord[] = [];
 
-  async create(rec: AttemptRecord, opts: { audit?: ExamAuditEntry; useGrant?: boolean } = {}): Promise<void> {
+  async create(rec: AttemptRecord, opts: CreateAttemptOptions = {}): Promise<void> {
     const k = this.key(rec.orgId, rec.id);
+    if (opts.recheck) {
+      const mine = [...this.rows.values()].filter((r) => r.orgId === rec.orgId && r.userId === rec.userId && r.examId === rec.examId).map(clone);
+      opts.recheck(mine, this.grants.filter((x) => x.orgId === rec.orgId && x.userId === rec.userId && x.examId === rec.examId && !x.usedAt).length);
+    }
     if (this.rows.has(k)) throw new Error(`attempt ${rec.id} exists`);
     const running = ['preparing', 'in-progress', 'grading'];
     if ([...this.rows.values()].some((r) => r.orgId === rec.orgId && r.userId === rec.userId && r.examId === rec.examId && running.includes(r.phase))) throw new RunningAttemptExists();
@@ -132,6 +147,10 @@ export class MemoryExamStore implements ExamStore {
     }
     this.rows.set(k, clone(rec));
     if (opts.audit) this.audits.push({ ...clone(opts.audit), orgId: rec.orgId });
+  }
+
+  async listActive(): Promise<AttemptRecord[]> {
+    return [...this.rows.values()].filter((r) => ['preparing', 'in-progress', 'grading'].includes(r.phase)).map(clone);
   }
 
   async get(orgId: string, id: string): Promise<AttemptRecord | null> {

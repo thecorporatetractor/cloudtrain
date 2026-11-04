@@ -196,9 +196,15 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 	tplSpec := map[string]any{
 		"hostname": v.Hostname,
 		"domain": map[string]any{
-			"cpu":       map[string]any{"cores": v.Cores},
-			"memory":    map[string]any{"guest": mem},
-			"resources": map[string]any{"requests": map[string]any{"memory": mem}},
+			"cpu":    map[string]any{"cores": v.Cores},
+			"memory": map[string]any{"guest": mem},
+			// CPU: the request KubeVirt would derive (cpuAllocationRatio 10:
+			// 100m per core) and a limit of the cores, so a busy VM cannot
+			// take a node's spare CPU from other sessions (escape-6).
+			"resources": map[string]any{
+				"requests": map[string]any{"memory": mem, "cpu": fmt.Sprintf("%dm", v.Cores*100)},
+				"limits":   map[string]any{"cpu": fmt.Sprintf("%d", v.Cores)},
+			},
 			"devices": map[string]any{
 				"disks":      disks,
 				"interfaces": []any{map[string]any{"name": "default", "bridge": map[string]any{}}},
