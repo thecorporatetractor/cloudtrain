@@ -48,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
@@ -111,6 +112,9 @@ type preflightOpts struct {
 	systemdImage string
 	// labPool is the manager's --lab-node-selector/--lab-tolerations.
 	labPool drivers.LabPlacement
+	// nodeCM, nodeCMName: write the kubelet verdict as the manager's
+	// --node-preflight ConfigMap (file, - = stdout) and its <ns>/<name>.
+	nodeCM, nodeCMName string
 }
 
 func cmdPreflight(args []string, stdout, stderr io.Writer) int {
@@ -132,6 +136,8 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 	systemdImage := fl.String("systemd-image", "", "with --probe: a tier-B systemd image (e.g. cloudtrain/deb-sys:24.04, on the nodes) to boot in each sandbox RuntimeClass and exec into")
 	labSelector := fl.String("lab-node-selector", "", "the orchestrator's --lab-node-selector: check the lab pool and the system pool are tainted apart")
 	labTolerations := fl.String("lab-tolerations", "", "the orchestrator's --lab-tolerations")
+	nodeCM := fl.String("node-configmap", "", "write the lab nodes' kubelet verdict (PID limit, seccompDefault) as the ConfigMap the orchestrator reads (--node-preflight) to this file (- = stdout); apply it with kubectl apply -f")
+	nodeCMName := fl.String("node-configmap-name", "cloudtrain-system/lab-node-preflight", "<namespace>/<name> of that ConfigMap (Helm: <release namespace>/<orchestrator.nodePreflightConfigMap>)")
 	asJSON := fl.Bool("json", false, "print the report as JSON")
 	if err := fl.Parse(args); err != nil {
 		return 2
@@ -166,7 +172,7 @@ func cmdPreflight(args []string, stdout, stderr io.Writer) int {
 	}
 	o := preflightOpts{mode: *mode, probe: *probe, toolsImage: *toolsImage, mtu: *mtu, timeout: *timeout,
 		modulesFile: filepath.Join(root, "deploy", "scripts", "lab-kernel-modules.txt"), systemdImage: *systemdImage,
-		sandboxesConfig: *sandboxesConfig, sandboxes: *sandboxes, tierRC: *tierRC, labPool: labPool}
+		sandboxesConfig: *sandboxesConfig, sandboxes: *sandboxes, tierRC: *tierRC, labPool: labPool, nodeCM: *nodeCM, nodeCMName: *nodeCMName}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+2*time.Minute)
 	defer cancel()
 	rep, sbVerdict, err := runNetworkPreflight(ctx, cfg, o, stderr)
@@ -255,6 +261,21 @@ func runNetworkPreflight(ctx context.Context, cfg *rest.Config, o preflightOpts,
 	mode := evaluateNetwork(cl, o.mode, rep)
 	rep.Mode = string(mode)
 	rep.Checks = append(rep.Checks, labPoolChecks(cl.Nodes, o.labPool)...)
+	if cs, err := kubernetes.NewForConfig(cfg); err == nil {
+		kc, n := kubeletChecksN(cl.Nodes, o.labPool, nodeConfigz(ctx, cs))
+		rep.Checks = append(rep.Checks, kc)
+		if o.nodeCM != "" {
+			b, err := nodePreflightConfigMap(kc, n, o.nodeCMName)
+			if err != nil {
+				return nil, nil, err
+			}
+			if o.nodeCM == "-" {
+				fmt.Fprint(logOut, string(b))
+			} else if err := os.WriteFile(o.nodeCM, b, 0o600); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
 	var ex drivers.PodExecutor
 	if o.probe {
 		if ex, err = drivers.NewRESTPodExecutor(cfg); err != nil {

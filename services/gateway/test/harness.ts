@@ -134,7 +134,7 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
     cluster,
     mailer,
     store,
-    config: { webUrl: 'http://web.test', publicUrl: 'http://gw.test', oidcClientId: 'cloudtrain-gateway', platformIdps: ['azarguard-entra', 'acme-idp'], devDomainVerifyBypass: true, kubeContext: 'test', namespace: 'ns1' },
+    config: { webUrl: 'http://web.test', publicUrl: 'http://gw.test', oidcClientId: 'cloudtrain-gateway', platformIdps: ['azarguard-entra', 'acme-idp'], devDomainVerifyBypass: true, kubeContext: 'test', namespace: 'ns1', capacity: { perLearner: 0, maxActive: 0, examReserve: 0 } },
   });
   const sessions = new SessionService(content, cluster, new FakeCompiler(), { validateTimeoutMs: 300, pollMs: 10, hooks: ps });
   const hub = new TerminalHub();

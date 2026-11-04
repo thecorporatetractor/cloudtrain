@@ -335,8 +335,14 @@ spec:
             - --session-cluster-role={{ $session }}
             - --service-account={{ .Release.Namespace }}/{{ $name }}
             - --isolation-profile={{ ($o.isolation).profile | default "dev" }}
+            {{- $failedRelease := int ($o.failedSessionReleaseMinutes | default 0) }}
+            - --failed-session-release={{ if eq $failedRelease 0 }}-1{{ else }}{{ $failedRelease }}{{ end }}m
             {{- with $o.vclusterPodCIDRs }}
             - --vcluster-pod-cidrs={{ join "," . }}
+            {{- end }}
+            - --node-preflight=/etc/cloudtrain/node-preflight/kubelet.yaml
+            {{- if ($o.isolation).kubeletLimitsAttested }}
+            - --kubelet-limits-attested
             {{- end }}
             {{- if $o.rbac.ovnCentral.enabled }}
             - --ovn-central={{ $o.rbac.ovnCentral.namespace }}/{{ $o.rbac.ovnCentral.selector }}
@@ -396,6 +402,7 @@ spec:
           volumeMounts:
             - {name: catalog, mountPath: /etc/cloudtrain/catalog, readOnly: true}
             - {name: tmp, mountPath: /tmp}
+            - {name: node-preflight, mountPath: /etc/cloudtrain/node-preflight, readOnly: true}
             {{- if $o.sandboxes }}
             - {name: sandboxes, mountPath: /etc/cloudtrain/sandboxes, readOnly: true}
             - {name: sandbox-preflight, mountPath: /etc/cloudtrain/sandbox-preflight, readOnly: true}
@@ -412,6 +419,9 @@ spec:
         {{- end }}
         - name: tmp
           emptyDir: {}
+        # labctl preflight --node-configmap (lab nodes' kubelet PID limit and seccompDefault); optional.
+        - name: node-preflight
+          configMap: {name: {{ $o.nodePreflightConfigMap | default "lab-node-preflight" }}, optional: true}
       {{- with $o.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

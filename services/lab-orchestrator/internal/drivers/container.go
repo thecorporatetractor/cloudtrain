@@ -232,7 +232,7 @@ func (d *ContainerDriver) BuildPod(ref NodeRef) *corev1.Pod {
 				Name:      ContainerName,
 				Image:     d.ImageFor(d.catalogImage(n.Image)),
 				Ports:     cports,
-				Resources: containerResources(n.Resources),
+				Resources: nodeResources(n.Driver, n.Resources),
 				Stdin:     true,
 				TTY:       true,
 			}},
@@ -261,25 +261,50 @@ func (d *ContainerDriver) catalogImage(ref string) string {
 	return ref
 }
 
-func containerResources(r *labsv1.NodeResources) corev1.ResourceRequirements {
-	out := corev1.ResourceRequirements{}
-	if r == nil {
-		return out
+// NodeResourceDefaults are a lab node container's resources when the lab
+// declares none (code review orch-2, security review escape-6): every lab
+// pod is Burstable, never BestEffort (first evicted, invisible to the
+// autoscaler), and memory and scratch disk are capped, so one learner cannot
+// starve a node's other sessions. CPU has a request only: it is compressible.
+type NodeResourceDefaults struct {
+	CPURequest, MemoryRequest, MemoryLimit, EphemeralRequest, EphemeralLimit string
+}
+
+// DefaultNodeResources per driver. Container nodes: a workstation or a
+// Linux host (2Gi covers the heaviest tool images without memoryMiB).
+// Netdev: an FRR router uses well under 100Mi.
+var DefaultNodeResources = map[labsv1.DriverName]NodeResourceDefaults{
+	labsv1.DriverContainer: {CPURequest: "100m", MemoryRequest: "256Mi", MemoryLimit: "2Gi", EphemeralRequest: "256Mi", EphemeralLimit: "8Gi"},
+	labsv1.DriverNetdev:    {CPURequest: "50m", MemoryRequest: "128Mi", MemoryLimit: "512Mi", EphemeralRequest: "64Mi", EphemeralLimit: "1Gi"},
+}
+
+// nodeResources maps a node's declared resources onto the container: a
+// declared CPU or memory is both request and limit (as before); what the lab
+// leaves out comes from the driver's defaults, and scratch disk is always
+// bounded.
+func nodeResources(driver labsv1.DriverName, r *labsv1.NodeResources) corev1.ResourceRequirements {
+	def, ok := DefaultNodeResources[driver]
+	if !ok {
+		def = DefaultNodeResources[labsv1.DriverContainer]
 	}
 	req, lim := corev1.ResourceList{}, corev1.ResourceList{}
-	if r.CPU != nil {
+	if r != nil && r.CPU != nil {
 		req[corev1.ResourceCPU] = r.CPU.DeepCopy()
 		lim[corev1.ResourceCPU] = r.CPU.DeepCopy()
+	} else {
+		req[corev1.ResourceCPU] = resource.MustParse(def.CPURequest)
 	}
-	if r.MemoryMiB != nil {
+	if r != nil && r.MemoryMiB != nil {
 		q := resource.NewQuantity(*r.MemoryMiB*1024*1024, resource.BinarySI)
 		req[corev1.ResourceMemory] = *q
 		lim[corev1.ResourceMemory] = q.DeepCopy()
+	} else {
+		req[corev1.ResourceMemory] = resource.MustParse(def.MemoryRequest)
+		lim[corev1.ResourceMemory] = resource.MustParse(def.MemoryLimit)
 	}
-	if len(req) > 0 {
-		out.Requests, out.Limits = req, lim
-	}
-	return out
+	req[corev1.ResourceEphemeralStorage] = resource.MustParse(def.EphemeralRequest)
+	lim[corev1.ResourceEphemeralStorage] = resource.MustParse(def.EphemeralLimit)
+	return corev1.ResourceRequirements{Requests: req, Limits: lim}
 }
 
 // BuildService renders the Service for a container node.

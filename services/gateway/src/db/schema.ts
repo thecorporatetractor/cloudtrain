@@ -566,7 +566,19 @@ export interface BillingLimitsTable {
   updated_at: Generated<Date>;
 }
 
+export interface SessionReservationsTable {
+  org_id: string;
+  session_name: string;
+  kind: 'lab' | 'exam';
+  units: Generated<number>;
+  user_id: string;
+  created_at: Generated<Date>;
+  confirmed_at: Date | null;
+  expires_at: Date;
+}
+
 export interface DB {
+  session_reservations: SessionReservationsTable;
   orgs: OrgsTable;
   users: UsersTable;
   org_domains: OrgDomainsTable;
