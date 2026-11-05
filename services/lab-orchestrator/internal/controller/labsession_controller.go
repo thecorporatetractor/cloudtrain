@@ -836,6 +836,19 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		}
 	}
 
+	// Exam environments: the reference the freeze compares with, taken
+	// before the candidate has access (see readysnap.go).
+	if needsReadySnapshot(s) {
+		snap, err := takeReadySnapshot(ctx, &NodeExecutor{Drivers: r.Drivers, Session: s, Template: tpl.spec}, tpl.spec)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		st.ReadySnapshot = snap
+		if err := save(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Endpoints for every declared access point.
 	var eps []labsv1.Endpoint
 	for _, n := range tpl.spec.Topology.Nodes {
@@ -1055,6 +1068,7 @@ func (r *LabSessionReconciler) rearmSetup(s *labsv1.LabSession, reason, msg stri
 	s.Status.SetupProgress = 0
 	s.Status.Endpoints = nil
 	s.Status.ComputedAnswers = nil
+	s.Status.ReadySnapshot = nil
 	r.startProvisioning(s, false)
 	r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, reason, msg)
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, reason, msg)

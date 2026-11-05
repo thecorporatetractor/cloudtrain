@@ -906,7 +906,7 @@ release; an existing version is never overwritten. A tag `<chart>-<version>`
 signed with cosign keyless (by digest) and has SLSA build provenance.
 
 ```bash
-helm install cloudtrain-crds oci://ghcr.io/<owner>/<repo>/charts/cloudtrain-crds --version 0.1.0 -n cloudtrain --create-namespace
+helm install cloudtrain-crds oci://ghcr.io/<owner>/<repo>/charts/cloudtrain-crds --version 0.1.1 -n cloudtrain --create-namespace
 cosign verify ghcr.io/<owner>/<repo>/charts/cloudtrain:0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github.com/<owner>/<repo>/\.github/workflows/charts\.yml@refs/(heads/main|tags/.+)$'
