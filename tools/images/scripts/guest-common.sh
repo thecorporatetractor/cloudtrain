@@ -9,6 +9,9 @@ if [ -w /dev/console ]; then exec > >(tee -a /dev/console) 2>&1; fi
 B=/opt/cloudtrain/build
 # shellcheck source=/dev/null
 source "$B/build.env"
+# require_auditctl (the exam freeze's loginuid lock)
+# shellcheck source=guest-loginuid.sh
+source "$B/guest-loginuid.sh"
 export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Optional pull-through mirror for docker.io (DOCKERIO_MIRROR, e.g. mirror.gcr.io) for the
@@ -37,7 +40,8 @@ grow_root() {
 }
 
 # Boot-time hygiene for lab VMs (no snaps, no background apt runs fighting for dpkg),
-# apt from the pinned Ubuntu snapshot, and the base packages every image needs.
+# apt from the pinned Ubuntu snapshot, and the base packages every image needs
+# (auditd: see require_auditctl in guest-loginuid.sh).
 base_setup() {
   printf '%s\n' 'Acquire::Retries "5";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' > /etc/apt/apt.conf.d/80-retries
   apt-get purge -y snapd unattended-upgrades || true
@@ -65,8 +69,9 @@ base_setup() {
   fi
   apt-get -o APT::Update::Error-Mode=any update
   apt-get install -y --no-install-recommends ca-certificates curl gpg apt-transport-https \
-    qemu-guest-agent jq bash-completion openssl "$@"
+    qemu-guest-agent jq bash-completion openssl auditd "$@"
   systemctl enable qemu-guest-agent || true
+  require_auditctl
 }
 
 # restore_ubuntu_sources: put the image's original Ubuntu sources back (also when a

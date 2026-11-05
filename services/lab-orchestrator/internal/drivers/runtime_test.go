@@ -3,6 +3,7 @@ package drivers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -252,6 +253,11 @@ func TestKubeadmUserdata(t *testing.T) {
 		// (before init/join), so no pod sandbox lands on it.
 		if !strings.Contains(s, "rm -f /etc/cni/net.d/87-podman-bridge.conflist") {
 			t.Errorf("%s: stray CNI config not removed\n%s", m.Name, s)
+		}
+		// The exam freeze's loginuid lock runs on every member, joined or not,
+		// on every boot (#394).
+		if bc, _ := doc["bootcmd"].([]any); len(bc) != 1 || !strings.Contains(fmt.Sprint(bc[0]), "auditctl --loginuid-immutable") {
+			t.Errorf("%s: no loginuid lock in bootcmd: %v", m.Name, doc["bootcmd"])
 		}
 		switch m.Name {
 		case "yard-cp-1":

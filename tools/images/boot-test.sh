@@ -10,7 +10,8 @@
 # Every check runs over ssh from the tester, as the learner would. The namespace,
 # VPC and subnet are deleted afterwards (KEEP=1 keeps them).
 #
-#   all           VM Running, ssh as learner, /etc/cloudtrain-release, no internet
+#   all           VM Running, ssh as learner, /etc/cloudtrain-release, no internet,
+#                 loginuids locked at boot by the image (the exam freeze's lock)
 #   kubeadm-node  `crictl images` lists every locked workload image; single-node
 #                 `kubeadm init` + Calico; one Pod per workload image Running offline;
 #                 a deny-all NetworkPolicy actually blocks traffic (Calico enforces it)
@@ -191,6 +192,15 @@ echo "== whoami via ssh: $SUDO_USER, host $(hostname)"; cat /etc/cloudtrain-rele
 cloud-init status --wait >/dev/null || true
 if timeout 3 bash -c '</dev/tcp/1.1.1.1/443' 2>/dev/null; then echo "FAIL: VM reaches the internet"; exit 1; fi
 echo "ok: no internet from the VM"
+# The exam freeze's loginuid lock: the image's own unit must have locked it at boot (this test's
+# cloud-init has no bootcmd, and nothing here calls auditctl). The kernel is asked directly: a
+# subshell's loginuid change fails with EPERM only when loginuids are immutable.
+st=$(cat /run/cloudtrain/loginuid-lock 2>/dev/null || echo missing)
+[ "$st" = locked ] || { echo "FAIL: /run/cloudtrain/loginuid-lock: $st"; journalctl -b -u cloudtrain-loginuid-lock --no-pager | tail -5; exit 1; }
+[ -e /proc/self/loginuid ] || { echo "FAIL: no /proc/self/loginuid"; exit 1; }
+if (echo 0 > /proc/self/loginuid; echo 4294967295 > /proc/self/loginuid) 2>/dev/null; then echo "FAIL: loginuid still mutable"; exit 1; fi
+systemctl is-active --quiet cloudtrain-loginuid-lock.service || { echo "FAIL: cloudtrain-loginuid-lock.service not active"; exit 1; }
+echo "ok: loginuid immutable at boot (cloudtrain-loginuid-lock.service)"
 EOS
   "test_$variant" || die "[$variant] FAILED (see $OUT)"
   log "[$variant] PASSED in $((SECONDS - t0))s (log: $OUT)"

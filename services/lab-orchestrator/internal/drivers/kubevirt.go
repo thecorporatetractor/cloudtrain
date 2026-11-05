@@ -265,9 +265,43 @@ type cloudInit struct {
 	RunCmd     []string
 }
 
-// LoginuidImmutable makes audit loginuids immutable once set (needs auditctl
-// and CAP_AUDIT_CONTROL; a no-op where the audit tools are missing).
-const LoginuidImmutable = "command -v auditctl >/dev/null 2>&1 && auditctl --loginuid-immutable >/dev/null 2>&1 || true"
+// LoginuidImmutable makes audit loginuids immutable once set
+// (/usr/sbin/auditctl --loginuid-immutable: the kernel feature is set with
+// its lock bit, so it stays until reboot). The exam freeze
+// (controller.RevokeScript) finds the learner's processes by loginuid; the
+// lock stops root from leaving the learner's login session by rewriting
+// /proc/self/loginuid by accident or with a simple script. Against a root
+// learner it is a guard and a forensic signal, not a boundary: root can
+// replace auditctl, the image's unit or this script. The freeze checks the
+// kernel state itself on every VM (controller.revokeLoginuidCheck).
+//
+// The images run it from cloudtrain-loginuid-lock.service before
+// sysinit.target, i.e. before sshd and systemd-user-sessions
+// (tools/images/scripts/guest-loginuid.sh, the same script, checked by a
+// test). The runtime runs it again as a cloud-init bootcmd on every boot,
+// which also covers images without the unit. It checks the result by trying
+// to change the loginuid of a subshell (EPERM when locked), not by trusting
+// auditctl's output. A failure does not stop the boot (a failing bootcmd
+// would leave cloud-init in error and the node never Ready) but is visible:
+// a warning on the console, in the journal (tag cloudtrain-loginuid) and in
+// /var/log/cloudtrain-loginuid.log, and "failed: <why>" instead of "locked"
+// in /run/cloudtrain/loginuid-lock.
+const LoginuidImmutable = `A=/usr/sbin/auditctl
+m=
+if [ ! -x "$A" ]; then m="$A not installed"
+elif ! o=$("$A" --loginuid-immutable 2>&1); then m="auditctl --loginuid-immutable failed: $o"
+elif [ ! -e /proc/self/loginuid ]; then m="state unreadable: no /proc/self/loginuid"
+elif (echo 0 > /proc/self/loginuid; echo 4294967295 > /proc/self/loginuid) 2>/dev/null; then m="loginuid still mutable after auditctl"
+fi
+mkdir -p /run/cloudtrain
+if [ -n "$m" ]; then
+  echo "failed: $m" > /run/cloudtrain/loginuid-lock
+  echo "cloudtrain: WARNING: loginuid lock failed (exam freeze weakened): $m" | tee -a /var/log/cloudtrain-loginuid.log /dev/console >&2
+  logger -p auth.warning -t cloudtrain-loginuid "loginuid lock failed: $m" 2>/dev/null
+else
+  echo locked > /run/cloudtrain/loginuid-lock
+fi
+exit 0`
 
 // Render returns the #cloud-config document: the learner account (sudo
 // without password, learner key), root reachable with the admin key only
@@ -290,10 +324,6 @@ func (c cloudInit) Render() ([]byte, error) {
 	files = append(files, c.Files...)
 	runcmd := []any{
 		[]any{"bash", "-c", "date +%s.%N > /var/log/cloudtrain-boot.ts"},
-		// Freeze (revoke.go): root cannot rewrite /proc/self/loginuid to
-		// hide a process from the learner's login session. Best effort: only
-		// where the audit tools are installed.
-		[]any{"bash", "-c", LoginuidImmutable},
 	}
 	for _, r := range c.RunCmd {
 		runcmd = append(runcmd, []any{"bash", "-c", r})
@@ -316,7 +346,10 @@ func (c cloudInit) Render() ([]byte, error) {
 			"ssh_authorized_keys": []any{strings.TrimSpace(string(c.LearnerPub))},
 		}},
 		"write_files": files,
-		"runcmd":      runcmd,
+		// Every boot (runcmd runs once per instance): the exam freeze's
+		// loginuid lock, see LoginuidImmutable.
+		"bootcmd": []any{[]any{"bash", "-c", LoginuidImmutable}},
+		"runcmd":  runcmd,
 	}
 	b, err := yaml.Marshal(doc)
 	if err != nil {

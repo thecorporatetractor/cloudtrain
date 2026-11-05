@@ -68,8 +68,9 @@ const (
 //     "cloudtrain-revoke: new process: <comm>[<pid>] <cgroup>". This catches
 //     what the tree walk cannot see, e.g. `sudo setsid -f sh -c 'while :; do
 //     ...; done'` from a shell without a loginuid, or after the learner
-//     rewrote /proc/self/loginuid as root (VMs also make loginuid immutable
-//     at boot where auditctl exists, see kubevirt.go).
+//     rewrote /proc/self/loginuid as root (VMs and kubeadm nodes make
+//     loginuid immutable on every boot, see drivers.LoginuidImmutable; the
+//     controller checks that on them, see revokeLoginuidCheck).
 //
 // Not detected: learner-started containers, cron/at jobs, a unit file
 // changed before Ready and restarted after it, and vcluster workloads.
@@ -141,6 +142,24 @@ const revokeStillRunning = "cloudtrain-revoke: still running: "
 // systemd unit, that survived the kill pass.
 const revokeNewProcess = "cloudtrain-revoke: new process: "
 
+// revokeLoginuid is reported by a VM or kubeadm node whose loginuids are not
+// immutable: the boot-time lock (drivers.LoginuidImmutable) did not take
+// effect, so root could have rewritten /proc/self/loginuid to hide a process
+// from the tree walk.
+const revokeLoginuid = "cloudtrain-revoke: loginuid not locked"
+
+// revokeLoginuidCheck runs after RevokeScript on VM targets only (the
+// controller knows the node kind; nothing in the guest decides whether the
+// check runs). It asks the kernel, not auditctl (a binary root may have
+// replaced): a subshell of the freeze shell tries to change its own
+// loginuid, which fails with EPERM only when loginuids are immutable. The
+// first write sets an unset loginuid (always allowed), the second tries to
+// change it.
+const revokeLoginuidCheck = `if [ ! -e /proc/self/loginuid ]; then echo "` + revokeLoginuid + ` (state unreadable)"
+elif (echo 0 > /proc/self/loginuid; echo 4294967295 > /proc/self/loginuid) 2>/dev/null; then echo "` + revokeLoginuid + `"
+fi
+`
+
 // revokeKept prefixes each learner process the freeze kept because it runs
 // as another account (see RevokeScript).
 const revokeKept = "cloudtrain-revoke: kept: "
@@ -209,6 +228,8 @@ func stillRunning(node, stdout string) []string {
 			out = append(out, node+": process "+p)
 		} else if p, ok := strings.CutPrefix(l, revokeKept); ok && p != "" {
 			out = append(out, node+": kept "+p)
+		} else if d, ok := strings.CutPrefix(l, revokeLoginuid); ok {
+			out = append(out, node+": loginuid not locked"+d+" (the boot-time lock did not take effect; root could leave the learner's login session)")
 		}
 	}
 	return out
@@ -261,6 +282,20 @@ func revokeTargets(spec *labsv1.LabTemplateSpec) []string {
 	return out
 }
 
+// revokeOnVM reports whether a revoke target is a VM (a vm node or a kubeadm
+// member "<node>/<member>"), where loginuids must be immutable.
+func revokeOnVM(spec *labsv1.LabTemplateSpec, on string) bool {
+	if strings.Contains(on, "/") {
+		return true
+	}
+	for _, n := range spec.Topology.Nodes {
+		if n.Name == on {
+			return n.Driver == labsv1.DriverVM
+		}
+	}
+	return false
+}
+
 // revokeAccess withdraws endpoints and, once, kills the learner's processes
 // on every target node. A node that cannot be reached (e.g. a VM that is
 // still booting) is retried on the next reconcile; nodes that are gone
@@ -281,6 +316,14 @@ func (r *LabSessionReconciler) revokeAccess(ctx context.Context, s *labsv1.LabSe
 			errs = errors.Join(errs, err)
 		}
 		running = append(running, stillRunning(on, res.Stdout)...)
+		if err == nil && revokeOnVM(tpl.spec, on) {
+			check := revokeLoginuidCheck
+			cres, cerr := ex.RunAction(ctx, labsv1.Action{On: on, As: labsv1.ActionAsAdmin, Run: &check, TimeoutSec: revokeActionTimeoutS})
+			if cerr != nil {
+				running = append(running, on+": loginuid lock not checked: "+firstLine(cerr.Error()))
+			}
+			running = append(running, stillRunning(on, cres.Stdout)...)
+		}
 	}
 	s.Status.StillRunningAfterRevoke = running
 	if len(running) > 0 {

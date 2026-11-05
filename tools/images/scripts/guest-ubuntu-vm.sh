@@ -35,6 +35,7 @@ apt-get install -y --no-install-recommends \
   bash-completion man-db manpages vim nano less tmux tar rsync lsof strace \
   dnsutils tcpdump netcat-openbsd curl wget sudo cron at jq
 systemctl enable qemu-guest-agent auditd chrony || true
+require_auditctl   # the exam freeze's loginuid lock (guest-loginuid.sh)
 
 cat > /etc/cloudtrain-release <<R
 CLOUDTRAIN_IMAGE=${CLOUDTRAIN_IMAGE##*/}

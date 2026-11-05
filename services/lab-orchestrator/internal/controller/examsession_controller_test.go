@@ -336,6 +336,10 @@ func TestExamLifecycleSubmitSharedEnvironment(t *testing.T) {
 	if len(h.w.ran("workstation|admin|/bin/sh -c u=learner")) == 0 || len(h.w.ran("db|admin|/bin/sh -c u=learner")) == 0 {
 		t.Errorf("revoke script did not run on entry and VM: %v", h.w.ran("u=learner"))
 	}
+	// #394: the loginuid lock is checked on the VM only (the entry is a container).
+	if len(h.w.ran("db|admin|/bin/sh -c "+revokeLoginuidCheck)) == 0 || len(h.w.ran("workstation|admin|/bin/sh -c "+revokeLoginuidCheck)) != 0 {
+		t.Errorf("loginuid check: %v", h.w.ran("/proc/self/loginuid"))
+	}
 	// Rerun ran for the tb task, reboot hit the VM, grading waited for the new boot.
 	if len(h.w.ran("RERUN tb")) != 1 || h.w.boots["db"] != 1 {
 		t.Errorf("rerun %v boots %v", h.w.ran("RERUN"), h.w.boots)
