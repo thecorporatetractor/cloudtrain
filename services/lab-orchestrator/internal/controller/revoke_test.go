@@ -124,7 +124,7 @@ func TestRevokeNewAwk(t *testing.T) {
 	}
 	run := func(sd string, rows ...string) []string {
 		t.Helper()
-		cmd := exec.Command("awk", "-v", "self=99", "-v", "rt=5000", "-v", "sd="+sd, "-v", "mains= 10 11 17 ", revokeNewAwk)
+		cmd := exec.Command("awk", "-v", "self=99", "-v", "rt=5000", "-v", "sd="+sd, "-v", "mains= 10 11 17 ", "-v", "rpids= 25 26 ", revokeNewAwk)
 		cmd.Stdin = strings.NewReader(strings.Join(rows, "\n") + "\n")
 		out, err := cmd.Output()
 		if err != nil {
@@ -158,19 +158,23 @@ func TestRevokeNewAwk(t *testing.T) {
 	got = run("1",
 		"1 0 100 /init.scope systemd",
 		"2 0 100 / kthreadd",
-		"3 2 6000 / kworker/0:1",                                     // kernel thread
-		"10 1 6000 /system.slice/cron.service cron",                  // unit
-		"11 1 6000 /system.slice/run-u42.service sh",                 // transient unit (reported separately)
-		"12 25 6000 /system.slice/docker-abc.scope sh",               // container
-		"25 1 6000 /system.slice/containerd.service containerd-shim", // its shim (re-parented, not the main process)
-		"18 1 6000 /system.slice/cron.service sh",                    // loop moved into cron.service/cgroup.procs
-		"19 10 6000 /system.slice/cron.service sh",                   // a cron job
-		"26 1 6000 /machine.slice/libpod-conmon-ab12.scope conmon",   // podman's conmon
-		"27 26 6000 /machine.slice/libpod-ab12.scope nginx",          // its container
-		"28 1 6000 /machine.slice/libpod-ab12.scope sh",              // loop moved into the container's scope
-		"29 1 6000 /system.slice/run-r1.scope sh",                    // transient scope (reported as a unit)
-		"17 1 6000 /system.slice/systemd-udevd.service/udev udev",    // sub-cgroup of a unit
-		"13 1 6000 /user.slice/user-0.slice/session-9.scope sshd",    // another root session
+		"3 2 6000 / kworker/0:1",                                             // kernel thread
+		"10 1 6000 /system.slice/cron.service cron",                          // unit
+		"11 1 6000 /system.slice/run-u42.service sh",                         // transient unit (reported separately)
+		"12 25 6000 /system.slice/docker-abc.scope sh",                       // container
+		"25 1 6000 /system.slice/containerd.service containerd-shim",         // its shim (re-parented, not the main process; in rpids)
+		"32 1 6000 /system.slice/containerd.service containerd-shim-runc-v2", // a loop named like a shim, not in any shim.pid
+		"31 1 6000 /machine.slice/libpod-conmon-ab12.scope conmon",           // a loop named conmon moved into the conmon scope
+		"33 18 6000 /machine.slice/libpod-ab12.scope sh",                     // a child of the loop moved into the container scope
+		"34 27 6000 /machine.slice/libpod-ab12.scope worker",                 // a process the container forked
+		"18 1 6000 /system.slice/cron.service sh",                            // loop moved into cron.service/cgroup.procs
+		"19 10 6000 /system.slice/cron.service sh",                           // a cron job
+		"26 1 6000 /machine.slice/libpod-conmon-ab12.scope conmon",           // podman's conmon
+		"27 26 6000 /machine.slice/libpod-ab12.scope nginx",                  // its container
+		"28 1 6000 /machine.slice/libpod-ab12.scope sh",                      // loop moved into the container's scope
+		"29 1 6000 /system.slice/run-r1.scope sh",                            // transient scope (reported as a unit)
+		"17 1 6000 /system.slice/systemd-udevd.service/udev udev",            // sub-cgroup of a unit
+		"13 1 6000 /user.slice/user-0.slice/session-9.scope sshd",            // another root session
 		"14 1 6000 / sh", // moved to the root cgroup
 		"15 1 6000 /user.slice/user-1000.slice/session-3.scope sh", // escaped the terminated session
 		"16 1 6000 /evil$(x) sh",                                   // learner-made cgroup
@@ -179,7 +183,9 @@ func TestRevokeNewAwk(t *testing.T) {
 		"99 98 6000 /user.slice/user-0.slice/session-7.scope sh",
 		"20 1 4000 / sh", // before Ready
 	)
-	want = []string{"sh[14] /", "sh[15] /user.slice/user-1000.slice/session-3.scope", "sh[16] /evil__x_", "sh[18] /system.slice/cron.service", "sh[28] /machine.slice/libpod-ab12.scope", "sshd[13] /user.slice/user-0.slice/session-9.scope"}
+	want = []string{"conmon[31] /machine.slice/libpod-conmon-ab12.scope", "containerd-shim-runc-v2[32] /system.slice/containerd.service",
+		"sh[14] /", "sh[15] /user.slice/user-1000.slice/session-3.scope", "sh[16] /evil__x_", "sh[18] /system.slice/cron.service",
+		"sh[28] /machine.slice/libpod-ab12.scope", "sh[33] /machine.slice/libpod-ab12.scope", "sshd[13] /user.slice/user-0.slice/session-9.scope"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("systemd: got %v; want %v", got, want)
 	}
@@ -189,6 +195,12 @@ func TestRevokeNewAwk(t *testing.T) {
 	}
 	if strings.Contains(revokeNewAwk, "'") {
 		t.Error("revokeNewAwk is single-quoted in the script and must not contain a single quote")
+	}
+	if strings.Contains(revokeNewAwk, "cm[p] ~") || strings.Contains(revokeNewAwk, "containerd-shim") {
+		t.Error("container runtimes must be recognised by PID (rpids), never by name")
+	}
+	if !strings.Contains(s, `-v rpids="$rpids"`) || !strings.Contains(s, revokeRuntimeSh) {
+		t.Error("RevokeScript must pass the verified runtime PIDs to the new-process check")
 	}
 }
 

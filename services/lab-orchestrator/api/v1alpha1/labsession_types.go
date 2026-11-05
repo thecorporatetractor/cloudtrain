@@ -224,14 +224,30 @@ type LabSessionStatus struct {
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 	// +optional
 	ReadyAt *metav1.Time `json:"readyAt,omitempty"`
+	// ReadySnapshot is what the exam freeze compares against, taken on
+	// every node (and cluster) of an exam environment once setup is done
+	// and before endpoints are published, i.e. before the candidate has
+	// access: per node, its instance id, boot id and uptime, the identity
+	// (inode, ctime, content hash) of every systemd unit file, cron/at file
+	// and the tools the freeze runs, and the active and enabled triggering
+	// units (timers, paths, sockets); per cluster its CronJobs and Jobs.
+	// Values are gzip+base64 (about 10-15 KiB per VM; at most 128 KiB per
+	// node and 640 KiB in all, "too-large" beyond), or "-" when the node
+	// could not be measured. It is taken again after setup re-runs (reset,
+	// replaced node). Platform only: it lives here, out of the candidate's
+	// reach, and is never sent to learners.
+	// +optional
+	ReadySnapshot map[string]string `json:"readySnapshot,omitempty"`
 	// +optional
 	Hibernated bool `json:"hibernated,omitempty"`
 	// StillRunningAfterRevoke lists what was started after Ready and still
-	// ran when learner access was revoked: transient systemd units ("node:
-	// unit", e.g. sudo systemd-run) and processes outside any systemd unit
-	// ("node: process comm[pid] cgroup", e.g. a loop daemonised through sudo
-	// setsid). They are left running, since they may be the graded state,
-	// and flagged for review instead.
+	// ran when learner access was revoked, or can still change state during
+	// grading: transient systemd units ("node: unit", e.g. sudo systemd-run),
+	// units whose files changed since Ready, processes outside any systemd
+	// unit ("node: process comm[pid] cgroup", e.g. a loop daemonised through
+	// sudo setsid), cron/at jobs, containers and cluster CronJobs/Jobs
+	// started after Ready (see RevokeScript). They are left running, since
+	// they may be the graded state, and flagged for review instead.
 	// +optional
 	StillRunningAfterRevoke []string `json:"stillRunningAfterRevoke,omitempty"`
 	// Topology is the resolved topology the session's resources were

@@ -36,7 +36,11 @@ type world struct {
 }
 
 func newWorld() *world {
-	return &world{passing: map[string]bool{}, failRun: map[string]bool{}, boots: map[string]int{}, provErr: map[string]error{}, execErr: map[string]error{}, stdout: map[string]string{}}
+	// Complete (empty) freeze measurements by default: the Ready snapshot,
+	// the cluster query and the freeze itself (see readysnap.go).
+	done := measurePrefix + "Z done\n"
+	stdout := map[string]string{"list-unit-files": done, "kubectl --request-timeout": measurePrefix + "K ok\n" + done, "u=learner": done}
+	return &world{passing: map[string]bool{}, failRun: map[string]bool{}, boots: map[string]int{}, provErr: map[string]error{}, execErr: map[string]error{}, stdout: stdout}
 }
 
 func (w *world) ran(substr string) []string {
@@ -94,7 +98,7 @@ func (d *scriptDriver) Exec(_ context.Context, ref drivers.NodeRef, req drivers.
 		}
 	}
 	switch {
-	case strings.Contains(script, "boot_id"):
+	case strings.Contains(script, bootIDCommand):
 		return drivers.ExecResult{Stdout: fmt.Sprintf("boot-%d\n", d.w.boots[node])}, nil
 	case strings.Contains(script, "systemctl reboot"):
 		d.w.boots[node]++
@@ -660,7 +664,7 @@ func TestExamRerunAndRebootStagesTimeOut(t *testing.T) {
 	h.solveAll()
 	h.w.mu.Lock()
 	h.w.execErr["RERUN "] = fmt.Errorf("connection refused")
-	h.w.execErr["boot_id"] = fmt.Errorf("connection refused")
+	h.w.execErr[bootIDCommand] = fmt.Errorf("connection refused")
 	h.w.mu.Unlock()
 	h.patchES(`{"spec":{"submit":true}}`)
 	h.pumpLenient(8)
@@ -760,7 +764,7 @@ func TestExamFreezeFlagsUnitsStillRunning(t *testing.T) {
 	h.pump(3)
 	h.solveAll()
 	h.w.mu.Lock()
-	h.w.stdout["u=learner"] = "cloudtrain-revoke: still running: run-u7.service\n"
+	h.w.stdout["u=learner"] = "cloudtrain-revoke: still running: run-u7.service\n" + measurePrefix + "Z done\n"
 	h.w.mu.Unlock()
 	h.patchES(`{"spec":{"submit":true}}`)
 	h.pumpLenient(20)
@@ -777,5 +781,57 @@ func TestExamFreezeFlagsUnitsStillRunning(t *testing.T) {
 	}
 	if len(rep.ReviewFlags) != 1 || !strings.Contains(rep.ReviewFlags[0], "run-u7.service") {
 		t.Errorf("reviewFlags %v", rep.ReviewFlags)
+	}
+}
+
+// #394: exam environments are measured once setup is done (before the
+// candidate has access) and the freeze compares with that: a unit started
+// after Ready whose file differs from the Ready snapshot flags the attempt
+// even when its ctime predates Ready. A cluster whose API gives no answer
+// at the freeze is reported as not checked.
+func TestExamFreezeComparesWithReadySnapshot(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	h.w.mu.Lock()
+	h.w.stdout["list-unit-files"] = measurePrefix + "S systemd\n" + measurePrefix + "F unit 7 1700000000 aaaaaaaaaaaaaaaa /etc/systemd/system/tr.service\n" + measurePrefix + "Z done\n"
+	h.w.stdout["kubectl --request-timeout"] = measurePrefix + "K ok\n" + measurePrefix + "Z done\n"
+	h.w.mu.Unlock()
+	h.pump(3)
+	for _, ls := range h.sessions() {
+		if len(ls.Status.ReadySnapshot) == 0 || ls.Status.ReadyAt == nil {
+			t.Fatalf("%s: readyAt %v, readySnapshot %v", ls.Name, ls.Status.ReadyAt, ls.Status.ReadySnapshot)
+		}
+		for node, v := range ls.Status.ReadySnapshot {
+			r, _, err := decodeSnapshot(v)
+			if err != nil || r == nil {
+				t.Fatalf("%s/%s: %v %v", ls.Name, node, r, err)
+			}
+			c := strings.Contains(node, "core") // core: the cluster (ClusterSnapshotScript)
+			if r.systemd == c || r.clusterOK != c {
+				t.Errorf("%s/%s: systemd %v cluster %v", ls.Name, node, r.systemd, r.clusterOK)
+			}
+			if !c && r.instance == "" {
+				t.Errorf("%s/%s: no instance id recorded", ls.Name, node)
+			}
+		}
+	}
+	h.solveAll()
+	h.w.mu.Lock()
+	h.w.stdout["u=learner"] = measurePrefix + "F unit 7 1699999999 bbbbbbbbbbbbbbbb /etc/systemd/system/tr.service\n" + measurePrefix + "N tr.service\n" + measurePrefix + "Z done\n"
+	h.w.stdout["kubectl --request-timeout"] = ""
+	h.w.mu.Unlock()
+	h.patchES(`{"spec":{"submit":true}}`)
+	h.pumpLenient(20)
+	es := h.es()
+	if es.Status.Grading == nil {
+		t.Fatalf("phase %s", es.Status.Phase)
+	}
+	got := strings.Join(es.Status.Grading.StillRunningAfterFreeze, "\n")
+	for _, want := range []string{
+		"es1-env/db: tr.service (unit file differs from the Ready snapshot: /etc/systemd/system/tr.service)",
+		"es1-env/core: cluster CronJobs and Jobs not checked (the API did not answer at the freeze)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stillRunningAfterFreeze lacks %q:\n%s", want, got)
+		}
 	}
 }

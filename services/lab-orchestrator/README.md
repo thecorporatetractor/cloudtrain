@@ -528,7 +528,11 @@ objective, weight, nodes, contexts) -> `Provisioning` (fails, unscored, after
 duration`, `InProgress`, endpoints mirrored -> `spec.submit` or the deadline
 -> `Grading`: **Freeze** (`accessRevoked` on every environment: endpoints
 withdrawn, every learner process on the entry node, the VMs and kubeadm
-members killed by `RevokeScript`; condition `AccessRevoked`) -> **Initial**
+members killed by `RevokeScript`; condition `AccessRevoked`; what can still
+change state during grading is compared with `status.readySnapshot`, taken
+before the candidate had access, and flagged for review: units and timers
+whose files changed, cron/at jobs, podman/docker containers and cluster
+CronJobs/Jobs started after Ready, replaced tools) -> **Initial**
 pass (`validateRequest`, existing grader) -> **Rerun** (`rules.idempotencyRerun`:
 each task's `spec.exam.rerun` actions, e.g. re-apply the saved manifest /
 playbook and assert no changes) -> **RerunGrade** -> **Reboot**

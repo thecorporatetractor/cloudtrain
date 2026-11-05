@@ -1079,6 +1079,13 @@ func (in *LabSessionStatus) DeepCopyInto(out *LabSessionStatus) {
 		in, out := &in.ReadyAt, &out.ReadyAt
 		*out = (*in).DeepCopy()
 	}
+	if in.ReadySnapshot != nil {
+		in, out := &in.ReadySnapshot, &out.ReadySnapshot
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.StillRunningAfterRevoke != nil {
 		in, out := &in.StillRunningAfterRevoke, &out.StillRunningAfterRevoke
 		*out = make([]string, len(*in))

@@ -24,6 +24,10 @@ bash "$ROOT/tools/charts/sync.sh" --check && pass "embedded files in sync" || fa
 helm lint "$CRDS" >/dev/null && pass "lint cloudtrain-crds" || fail "lint cloudtrain-crds"
 helm template c "$CRDS" > "$OUT/crds.yaml"
 check "crds: 5 CRDs, kept on uninstall" bash -c "[[ \$(yq -N 'select(.kind == \"CustomResourceDefinition\") | .metadata.name' '$OUT/crds.yaml' | grep -c cloudtrain.dev) == 5 ]] && yq -e 'select(.kind == \"CustomResourceDefinition\") | .metadata.annotations[\"helm.sh/resource-policy\"] == \"keep\"' '$OUT/crds.yaml'"
+# The orchestrator writes status fields the API server prunes unless the CRD
+# declares them; a CRD change needs a chart version bump (charts.yml never
+# republishes a version), or installs keep the old schema.
+check "crds: LabSession status has readySnapshot and stillRunningAfterRevoke" bash -c "yq -e 'select(.kind == \"CustomResourceDefinition\" and .metadata.name == \"labsessions.labs.cloudtrain.dev\") | .spec.versions[0].schema.openAPIV3Schema.properties.status.properties | (has(\"readySnapshot\") and has(\"stillRunningAfterRevoke\"))' '$OUT/crds.yaml'"
 
 for f in "$CHART"/examples/values-*.yaml; do
   n=$(basename "$f" .yaml)
