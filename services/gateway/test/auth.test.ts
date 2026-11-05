@@ -453,7 +453,7 @@ describe.skipIf(!available)('OIDC BFF auth flow (fake provider)', () => {
       };
       const r = await repairTenantIdps(h.t.db, kc as never);
       expect(calls).toEqual(['flow', 'idp acme-idp -> cloudtrain tenant broker login', 'mapper acme-idp', 'mark u-old acme-idp', 'drop u-foreign acme-idp']);
-      expect(r).toEqual({ brokerFlowFixed: ['acme-idp'], foreignReleased: ['acme-idp/u-foreign'], untrustedLinks: ['acme-idp/u-old'], originsMarked: ['acme-idp/u-old'] });
+      expect(r).toEqual({ brokerFlowFixed: ['acme-idp'], foreignReleased: ['acme-idp/u-foreign'], untrustedLinks: ['acme-idp/u-old'], originsMarked: ['acme-idp/u-old'], failures: [] });
     });
 
     it('a trusted login never takes an address from an account that holds it trusted', async () => {

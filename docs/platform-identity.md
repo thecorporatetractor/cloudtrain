@@ -51,8 +51,11 @@ and web (`apps/web`) build against this document and the types in
 - **A password does not launder a brokered account.** Keycloak's account console
   lets a brokered user add a password, and a password login carries no
   `identity_provider` claim. Every tenant IdP therefore stamps the users it
-  brokers with the attribute `ct_broker_origin` (a hardcoded-attribute mapper;
-  users cannot edit unmanaged attributes, which are admin-edit only), and on a
+  brokers with the attribute `ct_broker_origin` (a hardcoded-attribute mapper,
+  sync mode IMPORT: set when the IdP creates the user; the repair run adds the
+  alias of every other IdP the user is linked to, so values accumulate and none
+  is overwritten; users cannot edit unmanaged attributes, which are admin-edit
+  only), and on a
   local login the gateway asks Keycloak for the user's IdP links and that stamp.
   An account with an IdP origin is trusted only as that IdP would be (its org's
   verified domains), even after it unlinks the IdP; `users.last_idp` keeps that
@@ -152,7 +155,10 @@ per person and exam" is also a unique index, so it holds under concurrent starts
   discovery URL + client, or SAML metadata), verifies the domain (DNS TXT), maps IdP
   groups to CloudTrain roles and teams, tests the connection, then enforces SSO
   (local passwords disabled for that domain). The gateway drives Keycloak's admin
-  API; Keycloak is never exposed to org admins directly.
+  API; Keycloak is never exposed to org admins directly. Its admin client
+  (`cloudtrain-gateway-admin`, a service account) needs the `realm-management`
+  roles `manage-realm`, `manage-identity-providers` and `manage-users`
+  (docs/deploy.md).
 - **Provisioning:** just-in-time on first login (user + membership + mapped
   roles/teams), re-evaluated on every login. SCIM 2.0 (`/scim/v2`) is phase 2.
   Deprovisioning: deactivated in the IdP -> blocked at next login; org_admin can

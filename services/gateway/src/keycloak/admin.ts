@@ -43,6 +43,14 @@ export interface KcIdentityProvider {
   config: Record<string, string>;
 }
 
+export interface KcIdpMapper {
+  id: string;
+  name: string;
+  identityProviderAlias: string;
+  identityProviderMapper: string;
+  config: Record<string, string>;
+}
+
 export interface KcUser {
   id: string;
   username: string;
@@ -66,11 +74,19 @@ export interface KcUser {
 export const TENANT_BROKER_FLOW = 'cloudtrain tenant broker login';
 
 /**
- * User attribute a tenant IdP stamps on every Keycloak user it brokers (a hardcoded-attribute
- * mapper, value = the IdP alias). It outlives the IdP link: a brokered user who sets a password in
- * the account console and unlinks the IdP still carries it, and users cannot edit it (unmanaged
+ * User attribute holding the tenant IdPs a Keycloak user came from (one value per IdP alias). Each
+ * tenant IdP has a hardcoded-attribute mapper that sets it when the IdP creates the user (sync
+ * mode IMPORT, first login only), and the gateway's repair run (keycloak/repair.ts) adds the alias
+ * of every IdP a user is linked to, so a user linked to several IdPs keeps all of them. Nothing
+ * removes a value: the stamp outlives the IdP link (a brokered user who sets a password in the
+ * account console and unlinks the IdP still carries it), and users cannot edit it (unmanaged
  * attributes are admin-edit only). The gateway treats a local login of such a user like a login
- * through that IdP when deciding whether to trust its email (platform/identity.ts).
+ * through those IdPs when deciding whether to trust its email (platform/identity.ts).
+ *
+ * Not FORCE: Keycloak's hardcoded-attribute mapper then sets the attribute to the single value of
+ * the IdP of each login, which would drop the other IdPs' origins. FORCE protects nothing more
+ * either: it only re-stamps on a login through the IdP, i.e. while the link exists, and the repair
+ * run re-stamps every linked user anyway.
  */
 export const BROKER_ORIGIN_ATTRIBUTE = 'ct_broker_origin';
 const BROKER_ORIGIN_MAPPER = 'cloudtrain broker origin';
@@ -249,29 +265,39 @@ export class KeycloakAdmin {
     return (await this.request<Record<string, string>>('POST', '/identity-provider/import-config', { providerId, fromUrl })).data;
   }
 
-  async idpMappers(alias: string): Promise<{ id: string; name: string }[]> {
-    return (await this.request<{ id: string; name: string }[]>('GET', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`)).data;
+  async idpMappers(alias: string): Promise<KcIdpMapper[]> {
+    return (await this.request<KcIdpMapper[]>('GET', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`)).data;
+  }
+
+  /**
+   * Creates the IdP mapper named `mapper.name`, or updates it when its type or one of the config
+   * values in `mapper` differs (left alone when equal: no write per repair run).
+   */
+  private async ensureIdpMapper(alias: string, mapper: Omit<KcIdpMapper, 'id' | 'identityProviderAlias'>): Promise<void> {
+    const path = `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`;
+    const want = { ...mapper, identityProviderAlias: alias };
+    const existing = (await this.idpMappers(alias)).find((m) => m.name === mapper.name);
+    if (!existing) await this.request('POST', path, want);
+    else if (existing.identityProviderMapper !== mapper.identityProviderMapper || Object.entries(mapper.config).some(([k, v]) => existing.config?.[k] !== v)) {
+      await this.request('PUT', `${path}/${existing.id}`, { ...want, id: existing.id, config: { ...existing.config, ...mapper.config } });
+    }
   }
 
   /** Claim (OIDC) or attribute (SAML) -> user attribute, re-synced on every login. */
   async ensureAttributeMapper(alias: string, providerId: 'oidc' | 'saml', name: string, source: string, attribute: string): Promise<void> {
-    const existing = (await this.idpMappers(alias)).find((m) => m.name === name);
-    const mapper = {
+    await this.ensureIdpMapper(alias, {
       name,
-      identityProviderAlias: alias,
       identityProviderMapper: providerId === 'oidc' ? 'oidc-user-attribute-idp-mapper' : 'saml-user-attribute-idp-mapper',
       config: providerId === 'oidc' ? { syncMode: 'FORCE', claim: source, 'user.attribute': attribute } : { syncMode: 'FORCE', 'attribute.name': source, 'user.attribute': attribute },
-    };
-    if (existing) await this.request('PUT', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers/${existing.id}`, { ...mapper, id: existing.id });
-    else await this.request('POST', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`, mapper);
+    });
   }
 
-  /** Stamps BROKER_ORIGIN_ATTRIBUTE = `alias` on every user the IdP brokers (each login). Idempotent. */
+  /**
+   * Stamps BROKER_ORIGIN_ATTRIBUTE = `alias` on the users the IdP creates (IMPORT: once, at their
+   * first login; see BROKER_ORIGIN_ATTRIBUTE). Moves a FORCE mapper to IMPORT. Idempotent.
+   */
   async ensureBrokerOriginMapper(alias: string): Promise<void> {
-    const existing = (await this.idpMappers(alias)).find((m) => m.name === BROKER_ORIGIN_MAPPER);
-    const mapper = { name: BROKER_ORIGIN_MAPPER, identityProviderAlias: alias, identityProviderMapper: 'hardcoded-attribute-idp-mapper', config: { syncMode: 'FORCE', attribute: BROKER_ORIGIN_ATTRIBUTE, 'attribute.value': alias } };
-    if (existing) await this.request('PUT', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers/${existing.id}`, { ...mapper, id: existing.id });
-    else await this.request('POST', `/identity-provider/instances/${encodeURIComponent(alias)}/mappers`, mapper);
+    await this.ensureIdpMapper(alias, { name: BROKER_ORIGIN_MAPPER, identityProviderMapper: 'hardcoded-attribute-idp-mapper', config: { syncMode: 'IMPORT', attribute: BROKER_ORIGIN_ATTRIBUTE, 'attribute.value': alias } });
   }
 
   /* ---------------------------------------------------------------- users */

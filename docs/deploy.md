@@ -54,7 +54,13 @@ The web app has no OIDC settings: the gateway is the OIDC client (BFF).
   PKCE). Keycloak's admin API is optional (SSO connections, invitations). With it,
   the gateway re-applies the tenant IdP protections at startup and every
   `CT_KC_REPAIR_MS` (default 15 minutes; `0` = startup only): no `kc:sync` Job is
-  needed in production (docs/platform-identity.md).
+  needed in production (docs/platform-identity.md). The admin client
+  (`gateway.keycloak.adminClientId`, default `cloudtrain-gateway-admin`) is a
+  confidential client with service accounts enabled whose service account has the
+  `realm-management` client roles `manage-realm` (authentication flows, user
+  profile, organizations), `manage-identity-providers` (IdPs and their mappers) and
+  `manage-users` (users, IdP links, attributes); the dev realm grants these plus
+  the matching `view-*`/`query-users` roles (`deploy/dev/keycloak/gen-realms.mjs`).
 - For labs: KubeVirt + CDI, Multus, Kube-OVN, and `/dev/kvm` on the lab nodes (VM
   labs). See [any-kubernetes.md](any-kubernetes.md) section 3 per provider.
 
@@ -166,6 +172,7 @@ keep the old behaviour.
 | `gateway.existingSecret` | | the Secret from step 3 |
 | `gateway.oidc.issuer`, `.clientId` | | IdP issuer URL and client |
 | `gateway.keycloak.url` | | Keycloak admin API (optional) |
+| `gateway.keycloak.adminClientId` | `cloudtrain-gateway-admin` | admin API client (service account roles above); secret `CT_KEYCLOAK_ADMIN_CLIENT_SECRET` |
 | `gateway.trustProxy` | private ranges | proxies whose `X-Forwarded-*` are trusted (client IPs for audit and rate limits) |
 | `gateway.sessionsNamespace` | `cloudtrain-sessions` | lab sessions and lab pods |
 | `web.runtimeConfig.apiBase`, `web.csp.*` | same origin | runtime config and extra CSP sources |

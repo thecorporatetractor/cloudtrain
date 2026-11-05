@@ -1,6 +1,6 @@
 import { withTenant, type Db } from '../db/index.js';
 import { foreignLinks } from '../platform/kc-address.js';
-import { BROKER_ORIGIN_ATTRIBUTE, TENANT_BROKER_FLOW, type KeycloakAdmin } from './admin.js';
+import { BROKER_ORIGIN_ATTRIBUTE, TENANT_BROKER_FLOW, type KcUser, type KeycloakAdmin } from './admin.js';
 
 /*
  * Keycloak protections of tenant IdPs that must hold in production, not only
@@ -26,16 +26,43 @@ export interface RepairReport {
    * first broker login flow, which could link an IdP to an existing account by email.
    */
   untrustedLinks: string[];
-  /** Brokered users (`alias/userId`) stamped with BROKER_ORIGIN_ATTRIBUTE (linked before the mapper existed). */
+  /**
+   * Brokered users (`alias/userId`) given BROKER_ORIGIN_ATTRIBUTE = alias: linked before the mapper
+   * existed, or linked to an IdP that did not create them (the mapper stamps new users only).
+   */
   originsMarked: string[];
+  /**
+   * Steps that failed (`realm: …`, `alias: …` or `alias/userId: …`, with the error). A failure
+   * skips only that IdP or user; the next run retries it.
+   */
+  failures: string[];
 }
 
-export async function repairTenantIdps(db: Db, kc: KeycloakAdmin): Promise<RepairReport> {
-  const report: RepairReport = { brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [] };
-  // The origin stamp is an unmanaged attribute: users may not edit it, admins (and mappers) may.
-  await kc.allowUnmanagedAttributes();
-  // Every run: the flow may have been loosened in the admin console since it was created.
-  await kc.ensureTenantBrokerFlow();
+export interface RepairLog {
+  warn(o: object, m: string): void;
+}
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+export async function repairTenantIdps(db: Db, kc: KeycloakAdmin, log?: RepairLog): Promise<RepairReport> {
+  const report: RepairReport = { brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], failures: [] };
+  const failed = (what: string, e: unknown) => {
+    report.failures.push(`${what}: ${errText(e)}`);
+    log?.warn({ err: e, target: what }, 'keycloak: tenant IdP repair step failed, continuing');
+  };
+  // Realm-wide steps; a failure here does not stop the per-IdP repairs below.
+  try {
+    // The origin stamp is an unmanaged attribute: users may not edit it, admins (and mappers) may.
+    await kc.allowUnmanagedAttributes();
+  } catch (e) {
+    failed('realm (user profile)', e);
+  }
+  try {
+    // Every run: the flow may have been loosened in the admin console since it was created.
+    await kc.ensureTenantBrokerFlow();
+  } catch (e) {
+    failed('realm (tenant broker flow)', e);
+  }
   const { conns, owners } = await withTenant(db, { platform: true }, async (tx) => ({
     conns: await tx.selectFrom('sso_connections').select(['kc_alias', 'org_id']).orderBy('kc_alias').execute(),
     owners: await tx.selectFrom('org_domains').select(['domain', 'org_id']).where('verified_at', 'is not', null).execute(),
@@ -43,28 +70,40 @@ export async function repairTenantIdps(db: Db, kc: KeycloakAdmin): Promise<Repai
   const domainOwner = new Map(owners.map((d) => [d.domain, d.org_id]));
   for (const c of conns) {
     if (c.kc_alias === ENTRA_ALIAS) continue;
-    const idp = await kc.getIdp(c.kc_alias);
-    if (!idp) continue;
-    // Tenant IdPs never link to an existing account.
-    if (idp.firstBrokerLoginFlowAlias !== TENANT_BROKER_FLOW) {
-      await kc.updateIdp({ ...idp, firstBrokerLoginFlowAlias: TENANT_BROKER_FLOW });
-      report.brokerFlowFixed.push(c.kc_alias);
+    let users: KcUser[];
+    try {
+      const idp = await kc.getIdp(c.kc_alias);
+      if (!idp) continue;
+      // Tenant IdPs never link to an existing account.
+      if (idp.firstBrokerLoginFlowAlias !== TENANT_BROKER_FLOW) {
+        await kc.updateIdp({ ...idp, firstBrokerLoginFlowAlias: TENANT_BROKER_FLOW });
+        report.brokerFlowFixed.push(c.kc_alias);
+      }
+      await kc.ensureBrokerOriginMapper(c.kc_alias);
+      users = await kc.idpUsers(c.kc_alias, 200, true);
+    } catch (e) {
+      failed(c.kc_alias, e);
+      continue;
     }
-    await kc.ensureBrokerOriginMapper(c.kc_alias);
-    for (const u of await kc.idpUsers(c.kc_alias, 200, true)) {
-      if (!(u.attributes?.[BROKER_ORIGIN_ATTRIBUTE] ?? []).includes(c.kc_alias)) {
-        await kc.addUserAttribute(u.id, BROKER_ORIGIN_ATTRIBUTE, c.kc_alias);
-        report.originsMarked.push(`${c.kc_alias}/${u.id}`);
+    for (const u of users) {
+      try {
+        // Every IdP the user is linked to is one of its origins, also the ones that did not create it.
+        if (!(u.attributes?.[BROKER_ORIGIN_ATTRIBUTE] ?? []).includes(c.kc_alias)) {
+          await kc.addUserAttribute(u.id, BROKER_ORIGIN_ATTRIBUTE, c.kc_alias);
+          report.originsMarked.push(`${c.kc_alias}/${u.id}`);
+        }
+        // An address on another org's verified domain is released.
+        const owner = domainOwner.get((u.email ?? '').toLowerCase().split('@')[1] ?? '');
+        if (owner === c.org_id) continue;
+        if (!owner) {
+          report.untrustedLinks.push(`${c.kc_alias}/${u.id}`);
+          continue;
+        }
+        const foreign = await foreignLinks(db, await kc.federatedIdentities(u.id), owner);
+        if (foreign.length && (await kc.dropBrokeredLinks(u.id, foreign)) !== 'none') report.foreignReleased.push(`${c.kc_alias}/${u.id}`);
+      } catch (e) {
+        failed(`${c.kc_alias}/${u.id}`, e);
       }
-      // An address on another org's verified domain is released.
-      const owner = domainOwner.get((u.email ?? '').toLowerCase().split('@')[1] ?? '');
-      if (owner === c.org_id) continue;
-      if (!owner) {
-        report.untrustedLinks.push(`${c.kc_alias}/${u.id}`);
-        continue;
-      }
-      const foreign = await foreignLinks(db, await kc.federatedIdentities(u.id), owner);
-      if (foreign.length && (await kc.dropBrokeredLinks(u.id, foreign)) !== 'none') report.foreignReleased.push(`${c.kc_alias}/${u.id}`);
     }
   }
   return report;
@@ -76,9 +115,10 @@ export function scheduleTenantIdpRepair(db: Db, kc: KeycloakAdmin, everyMs: numb
   const run = () => {
     if (running) return;
     running = true;
-    void repairTenantIdps(db, kc)
+    void repairTenantIdps(db, kc, log)
       .then((r) => {
         if (r.brokerFlowFixed.length || r.foreignReleased.length || r.originsMarked.length) log.warn({ brokerFlowFixed: r.brokerFlowFixed, foreignReleased: r.foreignReleased, originsMarked: r.originsMarked.length }, 'keycloak: repaired tenant IdPs');
+        if (r.failures.length) log.warn({ failures: r.failures.length }, 'keycloak: tenant IdP repair finished with failures (retried next run)');
         if (r.untrustedLinks.length) log.info({ untrustedLinks: r.untrustedLinks.length }, 'keycloak: brokered users with an email on a domain no org verified (not trusted for invitations)');
       })
       .catch((e: unknown) => log.warn({ err: e }, 'keycloak: tenant IdP repair failed'))
