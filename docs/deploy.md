@@ -729,7 +729,9 @@ set: `networkPolicy.labs.denyCloudMetadata`, `networkPolicy.labs.defaultDeny` (w
 `orchestrator.networkMode: secondary`), `gateway.capacity.maxActiveSessions > 0`, and
 `sessions.quota` with `count/labsessions.labs.cloudtrain.dev` and ephemeral-storage
 requests and limits, and `orchestrator.vclusterPodCIDRs`. `labNodes` and the sandboxes
-are checked too. The manager re-checks the policy engine on every change of a
+are checked too. The manager itself refuses to start under production without
+`--vcluster-pod-cidrs`, `--apiserver-cidrs` (or the Role that reads them) and tier
+sandboxes, so a hand-written Deployment cannot skip the chart guard. The manager re-checks the policy engine on every change of a
 kube-system DaemonSet (a watch) and every two minutes. With a lab pool it requires a
 Ready agent on every lab node; otherwise every scheduled agent must be ready. It also
 re-reads labctl preflight's kubelet verdict every two minutes. Under production it

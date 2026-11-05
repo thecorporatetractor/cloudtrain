@@ -481,6 +481,11 @@ func main() {
 			}
 			log.Error(err, "vcluster endpoints allowlist is ineffective")
 		}
+	} else if profile == drivers.IsolationProduction {
+		// Without the pod CIDRs the host policy admits any endpoint address,
+		// so a virtual cluster admin could route a Service to a node or VNet IP.
+		log.Error(nil, "refusing to start: the production isolation profile needs --vcluster-pod-cidrs (Helm orchestrator.vclusterPodCIDRs): without it vcluster EndpointSlices may name node and VNet addresses")
+		os.Exit(1)
 	}
 	// Typed nil pointers must not reach the interfaces.
 	var nsAccess drivers.NamespaceAccess
