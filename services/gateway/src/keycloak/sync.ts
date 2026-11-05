@@ -111,7 +111,7 @@ export interface SyncReport extends RepairReport {
 }
 
 export async function syncKeycloak(ps: PlatformService, kc: KeycloakAdmin, db: Db, opts: { entraFile?: string } = {}): Promise<SyncReport> {
-  const report: SyncReport = { orgs: [], linkedIdps: [], brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], members: 0, entra: 'absent' };
+  const report: SyncReport = { orgs: [], linkedIdps: [], brokerFlowFixed: [], foreignReleased: [], untrustedLinks: [], originsMarked: [], failures: [], members: 0, entra: 'absent' };
   await kc.allowUnmanagedAttributes();
 
   const entra = await readEntra(opts.entraFile);
