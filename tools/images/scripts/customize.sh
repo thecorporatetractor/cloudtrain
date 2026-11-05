@@ -23,6 +23,7 @@ virt-customize "${VERBOSE[@]}" -a "$DISK" --memsize "${LIBGUESTFS_MEMSIZE:-2048}
   --copy-in "$VARIANT_DIR/in:/opt/cloudtrain" \
   --run-command "mv /opt/cloudtrain/in /opt/cloudtrain/build" \
   --upload /src/scripts/guest-common.sh:/opt/cloudtrain/build/guest-common.sh \
+  --upload /src/scripts/guest-loginuid.sh:/opt/cloudtrain/build/guest-loginuid.sh \
   --upload "/src/scripts/$GUEST_SCRIPT:/opt/cloudtrain/build/$GUEST_SCRIPT" \
   --run-command "bash /opt/cloudtrain/build/$GUEST_SCRIPT"
 

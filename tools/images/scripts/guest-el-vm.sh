@@ -43,6 +43,10 @@ dnf -y --setopt=install_weak_deps=False install \
   bash-completion man-db man-pages vim-enhanced nano less tmux tar bzip2 rsync lsof strace \
   bind-utils tcpdump nmap-ncat curl wget sudo cronie at tuned cloud-utils-growpart
 systemctl enable qemu-guest-agent firewalld auditd chronyd || true
+# The exam freeze's loginuid lock (unit + /usr/sbin/auditctl check): see guest-loginuid.sh
+# shellcheck source=guest-loginuid.sh
+source "$B/guest-loginuid.sh"
+require_auditctl
 # SELinux enforcing, targeted (the cloud image default; asserted here)
 sed -i 's/^SELINUX=.*/SELINUX=enforcing/; s/^SELINUXTYPE=.*/SELINUXTYPE=targeted/' /etc/selinux/config
 grep -q '^SELINUX=enforcing' /etc/selinux/config

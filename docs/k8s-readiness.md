@@ -18,6 +18,15 @@ For each lab, against the live cluster:
 6. Delete each session; every resource the session created is gone.
 7. Params: run step 1-3 with two different seeds.
 
+With `--freeze exam-pool` (labs in an exam pool of `content/curriculum.yaml`) or
+`--freeze all`, steps 3 and 5 run the exam freeze (`spec.accessRevoked`: endpoints
+withdrawn, the learner's processes ended) after the steps and before grading, as an
+exam does at the deadline. A lab whose correct solution depends on a process the
+freeze ends then fails. What the freeze reports (units or processes that would hold
+an exam attempt for review, a VM whose loginuids are not locked) is a warning. The
+batch verifier (`tools/verify-vm/ct-batch.sh`) runs with `--freeze exam-pool`
+(`FREEZE=off` disables it).
+
 Output: a JSON report per lab under `deploy/.results/verify/<lab>.json` plus a
 summary table. Exit non-zero on any failure.
 

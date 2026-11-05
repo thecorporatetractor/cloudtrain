@@ -6,6 +6,8 @@ package main
 // in-cluster controller exactly as for a learner. Solution, alternative and
 // mutation steps are executed with the same driver Exec code the controller
 // uses for setup actions (internal/controller.NodeExecutor).
+// With --freeze, base and alternative runs are frozen like an exam before
+// they are graded (verify_freeze.go).
 
 import (
 	"context"
@@ -75,6 +77,12 @@ type verifyOpts struct {
 	// sessionLabels are set on every LabSession (managers can select them
 	// with --session-selector).
 	sessionLabels map[string]string
+	// freeze selects the runs that are frozen like an exam before grading
+	// (verify_freeze.go): off, exam-pool (labs in an exam pool) or all.
+	freeze        string
+	freezeTimeout time.Duration
+	// examPool are the lab ids in an exam pool (--freeze exam-pool).
+	examPool map[string]bool
 }
 
 // GradeReport is one grading round.
@@ -98,6 +106,8 @@ type RunReport struct {
 	After    *GradeReport      `json:"gradeAfter,omitempty"`
 	// Again is a second grading right after After: it must agree with it.
 	Again *GradeReport `json:"gradeAgain,omitempty"`
+	// Freeze is the exam freeze before gradeAfter (--freeze).
+	Freeze *FreezeReport `json:"freeze,omitempty"`
 	// PrePassed are the checks that pass before the solution (base runs).
 	PrePassed []string `json:"prePassed,omitempty"`
 	// PrePassShare is their share of the check weight (base runs), recorded
@@ -146,7 +156,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	fl := flag.NewFlagSet("verify", flag.ContinueOnError)
 	fl.SetOutput(stderr)
 	o := verifyOpts{only: map[string]bool{}}
-	var only, catalogs, repoRoot string
+	var only, catalogs, repoRoot, freeze, exams string
 	fl.StringVar(&o.kubeContext, "context", "", "kubeconfig context (default: current context; never changed)")
 	fl.StringVar(&o.kubeconfig, "kubeconfig", "", "kubeconfig file (default: $KUBECONFIG or ~/.kube/config)")
 	fl.IntVar(&o.parallel, "parallel", 2, "sessions verified at the same time")
@@ -167,6 +177,9 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	// batch without a rebuild if a wider run shows guard-heavy labs above it.
 	fl.Float64Var(&o.maxPrepass, "max-prepass", 0.5, "largest share of the check weight that may pass before the solution (0-1; 1 disables the rule)")
 	fl.DurationVar(&o.gradeBudget, "grade-budget", 60*time.Second, "grading time the workspace waits for (CT_VALIDATE_TIMEOUT_MS); slower gradings are reported")
+	fl.StringVar(&freeze, "freeze", freezeOff, "run the exam freeze after the solution and each alternative, then grade: off, exam-pool (labs in an exam pool of --exams) or all")
+	fl.StringVar(&exams, "exams", "", "curriculum with the exam pools for --freeze exam-pool (default <repo>/content/curriculum.yaml)")
+	fl.DurationVar(&o.freezeTimeout, "freeze-timeout", 3*time.Minute, "max time for the controller to confirm the freeze")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
@@ -180,6 +193,11 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	o.sessionLabels = map[string]string{k: val}
+	var err error
+	if o.freeze, err = parseFreezeMode(freeze); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	if o.parallel < 1 {
 		o.parallel = 1
 	}
@@ -196,6 +214,15 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	if catalogs == "" {
 		catalogs = filepath.Join(repoRoot, "deploy", "images", "catalog.yaml")
+	}
+	if o.freeze == freezeExamPool {
+		if exams == "" {
+			exams = filepath.Join(repoRoot, "content", "curriculum.yaml")
+		}
+		if o.examPool, err = examPoolLabs(exams); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
 	}
 	cat, err := drivers.LoadCatalog(strings.Split(catalogs, ",")...)
 	if err != nil {
@@ -390,7 +417,9 @@ func plan(l *labUnderTest, quick bool) []runSpec {
 }
 
 type verifier struct {
-	o      verifyOpts
+	o verifyOpts
+	// poll is the status poll interval of grade and freeze (default 2s).
+	poll   time.Duration
 	c      client.Client
 	disc   discovery.DiscoveryInterface
 	rt     *drivers.Runtime
@@ -572,32 +601,9 @@ func (v *verifier) run(ctx context.Context, r runSpec) (rep RunReport) {
 		}
 	}
 
-	after, err := v.grade(ctx, sess, 2)
-	rep.After = after
-	if err != nil {
-		fail("grade after: %v", err)
+	// Freeze (--freeze) and grade.
+	if !v.afterSteps(ctx, r, sess, &rep, fail) {
 		return rep
-	}
-	switch r.kind {
-	case runBase, runAlternative:
-		for _, c := range after.Checks {
-			if !c.Passed {
-				fail("check %s fails after the %s (%s): %s", c.ID, r.kind, c.Message, tail(c.Output, 300))
-			}
-		}
-		if d := gradeDuration(after); v.o.gradeBudget > 0 && d > v.o.gradeBudget {
-			rep.Warnings = append(rep.Warnings, fmt.Sprintf("grading took %s, longer than the %s the workspace waits for a result", d.Round(time.Second), v.o.gradeBudget))
-		}
-		// Grading must not change what it grades: a second grading right away agrees.
-		again, err := v.grade(ctx, sess, 3)
-		rep.Again = again
-		if err != nil {
-			fail("grade again: %v", err)
-			return rep
-		}
-		for _, d := range regradeDiffs(after, again) {
-			fail("grading is not repeatable: %s", d)
-		}
 	}
 	if r.kind == runBase {
 		cur := &labsv1.LabSession{}
@@ -613,7 +619,7 @@ func (v *verifier) run(ctx context.Context, r runSpec) (rep RunReport) {
 	switch r.kind {
 	case runMutation:
 		got := map[string]bool{}
-		for _, c := range after.Checks {
+		for _, c := range rep.After.Checks {
 			got[c.ID] = c.Passed
 		}
 		for _, id := range r.expectFail {
@@ -764,7 +770,7 @@ func (v *verifier) grade(ctx context.Context, s *labsv1.LabSession, req int64) (
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(v.pollEvery()):
 		}
 	}
 }

@@ -115,6 +115,59 @@ func TestStillRunning(t *testing.T) {
 	}
 }
 
+// #394: a VM whose loginuids are not immutable is reported (the attempt is
+// held for review). The controller decides which targets are checked, by
+// node kind; the check asks the kernel (EPERM on a loginuid change).
+func TestRevokeLoginuidNotLocked(t *testing.T) {
+	got := stillRunning("ctl", "cloudtrain-revoke: loginuid not locked\ncloudtrain-revoke: loginuid not locked (state unreadable)\n")
+	if len(got) != 2 || !strings.HasPrefix(got[0], "ctl: loginuid not locked (the boot-time lock") || !strings.HasPrefix(got[1], "ctl: loginuid not locked (state unreadable) (") {
+		t.Errorf("got %v", got)
+	}
+	if strings.Contains(RevokeScript, "loginuid not locked") || strings.Contains(revokeLoginuidCheck, "auditctl") || strings.Contains(revokeLoginuidCheck, "/var/lib/cloud") {
+		t.Error("the loginuid check must not depend on guest state other than the kernel's")
+	}
+	spec := &labsv1.LabTemplateSpec{Topology: labsv1.Topology{Entry: "ws", Nodes: []labsv1.Node{
+		{Name: "ws", Driver: labsv1.DriverContainer},
+		{Name: "vm1", Driver: labsv1.DriverVM},
+		{Name: "k", Driver: labsv1.DriverK8sCluster, Cluster: &labsv1.ClusterSpec{Mode: labsv1.ClusterModeKubeadm, Nodes: []labsv1.ClusterNode{{Name: "cp"}}}},
+	}}}
+	var vms []string
+	for _, on := range revokeTargets(spec) {
+		if revokeOnVM(spec, on) {
+			vms = append(vms, on)
+		}
+	}
+	if strings.Join(vms, ",") != "vm1,k/cp" {
+		t.Errorf("checked targets %v", vms)
+	}
+	spec.Topology.Entry = "vm1"
+	if !revokeOnVM(spec, "vm1") {
+		t.Error("VM entry node not checked")
+	}
+}
+
+// The check itself, with fake loginuid files: a directory stands for a
+// locked loginuid (every write fails), a regular file for a mutable one.
+func TestRevokeLoginuidCheckScript(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	dir := t.TempDir()
+	locked, mutable := filepath.Join(dir, "locked"), filepath.Join(dir, "mutable")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mutable, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{locked: "", mutable: revokeLoginuid, filepath.Join(dir, "none"): revokeLoginuid + " (state unreadable)"} {
+		out, err := exec.Command("sh", "-c", strings.ReplaceAll(revokeLoginuidCheck, "/proc/self/loginuid", path)).CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != want {
+			t.Errorf("%s: %q, %v; want %q", filepath.Base(path), out, err, want)
+		}
+	}
+}
+
 // grading-3: what the tree walk cannot find (a root loop daemonised through
 // `sudo setsid -f` where no loginuid is set, or after root rewrote its
 // loginuid) is reported when it started after Ready and no unit owns it.
