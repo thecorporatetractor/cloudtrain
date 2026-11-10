@@ -11,6 +11,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -147,15 +148,19 @@ func (a *SessionAccess) Release(ctx context.Context, namespace string) error {
 	if a == nil || a.ClusterRole == "" {
 		return nil
 	}
-	rb := &rbacv1.RoleBinding{}
-	if err := a.reader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: a.ClusterRole}, rb); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !controllerutil.RemoveFinalizer(rb, Finalizer) {
-		return nil
-	}
-	if err := a.Client.Update(ctx, rb); client.IgnoreNotFound(err) != nil {
-		return fmt.Errorf("release RoleBinding %s/%s: %w", namespace, rb.Name, err)
+	// Sessions torn down together release concurrently: retry on conflict.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		rb := &rbacv1.RoleBinding{}
+		if err := a.reader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: a.ClusterRole}, rb); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if !controllerutil.RemoveFinalizer(rb, Finalizer) {
+			return nil
+		}
+		return client.IgnoreNotFound(a.Client.Update(ctx, rb))
+	})
+	if err != nil {
+		return fmt.Errorf("release RoleBinding %s/%s: %w", namespace, a.ClusterRole, err)
 	}
 	a.Forget(namespace)
 	return nil
