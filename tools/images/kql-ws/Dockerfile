@@ -19,7 +19,7 @@
 # /var/lib/cloudtrain/kql (root only). Licence notices: /usr/share/doc/cloudtrain-kql.
 
 # --- build: KustoLoco + patches, Kusto.Language from source ------------------------------
-FROM mcr.microsoft.com/dotnet/sdk:10.0-noble@sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble@sha256:8c6edfb26c85153f236d26efebd9ad349aec403583f343f201ee67838b23658d AS build
 ARG KUSTOLOCO_COMMIT
 ARG KUSTO_LANGUAGE_COMMIT
 # 1 runs KustoLoco's BasicTests and LokqlEngineTests on the patched tree (a few minutes)
